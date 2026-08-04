@@ -119,6 +119,714 @@ func requireFactTypes(t *testing.T, facts []IdentityFact, expected ...EventType)
 	}
 }
 
+func ceremonyRehydrationParams(challenge CeremonyChallenge) CeremonyChallengeRehydrationParams {
+	return CeremonyChallengeRehydrationParams{
+		ID: challenge.ID(), Purpose: challenge.Purpose(), ProofDigest: challenge.ProofDigest(),
+		ExpiresAt: challenge.ExpiresAt(), Status: challenge.Status(),
+		InstallationID: challenge.InstallationID(), WorkspaceID: challenge.WorkspaceID(),
+		PrincipalID: challenge.PrincipalID(), MembershipID: challenge.MembershipID(),
+		ActorID: challenge.ActorID(), DelegationID: challenge.DelegationID(), DeviceID: challenge.DeviceID(),
+	}
+}
+
+func TestRehydrateCeremonyChallengeRoundTripsEveryPurposeAndLifecycle(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	deviceID, _ := ParseDeviceID(identityUUID(300))
+	membershipID, _ := ParseMembershipID(identityUUID(301))
+	ceremonyIDs := make([]CeremonyID, 4)
+	for index := range ceremonyIDs {
+		ceremonyIDs[index], _ = ParseCeremonyID(identityUUID(302 + index))
+	}
+	digest := FingerprintCommand([]byte("persisted challenge proof"))
+	membership, _ := NewMembershipAcceptanceChallenge(
+		ceremonyIDs[0], digest, fixture.now.Add(time.Minute), fixture.workspace.ID(), membershipID, fixture.workload.ID(),
+	)
+	delegation, _ := NewDelegationActivationChallenge(
+		ceremonyIDs[1], digest, fixture.now.Add(time.Minute), fixture.workspace.ID(), fixture.delegation.ID(),
+		fixture.workload.ID(), fixture.actor.ID(),
+	)
+	device, _ := NewDevicePairingChallenge(
+		ceremonyIDs[2], digest, fixture.now.Add(time.Minute), fixture.installationID, fixture.workload.ID(), deviceID,
+	)
+	session, _ := NewSessionStartChallenge(
+		ceremonyIDs[3], digest, fixture.now.Add(time.Minute), fixture.workspace.ID(), fixture.delegation.ID(),
+		fixture.workload.ID(), fixture.actor.ID(),
+	)
+	for _, challenge := range []CeremonyChallenge{membership, delegation, device, session} {
+		for _, lifecycle := range []CeremonyChallenge{challenge, challenge.consume()} {
+			rehydrated, err := RehydrateCeremonyChallenge(ceremonyRehydrationParams(lifecycle))
+			if err != nil || rehydrated != lifecycle {
+				t.Fatalf("purpose %q status %q did not round trip: state=%#v error=%v", lifecycle.Purpose(), lifecycle.Status(), rehydrated, err)
+			}
+		}
+	}
+}
+
+func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
+	fixture := buildIdentityPath(t)
+
+	invitationID, _ := ParseInvitationID(identityUUID(310))
+	installationKey, _ := NewPublicKeyReference("keyref:rehydrated-installation")
+	generation, _ := ParseBootstrapGenerationID(identityUUID(311))
+	invitation, err := NewInstallationInvitation(
+		invitationID, fixture.installationID, installationKey,
+		FingerprintCommand([]byte("rehydrated invitation")), fixture.now, generation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rehydratedInvitation, err := RehydrateInstallationInvitation(InstallationInvitationRehydrationParams{
+		ID: invitation.ID(), InstallationID: invitation.InstallationID(),
+		InstallationPublicKey: invitation.InstallationPublicKey(), InvitationVerifier: invitation.InvitationVerifier(),
+		BootstrapGenerationID: invitation.BootstrapGenerationID(), ExpiresAt: invitation.ExpiresAt(),
+		FailedAttempts: invitation.FailedAttempts(), Status: invitation.Status(), Version: invitation.Version(),
+	})
+	if err != nil || rehydratedInvitation != invitation {
+		t.Fatalf("invitation did not round trip: state=%#v error=%v", rehydratedInvitation, err)
+	}
+
+	principal, err := RehydratePrincipal(PrincipalRehydrationParams{
+		ID: fixture.workload.ID(), InstallationID: fixture.workload.InstallationID(), Kind: fixture.workload.Kind(),
+		DisplayName: fixture.workload.DisplayName(), PublicKeyReference: fixture.workload.PublicKeyReference(),
+		Status: fixture.workload.Status(), Version: fixture.workload.Version(),
+	})
+	if err != nil || principal != fixture.workload {
+		t.Fatalf("principal did not round trip: state=%#v error=%v", principal, err)
+	}
+
+	deviceID, _ := ParseDeviceID(identityUUID(312))
+	deviceName, _ := NewDisplayName("Rehydrated Device")
+	deviceKey, _ := NewPublicKeyReference("keyref:rehydrated-device")
+	deviceCeremonyID, _ := ParseCeremonyID(identityUUID(313))
+	deviceDigest := FingerprintCommand([]byte("rehydrated device proof"))
+	deviceChallenge, _ := NewDevicePairingChallenge(
+		deviceCeremonyID, deviceDigest, fixture.now.Add(time.Minute), fixture.installationID, fixture.owner.ID(), deviceID,
+	)
+	deviceCreation, _ := ExpectCeremonyAbsent(deviceCeremonyID)
+	began, err := BeginDevicePairing(BeginDevicePairingInput{
+		Authorization: fixture.ownerAuth, Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
+		DeviceID: deviceID, DisplayName: deviceName, PublicKeyReference: deviceKey,
+		Challenge: deviceChallenge, ChallengeCreation: deviceCreation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceProof, _ := NewCeremonyProof(
+		deviceCeremonyID, CeremonyPurposeDevicePairing, deviceDigest, fixture.owner.ID(), deviceID,
+	)
+	paired, err := PairDevice(PairDeviceInput{
+		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
+		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(), Proof: deviceProof, EvaluatedAt: fixture.now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rehydratedDevice, err := RehydrateDevice(DeviceRehydrationParams{
+		ID: paired.Device().ID(), InstallationID: paired.Device().InstallationID(),
+		PrincipalID: paired.Device().PrincipalID(), DisplayName: paired.Device().DisplayName(),
+		PublicKeyReference: paired.Device().PublicKeyReference(), Status: paired.Device().Status(),
+		Version: paired.Device().Version(), TrustRevision: paired.Device().TrustRevision(),
+		PairingChallenge: paired.Device().PairingChallenge(),
+	})
+	if err != nil || rehydratedDevice != paired.Device() {
+		t.Fatalf("device did not round trip: state=%#v error=%v", rehydratedDevice, err)
+	}
+
+	rehydratedGrant, err := RehydrateGrant(GrantRehydrationParams{
+		ID: fixture.ownerGrant.ID(), InstallationID: fixture.ownerGrant.InstallationID(),
+		WorkspaceID: fixture.ownerGrant.WorkspaceID(), PrincipalID: fixture.ownerGrant.PrincipalID(),
+		Status: fixture.ownerGrant.Status(), Version: fixture.ownerGrant.Version(),
+		Capabilities: fixture.ownerGrant.Capabilities(),
+	})
+	if err != nil || rehydratedGrant.ID() != fixture.ownerGrant.ID() ||
+		!rehydratedGrant.Capabilities().Equal(fixture.ownerGrant.Capabilities()) {
+		t.Fatalf("grant did not round trip: state=%#v error=%v", rehydratedGrant, err)
+	}
+
+	rehydratedWorkspace, err := RehydrateWorkspace(WorkspaceRehydrationParams{
+		ID: fixture.workspace.ID(), InstallationID: fixture.workspace.InstallationID(),
+		AuthorityID: fixture.workspace.AuthorityID(), AuthorityEpoch: fixture.workspace.AuthorityEpoch(),
+		Alias: fixture.workspace.Alias(), DiscoveryLocator: fixture.workspace.DiscoveryLocator(),
+		PolicyRevision: fixture.workspace.PolicyRevision(), Status: fixture.workspace.Status(), Version: fixture.workspace.Version(),
+	})
+	if err != nil || rehydratedWorkspace != fixture.workspace {
+		t.Fatalf("workspace did not round trip: state=%#v error=%v", rehydratedWorkspace, err)
+	}
+
+	rehydratedMembership, err := RehydrateMembership(MembershipRehydrationParams{
+		ID: fixture.membership.ID(), WorkspaceID: fixture.membership.WorkspaceID(), PrincipalID: fixture.membership.PrincipalID(),
+		Status: fixture.membership.Status(), Version: fixture.membership.Version(),
+		Capabilities: fixture.membership.Capabilities(), AcceptanceChallenge: fixture.membership.AcceptanceChallenge(),
+	})
+	if err != nil || rehydratedMembership.ID() != fixture.membership.ID() ||
+		!rehydratedMembership.Capabilities().Equal(fixture.membership.Capabilities()) ||
+		rehydratedMembership.AcceptanceChallenge() != fixture.membership.AcceptanceChallenge() {
+		t.Fatalf("membership did not round trip: state=%#v error=%v", rehydratedMembership, err)
+	}
+
+	rehydratedActor, err := RehydrateActor(ActorRehydrationParams{
+		ID: fixture.actor.ID(), WorkspaceID: fixture.actor.WorkspaceID(), Kind: fixture.actor.Kind(),
+		Profile: fixture.actor.Profile(), Status: fixture.actor.Status(), Version: fixture.actor.Version(),
+	})
+	if err != nil || rehydratedActor != fixture.actor {
+		t.Fatalf("actor did not round trip: state=%#v error=%v", rehydratedActor, err)
+	}
+
+	rehydratedDelegation, err := RehydrateActorDelegation(ActorDelegationRehydrationParams{
+		ID: fixture.delegation.ID(), WorkspaceID: fixture.delegation.WorkspaceID(),
+		PrincipalID: fixture.delegation.PrincipalID(), ActorID: fixture.delegation.ActorID(),
+		MembershipID: fixture.delegation.MembershipID(), Status: fixture.delegation.Status(),
+		Version: fixture.delegation.Version(), Capabilities: fixture.delegation.Capabilities(),
+		ActivationChallenge: fixture.delegation.ActivationChallenge(),
+	})
+	if err != nil || rehydratedDelegation.ID() != fixture.delegation.ID() ||
+		!rehydratedDelegation.Capabilities().Equal(fixture.delegation.Capabilities()) ||
+		rehydratedDelegation.ActivationChallenge() != fixture.delegation.ActivationChallenge() {
+		t.Fatalf("delegation did not round trip: state=%#v error=%v", rehydratedDelegation, err)
+	}
+
+	sessionResult, err := StartActorSession(baseSessionInput(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rehydratedSession, err := RehydrateActorSession(ActorSessionRehydrationParams{
+		ID: sessionResult.Session().ID(), ClientInstanceID: sessionResult.Session().ClientInstanceID(),
+		ClientMetadata: sessionResult.Session().ClientMetadata(), Status: sessionResult.Session().Status(),
+		Version: sessionResult.Session().Version(), Binding: sessionResult.Session().Binding(),
+		Capabilities: sessionResult.Session().Capabilities(),
+	})
+	if err != nil || rehydratedSession.ID() != sessionResult.Session().ID() ||
+		!equalSessionBindings(rehydratedSession.Binding(), sessionResult.Session().Binding()) ||
+		!rehydratedSession.Capabilities().Equal(sessionResult.Session().Capabilities()) {
+		t.Fatalf("actor session did not round trip: state=%#v error=%v", rehydratedSession, err)
+	}
+}
+
+func TestRehydrationAcceptsEverySupportedIdentityLifecycleValue(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	invitationID, _ := ParseInvitationID(identityUUID(330))
+	installationKey, _ := NewPublicKeyReference("keyref:lifecycle-installation")
+	generation, _ := ParseBootstrapGenerationID(identityUUID(331))
+	for _, lifecycle := range []struct {
+		status   InstallationInvitationStatus
+		failures uint8
+		version  uint64
+	}{
+		{InstallationInvitationPending, 2, 3},
+		{InstallationInvitationConsumed, 2, 4},
+		{InstallationInvitationExhausted, MaxBootstrapFailedAttempts, 6},
+	} {
+		version := mustVersion(t, lifecycle.version)
+		state, err := RehydrateInstallationInvitation(InstallationInvitationRehydrationParams{
+			ID: invitationID, InstallationID: fixture.installationID, InstallationPublicKey: installationKey,
+			InvitationVerifier: FingerprintCommand([]byte("lifecycle invitation")), BootstrapGenerationID: generation,
+			ExpiresAt: fixture.now.Add(time.Minute), FailedAttempts: lifecycle.failures,
+			Status: lifecycle.status, Version: version,
+		})
+		if err != nil || state.Status() != lifecycle.status || state.FailedAttempts() != lifecycle.failures {
+			t.Fatalf("invitation lifecycle %q rejected: state=%#v error=%v", lifecycle.status, state, err)
+		}
+	}
+
+	for _, kind := range []PrincipalKind{PrincipalKindHuman, PrincipalKindWorkload, PrincipalKindService} {
+		for _, status := range []PrincipalStatus{PrincipalActive, PrincipalSuspended, PrincipalDisabled} {
+			publicKey := fixture.workload.PublicKeyReference()
+			version := InitialVersion()
+			if kind == PrincipalKindHuman {
+				publicKey = PublicKeyReference{}
+			}
+			if status != PrincipalActive {
+				version = mustVersion(t, 2)
+			}
+			state, err := RehydratePrincipal(PrincipalRehydrationParams{
+				ID: fixture.workload.ID(), InstallationID: fixture.installationID, Kind: kind,
+				DisplayName: fixture.workload.DisplayName(), PublicKeyReference: publicKey,
+				Status: status, Version: version,
+			})
+			if err != nil || state.Kind() != kind || state.Status() != status {
+				t.Fatalf("principal kind %q status %q rejected: state=%#v error=%v", kind, status, state, err)
+			}
+		}
+	}
+
+	deviceID, _ := ParseDeviceID(identityUUID(332))
+	deviceName, _ := NewDisplayName("Lifecycle Device")
+	deviceKey, _ := NewPublicKeyReference("keyref:lifecycle-device")
+	deviceCeremonyID, _ := ParseCeremonyID(identityUUID(333))
+	deviceChallenge, _ := NewDevicePairingChallenge(
+		deviceCeremonyID, FingerprintCommand([]byte("lifecycle device")), fixture.now.Add(time.Minute),
+		fixture.installationID, fixture.workload.ID(), deviceID,
+	)
+	for _, status := range []DeviceStatus{DevicePending, DeviceTrusted, DeviceSuspended, DeviceRevoked} {
+		pairing := CeremonyChallenge{}
+		version := InitialVersion()
+		if status == DevicePending {
+			pairing = deviceChallenge
+		}
+		if status == DeviceSuspended || status == DeviceRevoked {
+			version = mustVersion(t, 2)
+		}
+		state, err := RehydrateDevice(DeviceRehydrationParams{
+			ID: deviceID, InstallationID: fixture.installationID, PrincipalID: fixture.workload.ID(),
+			DisplayName: deviceName, PublicKeyReference: deviceKey, Status: status,
+			Version: version, TrustRevision: InitialVersion(), PairingChallenge: pairing,
+		})
+		if err != nil || state.Status() != status {
+			t.Fatalf("device lifecycle %q rejected: state=%#v error=%v", status, state, err)
+		}
+	}
+
+	for _, status := range []GrantStatus{GrantActive, GrantRevoked} {
+		version := InitialVersion()
+		if status == GrantRevoked {
+			version = mustVersion(t, 2)
+		}
+		state, err := RehydrateGrant(GrantRehydrationParams{
+			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: fixture.owner.ID(),
+			Status: status, Version: version, Capabilities: fixture.ownerGrant.Capabilities(),
+		})
+		if err != nil || state.Status() != status {
+			t.Fatalf("grant lifecycle %q rejected: state=%#v error=%v", status, state, err)
+		}
+	}
+
+	for _, status := range []WorkspaceStatus{WorkspaceActive, WorkspaceSuspended, WorkspaceArchived} {
+		version := InitialVersion()
+		if status != WorkspaceActive {
+			version = mustVersion(t, 2)
+		}
+		state, err := RehydrateWorkspace(WorkspaceRehydrationParams{
+			ID: fixture.workspace.ID(), InstallationID: fixture.installationID,
+			AuthorityID: fixture.authorityID, AuthorityEpoch: fixture.epoch, Alias: fixture.workspace.Alias(),
+			PolicyRevision: fixture.policy, Status: status, Version: version,
+		})
+		if err != nil || state.Status() != status || !state.DiscoveryLocator().valueIsZero() {
+			t.Fatalf("workspace lifecycle %q rejected: state=%#v error=%v", status, state, err)
+		}
+	}
+
+	membershipID, _ := ParseMembershipID(identityUUID(334))
+	membershipCeremonyID, _ := ParseCeremonyID(identityUUID(335))
+	membershipChallenge, _ := NewMembershipAcceptanceChallenge(
+		membershipCeremonyID, FingerprintCommand([]byte("lifecycle membership")), fixture.now.Add(time.Minute),
+		fixture.workspace.ID(), membershipID, fixture.workload.ID(),
+	)
+	for _, status := range []MembershipStatus{
+		MembershipInvited, MembershipActive, MembershipSuspended, MembershipRevoked,
+	} {
+		acceptance := membershipChallenge.consume()
+		version := mustVersion(t, 2)
+		if status == MembershipInvited {
+			acceptance = membershipChallenge
+			version = InitialVersion()
+		}
+		state, err := RehydrateMembership(MembershipRehydrationParams{
+			ID: membershipID, WorkspaceID: fixture.workspace.ID(), PrincipalID: fixture.workload.ID(),
+			Status: status, Version: version, Capabilities: fixture.membership.Capabilities(),
+			AcceptanceChallenge: acceptance,
+		})
+		if err != nil || state.Status() != status {
+			t.Fatalf("membership lifecycle %q rejected: state=%#v error=%v", status, state, err)
+		}
+	}
+
+	for _, kind := range []ActorKind{ActorKindHuman, ActorKindAgent, ActorKindAutomation, ActorKindService} {
+		for _, status := range []ActorStatus{ActorActive, ActorSuspended, ActorRetired} {
+			version := InitialVersion()
+			if status != ActorActive {
+				version = mustVersion(t, 2)
+			}
+			state, err := RehydrateActor(ActorRehydrationParams{
+				ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: kind,
+				Profile: fixture.actor.Profile(), Status: status, Version: version,
+			})
+			if err != nil || state.Kind() != kind || state.Status() != status {
+				t.Fatalf("actor kind %q status %q rejected: state=%#v error=%v", kind, status, state, err)
+			}
+		}
+	}
+
+	for _, status := range []DelegationStatus{
+		DelegationProposed, DelegationActive, DelegationSuspended, DelegationRevoked,
+	} {
+		activation := fixture.delegation.ActivationChallenge()
+		if status == DelegationProposed {
+			activation.status = CeremonyPending
+		}
+		state, err := RehydrateActorDelegation(ActorDelegationRehydrationParams{
+			ID: fixture.delegation.ID(), WorkspaceID: fixture.workspace.ID(), PrincipalID: fixture.workload.ID(),
+			ActorID: fixture.actor.ID(), MembershipID: fixture.membership.ID(), Status: status,
+			Version: fixture.delegation.Version(), Capabilities: fixture.delegation.Capabilities(),
+			ActivationChallenge: activation,
+		})
+		if err != nil || state.Status() != status {
+			t.Fatalf("delegation lifecycle %q rejected: state=%#v error=%v", status, state, err)
+		}
+	}
+
+	sessionResult, err := StartActorSession(baseSessionInput(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []ActorSessionStatus{
+		ActorSessionActive, ActorSessionEnded, ActorSessionRevoked, ActorSessionExpired,
+	} {
+		version := InitialVersion()
+		if status != ActorSessionActive {
+			version = mustVersion(t, 2)
+		}
+		state, rehydrationErr := RehydrateActorSession(ActorSessionRehydrationParams{
+			ID: sessionResult.Session().ID(), ClientInstanceID: sessionResult.Session().ClientInstanceID(),
+			ClientMetadata: sessionResult.Session().ClientMetadata(), Status: status,
+			Version: version, Binding: sessionResult.Session().Binding(),
+			Capabilities: sessionResult.Session().Capabilities(),
+		})
+		if rehydrationErr != nil || state.Status() != status {
+			t.Fatalf("session lifecycle %q rejected: state=%#v error=%v", status, state, rehydrationErr)
+		}
+	}
+}
+
+func TestRehydrationRejectsImpossibleInvitationCeremonyAndPrincipalStates(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	invitationID, _ := ParseInvitationID(identityUUID(320))
+	installationKey, _ := NewPublicKeyReference("keyref:invalid-state-installation")
+	generation, _ := ParseBootstrapGenerationID(identityUUID(321))
+	invitationBase := InstallationInvitationRehydrationParams{
+		ID: invitationID, InstallationID: fixture.installationID, InstallationPublicKey: installationKey,
+		InvitationVerifier: FingerprintCommand([]byte("invitation verifier")), BootstrapGenerationID: generation,
+		ExpiresAt: fixture.now.Add(time.Minute), Status: InstallationInvitationPending, Version: InitialVersion(),
+	}
+	invitationCases := []struct {
+		name   string
+		mutate func(*InstallationInvitationRehydrationParams)
+	}{
+		{"pending at failure ceiling", func(params *InstallationInvitationRehydrationParams) {
+			params.FailedAttempts = MaxBootstrapFailedAttempts
+			params.Version = mustVersion(t, 6)
+		}},
+		{"consumed without success version", func(params *InstallationInvitationRehydrationParams) {
+			params.Status = InstallationInvitationConsumed
+		}},
+		{"exhausted below failure ceiling", func(params *InstallationInvitationRehydrationParams) {
+			params.Status = InstallationInvitationExhausted
+		}},
+		{"unknown status", func(params *InstallationInvitationRehydrationParams) { params.Status = "unknown" }},
+		{"zero expiry", func(params *InstallationInvitationRehydrationParams) { params.ExpiresAt = time.Time{} }},
+		{"malformed public key", func(params *InstallationInvitationRehydrationParams) {
+			params.InstallationPublicKey = PublicKeyReference{value: " padded "}
+		}},
+	}
+	for _, test := range invitationCases {
+		t.Run("invitation/"+test.name, func(t *testing.T) {
+			params := invitationBase
+			test.mutate(&params)
+			state, err := RehydrateInstallationInvitation(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+
+	challengeCases := []struct {
+		name   string
+		mutate func(*CeremonyChallengeRehydrationParams)
+	}{
+		{"extraneous device", func(params *CeremonyChallengeRehydrationParams) {
+			params.DeviceID, _ = ParseDeviceID(identityUUID(322))
+		}},
+		{"missing actor", func(params *CeremonyChallengeRehydrationParams) { params.ActorID = ActorID{} }},
+		{"unknown status", func(params *CeremonyChallengeRehydrationParams) { params.Status = "unknown" }},
+		{"unknown purpose", func(params *CeremonyChallengeRehydrationParams) { params.Purpose = "unknown" }},
+	}
+	for _, test := range challengeCases {
+		t.Run("ceremony/"+test.name, func(t *testing.T) {
+			params := ceremonyRehydrationParams(fixture.sessionChallenge)
+			test.mutate(&params)
+			state, err := RehydrateCeremonyChallenge(params)
+			if !errors.Is(err, ErrInvalidCeremonyChallenge) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+
+	principalBase := PrincipalRehydrationParams{
+		ID: fixture.workload.ID(), InstallationID: fixture.installationID, Kind: PrincipalKindWorkload,
+		DisplayName: fixture.workload.DisplayName(), PublicKeyReference: fixture.workload.PublicKeyReference(),
+		Status: PrincipalActive, Version: InitialVersion(),
+	}
+	principalCases := []struct {
+		name   string
+		mutate func(*PrincipalRehydrationParams)
+	}{
+		{"workload without key", func(params *PrincipalRehydrationParams) {
+			params.PublicKeyReference = PublicKeyReference{}
+		}},
+		{"malformed display name", func(params *PrincipalRehydrationParams) {
+			params.DisplayName = DisplayName{value: " padded "}
+		}},
+		{"unknown kind", func(params *PrincipalRehydrationParams) { params.Kind = "unknown" }},
+		{"unknown status", func(params *PrincipalRehydrationParams) { params.Status = "unknown" }},
+		{"zero version", func(params *PrincipalRehydrationParams) { params.Version = Version{} }},
+		{"suspended at creation version", func(params *PrincipalRehydrationParams) {
+			params.Status = PrincipalSuspended
+		}},
+	}
+	for _, test := range principalCases {
+		t.Run("principal/"+test.name, func(t *testing.T) {
+			params := principalBase
+			test.mutate(&params)
+			state, err := RehydratePrincipal(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+}
+
+func TestRehydrationRejectsImpossibleDeviceGrantAndWorkspaceStates(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	deviceID, _ := ParseDeviceID(identityUUID(323))
+	deviceName, _ := NewDisplayName("Persisted Device")
+	deviceKey, _ := NewPublicKeyReference("keyref:persisted-device")
+	deviceCeremonyID, _ := ParseCeremonyID(identityUUID(324))
+	deviceChallenge, _ := NewDevicePairingChallenge(
+		deviceCeremonyID, FingerprintCommand([]byte("device proof")), fixture.now.Add(time.Minute),
+		fixture.installationID, fixture.workload.ID(), deviceID,
+	)
+	deviceBase := DeviceRehydrationParams{
+		ID: deviceID, InstallationID: fixture.installationID, PrincipalID: fixture.workload.ID(),
+		DisplayName: deviceName, PublicKeyReference: deviceKey, Status: DevicePending,
+		Version: InitialVersion(), TrustRevision: InitialVersion(), PairingChallenge: deviceChallenge,
+	}
+	deviceCases := []struct {
+		name   string
+		mutate func(*DeviceRehydrationParams)
+	}{
+		{"pending without pairing", func(params *DeviceRehydrationParams) {
+			params.PairingChallenge = CeremonyChallenge{}
+		}},
+		{"trusted with pending pairing", func(params *DeviceRehydrationParams) { params.Status = DeviceTrusted }},
+		{"cross principal pairing", func(params *DeviceRehydrationParams) { params.PrincipalID = fixture.owner.ID() }},
+		{"trust newer than aggregate", func(params *DeviceRehydrationParams) {
+			params.TrustRevision = mustVersion(t, 2)
+		}},
+		{"unknown status", func(params *DeviceRehydrationParams) { params.Status = "unknown" }},
+		{"suspended at creation version", func(params *DeviceRehydrationParams) {
+			params.Status = DeviceSuspended
+			params.PairingChallenge = CeremonyChallenge{}
+		}},
+		{"consumed pairing without trust advance", func(params *DeviceRehydrationParams) {
+			params.Status = DeviceTrusted
+			params.Version = mustVersion(t, 2)
+			params.PairingChallenge = params.PairingChallenge.consume()
+		}},
+	}
+	for _, test := range deviceCases {
+		t.Run("device/"+test.name, func(t *testing.T) {
+			params := deviceBase
+			test.mutate(&params)
+			state, err := RehydrateDevice(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+
+	badCapability := CapabilitySet{values: []Capability{{value: "*"}}}
+	grantCases := []GrantRehydrationParams{
+		{
+			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: fixture.owner.ID(),
+			Status: GrantActive, Version: InitialVersion(), Capabilities: badCapability,
+		},
+		{
+			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: fixture.owner.ID(),
+			Status: "unknown", Version: InitialVersion(), Capabilities: fixture.ownerGrant.Capabilities(),
+		},
+		{
+			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: PrincipalID{},
+			Status: GrantActive, Version: InitialVersion(), Capabilities: fixture.ownerGrant.Capabilities(),
+		},
+		{
+			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: fixture.owner.ID(),
+			Status: GrantRevoked, Version: InitialVersion(), Capabilities: fixture.ownerGrant.Capabilities(),
+		},
+	}
+	for index, params := range grantCases {
+		state, err := RehydrateGrant(params)
+		if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+			t.Fatalf("grant case %d: state=%#v error=%v", index, state, err)
+		}
+	}
+
+	workspaceBase := WorkspaceRehydrationParams{
+		ID: fixture.workspace.ID(), InstallationID: fixture.installationID, AuthorityID: fixture.authorityID,
+		AuthorityEpoch: fixture.epoch, Alias: fixture.workspace.Alias(), DiscoveryLocator: fixture.workspace.DiscoveryLocator(),
+		PolicyRevision: fixture.policy, Status: WorkspaceActive, Version: InitialVersion(),
+	}
+	workspaceCases := []struct {
+		name   string
+		mutate func(*WorkspaceRehydrationParams)
+	}{
+		{"malformed discovery", func(params *WorkspaceRehydrationParams) {
+			params.DiscoveryLocator = DiscoveryLocator{value: " padded "}
+		}},
+		{"malformed alias", func(params *WorkspaceRehydrationParams) {
+			params.Alias = WorkspaceAlias{value: " padded "}
+		}},
+		{"missing authority", func(params *WorkspaceRehydrationParams) { params.AuthorityID = AuthorityID{} }},
+		{"unknown status", func(params *WorkspaceRehydrationParams) { params.Status = "unknown" }},
+		{"zero version", func(params *WorkspaceRehydrationParams) { params.Version = Version{} }},
+		{"archived at creation version", func(params *WorkspaceRehydrationParams) { params.Status = WorkspaceArchived }},
+	}
+	for _, test := range workspaceCases {
+		t.Run("workspace/"+test.name, func(t *testing.T) {
+			params := workspaceBase
+			test.mutate(&params)
+			state, err := RehydrateWorkspace(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+}
+
+func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	badCapability := CapabilitySet{values: []Capability{{value: "*"}}}
+	membershipBase := MembershipRehydrationParams{
+		ID: fixture.membership.ID(), WorkspaceID: fixture.workspace.ID(), PrincipalID: fixture.workload.ID(),
+		Status: MembershipActive, Version: fixture.membership.Version(), Capabilities: fixture.membership.Capabilities(),
+		AcceptanceChallenge: fixture.membership.AcceptanceChallenge(),
+	}
+	membershipCases := []struct {
+		name   string
+		mutate func(*MembershipRehydrationParams)
+	}{
+		{"active with pending challenge", func(params *MembershipRehydrationParams) {
+			params.AcceptanceChallenge.status = CeremonyPending
+		}},
+		{"invited with consumed challenge", func(params *MembershipRehydrationParams) { params.Status = MembershipInvited }},
+		{"cross membership challenge", func(params *MembershipRehydrationParams) { params.ID = fixture.ownerMembership.ID() }},
+		{"invalid capabilities", func(params *MembershipRehydrationParams) { params.Capabilities = badCapability }},
+		{"invited without challenge", func(params *MembershipRehydrationParams) {
+			params.Status = MembershipInvited
+			params.AcceptanceChallenge = CeremonyChallenge{}
+		}},
+		{"suspended at creation version", func(params *MembershipRehydrationParams) {
+			params.Status = MembershipSuspended
+			params.Version = InitialVersion()
+		}},
+	}
+	for _, test := range membershipCases {
+		t.Run("membership/"+test.name, func(t *testing.T) {
+			params := membershipBase
+			test.mutate(&params)
+			state, err := RehydrateMembership(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+
+	actorCases := []ActorRehydrationParams{
+		{
+			ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: fixture.actor.Kind(),
+			Profile: ActorProfile{displayName: DisplayName{value: "\n"}}, Status: ActorActive, Version: InitialVersion(),
+		},
+		{
+			ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: "unknown",
+			Profile: fixture.actor.Profile(), Status: ActorActive, Version: InitialVersion(),
+		},
+		{
+			ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: fixture.actor.Kind(),
+			Profile: fixture.actor.Profile(), Status: "unknown", Version: InitialVersion(),
+		},
+		{
+			ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: fixture.actor.Kind(),
+			Profile: fixture.actor.Profile(), Status: ActorSuspended, Version: InitialVersion(),
+		},
+	}
+	for index, params := range actorCases {
+		state, err := RehydrateActor(params)
+		if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+			t.Fatalf("actor case %d: state=%#v error=%v", index, state, err)
+		}
+	}
+
+	delegationBase := ActorDelegationRehydrationParams{
+		ID: fixture.delegation.ID(), WorkspaceID: fixture.workspace.ID(), PrincipalID: fixture.workload.ID(),
+		ActorID: fixture.actor.ID(), MembershipID: fixture.membership.ID(), Status: DelegationActive,
+		Version: fixture.delegation.Version(), Capabilities: fixture.delegation.Capabilities(),
+		ActivationChallenge: fixture.delegation.ActivationChallenge(),
+	}
+	delegationCases := []struct {
+		name   string
+		mutate func(*ActorDelegationRehydrationParams)
+	}{
+		{"active with pending activation", func(params *ActorDelegationRehydrationParams) {
+			params.ActivationChallenge.status = CeremonyPending
+		}},
+		{"proposed with consumed activation", func(params *ActorDelegationRehydrationParams) {
+			params.Status = DelegationProposed
+		}},
+		{"cross actor activation", func(params *ActorDelegationRehydrationParams) { params.ActorID = ActorID{} }},
+		{"missing membership", func(params *ActorDelegationRehydrationParams) { params.MembershipID = MembershipID{} }},
+		{"invalid capabilities", func(params *ActorDelegationRehydrationParams) { params.Capabilities = badCapability }},
+		{"active at creation version", func(params *ActorDelegationRehydrationParams) {
+			params.Version = InitialVersion()
+		}},
+	}
+	for _, test := range delegationCases {
+		t.Run("delegation/"+test.name, func(t *testing.T) {
+			params := delegationBase
+			test.mutate(&params)
+			state, err := RehydrateActorDelegation(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+
+	sessionResult, err := StartActorSession(baseSessionInput(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBase := ActorSessionRehydrationParams{
+		ID: sessionResult.Session().ID(), ClientInstanceID: sessionResult.Session().ClientInstanceID(),
+		ClientMetadata: sessionResult.Session().ClientMetadata(), Status: ActorSessionActive,
+		Version: InitialVersion(), Binding: sessionResult.Session().Binding(), Capabilities: sessionResult.Session().Capabilities(),
+	}
+	sessionCases := []struct {
+		name   string
+		mutate func(*ActorSessionRehydrationParams)
+	}{
+		{"zero client", func(params *ActorSessionRehydrationParams) { params.ClientInstanceID = ClientInstanceID{} }},
+		{"malformed metadata", func(params *ActorSessionRehydrationParams) {
+			params.ClientMetadata = ClientMetadata{name: " bad ", version: "1"}
+		}},
+		{"unknown status", func(params *ActorSessionRehydrationParams) { params.Status = "unknown" }},
+		{"invalid capabilities", func(params *ActorSessionRehydrationParams) { params.Capabilities = badCapability }},
+		{"invalid binding", func(params *ActorSessionRehydrationParams) { params.Binding.membership = AggregateRef{} }},
+		{"malformed binding assurance", func(params *ActorSessionRehydrationParams) {
+			params.Binding.assurance = AssuranceClass{value: "Invalid"}
+		}},
+		{"ended at creation version", func(params *ActorSessionRehydrationParams) {
+			params.Status = ActorSessionEnded
+		}},
+	}
+	for _, test := range sessionCases {
+		t.Run("session/"+test.name, func(t *testing.T) {
+			params := sessionBase
+			test.mutate(&params)
+			state, err := RehydrateActorSession(params)
+			if !errors.Is(err, ErrInvalidIdentityState) || !state.IsZero() {
+				t.Fatalf("state=%#v error=%v", state, err)
+			}
+		})
+	}
+}
+
 type identityPathFixture struct {
 	now                time.Time
 	authorityID        AuthorityID

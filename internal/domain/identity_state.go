@@ -162,7 +162,8 @@ func NewCapabilitySet(capabilities ...Capability) (CapabilitySet, error) {
 	}
 	values := append([]Capability(nil), capabilities...)
 	for _, capability := range values {
-		if capability.String() == "" {
+		validated, err := NewCapability(capability.String())
+		if err != nil || validated != capability {
 			return CapabilitySet{}, ErrInvalidCapabilitySet
 		}
 	}
@@ -237,6 +238,10 @@ const (
 	CeremonyPending  CeremonyStatus = "pending"
 	CeremonyConsumed CeremonyStatus = "consumed"
 )
+
+func (status CeremonyStatus) Valid() bool {
+	return status == CeremonyPending || status == CeremonyConsumed
+}
 
 // CeremonyChallenge retains only bounded proof metadata. Secret handoff bytes
 // and cryptographic verification remain outside the pure domain transition.
@@ -368,6 +373,56 @@ func (challenge CeremonyChallenge) consume() CeremonyChallenge {
 	return challenge
 }
 
+// CeremonyChallengeRehydrationParams is the complete persisted representation of a
+// ceremony challenge. RehydrateCeremonyChallenge is the only persistence
+// entrypoint: callers cannot bypass purpose-specific reference validation.
+type CeremonyChallengeRehydrationParams struct {
+	ID             CeremonyID
+	Purpose        CeremonyPurpose
+	ProofDigest    CommandFingerprint
+	ExpiresAt      time.Time
+	Status         CeremonyStatus
+	InstallationID InstallationID
+	WorkspaceID    WorkspaceID
+	PrincipalID    PrincipalID
+	MembershipID   MembershipID
+	ActorID        ActorID
+	DelegationID   ActorDelegationID
+	DeviceID       DeviceID
+}
+
+func RehydrateCeremonyChallenge(params CeremonyChallengeRehydrationParams) (CeremonyChallenge, error) {
+	if params.ID.IsZero() || !params.Purpose.Valid() || params.ProofDigest.IsZero() ||
+		params.ExpiresAt.IsZero() || !params.Status.Valid() {
+		return CeremonyChallenge{}, ErrInvalidCeremonyChallenge
+	}
+	validReferences := false
+	switch params.Purpose {
+	case CeremonyPurposeMembershipAcceptance:
+		validReferences = params.InstallationID.IsZero() && !params.WorkspaceID.IsZero() &&
+			!params.PrincipalID.IsZero() && !params.MembershipID.IsZero() && params.ActorID.IsZero() &&
+			params.DelegationID.IsZero() && params.DeviceID.IsZero()
+	case CeremonyPurposeDelegationActivation, CeremonyPurposeActorSessionStart:
+		validReferences = params.InstallationID.IsZero() && !params.WorkspaceID.IsZero() &&
+			!params.PrincipalID.IsZero() && params.MembershipID.IsZero() && !params.ActorID.IsZero() &&
+			!params.DelegationID.IsZero() && params.DeviceID.IsZero()
+	case CeremonyPurposeDevicePairing:
+		validReferences = !params.InstallationID.IsZero() && params.WorkspaceID.IsZero() &&
+			!params.PrincipalID.IsZero() && params.MembershipID.IsZero() && params.ActorID.IsZero() &&
+			params.DelegationID.IsZero() && !params.DeviceID.IsZero()
+	}
+	if !validReferences {
+		return CeremonyChallenge{}, ErrInvalidCeremonyChallenge
+	}
+	return CeremonyChallenge{
+		id: params.ID, purpose: params.Purpose, proofDigest: params.ProofDigest,
+		expiresAt: params.ExpiresAt.UTC(), status: params.Status,
+		installationID: params.InstallationID, workspaceID: params.WorkspaceID,
+		principalID: params.PrincipalID, membershipID: params.MembershipID,
+		actorID: params.ActorID, delegationID: params.DelegationID, deviceID: params.DeviceID,
+	}, nil
+}
+
 // CeremonyCreationExpectation makes global CeremonyID uniqueness an explicit
 // unit-of-work precondition. The persistence boundary must atomically verify
 // that this ID is absent when it stores the transition result.
@@ -450,6 +505,57 @@ type InstallationInvitationState struct {
 	failedAttempts        uint8
 	status                InstallationInvitationStatus
 	version               Version
+}
+
+type InstallationInvitationRehydrationParams struct {
+	ID                    InvitationID
+	InstallationID        InstallationID
+	InstallationPublicKey PublicKeyReference
+	InvitationVerifier    CommandFingerprint
+	BootstrapGenerationID BootstrapGenerationID
+	ExpiresAt             time.Time
+	FailedAttempts        uint8
+	Status                InstallationInvitationStatus
+	Version               Version
+}
+
+func RehydrateInstallationInvitation(
+	params InstallationInvitationRehydrationParams,
+) (InstallationInvitationState, error) {
+	if params.ID.IsZero() || params.InstallationID.IsZero() || !validPublicKeyReferenceValue(params.InstallationPublicKey) ||
+		params.InvitationVerifier.IsZero() || params.BootstrapGenerationID.IsZero() || params.ExpiresAt.IsZero() ||
+		params.Version.IsZero() || params.FailedAttempts > MaxBootstrapFailedAttempts {
+		return InstallationInvitationState{}, ErrInvalidIdentityState
+	}
+	var expectedVersion uint64
+	switch params.Status {
+	case InstallationInvitationPending:
+		if params.FailedAttempts == MaxBootstrapFailedAttempts {
+			return InstallationInvitationState{}, ErrInvalidIdentityState
+		}
+		expectedVersion = uint64(params.FailedAttempts) + 1
+	case InstallationInvitationConsumed:
+		if params.FailedAttempts == MaxBootstrapFailedAttempts {
+			return InstallationInvitationState{}, ErrInvalidIdentityState
+		}
+		expectedVersion = uint64(params.FailedAttempts) + 2
+	case InstallationInvitationExhausted:
+		if params.FailedAttempts != MaxBootstrapFailedAttempts {
+			return InstallationInvitationState{}, ErrInvalidIdentityState
+		}
+		expectedVersion = uint64(MaxBootstrapFailedAttempts) + 1
+	default:
+		return InstallationInvitationState{}, ErrInvalidIdentityState
+	}
+	if params.Version.Uint64() != expectedVersion {
+		return InstallationInvitationState{}, ErrInvalidIdentityState
+	}
+	return InstallationInvitationState{
+		id: params.ID, installationID: params.InstallationID,
+		installationPublicKey: params.InstallationPublicKey, invitationVerifier: params.InvitationVerifier,
+		bootstrapGeneration: params.BootstrapGenerationID, expiresAt: params.ExpiresAt.UTC(),
+		failedAttempts: params.FailedAttempts, status: params.Status, version: params.Version,
+	}, nil
 }
 
 func NewInstallationInvitation(
@@ -819,6 +925,10 @@ const (
 	PrincipalDisabled  PrincipalStatus = "disabled"
 )
 
+func (status PrincipalStatus) Valid() bool {
+	return status == PrincipalActive || status == PrincipalSuspended || status == PrincipalDisabled
+}
+
 type PrincipalState struct {
 	id             PrincipalID
 	installationID InstallationID
@@ -846,6 +956,10 @@ const (
 	DeviceSuspended DeviceStatus = "suspended"
 	DeviceRevoked   DeviceStatus = "revoked"
 )
+
+func (status DeviceStatus) Valid() bool {
+	return status == DevicePending || status == DeviceTrusted || status == DeviceSuspended || status == DeviceRevoked
+}
 
 type DeviceState struct {
 	id             DeviceID
@@ -877,6 +991,8 @@ const (
 	GrantRevoked GrantStatus = "revoked"
 )
 
+func (status GrantStatus) Valid() bool { return status == GrantActive || status == GrantRevoked }
+
 type GrantState struct {
 	id             GrantID
 	installationID InstallationID
@@ -903,6 +1019,10 @@ const (
 	WorkspaceSuspended WorkspaceStatus = "suspended"
 	WorkspaceArchived  WorkspaceStatus = "archived"
 )
+
+func (status WorkspaceStatus) Valid() bool {
+	return status == WorkspaceActive || status == WorkspaceSuspended || status == WorkspaceArchived
+}
 
 type WorkspaceState struct {
 	id             WorkspaceID
@@ -935,6 +1055,11 @@ const (
 	MembershipSuspended MembershipStatus = "suspended"
 	MembershipRevoked   MembershipStatus = "revoked"
 )
+
+func (status MembershipStatus) Valid() bool {
+	return status == MembershipInvited || status == MembershipActive ||
+		status == MembershipSuspended || status == MembershipRevoked
+}
 
 type MembershipState struct {
 	id           MembershipID
@@ -978,6 +1103,10 @@ const (
 	ActorRetired   ActorStatus = "retired"
 )
 
+func (status ActorStatus) Valid() bool {
+	return status == ActorActive || status == ActorSuspended || status == ActorRetired
+}
+
 type ActorState struct {
 	id          ActorID
 	workspaceID WorkspaceID
@@ -1003,6 +1132,11 @@ const (
 	DelegationSuspended DelegationStatus = "suspended"
 	DelegationRevoked   DelegationStatus = "revoked"
 )
+
+func (status DelegationStatus) Valid() bool {
+	return status == DelegationProposed || status == DelegationActive ||
+		status == DelegationSuspended || status == DelegationRevoked
+}
 
 type ActorDelegationState struct {
 	id           ActorDelegationID
@@ -1038,6 +1172,11 @@ const (
 	ActorSessionExpired ActorSessionStatus = "expired"
 )
 
+func (status ActorSessionStatus) Valid() bool {
+	return status == ActorSessionActive || status == ActorSessionEnded ||
+		status == ActorSessionRevoked || status == ActorSessionExpired
+}
+
 type ActorSessionState struct {
 	id             ActorSessionID
 	clientInstance ClientInstanceID
@@ -1057,6 +1196,378 @@ func (state ActorSessionState) Version() Version                   { return stat
 func (state ActorSessionState) Binding() SessionBinding            { return state.binding }
 func (state ActorSessionState) Capabilities() CapabilitySet {
 	return cloneCapabilitySet(state.capabilities)
+}
+
+// The rehydration parameter types below are deliberately separate from
+// transition inputs. They describe only durable state and force every adapter
+// to pass back through the same invariant checks after decoding storage.
+
+type PrincipalRehydrationParams struct {
+	ID                 PrincipalID
+	InstallationID     InstallationID
+	Kind               PrincipalKind
+	DisplayName        DisplayName
+	PublicKeyReference PublicKeyReference
+	Status             PrincipalStatus
+	Version            Version
+}
+
+func RehydratePrincipal(params PrincipalRehydrationParams) (PrincipalState, error) {
+	if params.ID.IsZero() || params.InstallationID.IsZero() || !params.Kind.Valid() ||
+		!params.Status.Valid() || params.Version.IsZero() || !validDisplayNameValue(params.DisplayName) ||
+		(!params.PublicKeyReference.valueIsZero() && !validPublicKeyReferenceValue(params.PublicKeyReference)) ||
+		(params.Kind != PrincipalKindHuman && params.PublicKeyReference.valueIsZero()) ||
+		(params.Status != PrincipalActive && !versionRecordsMutation(params.Version)) {
+		return PrincipalState{}, ErrInvalidIdentityState
+	}
+	return PrincipalState{
+		id: params.ID, installationID: params.InstallationID, kind: params.Kind,
+		displayName: params.DisplayName, publicKey: params.PublicKeyReference,
+		status: params.Status, version: params.Version,
+	}, nil
+}
+
+type DeviceRehydrationParams struct {
+	ID                 DeviceID
+	InstallationID     InstallationID
+	PrincipalID        PrincipalID
+	DisplayName        DisplayName
+	PublicKeyReference PublicKeyReference
+	Status             DeviceStatus
+	Version            Version
+	TrustRevision      Version
+	PairingChallenge   CeremonyChallenge
+}
+
+func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
+	if params.ID.IsZero() || params.InstallationID.IsZero() || params.PrincipalID.IsZero() ||
+		!validDisplayNameValue(params.DisplayName) || !validPublicKeyReferenceValue(params.PublicKeyReference) ||
+		!params.Status.Valid() || params.Version.IsZero() || params.TrustRevision.IsZero() ||
+		params.TrustRevision.Uint64() > params.Version.Uint64() {
+		return DeviceState{}, ErrInvalidIdentityState
+	}
+	hasPairing := !params.PairingChallenge.IsZero()
+	if (params.Status == DeviceSuspended || params.Status == DeviceRevoked) && !versionRecordsMutation(params.Version) {
+		return DeviceState{}, ErrInvalidIdentityState
+	}
+	if params.Status == DevicePending {
+		if !hasPairing || params.PairingChallenge.Status() != CeremonyPending {
+			return DeviceState{}, ErrInvalidIdentityState
+		}
+	} else if hasPairing {
+		if params.PairingChallenge.Status() != CeremonyConsumed || !versionRecordsMutation(params.Version) ||
+			!versionRecordsMutation(params.TrustRevision) {
+			return DeviceState{}, ErrInvalidIdentityState
+		}
+	}
+	if hasPairing && (!validCeremonyChallenge(params.PairingChallenge) ||
+		params.PairingChallenge.Purpose() != CeremonyPurposeDevicePairing ||
+		params.PairingChallenge.InstallationID() != params.InstallationID ||
+		params.PairingChallenge.PrincipalID() != params.PrincipalID ||
+		params.PairingChallenge.DeviceID() != params.ID) {
+		return DeviceState{}, ErrInvalidIdentityState
+	}
+	return DeviceState{
+		id: params.ID, installationID: params.InstallationID, principalID: params.PrincipalID,
+		displayName: params.DisplayName, publicKey: params.PublicKeyReference, status: params.Status,
+		version: params.Version, trustRevision: params.TrustRevision, pairing: params.PairingChallenge,
+	}, nil
+}
+
+type GrantRehydrationParams struct {
+	ID             GrantID
+	InstallationID InstallationID
+	WorkspaceID    WorkspaceID
+	PrincipalID    PrincipalID
+	Status         GrantStatus
+	Version        Version
+	Capabilities   CapabilitySet
+}
+
+func RehydrateGrant(params GrantRehydrationParams) (GrantState, error) {
+	capabilities, valid := validatedCapabilitySet(params.Capabilities)
+	if params.ID.IsZero() || params.InstallationID.IsZero() || params.PrincipalID.IsZero() ||
+		!params.Status.Valid() || params.Version.IsZero() || !valid ||
+		(params.Status == GrantRevoked && !versionRecordsMutation(params.Version)) {
+		return GrantState{}, ErrInvalidIdentityState
+	}
+	return GrantState{
+		id: params.ID, installationID: params.InstallationID, workspaceID: params.WorkspaceID,
+		principalID: params.PrincipalID, status: params.Status, version: params.Version,
+		capabilities: capabilities,
+	}, nil
+}
+
+type WorkspaceRehydrationParams struct {
+	ID               WorkspaceID
+	InstallationID   InstallationID
+	AuthorityID      AuthorityID
+	AuthorityEpoch   AuthorityEpoch
+	Alias            WorkspaceAlias
+	DiscoveryLocator DiscoveryLocator
+	PolicyRevision   PolicyRevision
+	Status           WorkspaceStatus
+	Version          Version
+}
+
+func RehydrateWorkspace(params WorkspaceRehydrationParams) (WorkspaceState, error) {
+	if params.ID.IsZero() || params.InstallationID.IsZero() || params.AuthorityID.IsZero() ||
+		params.AuthorityEpoch.IsZero() || !validWorkspaceAliasValue(params.Alias) ||
+		(!params.DiscoveryLocator.valueIsZero() && !validDiscoveryLocatorValue(params.DiscoveryLocator)) ||
+		!validPolicyRevisionValue(params.PolicyRevision) || !params.Status.Valid() || params.Version.IsZero() ||
+		(params.Status != WorkspaceActive && !versionRecordsMutation(params.Version)) {
+		return WorkspaceState{}, ErrInvalidIdentityState
+	}
+	return WorkspaceState{
+		id: params.ID, installationID: params.InstallationID, authorityID: params.AuthorityID,
+		epoch: params.AuthorityEpoch, alias: params.Alias, discovery: params.DiscoveryLocator,
+		policy: params.PolicyRevision, status: params.Status, version: params.Version,
+	}, nil
+}
+
+type MembershipRehydrationParams struct {
+	ID                  MembershipID
+	WorkspaceID         WorkspaceID
+	PrincipalID         PrincipalID
+	Status              MembershipStatus
+	Version             Version
+	Capabilities        CapabilitySet
+	AcceptanceChallenge CeremonyChallenge
+}
+
+func RehydrateMembership(params MembershipRehydrationParams) (MembershipState, error) {
+	capabilities, valid := validatedCapabilitySet(params.Capabilities)
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.PrincipalID.IsZero() ||
+		!params.Status.Valid() || params.Version.IsZero() || !valid {
+		return MembershipState{}, ErrInvalidIdentityState
+	}
+	hasAcceptance := !params.AcceptanceChallenge.IsZero()
+	if (params.Status == MembershipSuspended || params.Status == MembershipRevoked) &&
+		!versionRecordsMutation(params.Version) {
+		return MembershipState{}, ErrInvalidIdentityState
+	}
+	if params.Status == MembershipInvited {
+		if !hasAcceptance || params.AcceptanceChallenge.Status() != CeremonyPending {
+			return MembershipState{}, ErrInvalidIdentityState
+		}
+	} else if hasAcceptance {
+		if params.AcceptanceChallenge.Status() != CeremonyConsumed || !versionRecordsMutation(params.Version) {
+			return MembershipState{}, ErrInvalidIdentityState
+		}
+	}
+	if hasAcceptance && (!validCeremonyChallenge(params.AcceptanceChallenge) ||
+		params.AcceptanceChallenge.Purpose() != CeremonyPurposeMembershipAcceptance ||
+		params.AcceptanceChallenge.WorkspaceID() != params.WorkspaceID ||
+		params.AcceptanceChallenge.MembershipID() != params.ID ||
+		params.AcceptanceChallenge.PrincipalID() != params.PrincipalID) {
+		return MembershipState{}, ErrInvalidIdentityState
+	}
+	return MembershipState{
+		id: params.ID, workspaceID: params.WorkspaceID, principalID: params.PrincipalID,
+		status: params.Status, version: params.Version, capabilities: capabilities,
+		acceptance: params.AcceptanceChallenge,
+	}, nil
+}
+
+type ActorRehydrationParams struct {
+	ID          ActorID
+	WorkspaceID WorkspaceID
+	Kind        ActorKind
+	Profile     ActorProfile
+	Status      ActorStatus
+	Version     Version
+}
+
+func RehydrateActor(params ActorRehydrationParams) (ActorState, error) {
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || !params.Kind.Valid() ||
+		!validActorProfileValue(params.Profile) || !params.Status.Valid() || params.Version.IsZero() ||
+		(params.Status != ActorActive && !versionRecordsMutation(params.Version)) {
+		return ActorState{}, ErrInvalidIdentityState
+	}
+	return ActorState{
+		id: params.ID, workspaceID: params.WorkspaceID, kind: params.Kind,
+		profile: params.Profile, status: params.Status, version: params.Version,
+	}, nil
+}
+
+type ActorDelegationRehydrationParams struct {
+	ID                  ActorDelegationID
+	WorkspaceID         WorkspaceID
+	PrincipalID         PrincipalID
+	ActorID             ActorID
+	MembershipID        MembershipID
+	Status              DelegationStatus
+	Version             Version
+	Capabilities        CapabilitySet
+	ActivationChallenge CeremonyChallenge
+}
+
+func RehydrateActorDelegation(
+	params ActorDelegationRehydrationParams,
+) (ActorDelegationState, error) {
+	capabilities, valid := validatedCapabilitySet(params.Capabilities)
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.PrincipalID.IsZero() ||
+		params.ActorID.IsZero() || params.MembershipID.IsZero() || !params.Status.Valid() ||
+		params.Version.IsZero() || !valid || params.ActivationChallenge.IsZero() ||
+		!validCeremonyChallenge(params.ActivationChallenge) ||
+		params.ActivationChallenge.Purpose() != CeremonyPurposeDelegationActivation ||
+		params.ActivationChallenge.WorkspaceID() != params.WorkspaceID ||
+		params.ActivationChallenge.PrincipalID() != params.PrincipalID ||
+		params.ActivationChallenge.ActorID() != params.ActorID ||
+		params.ActivationChallenge.DelegationID() != params.ID {
+		return ActorDelegationState{}, ErrInvalidIdentityState
+	}
+	if (params.Status == DelegationProposed) != (params.ActivationChallenge.Status() == CeremonyPending) {
+		return ActorDelegationState{}, ErrInvalidIdentityState
+	}
+	if params.Status != DelegationProposed && !versionRecordsMutation(params.Version) {
+		return ActorDelegationState{}, ErrInvalidIdentityState
+	}
+	return ActorDelegationState{
+		id: params.ID, workspaceID: params.WorkspaceID, principalID: params.PrincipalID,
+		actorID: params.ActorID, membershipID: params.MembershipID, status: params.Status,
+		version: params.Version, capabilities: capabilities, activation: params.ActivationChallenge,
+	}, nil
+}
+
+type ActorSessionRehydrationParams struct {
+	ID               ActorSessionID
+	ClientInstanceID ClientInstanceID
+	ClientMetadata   ClientMetadata
+	Status           ActorSessionStatus
+	Version          Version
+	Binding          SessionBinding
+	Capabilities     CapabilitySet
+}
+
+func RehydrateActorSession(params ActorSessionRehydrationParams) (ActorSessionState, error) {
+	capabilities, capabilitiesValid := validatedCapabilitySet(params.Capabilities)
+	binding, bindingValid := validatedSessionBinding(params.Binding)
+	if params.ID.IsZero() || params.ClientInstanceID.IsZero() ||
+		!validClientMetadataValue(params.ClientMetadata) || !params.Status.Valid() ||
+		params.Version.IsZero() || !capabilitiesValid || !bindingValid ||
+		(params.Status != ActorSessionActive && !versionRecordsMutation(params.Version)) {
+		return ActorSessionState{}, ErrInvalidIdentityState
+	}
+	return ActorSessionState{
+		id: params.ID, clientInstance: params.ClientInstanceID, clientMetadata: params.ClientMetadata,
+		status: params.Status, version: params.Version, binding: binding, capabilities: capabilities,
+	}, nil
+}
+
+func validDisplayNameValue(value DisplayName) bool {
+	validated, err := NewDisplayName(value.String())
+	return err == nil && validated == value
+}
+
+func versionRecordsMutation(version Version) bool {
+	return version.Uint64() > InitialVersion().Uint64()
+}
+
+func (reference PublicKeyReference) valueIsZero() bool { return reference.String() == "" }
+
+func validPublicKeyReferenceValue(value PublicKeyReference) bool {
+	validated, err := NewPublicKeyReference(value.String())
+	return err == nil && validated == value
+}
+
+func validWorkspaceAliasValue(value WorkspaceAlias) bool {
+	validated, err := NewWorkspaceAlias(value.String())
+	return err == nil && validated == value
+}
+
+func (locator DiscoveryLocator) valueIsZero() bool { return locator.String() == "" }
+
+func validDiscoveryLocatorValue(value DiscoveryLocator) bool {
+	validated, err := NewDiscoveryLocator(value.String())
+	return err == nil && validated == value
+}
+
+func validPolicyRevisionValue(value PolicyRevision) bool {
+	validated, err := NewPolicyRevision(value.String())
+	return err == nil && validated == value
+}
+
+func validAssuranceClassValue(value AssuranceClass) bool {
+	validated, err := NewAssuranceClass(value.String())
+	return err == nil && validated == value
+}
+
+func validActorProfileValue(value ActorProfile) bool {
+	validated, err := NewActorProfile(value.DisplayName())
+	return err == nil && validated == value && validDisplayNameValue(value.DisplayName())
+}
+
+func validClientMetadataValue(value ClientMetadata) bool {
+	validated, err := NewClientMetadata(value.Name(), value.Version())
+	return err == nil && validated == value
+}
+
+func validatedCapabilitySet(value CapabilitySet) (CapabilitySet, bool) {
+	validated, err := NewCapabilitySet(value.Values()...)
+	return validated, err == nil && validated.Equal(value)
+}
+
+func equalSessionBindings(left SessionBinding, right SessionBinding) bool {
+	if left.AuthorityID() != right.AuthorityID() || left.AuthorityEpoch() != right.AuthorityEpoch() ||
+		left.WorkspaceID() != right.WorkspaceID() || left.PrincipalID() != right.PrincipalID() ||
+		left.ActorID() != right.ActorID() || left.MembershipRevision() != right.MembershipRevision() ||
+		left.DelegationRevision() != right.DelegationRevision() || left.PolicyRevision() != right.PolicyRevision() ||
+		left.AssuranceClass() != right.AssuranceClass() || !left.IssuedAt().Equal(right.IssuedAt()) ||
+		!left.AbsoluteExpiry().Equal(right.AbsoluteExpiry()) {
+		return false
+	}
+	leftDevice, leftHasDevice := left.DeviceRevision()
+	rightDevice, rightHasDevice := right.DeviceRevision()
+	leftTrust, leftHasTrust := left.DeviceTrustRevision()
+	rightTrust, rightHasTrust := right.DeviceTrustRevision()
+	if leftHasDevice != rightHasDevice || leftDevice != rightDevice || leftHasTrust != rightHasTrust || leftTrust != rightTrust {
+		return false
+	}
+	leftGrants := left.GrantRevisions()
+	rightGrants := right.GrantRevisions()
+	if len(leftGrants) != len(rightGrants) {
+		return false
+	}
+	for index := range leftGrants {
+		if leftGrants[index] != rightGrants[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func validCeremonyChallenge(challenge CeremonyChallenge) bool {
+	validated, err := RehydrateCeremonyChallenge(CeremonyChallengeRehydrationParams{
+		ID: challenge.ID(), Purpose: challenge.Purpose(), ProofDigest: challenge.ProofDigest(),
+		ExpiresAt: challenge.ExpiresAt(), Status: challenge.Status(),
+		InstallationID: challenge.InstallationID(), WorkspaceID: challenge.WorkspaceID(),
+		PrincipalID: challenge.PrincipalID(), MembershipID: challenge.MembershipID(),
+		ActorID: challenge.ActorID(), DelegationID: challenge.DelegationID(), DeviceID: challenge.DeviceID(),
+	})
+	return err == nil && validated == challenge
+}
+
+func validatedSessionBinding(value SessionBinding) (SessionBinding, bool) {
+	if !validPolicyRevisionValue(value.PolicyRevision()) || !validAssuranceClassValue(value.AssuranceClass()) {
+		return SessionBinding{}, false
+	}
+	device, hasDevice := value.DeviceRevision()
+	deviceTrust, hasDeviceTrust := value.DeviceTrustRevision()
+	if hasDevice != hasDeviceTrust {
+		return SessionBinding{}, false
+	}
+	var devicePointer *AggregateRef
+	if hasDevice {
+		deviceCopy := device
+		devicePointer = &deviceCopy
+	}
+	validated, err := NewSessionBinding(
+		value.AuthorityID(), value.AuthorityEpoch(), value.WorkspaceID(), value.PrincipalID(), value.ActorID(),
+		value.MembershipRevision(), value.DelegationRevision(), devicePointer, deviceTrust,
+		value.GrantRevisions(), value.PolicyRevision(), value.AssuranceClass(), value.IssuedAt(), value.AbsoluteExpiry(),
+	)
+	return validated, err == nil && equalSessionBindings(validated, value)
 }
 
 func cloneCapabilitySet(set CapabilitySet) CapabilitySet {
