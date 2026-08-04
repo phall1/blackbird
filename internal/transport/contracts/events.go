@@ -1,0 +1,840 @@
+package contracts
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/phall1/blackbird/internal/domain"
+)
+
+type EventEnvelopeDTO[Payload any] struct {
+	Schema         string                 `json:"schema"`
+	EventID        domain.EventID         `json:"event_id"`
+	EventType      string                 `json:"event_type"`
+	EventVersion   uint32                 `json:"event_version"`
+	AuthorityID    domain.AuthorityID     `json:"authority_id"`
+	AuthorityEpoch domain.AuthorityEpoch  `json:"authority_epoch"`
+	InstallationID *domain.InstallationID `json:"installation_id,omitempty"`
+	WorkspaceID    *domain.WorkspaceID    `json:"workspace_id,omitempty"`
+	OriginPosition uint64                 `json:"origin_position"`
+	Aggregate      EventAggregateDTO      `json:"aggregate"`
+	PrincipalID    domain.PrincipalID     `json:"principal_id"`
+	ActorID        *domain.ActorID        `json:"actor_id,omitempty"`
+	ActorSessionID *domain.ActorSessionID `json:"actor_session_id,omitempty"`
+	CommandID      domain.CommandID       `json:"command_id"`
+	CausationID    *domain.EventID        `json:"causation_id,omitempty"`
+	CorrelationID  domain.CorrelationID   `json:"correlation_id"`
+	OccurredAt     time.Time              `json:"occurred_at"`
+	RecordedAt     time.Time              `json:"recorded_at"`
+	Payload        Payload                `json:"payload"`
+	Extensions     EmptyExtensionsDTO     `json:"extensions"`
+}
+
+type EmptyExtensionsDTO struct{}
+
+// RawEventEnvelopeDTO validates and retains an event envelope whose event type
+// or major version is not understood by this binary. Consumers can dispatch on
+// the header and retain or ignore the opaque payload without guessing its
+// schema. Known event decoders remain strict and typed.
+type RawEventEnvelopeDTO struct {
+	Schema         string                 `json:"schema"`
+	EventID        domain.EventID         `json:"event_id"`
+	EventType      string                 `json:"event_type"`
+	EventVersion   uint32                 `json:"event_version"`
+	AuthorityID    domain.AuthorityID     `json:"authority_id"`
+	AuthorityEpoch domain.AuthorityEpoch  `json:"authority_epoch"`
+	InstallationID *domain.InstallationID `json:"installation_id,omitempty"`
+	WorkspaceID    *domain.WorkspaceID    `json:"workspace_id,omitempty"`
+	OriginPosition uint64                 `json:"origin_position"`
+	Aggregate      EventAggregateDTO      `json:"aggregate"`
+	PrincipalID    domain.PrincipalID     `json:"principal_id"`
+	ActorID        *domain.ActorID        `json:"actor_id,omitempty"`
+	ActorSessionID *domain.ActorSessionID `json:"actor_session_id,omitempty"`
+	CommandID      domain.CommandID       `json:"command_id"`
+	CausationID    *domain.EventID        `json:"causation_id,omitempty"`
+	CorrelationID  domain.CorrelationID   `json:"correlation_id"`
+	OccurredAt     time.Time              `json:"occurred_at"`
+	RecordedAt     time.Time              `json:"recorded_at"`
+	Payload        json.RawMessage        `json:"payload"`
+	Extensions     json.RawMessage        `json:"extensions"`
+}
+
+type EventAggregateDTO struct {
+	Type    domain.AggregateKind `json:"type"`
+	ID      string               `json:"id"`
+	Version domain.Version       `json:"version"`
+}
+
+type InstallationBootstrappedPayloadDTO struct {
+	InstallationID           domain.InstallationID `json:"installation_id"`
+	InvitationID             domain.InvitationID   `json:"invitation_id"`
+	PrincipalID              domain.PrincipalID    `json:"principal_id"`
+	DeviceID                 domain.DeviceID       `json:"device_id"`
+	InstallationOwnerGrantID domain.GrantID        `json:"installation_owner_grant_id"`
+	TranscriptHash           string                `json:"transcript_hash"`
+}
+
+type PrincipalRegisteredPayloadDTO struct {
+	PrincipalID domain.PrincipalID `json:"principal_id"`
+	Kind        string             `json:"kind"`
+	DisplayName string             `json:"display_name"`
+}
+
+// CeremonyIDDTO is a transport-owned, baseline-safe UUIDv7 identity. It keeps
+// this wire contract independent of the later identity-state implementation.
+type CeremonyIDDTO string
+
+type DevicePairingBeganPayloadDTO struct {
+	DeviceID           domain.DeviceID    `json:"device_id"`
+	PrincipalID        domain.PrincipalID `json:"principal_id"`
+	CeremonyID         CeremonyIDDTO      `json:"ceremony_id"`
+	DisplayName        string             `json:"display_name"`
+	PublicKeyReference string             `json:"public_key_reference"`
+}
+
+type DevicePairedPayloadDTO struct {
+	DeviceID       domain.DeviceID    `json:"device_id"`
+	PrincipalID    domain.PrincipalID `json:"principal_id"`
+	DisplayName    string             `json:"display_name"`
+	TranscriptHash string             `json:"transcript_hash"`
+}
+
+type WorkspaceCreatedPayloadDTO struct {
+	WorkspaceID     domain.WorkspaceID    `json:"workspace_id"`
+	Alias           string                `json:"alias"`
+	HomeAuthorityID domain.AuthorityID    `json:"home_authority_id"`
+	AuthorityEpoch  domain.AuthorityEpoch `json:"authority_epoch"`
+	PolicyRevision  string                `json:"policy_revision"`
+}
+
+type WorkspaceMemberInvitedPayloadDTO struct {
+	WorkspaceID       domain.WorkspaceID  `json:"workspace_id"`
+	MembershipID      domain.MembershipID `json:"membership_id"`
+	PrincipalID       domain.PrincipalID  `json:"principal_id"`
+	CapabilityCeiling []string            `json:"capability_ceiling"`
+}
+
+type WorkspaceMembershipAcceptedPayloadDTO struct {
+	WorkspaceID  domain.WorkspaceID  `json:"workspace_id"`
+	MembershipID domain.MembershipID `json:"membership_id"`
+	PrincipalID  domain.PrincipalID  `json:"principal_id"`
+}
+
+type ActorCreatedPayloadDTO struct {
+	ActorID     domain.ActorID     `json:"actor_id"`
+	WorkspaceID domain.WorkspaceID `json:"workspace_id"`
+	Kind        string             `json:"kind"`
+	DisplayName string             `json:"display_name"`
+}
+
+type ActorDelegationProposedPayloadDTO struct {
+	DelegationID domain.ActorDelegationID `json:"delegation_id"`
+	WorkspaceID  domain.WorkspaceID       `json:"workspace_id"`
+	PrincipalID  domain.PrincipalID       `json:"principal_id"`
+	ActorID      domain.ActorID           `json:"actor_id"`
+	CeremonyID   CeremonyIDDTO            `json:"ceremony_id"`
+}
+
+type ActorDelegationActivatedPayloadDTO struct {
+	DelegationID           domain.ActorDelegationID `json:"delegation_id"`
+	PrincipalID            domain.PrincipalID       `json:"principal_id"`
+	ActorID                domain.ActorID           `json:"actor_id"`
+	SessionStartCeremonyID CeremonyIDDTO            `json:"session_start_ceremony_id"`
+}
+
+type ActorSessionStartedPayloadDTO struct {
+	ActorSessionID        domain.ActorSessionID    `json:"actor_session_id"`
+	WorkspaceID           domain.WorkspaceID       `json:"workspace_id"`
+	PrincipalID           domain.PrincipalID       `json:"principal_id"`
+	ActorID               domain.ActorID           `json:"actor_id"`
+	MembershipID          domain.MembershipID      `json:"membership_id"`
+	MembershipVersion     domain.Version           `json:"membership_version"`
+	DelegationID          domain.ActorDelegationID `json:"delegation_id"`
+	DelegationVersion     domain.Version           `json:"delegation_version"`
+	DeviceID              *domain.DeviceID         `json:"device_id,omitempty"`
+	DeviceVersion         *domain.Version          `json:"device_version,omitempty"`
+	DeviceTrustRevision   *domain.Version          `json:"device_trust_revision,omitempty"`
+	GrantRevisions        []GrantRevisionDTO       `json:"grant_revisions"`
+	ClientInstanceID      domain.ClientInstanceID  `json:"client_instance_id"`
+	PolicyRevision        string                   `json:"policy_revision"`
+	AssuranceClass        string                   `json:"assurance_class"`
+	EffectiveCapabilities []string                 `json:"effective_capabilities"`
+	IssuedAt              time.Time                `json:"issued_at"`
+	AbsoluteExpiry        time.Time                `json:"absolute_expiry"`
+}
+
+type InstallationBootstrappedEventDTO = EventEnvelopeDTO[InstallationBootstrappedPayloadDTO]
+type PrincipalRegisteredEventDTO = EventEnvelopeDTO[PrincipalRegisteredPayloadDTO]
+type DevicePairingBeganEventDTO = EventEnvelopeDTO[DevicePairingBeganPayloadDTO]
+type DevicePairedEventDTO = EventEnvelopeDTO[DevicePairedPayloadDTO]
+type WorkspaceCreatedEventDTO = EventEnvelopeDTO[WorkspaceCreatedPayloadDTO]
+type WorkspaceMemberInvitedEventDTO = EventEnvelopeDTO[WorkspaceMemberInvitedPayloadDTO]
+type WorkspaceMembershipAcceptedEventDTO = EventEnvelopeDTO[WorkspaceMembershipAcceptedPayloadDTO]
+type ActorCreatedEventDTO = EventEnvelopeDTO[ActorCreatedPayloadDTO]
+type ActorDelegationProposedEventDTO = EventEnvelopeDTO[ActorDelegationProposedPayloadDTO]
+type ActorDelegationActivatedEventDTO = EventEnvelopeDTO[ActorDelegationActivatedPayloadDTO]
+type ActorSessionStartedEventDTO = EventEnvelopeDTO[ActorSessionStartedPayloadDTO]
+
+func DecodeEventEnvelope(data []byte) (RawEventEnvelopeDTO, error) {
+	var event RawEventEnvelopeDTO
+	if err := decodeOutput(data, MaxOutcomeJSONBytes, &event); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := requireTopLevelJSONMembers(data, "principal_id", "correlation_id", "payload", "extensions"); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateLiteral("schema", event.Schema, SchemaEventEnvelope); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateRequiredID("event_id", event.EventID); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateToken("event_type", event.EventType, 256); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if event.EventVersion == 0 {
+		return RawEventEnvelopeDTO{}, invalid("event_version", "must be positive")
+	}
+	if knownW0EventType(event.EventType) && event.EventVersion != 1 {
+		return RawEventEnvelopeDTO{}, invalid("event_version", "known event type has an unsupported major version")
+	}
+	if err := validateRequiredID("authority_id", event.AuthorityID); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateRequiredID("authority_epoch", event.AuthorityEpoch); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	installationScope := event.InstallationID != nil && !event.InstallationID.IsZero()
+	workspaceScope := event.WorkspaceID != nil && !event.WorkspaceID.IsZero()
+	if installationScope == workspaceScope {
+		return RawEventEnvelopeDTO{}, invalid("workspace_id", "exactly one nonzero installation_id or workspace_id scope is required")
+	}
+	if event.OriginPosition == 0 {
+		return RawEventEnvelopeDTO{}, invalid("origin_position", "must be positive")
+	}
+	if knownW0EventType(event.EventType) {
+		if !event.Aggregate.Type.Valid() {
+			return RawEventEnvelopeDTO{}, invalid("aggregate.type", "is not a supported aggregate kind")
+		}
+		if err := validateAggregateID(event.Aggregate.Type, event.Aggregate.ID); err != nil {
+			return RawEventEnvelopeDTO{}, err
+		}
+	} else {
+		if err := validateToken("aggregate.type", string(event.Aggregate.Type), 64); err != nil {
+			return RawEventEnvelopeDTO{}, err
+		}
+		if err := validateToken("aggregate.id", event.Aggregate.ID, 256); err != nil {
+			return RawEventEnvelopeDTO{}, err
+		}
+	}
+	if err := validateVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateRequiredID("principal_id", event.PrincipalID); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateRequiredID("command_id", event.CommandID); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateRequiredID("correlation_id", event.CorrelationID); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if event.ActorID != nil && event.ActorID.IsZero() {
+		return RawEventEnvelopeDTO{}, invalid("actor_id", "must be nonzero when present")
+	}
+	if event.ActorSessionID != nil && event.ActorSessionID.IsZero() {
+		return RawEventEnvelopeDTO{}, invalid("actor_session_id", "must be nonzero when present")
+	}
+	if event.ActorSessionID != nil && event.ActorID == nil {
+		return RawEventEnvelopeDTO{}, invalid("actor_id", "is required when actor_session_id is present")
+	}
+	if event.CausationID != nil && event.CausationID.IsZero() {
+		return RawEventEnvelopeDTO{}, invalid("causation_id", "must be nonzero when present")
+	}
+	if err := validateUTCInstant("occurred_at", event.OccurredAt); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if err := validateUTCInstant("recorded_at", event.RecordedAt); err != nil {
+		return RawEventEnvelopeDTO{}, err
+	}
+	if !rawJSONObject(event.Payload) {
+		return RawEventEnvelopeDTO{}, invalid("payload", "must be a JSON object")
+	}
+	if !rawJSONObject(event.Extensions) {
+		return RawEventEnvelopeDTO{}, invalid("extensions", "must be a JSON object")
+	}
+	if knownW0EventType(event.EventType) {
+		if err := validateKnownW0Event(data, event.EventType); err != nil {
+			return RawEventEnvelopeDTO{}, err
+		}
+	}
+	return event, nil
+}
+
+func rawJSONObject(value json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(value)
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+}
+
+func knownW0EventType(eventType string) bool {
+	switch eventType {
+	case EventTypeInstallationBootstrapped,
+		EventTypePrincipalRegistered,
+		EventTypeDevicePairingBegan,
+		EventTypeDevicePaired,
+		EventTypeWorkspaceCreated,
+		EventTypeWorkspaceMemberInvited,
+		EventTypeWorkspaceMembershipAccepted,
+		EventTypeActorCreated,
+		EventTypeActorDelegationProposed,
+		EventTypeActorDelegationActivated,
+		EventTypeActorSessionStarted:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateKnownW0Event(data []byte, eventType string) error {
+	switch eventType {
+	case EventTypeInstallationBootstrapped:
+		_, err := DecodeInstallationBootstrappedEvent(data)
+		return err
+	case EventTypePrincipalRegistered:
+		_, err := DecodePrincipalRegisteredEvent(data)
+		return err
+	case EventTypeDevicePairingBegan:
+		_, err := DecodeDevicePairingBeganEvent(data)
+		return err
+	case EventTypeDevicePaired:
+		_, err := DecodeDevicePairedEvent(data)
+		return err
+	case EventTypeWorkspaceCreated:
+		_, err := DecodeWorkspaceCreatedEvent(data)
+		return err
+	case EventTypeWorkspaceMemberInvited:
+		_, err := DecodeWorkspaceMemberInvitedEvent(data)
+		return err
+	case EventTypeWorkspaceMembershipAccepted:
+		_, err := DecodeWorkspaceMembershipAcceptedEvent(data)
+		return err
+	case EventTypeActorCreated:
+		_, err := DecodeActorCreatedEvent(data)
+		return err
+	case EventTypeActorDelegationProposed:
+		_, err := DecodeActorDelegationProposedEvent(data)
+		return err
+	case EventTypeActorDelegationActivated:
+		_, err := DecodeActorDelegationActivatedEvent(data)
+		return err
+	case EventTypeActorSessionStarted:
+		_, err := DecodeActorSessionStartedEvent(data)
+		return err
+	default:
+		return nil
+	}
+}
+
+func DecodeInstallationBootstrappedEvent(data []byte) (InstallationBootstrappedEventDTO, error) {
+	event, err := decodeEvent[InstallationBootstrappedPayloadDTO](
+		data,
+		EventTypeInstallationBootstrapped,
+		domain.AggregateKindInvitation,
+		true,
+	)
+	if err != nil {
+		return InstallationBootstrappedEventDTO{}, err
+	}
+	if event.InstallationID == nil || *event.InstallationID != event.Payload.InstallationID {
+		return InstallationBootstrappedEventDTO{}, invalid("payload.installation_id", "must match installation_id scope")
+	}
+	if event.Payload.InvitationID.String() != event.Aggregate.ID {
+		return InstallationBootstrappedEventDTO{}, invalid("payload.invitation_id", "must match aggregate.id")
+	}
+	if err := validateAdvancedVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return InstallationBootstrappedEventDTO{}, err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"payload.principal_id":                event.Payload.PrincipalID,
+		"payload.device_id":                   event.Payload.DeviceID,
+		"payload.installation_owner_grant_id": event.Payload.InstallationOwnerGrantID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return InstallationBootstrappedEventDTO{}, err
+		}
+	}
+	if event.PrincipalID != event.Payload.PrincipalID {
+		return InstallationBootstrappedEventDTO{}, invalid("principal_id", "must match payload.principal_id")
+	}
+	if err := validateRequiredID("payload.invitation_id", event.Payload.InvitationID); err != nil {
+		return InstallationBootstrappedEventDTO{}, err
+	}
+	if err := validateSHA256Hex("payload.transcript_hash", event.Payload.TranscriptHash); err != nil {
+		return InstallationBootstrappedEventDTO{}, err
+	}
+	return event, nil
+}
+
+func DecodePrincipalRegisteredEvent(data []byte) (PrincipalRegisteredEventDTO, error) {
+	event, err := decodeEvent[PrincipalRegisteredPayloadDTO](
+		data,
+		EventTypePrincipalRegistered,
+		domain.AggregateKindPrincipal,
+		true,
+	)
+	if err != nil {
+		return PrincipalRegisteredEventDTO{}, err
+	}
+	if event.Payload.PrincipalID.String() != event.Aggregate.ID {
+		return PrincipalRegisteredEventDTO{}, invalid("payload.principal_id", "must match aggregate.id")
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return PrincipalRegisteredEventDTO{}, err
+	}
+	if !validPrincipalKind(event.Payload.Kind) {
+		return PrincipalRegisteredEventDTO{}, invalid("payload.kind", "is not a stable principal kind")
+	}
+	if err := validateText("payload.display_name", event.Payload.DisplayName, maxDisplayNameBytes, true); err != nil {
+		return PrincipalRegisteredEventDTO{}, err
+	}
+	return event, nil
+}
+
+func validPrincipalKind(kind string) bool {
+	return kind == PrincipalKindHuman || kind == PrincipalKindWorkload || kind == PrincipalKindService
+}
+
+func DecodeDevicePairingBeganEvent(data []byte) (DevicePairingBeganEventDTO, error) {
+	event, err := decodeEvent[DevicePairingBeganPayloadDTO](
+		data,
+		EventTypeDevicePairingBegan,
+		domain.AggregateKindDevice,
+		true,
+	)
+	if err != nil {
+		return DevicePairingBeganEventDTO{}, err
+	}
+	if event.Payload.DeviceID.String() != event.Aggregate.ID {
+		return DevicePairingBeganEventDTO{}, invalid("payload.device_id", "must match aggregate.id")
+	}
+	if event.PrincipalID != event.Payload.PrincipalID {
+		return DevicePairingBeganEventDTO{}, invalid("principal_id", "must match payload.principal_id")
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return DevicePairingBeganEventDTO{}, err
+	}
+	if err := validateCeremonyID("payload.ceremony_id", event.Payload.CeremonyID); err != nil {
+		return DevicePairingBeganEventDTO{}, err
+	}
+	if err := validateText("payload.display_name", event.Payload.DisplayName, maxDisplayNameBytes, true); err != nil {
+		return DevicePairingBeganEventDTO{}, err
+	}
+	if err := validateText("payload.public_key_reference", event.Payload.PublicKeyReference, 256, true); err != nil {
+		return DevicePairingBeganEventDTO{}, err
+	}
+	return event, nil
+}
+
+func DecodeDevicePairedEvent(data []byte) (DevicePairedEventDTO, error) {
+	event, err := decodeEvent[DevicePairedPayloadDTO](
+		data,
+		EventTypeDevicePaired,
+		domain.AggregateKindDevice,
+		true,
+	)
+	if err != nil {
+		return DevicePairedEventDTO{}, err
+	}
+	if event.Payload.DeviceID.String() != event.Aggregate.ID {
+		return DevicePairedEventDTO{}, invalid("payload.device_id", "must match aggregate.id")
+	}
+	if event.PrincipalID != event.Payload.PrincipalID {
+		return DevicePairedEventDTO{}, invalid("principal_id", "must match payload.principal_id")
+	}
+	if err := validateRequiredID("payload.principal_id", event.Payload.PrincipalID); err != nil {
+		return DevicePairedEventDTO{}, err
+	}
+	if err := validateText("payload.display_name", event.Payload.DisplayName, maxDisplayNameBytes, true); err != nil {
+		return DevicePairedEventDTO{}, err
+	}
+	if err := validateSHA256Hex("payload.transcript_hash", event.Payload.TranscriptHash); err != nil {
+		return DevicePairedEventDTO{}, err
+	}
+	return event, nil
+}
+
+func DecodeWorkspaceCreatedEvent(data []byte) (WorkspaceCreatedEventDTO, error) {
+	event, err := decodeEvent[WorkspaceCreatedPayloadDTO](
+		data,
+		EventTypeWorkspaceCreated,
+		domain.AggregateKindWorkspace,
+		false,
+	)
+	if err != nil {
+		return WorkspaceCreatedEventDTO{}, err
+	}
+	if event.Payload.WorkspaceID.String() != event.Aggregate.ID {
+		return WorkspaceCreatedEventDTO{}, invalid("payload.workspace_id", "must match aggregate.id")
+	}
+	if event.WorkspaceID == nil || *event.WorkspaceID != event.Payload.WorkspaceID {
+		return WorkspaceCreatedEventDTO{}, invalid("payload.workspace_id", "must match workspace_id")
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return WorkspaceCreatedEventDTO{}, err
+	}
+	if err := validateText("payload.alias", event.Payload.Alias, maxDisplayNameBytes, true); err != nil {
+		return WorkspaceCreatedEventDTO{}, err
+	}
+	if event.Payload.HomeAuthorityID != event.AuthorityID {
+		return WorkspaceCreatedEventDTO{}, invalid("payload.home_authority_id", "must match authority_id")
+	}
+	if !event.Payload.AuthorityEpoch.Equal(event.AuthorityEpoch) {
+		return WorkspaceCreatedEventDTO{}, invalid("payload.authority_epoch", "must match authority_epoch")
+	}
+	if _, err := domain.NewPolicyRevision(event.Payload.PolicyRevision); err != nil {
+		return WorkspaceCreatedEventDTO{}, invalid("payload.policy_revision", err.Error())
+	}
+	return event, nil
+}
+
+func DecodeWorkspaceMemberInvitedEvent(data []byte) (WorkspaceMemberInvitedEventDTO, error) {
+	event, err := decodeEvent[WorkspaceMemberInvitedPayloadDTO](
+		data,
+		EventTypeWorkspaceMemberInvited,
+		domain.AggregateKindMembership,
+		false,
+	)
+	if err != nil {
+		return WorkspaceMemberInvitedEventDTO{}, err
+	}
+	if event.Payload.MembershipID.String() != event.Aggregate.ID {
+		return WorkspaceMemberInvitedEventDTO{}, invalid("payload.membership_id", "must match aggregate.id")
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return WorkspaceMemberInvitedEventDTO{}, err
+	}
+	if err := validateWorkspaceMembershipPayload(
+		event.WorkspaceID,
+		event.Payload.WorkspaceID,
+		event.Payload.PrincipalID,
+	); err != nil {
+		return WorkspaceMemberInvitedEventDTO{}, err
+	}
+	if _, err := normalizeCapabilities("payload.capability_ceiling", event.Payload.CapabilityCeiling); err != nil {
+		return WorkspaceMemberInvitedEventDTO{}, err
+	}
+	return event, nil
+}
+
+func DecodeWorkspaceMembershipAcceptedEvent(data []byte) (WorkspaceMembershipAcceptedEventDTO, error) {
+	event, err := decodeEvent[WorkspaceMembershipAcceptedPayloadDTO](
+		data,
+		EventTypeWorkspaceMembershipAccepted,
+		domain.AggregateKindMembership,
+		false,
+	)
+	if err != nil {
+		return WorkspaceMembershipAcceptedEventDTO{}, err
+	}
+	if event.Payload.MembershipID.String() != event.Aggregate.ID {
+		return WorkspaceMembershipAcceptedEventDTO{}, invalid("payload.membership_id", "must match aggregate.id")
+	}
+	if err := validateWorkspaceMembershipPayload(
+		event.WorkspaceID,
+		event.Payload.WorkspaceID,
+		event.Payload.PrincipalID,
+	); err != nil {
+		return WorkspaceMembershipAcceptedEventDTO{}, err
+	}
+	if event.PrincipalID != event.Payload.PrincipalID {
+		return WorkspaceMembershipAcceptedEventDTO{}, invalid("principal_id", "must match payload.principal_id")
+	}
+	return event, nil
+}
+
+func DecodeActorCreatedEvent(data []byte) (ActorCreatedEventDTO, error) {
+	event, err := decodeEvent[ActorCreatedPayloadDTO](
+		data,
+		EventTypeActorCreated,
+		domain.AggregateKindActor,
+		false,
+	)
+	if err != nil {
+		return ActorCreatedEventDTO{}, err
+	}
+	if event.Payload.ActorID.String() != event.Aggregate.ID {
+		return ActorCreatedEventDTO{}, invalid("payload.actor_id", "must match aggregate.id")
+	}
+	if event.WorkspaceID == nil || *event.WorkspaceID != event.Payload.WorkspaceID {
+		return ActorCreatedEventDTO{}, invalid("payload.workspace_id", "must match workspace_id")
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return ActorCreatedEventDTO{}, err
+	}
+	if !validActorKind(event.Payload.Kind) {
+		return ActorCreatedEventDTO{}, invalid("payload.kind", "is not a stable actor kind")
+	}
+	if err := validateText("payload.display_name", event.Payload.DisplayName, maxDisplayNameBytes, true); err != nil {
+		return ActorCreatedEventDTO{}, err
+	}
+	return event, nil
+}
+
+func DecodeActorDelegationProposedEvent(data []byte) (ActorDelegationProposedEventDTO, error) {
+	event, err := decodeEvent[ActorDelegationProposedPayloadDTO](
+		data,
+		EventTypeActorDelegationProposed,
+		domain.AggregateKindActorDelegation,
+		false,
+	)
+	if err != nil {
+		return ActorDelegationProposedEventDTO{}, err
+	}
+	if event.Payload.DelegationID.String() != event.Aggregate.ID {
+		return ActorDelegationProposedEventDTO{}, invalid("payload.delegation_id", "must match aggregate.id")
+	}
+	if event.WorkspaceID == nil || *event.WorkspaceID != event.Payload.WorkspaceID {
+		return ActorDelegationProposedEventDTO{}, invalid("payload.workspace_id", "must match workspace_id")
+	}
+	if err := validateRequiredID("payload.principal_id", event.Payload.PrincipalID); err != nil {
+		return ActorDelegationProposedEventDTO{}, err
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return ActorDelegationProposedEventDTO{}, err
+	}
+	if err := validateCeremonyID("payload.ceremony_id", event.Payload.CeremonyID); err != nil {
+		return ActorDelegationProposedEventDTO{}, err
+	}
+	return event, nil
+}
+
+func DecodeActorDelegationActivatedEvent(data []byte) (ActorDelegationActivatedEventDTO, error) {
+	event, err := decodeEvent[ActorDelegationActivatedPayloadDTO](
+		data,
+		EventTypeActorDelegationActivated,
+		domain.AggregateKindActorDelegation,
+		false,
+	)
+	if err != nil {
+		return ActorDelegationActivatedEventDTO{}, err
+	}
+	if event.Payload.DelegationID.String() != event.Aggregate.ID {
+		return ActorDelegationActivatedEventDTO{}, invalid("payload.delegation_id", "must match aggregate.id")
+	}
+	if event.PrincipalID != event.Payload.PrincipalID {
+		return ActorDelegationActivatedEventDTO{}, invalid("principal_id", "must match payload.principal_id")
+	}
+	if event.Aggregate.Version.Uint64() != 2 {
+		return ActorDelegationActivatedEventDTO{}, invalid("aggregate.version", "must equal post-activation version 2")
+	}
+	if err := validateCeremonyID("payload.session_start_ceremony_id", event.Payload.SessionStartCeremonyID); err != nil {
+		return ActorDelegationActivatedEventDTO{}, err
+	}
+	return event, nil
+}
+
+func validActorKind(kind string) bool {
+	return kind == ActorKindHuman || kind == ActorKindAgent || kind == ActorKindAutomation || kind == ActorKindService
+}
+
+func validateCeremonyID(field string, id CeremonyIDDTO) error {
+	if id == "" {
+		return invalid(field, "is required")
+	}
+	if _, err := domain.ParseEventID(string(id)); err != nil {
+		return invalid(field, "must be nonzero UUIDv7 text")
+	}
+	return nil
+}
+
+func DecodeActorSessionStartedEvent(data []byte) (ActorSessionStartedEventDTO, error) {
+	event, err := decodeEvent[ActorSessionStartedPayloadDTO](
+		data,
+		EventTypeActorSessionStarted,
+		domain.AggregateKindActorSession,
+		false,
+	)
+	if err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if event.Payload.ActorSessionID.String() != event.Aggregate.ID {
+		return ActorSessionStartedEventDTO{}, invalid("payload.actor_session_id", "must match aggregate.id")
+	}
+	if event.ActorSessionID == nil || *event.ActorSessionID != event.Payload.ActorSessionID {
+		return ActorSessionStartedEventDTO{}, invalid("actor_session_id", "must match payload.actor_session_id")
+	}
+	if event.WorkspaceID == nil || *event.WorkspaceID != event.Payload.WorkspaceID {
+		return ActorSessionStartedEventDTO{}, invalid("payload.workspace_id", "must match workspace_id")
+	}
+	if event.PrincipalID != event.Payload.PrincipalID {
+		return ActorSessionStartedEventDTO{}, invalid("principal_id", "must match payload.principal_id")
+	}
+	if event.ActorID == nil || *event.ActorID != event.Payload.ActorID {
+		return ActorSessionStartedEventDTO{}, invalid("actor_id", "must match payload.actor_id")
+	}
+	if err := validateInitialVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"payload.principal_id":       event.Payload.PrincipalID,
+		"payload.actor_id":           event.Payload.ActorID,
+		"payload.membership_id":      event.Payload.MembershipID,
+		"payload.delegation_id":      event.Payload.DelegationID,
+		"payload.client_instance_id": event.Payload.ClientInstanceID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return ActorSessionStartedEventDTO{}, err
+		}
+	}
+	if (event.Payload.DeviceID == nil) != (event.Payload.DeviceVersion == nil) ||
+		(event.Payload.DeviceID == nil) != (event.Payload.DeviceTrustRevision == nil) {
+		return ActorSessionStartedEventDTO{}, invalid(
+			"payload.device_version",
+			"device_version and device_trust_revision must be present exactly when payload.device_id is present",
+		)
+	}
+	if event.Payload.DeviceID != nil {
+		if event.Payload.DeviceID.IsZero() {
+			return ActorSessionStartedEventDTO{}, invalid("payload.device_id", "must be nonzero when present")
+		}
+		if err := validateVersion("payload.device_version", *event.Payload.DeviceVersion); err != nil {
+			return ActorSessionStartedEventDTO{}, err
+		}
+		if err := validateVersion("payload.device_trust_revision", *event.Payload.DeviceTrustRevision); err != nil {
+			return ActorSessionStartedEventDTO{}, err
+		}
+	}
+	if err := validateVersion("payload.membership_version", event.Payload.MembershipVersion); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if err := validateVersion("payload.delegation_version", event.Payload.DelegationVersion); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if err := validateGrantRevisionSet("payload.grant_revisions", event.Payload.GrantRevisions); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if _, err := domain.NewPolicyRevision(event.Payload.PolicyRevision); err != nil {
+		return ActorSessionStartedEventDTO{}, invalid("payload.policy_revision", err.Error())
+	}
+	if _, err := domain.NewAssuranceClass(event.Payload.AssuranceClass); err != nil {
+		return ActorSessionStartedEventDTO{}, invalid("payload.assurance_class", err.Error())
+	}
+	if _, err := normalizeCapabilities("payload.effective_capabilities", event.Payload.EffectiveCapabilities); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if err := validateUTCInstant("payload.issued_at", event.Payload.IssuedAt); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if err := validateUTCInstant("payload.absolute_expiry", event.Payload.AbsoluteExpiry); err != nil {
+		return ActorSessionStartedEventDTO{}, err
+	}
+	if !event.Payload.AbsoluteExpiry.After(event.Payload.IssuedAt) {
+		return ActorSessionStartedEventDTO{}, invalid("payload.absolute_expiry", "must be after issued_at")
+	}
+	if event.Payload.IssuedAt.After(event.OccurredAt) {
+		return ActorSessionStartedEventDTO{}, invalid("payload.issued_at", "must not be after occurred_at")
+	}
+	return event, nil
+}
+
+func decodeEvent[Payload any](
+	data []byte,
+	eventType string,
+	aggregateKind domain.AggregateKind,
+	installationScope bool,
+) (EventEnvelopeDTO[Payload], error) {
+	var event EventEnvelopeDTO[Payload]
+	if err := decodeOutput(data, MaxOutcomeJSONBytes, &event); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := requireTopLevelJSONMembers(data, "principal_id", "correlation_id", "extensions"); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	var shape struct {
+		Extensions json.RawMessage `json:"extensions"`
+	}
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return EventEnvelopeDTO[Payload]{}, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	}
+	if !rawJSONObject(shape.Extensions) {
+		return EventEnvelopeDTO[Payload]{}, invalid("extensions", "must be a JSON object")
+	}
+	if err := validateLiteral("schema", event.Schema, SchemaEventEnvelope); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateRequiredID("event_id", event.EventID); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateLiteral("event_type", event.EventType, eventType); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if event.EventVersion != 1 {
+		return EventEnvelopeDTO[Payload]{}, invalid("event_version", "must equal 1")
+	}
+	if err := validateRequiredID("authority_id", event.AuthorityID); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateRequiredID("authority_epoch", event.AuthorityEpoch); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if installationScope {
+		if event.InstallationID == nil || event.InstallationID.IsZero() || event.WorkspaceID != nil {
+			return EventEnvelopeDTO[Payload]{}, invalid("installation_id", "installation event requires only installation_id scope")
+		}
+	} else if event.WorkspaceID == nil || event.WorkspaceID.IsZero() || event.InstallationID != nil {
+		return EventEnvelopeDTO[Payload]{}, invalid("workspace_id", "workspace event requires only workspace_id scope")
+	}
+	if event.OriginPosition == 0 {
+		return EventEnvelopeDTO[Payload]{}, invalid("origin_position", "must be positive")
+	}
+	if event.Aggregate.Type != aggregateKind {
+		return EventEnvelopeDTO[Payload]{}, invalid("aggregate.type", fmt.Sprintf("must equal %q", aggregateKind))
+	}
+	if err := validateAggregateID(event.Aggregate.Type, event.Aggregate.ID); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateVersion("aggregate.version", event.Aggregate.Version); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateRequiredID("command_id", event.CommandID); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateRequiredID("principal_id", event.PrincipalID); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if event.ActorID != nil && event.ActorID.IsZero() {
+		return EventEnvelopeDTO[Payload]{}, invalid("actor_id", "must be nonzero when present")
+	}
+	if event.ActorSessionID != nil && event.ActorSessionID.IsZero() {
+		return EventEnvelopeDTO[Payload]{}, invalid("actor_session_id", "must be nonzero when present")
+	}
+	if event.ActorSessionID != nil && event.ActorID == nil {
+		return EventEnvelopeDTO[Payload]{}, invalid("actor_id", "is required when actor_session_id is present")
+	}
+	if event.CausationID != nil && event.CausationID.IsZero() {
+		return EventEnvelopeDTO[Payload]{}, invalid("causation_id", "must be nonzero when present")
+	}
+	if err := validateRequiredID("correlation_id", event.CorrelationID); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateUTCInstant("occurred_at", event.OccurredAt); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	if err := validateUTCInstant("recorded_at", event.RecordedAt); err != nil {
+		return EventEnvelopeDTO[Payload]{}, err
+	}
+	return event, nil
+}
+
+func validateWorkspaceMembershipPayload(
+	envelopeWorkspace *domain.WorkspaceID,
+	payloadWorkspace domain.WorkspaceID,
+	principal domain.PrincipalID,
+) error {
+	if envelopeWorkspace == nil || *envelopeWorkspace != payloadWorkspace {
+		return invalid("payload.workspace_id", "must match workspace_id")
+	}
+	return validateRequiredID("payload.principal_id", principal)
+}
