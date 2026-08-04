@@ -22,22 +22,24 @@ var (
 type IdentifierKind string
 
 const (
-	IdentifierKindInstallation    IdentifierKind = "installation"
-	IdentifierKindAuthority       IdentifierKind = "authority"
-	IdentifierKindWorkspace       IdentifierKind = "workspace"
-	IdentifierKindPrincipal       IdentifierKind = "principal"
-	IdentifierKindDevice          IdentifierKind = "device"
-	IdentifierKindMembership      IdentifierKind = "membership"
-	IdentifierKindActor           IdentifierKind = "actor"
-	IdentifierKindActorDelegation IdentifierKind = "actor_delegation"
-	IdentifierKindActorSession    IdentifierKind = "actor_session"
-	IdentifierKindGrant           IdentifierKind = "grant"
-	IdentifierKindInvitation      IdentifierKind = "invitation"
-	IdentifierKindCommand         IdentifierKind = "command"
-	IdentifierKindReceipt         IdentifierKind = "receipt"
-	IdentifierKindEvent           IdentifierKind = "event"
-	IdentifierKindCorrelation     IdentifierKind = "correlation"
-	IdentifierKindClientInstance  IdentifierKind = "client_instance"
+	IdentifierKindInstallation        IdentifierKind = "installation"
+	IdentifierKindAuthority           IdentifierKind = "authority"
+	IdentifierKindWorkspace           IdentifierKind = "workspace"
+	IdentifierKindPrincipal           IdentifierKind = "principal"
+	IdentifierKindDevice              IdentifierKind = "device"
+	IdentifierKindMembership          IdentifierKind = "membership"
+	IdentifierKindActor               IdentifierKind = "actor"
+	IdentifierKindActorDelegation     IdentifierKind = "actor_delegation"
+	IdentifierKindActorSession        IdentifierKind = "actor_session"
+	IdentifierKindGrant               IdentifierKind = "grant"
+	IdentifierKindInvitation          IdentifierKind = "invitation"
+	IdentifierKindCeremony            IdentifierKind = "ceremony"
+	IdentifierKindBootstrapGeneration IdentifierKind = "bootstrap_generation"
+	IdentifierKindCommand             IdentifierKind = "command"
+	IdentifierKindReceipt             IdentifierKind = "receipt"
+	IdentifierKindEvent               IdentifierKind = "event"
+	IdentifierKindCorrelation         IdentifierKind = "correlation"
+	IdentifierKindClientInstance      IdentifierKind = "client_instance"
 )
 
 // IdentifierError reports a failed typed-ID boundary without weakening the
@@ -226,6 +228,8 @@ type actorDelegationIDMarker struct{}
 type actorSessionIDMarker struct{}
 type grantIDMarker struct{}
 type invitationIDMarker struct{}
+type ceremonyIDMarker struct{}
+type bootstrapGenerationIDMarker struct{}
 type commandIDMarker struct{}
 type receiptIDMarker struct{}
 type eventIDMarker struct{}
@@ -243,11 +247,15 @@ func (actorDelegationIDMarker) identifierKind() IdentifierKind { return Identifi
 func (actorSessionIDMarker) identifierKind() IdentifierKind    { return IdentifierKindActorSession }
 func (grantIDMarker) identifierKind() IdentifierKind           { return IdentifierKindGrant }
 func (invitationIDMarker) identifierKind() IdentifierKind      { return IdentifierKindInvitation }
-func (commandIDMarker) identifierKind() IdentifierKind         { return IdentifierKindCommand }
-func (receiptIDMarker) identifierKind() IdentifierKind         { return IdentifierKindReceipt }
-func (eventIDMarker) identifierKind() IdentifierKind           { return IdentifierKindEvent }
-func (correlationIDMarker) identifierKind() IdentifierKind     { return IdentifierKindCorrelation }
-func (clientInstanceIDMarker) identifierKind() IdentifierKind  { return IdentifierKindClientInstance }
+func (ceremonyIDMarker) identifierKind() IdentifierKind        { return IdentifierKindCeremony }
+func (bootstrapGenerationIDMarker) identifierKind() IdentifierKind {
+	return IdentifierKindBootstrapGeneration
+}
+func (commandIDMarker) identifierKind() IdentifierKind        { return IdentifierKindCommand }
+func (receiptIDMarker) identifierKind() IdentifierKind        { return IdentifierKindReceipt }
+func (eventIDMarker) identifierKind() IdentifierKind          { return IdentifierKindEvent }
+func (correlationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindCorrelation }
+func (clientInstanceIDMarker) identifierKind() IdentifierKind { return IdentifierKindClientInstance }
 
 // The unique marker embedded in every wrapper makes both implicit assignment
 // and explicit cross-kind conversion fail at compile time.
@@ -264,6 +272,10 @@ type ActorDelegationID struct {
 type ActorSessionID struct{ typedID[actorSessionIDMarker] }
 type GrantID struct{ typedID[grantIDMarker] }
 type InvitationID struct{ typedID[invitationIDMarker] }
+type CeremonyID struct{ typedID[ceremonyIDMarker] }
+type BootstrapGenerationID struct {
+	typedID[bootstrapGenerationIDMarker]
+}
 type CommandID struct{ typedID[commandIDMarker] }
 type ReceiptID struct{ typedID[receiptIDMarker] }
 type EventID struct{ typedID[eventIDMarker] }
@@ -315,6 +327,14 @@ func ParseGrantID(text string) (GrantID, error) {
 func ParseInvitationID(text string) (InvitationID, error) {
 	id, err := parseTypedID[invitationIDMarker](text)
 	return InvitationID{typedID: id}, err
+}
+func ParseCeremonyID(text string) (CeremonyID, error) {
+	id, err := parseTypedID[ceremonyIDMarker](text)
+	return CeremonyID{typedID: id}, err
+}
+func ParseBootstrapGenerationID(text string) (BootstrapGenerationID, error) {
+	id, err := parseTypedID[bootstrapGenerationIDMarker](text)
+	return BootstrapGenerationID{typedID: id}, err
 }
 func ParseCommandID(text string) (CommandID, error) {
 	id, err := parseTypedID[commandIDMarker](text)
@@ -380,6 +400,14 @@ func NewGrantID() (GrantID, error) {
 func NewInvitationID() (InvitationID, error) {
 	id, err := newTypedID[invitationIDMarker]()
 	return InvitationID{typedID: id}, err
+}
+func NewCeremonyID() (CeremonyID, error) {
+	id, err := newTypedID[ceremonyIDMarker]()
+	return CeremonyID{typedID: id}, err
+}
+func NewBootstrapGenerationID() (BootstrapGenerationID, error) {
+	id, err := newTypedID[bootstrapGenerationIDMarker]()
+	return BootstrapGenerationID{typedID: id}, err
 }
 func NewCommandID() (CommandID, error) {
 	id, err := newTypedID[commandIDMarker]()

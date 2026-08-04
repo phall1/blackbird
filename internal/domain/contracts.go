@@ -279,7 +279,6 @@ func (scope IdempotencyScope) Key() IdempotencyKey { return scope.key }
 // principal/client-instance contract.
 type ProvisioningIdempotencyScope struct {
 	scope      AuthorityScope
-	invitation InvitationID
 	transcript CommandFingerprint
 	operation  OperationName
 	key        IdempotencyKey
@@ -287,20 +286,16 @@ type ProvisioningIdempotencyScope struct {
 
 func NewProvisioningIdempotencyScope(
 	scope AuthorityScope,
-	invitation InvitationID,
 	transcript CommandFingerprint,
 	operation OperationName,
 	key IdempotencyKey,
 ) (ProvisioningIdempotencyScope, error) {
-	if scope.IsZero() || invitation.IsZero() || transcript.IsZero() || operation.String() == "" || key.String() == "" {
+	if scope.IsZero() || scope.Kind() != ScopeKindInstallation || transcript.IsZero() ||
+		operation.String() != "installation.bootstrap.v1" || key.String() == "" {
 		return ProvisioningIdempotencyScope{}, ErrInvalidScope
 	}
 	return ProvisioningIdempotencyScope{
-		scope:      scope,
-		invitation: invitation,
-		transcript: transcript,
-		operation:  operation,
-		key:        key,
+		scope: scope, transcript: transcript, operation: operation, key: key,
 	}, nil
 }
 
@@ -313,7 +308,6 @@ func FingerprintCommand(canonicalSemanticBytes []byte) CommandFingerprint {
 func (fingerprint CommandFingerprint) IsZero() bool { return fingerprint == CommandFingerprint{} }
 
 func (scope ProvisioningIdempotencyScope) AuthorityScope() AuthorityScope { return scope.scope }
-func (scope ProvisioningIdempotencyScope) InvitationID() InvitationID     { return scope.invitation }
 func (scope ProvisioningIdempotencyScope) TranscriptFingerprint() CommandFingerprint {
 	return scope.transcript
 }
@@ -469,6 +463,7 @@ type SessionBinding struct {
 	delegation     AggregateRef
 	device         AggregateRef
 	hasDevice      bool
+	deviceTrust    Version
 	grants         []AggregateRef
 	policy         PolicyRevision
 	assurance      AssuranceClass
@@ -485,6 +480,7 @@ func NewSessionBinding(
 	membership AggregateRef,
 	delegation AggregateRef,
 	device *AggregateRef,
+	deviceTrust Version,
 	grants []AggregateRef,
 	policy PolicyRevision,
 	assurance AssuranceClass,
@@ -495,7 +491,8 @@ func NewSessionBinding(
 		membership.IsZero() || membership.Kind() != AggregateKindMembership ||
 		delegation.IsZero() || delegation.Kind() != AggregateKindActorDelegation ||
 		policy.String() == "" || assurance.String() == "" || issuedAt.IsZero() ||
-		absoluteExpiry.IsZero() || !absoluteExpiry.After(issuedAt) {
+		absoluteExpiry.IsZero() || !absoluteExpiry.After(issuedAt) ||
+		absoluteExpiry.Sub(issuedAt) > MaxActorSessionLifetime || len(grants) > MaxSessionGrantRevisions {
 		return SessionBinding{}, ErrInvalidSessionBinding
 	}
 	binding := SessionBinding{
@@ -512,13 +509,19 @@ func NewSessionBinding(
 		absoluteExpiry: absoluteExpiry.UTC(),
 	}
 	if device != nil {
-		if device.Kind() != AggregateKindDevice || device.IsZero() {
+		if device.Kind() != AggregateKindDevice || device.IsZero() || deviceTrust.IsZero() {
 			return SessionBinding{}, ErrInvalidSessionBinding
 		}
 		binding.device = *device
 		binding.hasDevice = true
+		binding.deviceTrust = deviceTrust
+	} else if !deviceTrust.IsZero() {
+		return SessionBinding{}, ErrInvalidSessionBinding
 	}
 	binding.grants = append([]AggregateRef(nil), grants...)
+	sort.Slice(binding.grants, func(left, right int) bool {
+		return binding.grants[left].Target().String() < binding.grants[right].Target().String()
+	})
 	seenGrants := make(map[AggregateTarget]struct{}, len(binding.grants))
 	for _, grant := range binding.grants {
 		if grant.Kind() != AggregateKindGrant || grant.IsZero() {
@@ -546,6 +549,10 @@ func (binding SessionBinding) AbsoluteExpiry() time.Time        { return binding
 
 func (binding SessionBinding) DeviceRevision() (AggregateRef, bool) {
 	return binding.device, binding.hasDevice
+}
+
+func (binding SessionBinding) DeviceTrustRevision() (Version, bool) {
+	return binding.deviceTrust, binding.hasDevice
 }
 
 func (binding SessionBinding) GrantRevisions() []AggregateRef {

@@ -32,6 +32,8 @@ var (
 	_ identifierBoundary = ActorSessionID{}
 	_ identifierBoundary = GrantID{}
 	_ identifierBoundary = InvitationID{}
+	_ identifierBoundary = CeremonyID{}
+	_ identifierBoundary = BootstrapGenerationID{}
 	_ identifierBoundary = CommandID{}
 	_ identifierBoundary = ReceiptID{}
 	_ identifierBoundary = EventID{}
@@ -50,6 +52,8 @@ var (
 	_ encoding.TextUnmarshaler = (*ActorSessionID)(nil)
 	_ encoding.TextUnmarshaler = (*GrantID)(nil)
 	_ encoding.TextUnmarshaler = (*InvitationID)(nil)
+	_ encoding.TextUnmarshaler = (*CeremonyID)(nil)
+	_ encoding.TextUnmarshaler = (*BootstrapGenerationID)(nil)
 	_ encoding.TextUnmarshaler = (*CommandID)(nil)
 	_ encoding.TextUnmarshaler = (*ReceiptID)(nil)
 	_ encoding.TextUnmarshaler = (*EventID)(nil)
@@ -71,12 +75,16 @@ func TestAllIdentifierKindsStrictlyRoundTrip(t *testing.T) {
 		IdentifierKindActorSession:    func(value string) (identifierBoundary, error) { return ParseActorSessionID(value) },
 		IdentifierKindGrant:           func(value string) (identifierBoundary, error) { return ParseGrantID(value) },
 		IdentifierKindInvitation:      func(value string) (identifierBoundary, error) { return ParseInvitationID(value) },
-		IdentifierKindCommand:         func(value string) (identifierBoundary, error) { return ParseCommandID(value) },
-		IdentifierKindReceipt:         func(value string) (identifierBoundary, error) { return ParseReceiptID(value) },
-		IdentifierKindEvent:           func(value string) (identifierBoundary, error) { return ParseEventID(value) },
-		IdentifierKindCorrelation:     func(value string) (identifierBoundary, error) { return ParseCorrelationID(value) },
-		IdentifierKindClientInstance:  func(value string) (identifierBoundary, error) { return ParseClientInstanceID(value) },
-		IdentifierKindAuthorityEpoch:  func(value string) (identifierBoundary, error) { return ParseAuthorityEpoch(value) },
+		IdentifierKindCeremony:        func(value string) (identifierBoundary, error) { return ParseCeremonyID(value) },
+		IdentifierKindBootstrapGeneration: func(value string) (identifierBoundary, error) {
+			return ParseBootstrapGenerationID(value)
+		},
+		IdentifierKindCommand:        func(value string) (identifierBoundary, error) { return ParseCommandID(value) },
+		IdentifierKindReceipt:        func(value string) (identifierBoundary, error) { return ParseReceiptID(value) },
+		IdentifierKindEvent:          func(value string) (identifierBoundary, error) { return ParseEventID(value) },
+		IdentifierKindCorrelation:    func(value string) (identifierBoundary, error) { return ParseCorrelationID(value) },
+		IdentifierKindClientInstance: func(value string) (identifierBoundary, error) { return ParseClientInstanceID(value) },
+		IdentifierKindAuthorityEpoch: func(value string) (identifierBoundary, error) { return ParseAuthorityEpoch(value) },
 	}
 
 	for kind, parse := range parsers {
@@ -158,7 +166,8 @@ func TestIdentifierKindsAreNominallyDistinct(t *testing.T) {
 		reflect.TypeFor[DeviceID](), reflect.TypeFor[MembershipID](),
 		reflect.TypeFor[ActorID](), reflect.TypeFor[ActorDelegationID](),
 		reflect.TypeFor[ActorSessionID](), reflect.TypeFor[GrantID](),
-		reflect.TypeFor[InvitationID](), reflect.TypeFor[CommandID](),
+		reflect.TypeFor[InvitationID](), reflect.TypeFor[CeremonyID](), reflect.TypeFor[CommandID](),
+		reflect.TypeFor[BootstrapGenerationID](),
 		reflect.TypeFor[ReceiptID](), reflect.TypeFor[EventID](),
 		reflect.TypeFor[CorrelationID](), reflect.TypeFor[ClientInstanceID](),
 		reflect.TypeFor[AuthorityEpoch](),

@@ -126,6 +126,18 @@ func TestEventPayloadIsBoundedObjectAndImmutable(t *testing.T) {
 	if _, err := NewEventPayload(bytes.Repeat([]byte{'x'}, MaxEventPayloadBytes+1)); !errors.Is(err, ErrEventPayloadTooLarge) {
 		t.Fatalf("oversize error = %v", err)
 	}
+	nestedPayload := func(depth int) []byte {
+		arrays := depth - 1 // The required root object is depth one.
+		return []byte(`{"value":` + strings.Repeat(`[`, arrays) + `0` + strings.Repeat(`]`, arrays) + `}`)
+	}
+	for _, depth := range []int{MaxEventPayloadDepth - 1, MaxEventPayloadDepth} {
+		if _, err := NewEventPayload(nestedPayload(depth)); err != nil {
+			t.Fatalf("depth %d rejected: %v", depth, err)
+		}
+	}
+	if _, err := NewEventPayload(nestedPayload(MaxEventPayloadDepth + 1)); !errors.Is(err, ErrInvalidEventPayload) {
+		t.Fatalf("depth %d error = %v", MaxEventPayloadDepth+1, err)
+	}
 }
 
 func TestDigestTypesAreStrictAndNonInterchangeable(t *testing.T) {

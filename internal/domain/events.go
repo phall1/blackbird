@@ -18,6 +18,7 @@ const (
 	// ADR-0004. Public delta codecs may use a different transport schema.
 	EventEnvelopeSchema  = "blackbird.event/v1"
 	MaxEventPayloadBytes = 64 * 1024
+	MaxEventPayloadDepth = 64
 )
 
 var (
@@ -242,7 +243,7 @@ func NewEventPayload(object []byte) (EventPayload, error) {
 	}
 	decoder := json.NewDecoder(strings.NewReader(trimmed))
 	decoder.UseNumber()
-	if err := validateIJSONValue(decoder, true); err != nil {
+	if err := validateIJSONValue(decoder, true, 1); err != nil {
 		return EventPayload{}, fmt.Errorf("%w: %v", ErrInvalidEventPayload, err)
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -251,13 +252,16 @@ func NewEventPayload(object []byte) (EventPayload, error) {
 	return EventPayload{object: append([]byte(nil), trimmed...)}, nil
 }
 
-func validateIJSONValue(decoder *json.Decoder, requireObject bool) error {
+func validateIJSONValue(decoder *json.Decoder, requireObject bool, depth int) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
 	}
 	switch value := token.(type) {
 	case json.Delim:
+		if depth > MaxEventPayloadDepth {
+			return ErrInvalidEventPayload
+		}
 		switch value {
 		case '{':
 			keys := make(map[string]struct{})
@@ -274,7 +278,7 @@ func validateIJSONValue(decoder *json.Decoder, requireObject bool) error {
 					return fmt.Errorf("duplicate object key %q", key)
 				}
 				keys[key] = struct{}{}
-				if err := validateIJSONValue(decoder, false); err != nil {
+				if err := validateIJSONValue(decoder, false, depth+1); err != nil {
 					return err
 				}
 			}
@@ -288,7 +292,7 @@ func validateIJSONValue(decoder *json.Decoder, requireObject bool) error {
 				return ErrInvalidEventPayload
 			}
 			for decoder.More() {
-				if err := validateIJSONValue(decoder, false); err != nil {
+				if err := validateIJSONValue(decoder, false, depth+1); err != nil {
 					return err
 				}
 			}
