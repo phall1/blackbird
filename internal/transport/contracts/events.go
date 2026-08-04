@@ -18,7 +18,7 @@ type EventEnvelopeDTO[Payload any] struct {
 	AuthorityEpoch domain.AuthorityEpoch  `json:"authority_epoch"`
 	InstallationID *domain.InstallationID `json:"installation_id,omitempty"`
 	WorkspaceID    *domain.WorkspaceID    `json:"workspace_id,omitempty"`
-	OriginPosition uint64                 `json:"origin_position"`
+	OriginPosition domain.StreamPosition  `json:"origin_position"`
 	Aggregate      EventAggregateDTO      `json:"aggregate"`
 	PrincipalID    domain.PrincipalID     `json:"principal_id"`
 	ActorID        *domain.ActorID        `json:"actor_id,omitempty"`
@@ -47,7 +47,7 @@ type RawEventEnvelopeDTO struct {
 	AuthorityEpoch domain.AuthorityEpoch  `json:"authority_epoch"`
 	InstallationID *domain.InstallationID `json:"installation_id,omitempty"`
 	WorkspaceID    *domain.WorkspaceID    `json:"workspace_id,omitempty"`
-	OriginPosition uint64                 `json:"origin_position"`
+	OriginPosition domain.StreamPosition  `json:"origin_position"`
 	Aggregate      EventAggregateDTO      `json:"aggregate"`
 	PrincipalID    domain.PrincipalID     `json:"principal_id"`
 	ActorID        *domain.ActorID        `json:"actor_id,omitempty"`
@@ -65,6 +65,35 @@ type EventAggregateDTO struct {
 	Type    domain.AggregateKind `json:"type"`
 	ID      string               `json:"id"`
 	Version domain.Version       `json:"version"`
+}
+
+// MarshalJSON keeps the exported generic DTO from becoming an unchecked event
+// encoder. The alias prevents recursion; the shared decoder then applies the
+// same bounded I-JSON and event-semantic checks used at every ingress boundary.
+func (event EventEnvelopeDTO[Payload]) MarshalJSON() ([]byte, error) {
+	type eventEnvelopeWire EventEnvelopeDTO[Payload]
+	encoded, err := json.Marshal(eventEnvelopeWire(event))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := DecodeEventEnvelope(encoded); err != nil {
+		return nil, fmt.Errorf("marshal event envelope: %w", err)
+	}
+	return encoded, nil
+}
+
+// MarshalJSON subjects retained future events to the same validation as typed
+// events, including opaque payload and extension number bounds.
+func (event RawEventEnvelopeDTO) MarshalJSON() ([]byte, error) {
+	type rawEventEnvelopeWire RawEventEnvelopeDTO
+	encoded, err := json.Marshal(rawEventEnvelopeWire(event))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := DecodeEventEnvelope(encoded); err != nil {
+		return nil, fmt.Errorf("marshal raw event envelope: %w", err)
+	}
+	return encoded, nil
 }
 
 type InstallationBootstrappedPayloadDTO struct {
@@ -211,7 +240,7 @@ func DecodeEventEnvelope(data []byte) (RawEventEnvelopeDTO, error) {
 	if installationScope == workspaceScope {
 		return RawEventEnvelopeDTO{}, invalid("workspace_id", "exactly one nonzero installation_id or workspace_id scope is required")
 	}
-	if event.OriginPosition == 0 {
+	if event.OriginPosition.IsZero() {
 		return RawEventEnvelopeDTO{}, invalid("origin_position", "must be positive")
 	}
 	if knownW0EventType(event.EventType) {
@@ -807,7 +836,7 @@ func decodeEvent[Payload any](
 	} else if event.WorkspaceID == nil || event.WorkspaceID.IsZero() || event.InstallationID != nil {
 		return EventEnvelopeDTO[Payload]{}, invalid("workspace_id", "workspace event requires only workspace_id scope")
 	}
-	if event.OriginPosition == 0 {
+	if event.OriginPosition.IsZero() {
 		return EventEnvelopeDTO[Payload]{}, invalid("origin_position", "must be positive")
 	}
 	if event.Aggregate.Type != aggregateKind {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -144,7 +145,7 @@ func TestErrorCodeSpecificDetailsRejectAmbiguity(t *testing.T) {
 			Retryable: code.DefaultRetryable(),
 		}
 	}
-	delay := uint64(250)
+	delay := uint32(250)
 	inProgress := base(domain.ErrorCodeCommandInProgress)
 	inProgress.RetryAfterMS = &delay
 	inProgress.Details = ErrorDetailsDTO{Recovery: RecoveryRetryAfterDelay, IdempotencyKey: "retry-key"}
@@ -205,7 +206,7 @@ func TestErrorCodeSpecificDetailsRejectAmbiguity(t *testing.T) {
 		}()},
 		{name: "zero retry delay", value: func() ErrorDTO {
 			value := inProgress
-			zero := uint64(0)
+			zero := uint32(0)
 			value.RetryAfterMS = &zero
 			return value
 		}()},
@@ -532,7 +533,7 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	wrongBootstrapScope := installation
 	wrongInstallationID := mustParseInstallationID(t, idWorkspace)
 	wrongBootstrapScope.InstallationID = &wrongInstallationID
-	if _, err := DecodeInstallationBootstrappedEvent(mustMarshal(t, wrongBootstrapScope)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeInstallationBootstrappedEvent(mustMarshalEventUnchecked(t, wrongBootstrapScope)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("bootstrap scope mismatch error = %v, want ErrInvalidContract", err)
 	}
 	ordinaryPrincipalRegistration := principal
@@ -543,12 +544,12 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	}
 	unknownPrincipalKind := principal
 	unknownPrincipalKind.Payload.Kind = "robot"
-	if _, err := DecodePrincipalRegisteredEvent(mustMarshal(t, unknownPrincipalKind)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodePrincipalRegisteredEvent(mustMarshalEventUnchecked(t, unknownPrincipalKind)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("unknown principal kind error = %v, want ErrInvalidContract", err)
 	}
 	wrongDeviceAttribution := device
 	wrongDeviceAttribution.PrincipalID = mustParsePrincipalID(t, idActor)
-	if _, err := DecodeDevicePairedEvent(mustMarshal(t, wrongDeviceAttribution)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeDevicePairedEvent(mustMarshalEventUnchecked(t, wrongDeviceAttribution)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("device attribution mismatch error = %v, want ErrInvalidContract", err)
 	}
 	ordinaryDevicePairing := device
@@ -559,7 +560,7 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	wrongWorkspaceScope := workspace
 	wrongWorkspaceID := mustParseWorkspaceID(t, idInvitation)
 	wrongWorkspaceScope.WorkspaceID = &wrongWorkspaceID
-	if _, err := DecodeWorkspaceCreatedEvent(mustMarshal(t, wrongWorkspaceScope)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeWorkspaceCreatedEvent(mustMarshalEventUnchecked(t, wrongWorkspaceScope)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("workspace scope mismatch error = %v, want ErrInvalidContract", err)
 	}
 	ordinaryMembershipAcceptance := accepted
@@ -625,17 +626,17 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 
 	wrongPairingOrigin := pairingBegan
 	wrongPairingOrigin.Aggregate.Version = mustVersion(t, 2)
-	if _, err := DecodeDevicePairingBeganEvent(mustMarshal(t, wrongPairingOrigin)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeDevicePairingBeganEvent(mustMarshalEventUnchecked(t, wrongPairingOrigin)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("DevicePairingBegan wrong origin error = %v, want ErrInvalidContract", err)
 	}
 	wrongPairingAttribution := pairingBegan
 	wrongPairingAttribution.PrincipalID = mustParsePrincipalID(t, idActor)
-	if _, err := DecodeDevicePairingBeganEvent(mustMarshal(t, wrongPairingAttribution)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeDevicePairingBeganEvent(mustMarshalEventUnchecked(t, wrongPairingAttribution)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("DevicePairingBegan wrong attribution error = %v, want ErrInvalidContract", err)
 	}
 	wrongActorKind := createdActor
 	wrongActorKind.Payload.Kind = "robot"
-	if _, err := DecodeActorCreatedEvent(mustMarshal(t, wrongActorKind)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorCreatedEvent(mustMarshalEventUnchecked(t, wrongActorKind)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("ActorCreated wrong kind error = %v, want ErrInvalidContract", err)
 	}
 	distinctAuthorActor := createdActor
@@ -658,32 +659,32 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	}
 	wrongProposalScope := proposed
 	wrongProposalScope.WorkspaceID = &wrongWorkspaceID
-	if _, err := DecodeActorDelegationProposedEvent(mustMarshal(t, wrongProposalScope)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorDelegationProposedEvent(mustMarshalEventUnchecked(t, wrongProposalScope)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("ActorDelegationProposed wrong scope error = %v, want ErrInvalidContract", err)
 	}
 	wrongActivationVersion := activated
 	wrongActivationVersion.Aggregate.Version = domain.InitialVersion()
-	if _, err := DecodeActorDelegationActivatedEvent(mustMarshal(t, wrongActivationVersion)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorDelegationActivatedEvent(mustMarshalEventUnchecked(t, wrongActivationVersion)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("ActorDelegationActivated wrong version error = %v, want ErrInvalidContract", err)
 	}
 	wrongActivationPrincipal := activated
 	wrongActivationPrincipal.PrincipalID = mustParsePrincipalID(t, idActor)
-	if _, err := DecodeActorDelegationActivatedEvent(mustMarshal(t, wrongActivationPrincipal)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorDelegationActivatedEvent(mustMarshalEventUnchecked(t, wrongActivationPrincipal)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("ActorDelegationActivated wrong principal error = %v, want ErrInvalidContract", err)
 	}
 	wrongCeremony := activated
 	wrongCeremony.Payload.SessionStartCeremonyID = "not-a-uuid"
-	if _, err := DecodeActorDelegationActivatedEvent(mustMarshal(t, wrongCeremony)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorDelegationActivatedEvent(mustMarshalEventUnchecked(t, wrongCeremony)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("ActorDelegationActivated wrong ceremony error = %v, want ErrInvalidContract", err)
 	}
 	sessionWithoutActor := createdActor
 	sessionWithoutActor.ActorSessionID = pointer(mustParseActorSessionID(t, idSession))
-	if _, err := DecodeActorCreatedEvent(mustMarshal(t, sessionWithoutActor)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorCreatedEvent(mustMarshalEventUnchecked(t, sessionWithoutActor)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("session without author actor error = %v, want ErrInvalidContract", err)
 	}
 	actorWithoutSession := createdActor
 	actorWithoutSession.ActorID = pointer(mustParseActorID(t, idPrincipal))
-	if _, err := DecodeActorCreatedEvent(mustMarshal(t, actorWithoutSession)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeActorCreatedEvent(mustMarshalEventUnchecked(t, actorWithoutSession)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("actor without author session error = %v, want ErrInvalidContract", err)
 	}
 
@@ -721,7 +722,7 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	}
 	for _, test := range startedAmbiguities {
 		t.Run("actor session "+test.name, func(t *testing.T) {
-			if _, err := DecodeActorSessionStartedEvent(mustMarshal(t, test.edit(started))); !errors.Is(err, ErrInvalidContract) {
+			if _, err := DecodeActorSessionStartedEvent(mustMarshalEventUnchecked(t, test.edit(started))); !errors.Is(err, ErrInvalidContract) {
 				t.Fatalf("error = %v, want ErrInvalidContract", err)
 			}
 		})
@@ -853,8 +854,175 @@ func TestEventEnvelopeForwardCompatibilityAndAmbiguityRejection(t *testing.T) {
 	)
 	bootstrap.Aggregate.Version = mustVersion(t, 2)
 	bootstrap.PrincipalID = mustParsePrincipalID(t, idActor)
-	if _, err := DecodeInstallationBootstrappedEvent(mustMarshal(t, bootstrap)); !errors.Is(err, ErrInvalidContract) {
+	if _, err := DecodeInstallationBootstrappedEvent(mustMarshalEventUnchecked(t, bootstrap)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("bootstrap attribution mismatch error = %v, want ErrInvalidContract", err)
+	}
+}
+
+func TestIJSONIntegerBoundsAcrossTransportPaths(t *testing.T) {
+	t.Parallel()
+
+	maximum := strconv.FormatUint(domain.MaxCanonicalInteger, 10)
+	unsafe := strconv.FormatUint(domain.MaxCanonicalInteger+1, 10)
+	installationID := mustParseInstallationID(t, idInstallation)
+	known := fixtureEvent(
+		t,
+		EventTypeInstallationBootstrapped,
+		domain.AggregateKindInvitation,
+		idInvitation,
+		&installationID,
+		nil,
+		InstallationBootstrappedPayloadDTO{
+			InstallationID:           installationID,
+			InvitationID:             mustParseInvitationID(t, idInvitation),
+			PrincipalID:              mustParsePrincipalID(t, idPrincipal),
+			DeviceID:                 mustParseDeviceID(t, idDevice),
+			InstallationOwnerGrantID: mustParseGrantID(t, idGrant),
+			TranscriptHash:           strings.Repeat("a", 64),
+		},
+	)
+	known.Aggregate.Version = mustVersion(t, 2)
+	known.OriginPosition = mustStreamPosition(t, domain.MaxCanonicalInteger)
+	knownAtMaximum := mustMarshal(t, known)
+	if _, err := DecodeInstallationBootstrappedEvent(knownAtMaximum); err != nil {
+		t.Fatalf("known event at maximum error = %v", err)
+	}
+	if _, err := DecodeEventEnvelope(knownAtMaximum); err != nil {
+		t.Fatalf("raw known event at maximum error = %v", err)
+	}
+	knownPastMaximum := bytes.Replace(
+		knownAtMaximum,
+		[]byte(`"origin_position":`+maximum),
+		[]byte(`"origin_position":`+unsafe),
+		1,
+	)
+	if _, err := DecodeInstallationBootstrappedEvent(knownPastMaximum); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("known event past maximum error = %v, want ErrInvalidJSON", err)
+	}
+	if _, err := DecodeEventEnvelope(knownPastMaximum); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("raw known event past maximum error = %v, want ErrInvalidJSON", err)
+	}
+
+	unknown := fixtureEvent(
+		t,
+		"blackbird.future.integer_fact",
+		domain.AggregateKindInvitation,
+		idInvitation,
+		&installationID,
+		nil,
+		map[string]any{"future_integer": domain.MaxCanonicalInteger},
+	)
+	unknown.EventVersion = 2
+	unknown.Aggregate.Type = domain.AggregateKind("future_widget")
+	unknown.Aggregate.ID = "future-widget-maximum"
+	unknown.Aggregate.Version = mustVersion(t, domain.MaxCanonicalInteger)
+	unknown.OriginPosition = mustStreamPosition(t, domain.MaxCanonicalInteger)
+	unknownAtMaximum := mustMarshal(t, unknown)
+	raw, err := DecodeEventEnvelope(unknownAtMaximum)
+	if err != nil {
+		t.Fatalf("unknown event at maximum error = %v", err)
+	}
+	if _, err := json.Marshal(raw); err != nil {
+		t.Fatalf("retained raw event at maximum marshal error = %v", err)
+	}
+
+	unsafeUnknownPayload := bytes.Replace(
+		unknownAtMaximum,
+		[]byte(`"future_integer":`+maximum),
+		[]byte(`"future_integer":`+unsafe),
+		1,
+	)
+	if _, err := DecodeEventEnvelope(unsafeUnknownPayload); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("unknown payload past maximum error = %v, want ErrInvalidJSON", err)
+	}
+	unsafeUnknownExtensions := bytes.Replace(
+		unknownAtMaximum,
+		[]byte(`"extensions":{}`),
+		[]byte(`"extensions":{"future_integer":`+unsafe+`}`),
+		1,
+	)
+	if _, err := DecodeEventEnvelope(unsafeUnknownExtensions); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("unknown extensions past maximum error = %v, want ErrInvalidJSON", err)
+	}
+	unsafeKnownAdditivePayload := bytes.Replace(
+		knownAtMaximum,
+		[]byte(`"payload":{`),
+		[]byte(`"payload":{"future_integer":`+unsafe+`,`),
+		1,
+	)
+	safeKnownAdditivePayload := bytes.Replace(
+		knownAtMaximum,
+		[]byte(`"payload":{`),
+		[]byte(`"payload":{"future_integer":`+maximum+`,`),
+		1,
+	)
+	if _, err := DecodeInstallationBootstrappedEvent(safeKnownAdditivePayload); err != nil {
+		t.Fatalf("known additive payload at maximum error = %v", err)
+	}
+	if _, err := DecodeInstallationBootstrappedEvent(unsafeKnownAdditivePayload); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("known additive payload past maximum error = %v, want ErrInvalidJSON", err)
+	}
+	safeAdditiveOutcome := addTopLevelJSONField(
+		mustMarshal(t, fixtureWorkspaceResult(t)),
+		`"future_integer":`+maximum,
+	)
+	if _, err := DecodeWorkspaceCreateResult(safeAdditiveOutcome); err != nil {
+		t.Fatalf("discarded additive output at maximum error = %v", err)
+	}
+	unsafeAdditiveOutcome := addTopLevelJSONField(
+		mustMarshal(t, fixtureWorkspaceResult(t)),
+		`"future_integer":`+unsafe,
+	)
+	if _, err := DecodeWorkspaceCreateResult(unsafeAdditiveOutcome); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("discarded additive output past maximum error = %v, want ErrInvalidJSON", err)
+	}
+	negativeAdditiveOutcome := addTopLevelJSONField(
+		mustMarshal(t, fixtureWorkspaceResult(t)),
+		`"future_integer":-1`,
+	)
+	if _, err := DecodeWorkspaceCreateResult(negativeAdditiveOutcome); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("discarded negative additive output error = %v, want ErrInvalidJSON", err)
+	}
+
+	unsafeGeneric := unknown
+	unsafeGeneric.Payload = map[string]any{"future_integer": domain.MaxCanonicalInteger + 1}
+	if _, err := json.Marshal(unsafeGeneric); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("direct generic event marshal error = %v, want ErrInvalidJSON", err)
+	}
+	raw.Payload = json.RawMessage(`{"future_integer":` + unsafe + `}`)
+	if _, err := json.Marshal(raw); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("direct raw event marshal error = %v, want ErrInvalidJSON", err)
+	}
+	raw.Payload = json.RawMessage(`{"future_integer":` + maximum + `}`)
+	raw.Extensions = json.RawMessage(`{"future_integer":` + unsafe + `}`)
+	if _, err := json.Marshal(raw); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("direct raw event extensions marshal error = %v, want ErrInvalidJSON", err)
+	}
+	invalidEnvelope := known
+	invalidEnvelope.PrincipalID = mustParsePrincipalID(t, idActor)
+	if _, err := json.Marshal(invalidEnvelope); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("direct semantically invalid event marshal error = %v, want ErrInvalidContract", err)
+	}
+
+	for _, representation := range []string{
+		unsafe,
+		unsafe + ".0",
+		"9.007199254740992e15",
+		"-" + unsafe,
+		"-1",
+		"1e309",
+	} {
+		t.Run("opaque number "+representation, func(t *testing.T) {
+			candidate := bytes.Replace(
+				unknownAtMaximum,
+				[]byte(`"future_integer":`+maximum),
+				[]byte(`"future_integer":`+representation),
+				1,
+			)
+			if _, err := DecodeEventEnvelope(candidate); !errors.Is(err, ErrInvalidJSON) {
+				t.Fatalf("error = %v, want ErrInvalidJSON", err)
+			}
+		})
 	}
 }
 
@@ -939,7 +1107,7 @@ func fixtureEvent[Payload any](
 		AuthorityEpoch: mustParseAuthorityEpoch(t, idEpoch),
 		InstallationID: installationID,
 		WorkspaceID:    workspaceID,
-		OriginPosition: 1,
+		OriginPosition: mustStreamPosition(t, 1),
 		Aggregate:      EventAggregateDTO{Type: aggregateKind, ID: aggregateID, Version: domain.InitialVersion()},
 		CommandID:      mustParseCommandID(t, idCommand),
 		PrincipalID:    mustParsePrincipalID(t, idPrincipal),
@@ -958,6 +1126,21 @@ func mustVersion(t *testing.T, value uint64) domain.Version {
 		t.Fatal(err)
 	}
 	return version
+}
+
+func mustStreamPosition(t *testing.T, value uint64) domain.StreamPosition {
+	t.Helper()
+	position, err := domain.NewStreamPosition(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return position
+}
+
+func mustMarshalEventUnchecked[Payload any](t *testing.T, event EventEnvelopeDTO[Payload]) []byte {
+	t.Helper()
+	type eventEnvelopeWire EventEnvelopeDTO[Payload]
+	return mustMarshal(t, eventEnvelopeWire(event))
 }
 
 func pointer[T any](value T) *T { return &value }

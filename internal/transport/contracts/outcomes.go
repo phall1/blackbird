@@ -28,7 +28,7 @@ const (
 	StateTrusted  = "trusted"
 	StateConsumed = "consumed"
 
-	MaxRetryAfterMS uint64 = 5 * 60 * 1000
+	MaxRetryAfterMS uint32 = 5 * 60 * 1000
 )
 
 type CommandResultMetadataDTO struct {
@@ -247,7 +247,7 @@ type ErrorDTO struct {
 	Category      domain.ErrorCategory  `json:"category"`
 	Message       string                `json:"message"`
 	Retryable     bool                  `json:"retryable"`
-	RetryAfterMS  *uint64               `json:"retry_after_ms"`
+	RetryAfterMS  *uint32               `json:"retry_after_ms"`
 	CorrelationID *domain.CorrelationID `json:"correlation_id,omitempty"`
 	Details       ErrorDetailsDTO       `json:"details"`
 }

@@ -15,7 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -195,6 +197,9 @@ func walkJSONValue(decoder *json.Decoder, depth int) error {
 	}
 	delimiter, composite := token.(json.Delim)
 	if !composite {
+		if number, ok := token.(json.Number); ok {
+			return validateJSONNumber(number)
+		}
 		return nil
 	}
 	switch delimiter {
@@ -239,6 +244,21 @@ func walkJSONValue(decoder *json.Decoder, depth int) error {
 		}
 	default:
 		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	return nil
+}
+
+func validateJSONNumber(value json.Number) error {
+	number, err := strconv.ParseFloat(value.String(), 64)
+	if err != nil || math.IsInf(number, 0) || math.IsNaN(number) {
+		return fmt.Errorf("JSON number %q is not a finite binary64 value", value)
+	}
+	if math.Trunc(number) == number && (number < 0 || number > float64(domain.MaxCanonicalInteger)) {
+		return fmt.Errorf(
+			"JSON integer %q is outside the interoperable range 0..%d",
+			value,
+			domain.MaxCanonicalInteger,
+		)
 	}
 	return nil
 }
