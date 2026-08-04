@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +166,65 @@ func TestDigestTypesAreStrictAndNonInterchangeable(t *testing.T) {
 	}
 }
 
+func TestStreamPositionEnforcesCanonicalIntegerBoundary(t *testing.T) {
+	nearMaximum, err := NewStreamPosition(MaxCanonicalInteger - 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximum, err := nearMaximum.Next()
+	if err != nil || !maximum.Valid() || maximum.Uint64() != MaxCanonicalInteger {
+		t.Fatalf("maximum successor = %#v, %v", maximum, err)
+	}
+	encoded, err := json.Marshal(maximum)
+	if err != nil || string(encoded) != strconv.FormatUint(MaxCanonicalInteger, 10) {
+		t.Fatalf("maximum marshal = %s, %v", encoded, err)
+	}
+	var decoded StreamPosition
+	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != maximum {
+		t.Fatalf("maximum unmarshal = %#v, %v", decoded, err)
+	}
+	text, err := maximum.MarshalText()
+	if err != nil || string(text) != strconv.FormatUint(MaxCanonicalInteger, 10) {
+		t.Fatalf("maximum text marshal = %s, %v", text, err)
+	}
+	var decodedText StreamPosition
+	if err := decodedText.UnmarshalText(text); err != nil || decodedText != maximum {
+		t.Fatalf("maximum text unmarshal = %#v, %v", decodedText, err)
+	}
+	if _, err := maximum.Next(); !errors.Is(err, ErrStreamPositionOverflow) {
+		t.Fatalf("maximum successor error = %v", err)
+	}
+
+	aboveMaximum := strconv.FormatUint(MaxCanonicalInteger+1, 10)
+	if _, err := NewStreamPosition(MaxCanonicalInteger + 1); !errors.Is(err, ErrInvalidStreamPosition) {
+		t.Fatalf("above-maximum constructor error = %v", err)
+	}
+	for _, text := range []string{"", "0", "01", "+1", "-1", aboveMaximum} {
+		if _, err := ParseStreamPosition(text); !errors.Is(err, ErrInvalidStreamPosition) {
+			t.Errorf("ParseStreamPosition(%q) error = %v", text, err)
+		}
+	}
+	if err := json.Unmarshal([]byte(aboveMaximum), &decoded); !errors.Is(err, ErrInvalidStreamPosition) {
+		t.Fatalf("above-maximum JSON error = %v", err)
+	}
+	if err := decoded.UnmarshalText([]byte(aboveMaximum)); !errors.Is(err, ErrInvalidStreamPosition) {
+		t.Fatalf("above-maximum text error = %v", err)
+	}
+	forged := StreamPosition{value: MaxCanonicalInteger + 1}
+	if forged.Valid() {
+		t.Fatal("forged stream position is valid")
+	}
+	if _, err := forged.Next(); !errors.Is(err, ErrInvalidStreamPosition) {
+		t.Fatalf("forged successor error = %v", err)
+	}
+	if _, err := forged.MarshalText(); !errors.Is(err, ErrInvalidStreamPosition) {
+		t.Fatalf("forged text marshal error = %v", err)
+	}
+	if _, err := json.Marshal(forged); !errors.Is(err, ErrInvalidStreamPosition) {
+		t.Fatalf("forged JSON marshal error = %v", err)
+	}
+}
+
 func TestEventEnvelopeOwnsCompleteInternalVocabulary(t *testing.T) {
 	params := validEnvelopeParams(t)
 	envelope, err := NewEventEnvelope(params, acceptEventDigests)
@@ -232,6 +292,24 @@ func TestEventEnvelopeRejectsInvalidRequiredAndSelfCausation(t *testing.T) {
 	params.CausationEventID = &params.EventID
 	if _, err := NewEventEnvelope(params, acceptEventDigests); !errors.Is(err, ErrInvalidEventEnvelope) {
 		t.Fatalf("self-causation error = %v", err)
+	}
+	params = validEnvelopeParams(t)
+	params.StreamPosition = StreamPosition{value: MaxCanonicalInteger + 1}
+	if _, err := NewEventEnvelope(params, acceptEventDigests); !errors.Is(err, ErrInvalidEventEnvelope) {
+		t.Fatalf("forged stream position error = %v", err)
+	}
+	params = validEnvelopeParams(t)
+	params.Aggregate.version = Version{value: MaxCanonicalInteger + 1}
+	if _, err := NewEventEnvelope(params, acceptEventDigests); !errors.Is(err, ErrInvalidEventEnvelope) {
+		t.Fatalf("forged aggregate version error = %v", err)
+	}
+	valid, err := NewEventEnvelope(validEnvelopeParams(t), acceptEventDigests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid.streamPosition = StreamPosition{value: MaxCanonicalInteger + 1}
+	if _, err := json.Marshal(valid); !errors.Is(err, ErrInvalidEventEnvelope) {
+		t.Fatalf("forged envelope marshal error = %v", err)
 	}
 }
 

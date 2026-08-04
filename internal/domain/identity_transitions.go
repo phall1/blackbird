@@ -250,7 +250,7 @@ func transitionError(code ErrorCode, message string) error {
 }
 
 func checkExpectedVersion(actual Version, expected Version) error {
-	if actual.IsZero() || expected.IsZero() || actual != expected {
+	if !actual.Valid() || !expected.Valid() || actual != expected {
 		return transitionConflict(ConflictVersion, "aggregate version is stale")
 	}
 	return nil
@@ -1271,7 +1271,7 @@ func TrustedDeviceSessionStart(
 	expectedVersion Version,
 	expectedTrustRevision Version,
 ) (SessionStartAuthority, error) {
-	if device.IsZero() || expectedVersion.IsZero() || expectedTrustRevision.IsZero() {
+	if device.IsZero() || !expectedVersion.Valid() || !expectedTrustRevision.Valid() {
 		return SessionStartAuthority{}, ErrInvalidAuthorization
 	}
 	return SessionStartAuthority{
@@ -1295,7 +1295,7 @@ type GrantRevision struct {
 }
 
 func NewGrantRevision(grant GrantState, expected Version) (GrantRevision, error) {
-	if grant.IsZero() || expected.IsZero() {
+	if grant.IsZero() || !expected.Valid() {
 		return GrantRevision{}, ErrInvalidIdentityState
 	}
 	return GrantRevision{grant: grant, expected: expected}, nil

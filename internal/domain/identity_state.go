@@ -524,7 +524,7 @@ func RehydrateInstallationInvitation(
 ) (InstallationInvitationState, error) {
 	if params.ID.IsZero() || params.InstallationID.IsZero() || !validPublicKeyReferenceValue(params.InstallationPublicKey) ||
 		params.InvitationVerifier.IsZero() || params.BootstrapGenerationID.IsZero() || params.ExpiresAt.IsZero() ||
-		params.Version.IsZero() || params.FailedAttempts > MaxBootstrapFailedAttempts {
+		!params.Version.Valid() || params.FailedAttempts > MaxBootstrapFailedAttempts {
 		return InstallationInvitationState{}, ErrInvalidIdentityState
 	}
 	var expectedVersion uint64
@@ -851,7 +851,7 @@ func newIdentityAuthorization(
 	if authorityID.IsZero() || epoch.IsZero() || installationID.IsZero() || principalID.IsZero() ||
 		capabilities.IsZero() || policy.String() == "" || assurance.String() == "" || evaluatedAt.IsZero() ||
 		maxSessionLifetime <= 0 || maxSessionLifetime > MaxActorSessionLifetime ||
-		(hasAuthenticatedDevice && (workspaceID.IsZero() || authenticatedDevice.IsZero() || deviceTrustRevision.IsZero())) ||
+		(hasAuthenticatedDevice && (workspaceID.IsZero() || authenticatedDevice.IsZero() || !deviceTrustRevision.Valid())) ||
 		(!hasAuthenticatedDevice && (!authenticatedDevice.IsZero() || !deviceTrustRevision.IsZero())) {
 		return IdentityAuthorization{}, ErrInvalidAuthorization
 	}
@@ -1214,7 +1214,7 @@ type PrincipalRehydrationParams struct {
 
 func RehydratePrincipal(params PrincipalRehydrationParams) (PrincipalState, error) {
 	if params.ID.IsZero() || params.InstallationID.IsZero() || !params.Kind.Valid() ||
-		!params.Status.Valid() || params.Version.IsZero() || !validDisplayNameValue(params.DisplayName) ||
+		!params.Status.Valid() || !params.Version.Valid() || !validDisplayNameValue(params.DisplayName) ||
 		(!params.PublicKeyReference.valueIsZero() && !validPublicKeyReferenceValue(params.PublicKeyReference)) ||
 		(params.Kind != PrincipalKindHuman && params.PublicKeyReference.valueIsZero()) ||
 		(params.Status != PrincipalActive && !versionRecordsMutation(params.Version)) {
@@ -1242,7 +1242,7 @@ type DeviceRehydrationParams struct {
 func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
 	if params.ID.IsZero() || params.InstallationID.IsZero() || params.PrincipalID.IsZero() ||
 		!validDisplayNameValue(params.DisplayName) || !validPublicKeyReferenceValue(params.PublicKeyReference) ||
-		!params.Status.Valid() || params.Version.IsZero() || params.TrustRevision.IsZero() ||
+		!params.Status.Valid() || !params.Version.Valid() || !params.TrustRevision.Valid() ||
 		params.TrustRevision.Uint64() > params.Version.Uint64() {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
@@ -1287,7 +1287,7 @@ type GrantRehydrationParams struct {
 func RehydrateGrant(params GrantRehydrationParams) (GrantState, error) {
 	capabilities, valid := validatedCapabilitySet(params.Capabilities)
 	if params.ID.IsZero() || params.InstallationID.IsZero() || params.PrincipalID.IsZero() ||
-		!params.Status.Valid() || params.Version.IsZero() || !valid ||
+		!params.Status.Valid() || !params.Version.Valid() || !valid ||
 		(params.Status == GrantRevoked && !versionRecordsMutation(params.Version)) {
 		return GrantState{}, ErrInvalidIdentityState
 	}
@@ -1314,7 +1314,7 @@ func RehydrateWorkspace(params WorkspaceRehydrationParams) (WorkspaceState, erro
 	if params.ID.IsZero() || params.InstallationID.IsZero() || params.AuthorityID.IsZero() ||
 		params.AuthorityEpoch.IsZero() || !validWorkspaceAliasValue(params.Alias) ||
 		(!params.DiscoveryLocator.valueIsZero() && !validDiscoveryLocatorValue(params.DiscoveryLocator)) ||
-		!validPolicyRevisionValue(params.PolicyRevision) || !params.Status.Valid() || params.Version.IsZero() ||
+		!validPolicyRevisionValue(params.PolicyRevision) || !params.Status.Valid() || !params.Version.Valid() ||
 		(params.Status != WorkspaceActive && !versionRecordsMutation(params.Version)) {
 		return WorkspaceState{}, ErrInvalidIdentityState
 	}
@@ -1338,7 +1338,7 @@ type MembershipRehydrationParams struct {
 func RehydrateMembership(params MembershipRehydrationParams) (MembershipState, error) {
 	capabilities, valid := validatedCapabilitySet(params.Capabilities)
 	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.PrincipalID.IsZero() ||
-		!params.Status.Valid() || params.Version.IsZero() || !valid {
+		!params.Status.Valid() || !params.Version.Valid() || !valid {
 		return MembershipState{}, ErrInvalidIdentityState
 	}
 	hasAcceptance := !params.AcceptanceChallenge.IsZero()
@@ -1380,7 +1380,7 @@ type ActorRehydrationParams struct {
 
 func RehydrateActor(params ActorRehydrationParams) (ActorState, error) {
 	if params.ID.IsZero() || params.WorkspaceID.IsZero() || !params.Kind.Valid() ||
-		!validActorProfileValue(params.Profile) || !params.Status.Valid() || params.Version.IsZero() ||
+		!validActorProfileValue(params.Profile) || !params.Status.Valid() || !params.Version.Valid() ||
 		(params.Status != ActorActive && !versionRecordsMutation(params.Version)) {
 		return ActorState{}, ErrInvalidIdentityState
 	}
@@ -1408,7 +1408,7 @@ func RehydrateActorDelegation(
 	capabilities, valid := validatedCapabilitySet(params.Capabilities)
 	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.PrincipalID.IsZero() ||
 		params.ActorID.IsZero() || params.MembershipID.IsZero() || !params.Status.Valid() ||
-		params.Version.IsZero() || !valid || params.ActivationChallenge.IsZero() ||
+		!params.Version.Valid() || !valid || params.ActivationChallenge.IsZero() ||
 		!validCeremonyChallenge(params.ActivationChallenge) ||
 		params.ActivationChallenge.Purpose() != CeremonyPurposeDelegationActivation ||
 		params.ActivationChallenge.WorkspaceID() != params.WorkspaceID ||
@@ -1445,7 +1445,7 @@ func RehydrateActorSession(params ActorSessionRehydrationParams) (ActorSessionSt
 	binding, bindingValid := validatedSessionBinding(params.Binding)
 	if params.ID.IsZero() || params.ClientInstanceID.IsZero() ||
 		!validClientMetadataValue(params.ClientMetadata) || !params.Status.Valid() ||
-		params.Version.IsZero() || !capabilitiesValid || !bindingValid ||
+		!params.Version.Valid() || !capabilitiesValid || !bindingValid ||
 		(params.Status != ActorSessionActive && !versionRecordsMutation(params.Version)) {
 		return ActorSessionState{}, ErrInvalidIdentityState
 	}
@@ -1461,7 +1461,7 @@ func validDisplayNameValue(value DisplayName) bool {
 }
 
 func versionRecordsMutation(version Version) bool {
-	return version.Uint64() > InitialVersion().Uint64()
+	return version.Valid() && version.Uint64() > InitialVersion().Uint64()
 }
 
 func (reference PublicKeyReference) valueIsZero() bool { return reference.String() == "" }

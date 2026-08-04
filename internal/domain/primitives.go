@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 )
+
+// MaxCanonicalInteger is the largest integer exactly representable by every
+// I-JSON consumer. Domain values carried by Blackbird's JSON/JCS contracts
+// must not exceed it, even when their Go representation is wider.
+const MaxCanonicalInteger uint64 = 1<<53 - 1
 
 const IdentifierKindAuthorityEpoch IdentifierKind = "authority_epoch"
 
@@ -42,7 +46,7 @@ type Version struct {
 }
 
 func NewVersion(value uint64) (Version, error) {
-	if value == 0 {
+	if value == 0 || value > MaxCanonicalInteger {
 		return Version{}, ErrInvalidVersion
 	}
 	return Version{value: value}, nil
@@ -63,27 +67,31 @@ func InitialVersion() Version { return Version{value: 1} }
 
 func (version Version) IsZero() bool { return version.value == 0 }
 
+func (version Version) Valid() bool {
+	return version.value > 0 && version.value <= MaxCanonicalInteger
+}
+
 func (version Version) Uint64() uint64 { return version.value }
 
 func (version Version) String() string {
-	if version.IsZero() {
+	if !version.Valid() {
 		return ""
 	}
 	return strconv.FormatUint(version.value, 10)
 }
 
 func (version Version) Next() (Version, error) {
-	if version.IsZero() {
+	if !version.Valid() {
 		return Version{}, ErrInvalidVersion
 	}
-	if version.value == math.MaxUint64 {
+	if version.value == MaxCanonicalInteger {
 		return Version{}, ErrVersionOverflow
 	}
 	return Version{value: version.value + 1}, nil
 }
 
 func (version Version) MarshalText() ([]byte, error) {
-	if version.IsZero() {
+	if !version.Valid() {
 		return nil, ErrInvalidVersion
 	}
 	return []byte(version.String()), nil
@@ -102,7 +110,7 @@ func (version *Version) UnmarshalText(text []byte) error {
 }
 
 func (version Version) MarshalJSON() ([]byte, error) {
-	if version.IsZero() {
+	if !version.Valid() {
 		return nil, ErrInvalidVersion
 	}
 	return strconv.AppendUint(nil, version.value, 10), nil

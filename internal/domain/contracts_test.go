@@ -32,6 +32,18 @@ func TestAggregateExpectationsSeparateCreateFromUpdate(t *testing.T) {
 	if version, ok := expected.Version(); !ok || version.Uint64() != 9 {
 		t.Fatalf("version = %v, %v", version, ok)
 	}
+	forged := Version{value: MaxCanonicalInteger + 1}
+	if _, err := NewAggregateRef(workspace, forged); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("forged aggregate reference error = %v", err)
+	}
+	if _, err := ExpectAggregateVersion(workspace, forged); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("forged aggregate expectation error = %v", err)
+	}
+	forgedExpectation := expected
+	forgedExpectation.version = forged
+	if _, err := newAtomicCommitSet(CommitSetCreateWorkspaceOwner, forgedExpectation); !errors.Is(err, ErrInvalidExpectation) {
+		t.Fatalf("forged commit-set expectation error = %v", err)
+	}
 }
 
 func TestCanonicalIdempotencyScopeHasExactAuthorityIndependentIdentity(t *testing.T) {
@@ -196,5 +208,31 @@ func TestSessionBindingCapturesExactSecuritySnapshot(t *testing.T) {
 		policy, assurance, issuedAt, expiresAt,
 	); !errors.Is(err, ErrInvalidSessionBinding) {
 		t.Fatalf("unbounded grants error = %v", err)
+	}
+	forgedVersion := Version{value: MaxCanonicalInteger + 1}
+	forgedMembershipRef := membershipRef
+	forgedMembershipRef.version = forgedVersion
+	if _, err := NewSessionBinding(
+		authority, epoch, workspace, principal, actor,
+		forgedMembershipRef, delegationRef, nil, Version{}, nil,
+		policy, assurance, issuedAt, expiresAt,
+	); !errors.Is(err, ErrInvalidSessionBinding) {
+		t.Fatalf("forged membership revision error = %v", err)
+	}
+	if _, err := NewSessionBinding(
+		authority, epoch, workspace, principal, actor,
+		membershipRef, delegationRef, &deviceRef, forgedVersion, nil,
+		policy, assurance, issuedAt, expiresAt,
+	); !errors.Is(err, ErrInvalidSessionBinding) {
+		t.Fatalf("forged device trust revision error = %v", err)
+	}
+	forgedGrantRef := grantRef
+	forgedGrantRef.version = forgedVersion
+	if _, err := NewSessionBinding(
+		authority, epoch, workspace, principal, actor,
+		membershipRef, delegationRef, nil, Version{}, []AggregateRef{forgedGrantRef},
+		policy, assurance, issuedAt, expiresAt,
+	); !errors.Is(err, ErrInvalidSessionBinding) {
+		t.Fatalf("forged grant revision error = %v", err)
 	}
 }

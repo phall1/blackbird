@@ -28,6 +28,7 @@ var (
 	ErrInvalidEventPayload     = errors.New("invalid event payload")
 	ErrEventPayloadTooLarge    = errors.New("event payload exceeds maximum size")
 	ErrInvalidStreamPosition   = errors.New("invalid stream position")
+	ErrStreamPositionOverflow  = errors.New("stream position overflow")
 	ErrInvalidEventEnvelope    = errors.New("invalid event envelope")
 	ErrEventDigestVerification = errors.New("event digest verification failed")
 	ErrInvalidEventBatch       = errors.New("invalid committed event batch")
@@ -210,20 +211,79 @@ func (version EventSchemaVersion) IsZero() bool   { return version.value == 0 }
 type StreamPosition struct{ value uint64 }
 
 func NewStreamPosition(value uint64) (StreamPosition, error) {
-	if value == 0 {
+	if value == 0 || value > MaxCanonicalInteger {
 		return StreamPosition{}, ErrInvalidStreamPosition
 	}
 	return StreamPosition{value: value}, nil
 }
 
-func (position StreamPosition) Uint64() uint64 { return position.value }
-func (position StreamPosition) IsZero() bool   { return position.value == 0 }
-
-func (position StreamPosition) Next() (StreamPosition, error) {
-	if position.value == 0 || position.value == ^uint64(0) {
+func ParseStreamPosition(text string) (StreamPosition, error) {
+	if text == "" || text[0] == '+' || text[0] == '-' || (len(text) > 1 && text[0] == '0') {
 		return StreamPosition{}, ErrInvalidStreamPosition
 	}
+	value, err := strconv.ParseUint(text, 10, 64)
+	if err != nil {
+		return StreamPosition{}, fmt.Errorf("%w: %q", ErrInvalidStreamPosition, text)
+	}
+	return NewStreamPosition(value)
+}
+
+func (position StreamPosition) Uint64() uint64 { return position.value }
+func (position StreamPosition) IsZero() bool   { return position.value == 0 }
+func (position StreamPosition) Valid() bool {
+	return position.value > 0 && position.value <= MaxCanonicalInteger
+}
+
+func (position StreamPosition) Next() (StreamPosition, error) {
+	if !position.Valid() {
+		return StreamPosition{}, ErrInvalidStreamPosition
+	}
+	if position.value == MaxCanonicalInteger {
+		return StreamPosition{}, ErrStreamPositionOverflow
+	}
 	return StreamPosition{value: position.value + 1}, nil
+}
+
+func (position StreamPosition) MarshalText() ([]byte, error) {
+	if !position.Valid() {
+		return nil, ErrInvalidStreamPosition
+	}
+	return strconv.AppendUint(nil, position.value, 10), nil
+}
+
+func (position *StreamPosition) UnmarshalText(text []byte) error {
+	if position == nil {
+		return ErrInvalidStreamPosition
+	}
+	parsed, err := ParseStreamPosition(string(text))
+	if err != nil {
+		return err
+	}
+	*position = parsed
+	return nil
+}
+
+func (position StreamPosition) MarshalJSON() ([]byte, error) {
+	if !position.Valid() {
+		return nil, ErrInvalidStreamPosition
+	}
+	return strconv.AppendUint(nil, position.value, 10), nil
+}
+
+func (position *StreamPosition) UnmarshalJSON(data []byte) error {
+	if position == nil {
+		return ErrInvalidStreamPosition
+	}
+	var value uint64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("%w: %s", ErrInvalidStreamPosition, data)
+	}
+	parsed, err := NewStreamPosition(value)
+	if err != nil {
+		return err
+	}
+	*position = parsed
+	return nil
 }
 
 // EventPayload owns bounded I-JSON object bytes. It rejects duplicate object
@@ -312,8 +372,7 @@ func validateIJSONValue(decoder *json.Decoder, requireObject bool, depth int) er
 		if parseErr != nil || math.IsInf(number, 0) || math.IsNaN(number) {
 			return ErrInvalidEventPayload
 		}
-		const maxSafeInteger = float64(1<<53 - 1)
-		if math.Trunc(number) == number && math.Abs(number) > maxSafeInteger {
+		if math.Trunc(number) == number && math.Abs(number) > float64(MaxCanonicalInteger) {
 			return ErrInvalidEventPayload
 		}
 		return nil
@@ -453,7 +512,7 @@ func NewEventEnvelope(params EventEnvelopeParams, verifier EventDigestVerifier) 
 
 func newUnverifiedEventEnvelope(params EventEnvelopeParams) (EventEnvelope, error) {
 	if params.EventID.IsZero() || params.CommandID.IsZero() || params.AuthorityID.IsZero() ||
-		params.AuthorityEpoch.IsZero() || params.Scope.IsZero() || params.StreamPosition.IsZero() ||
+		params.AuthorityEpoch.IsZero() || params.Scope.IsZero() || !params.StreamPosition.Valid() ||
 		params.PreviousStreamDigest.IsZero() || params.EventDigest.IsZero() || params.StreamDigest.IsZero() ||
 		params.Aggregate.IsZero() || !params.EventType.Valid() || params.SchemaVersion.IsZero() ||
 		params.Payload.IsZero() || params.PrincipalID.IsZero() || params.AuthorizationDigest.IsZero() ||
@@ -532,7 +591,7 @@ func (event EventEnvelope) CausationEventID() (EventID, bool) {
 }
 
 func (event EventEnvelope) MarshalJSON() ([]byte, error) {
-	if event.eventID.IsZero() || event.payload.IsZero() {
+	if event.eventID.IsZero() || !event.streamPosition.Valid() || event.aggregate.IsZero() || event.payload.IsZero() {
 		return nil, ErrInvalidEventEnvelope
 	}
 	var actorSessionID *ActorSessionID
@@ -611,7 +670,8 @@ func NewCommittedEventBatch(events []EventEnvelope) (CommittedEventBatch, error)
 	first := cloned[0]
 	seenEventIDs := make(map[EventID]struct{}, len(cloned))
 	for index, event := range cloned {
-		if event.eventID.IsZero() || event.commandID != first.commandID ||
+		if event.eventID.IsZero() || !event.streamPosition.Valid() || event.aggregate.IsZero() ||
+			event.commandID != first.commandID ||
 			event.authorityID != first.authorityID || !event.authorityEpoch.Equal(first.authorityEpoch) ||
 			event.scope != first.scope || event.commandReceiptID != first.commandReceiptID ||
 			event.correlationID != first.correlationID || event.principalID != first.principalID ||

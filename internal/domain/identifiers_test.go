@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -198,6 +198,9 @@ func TestAuthorityEpochEqualityOnly(t *testing.T) {
 
 func TestVersionCheckedSuccessorAndRoundTrips(t *testing.T) {
 	version := InitialVersion()
+	if !version.Valid() {
+		t.Fatal("initial version is invalid")
+	}
 	next, err := version.Next()
 	if err != nil || next.Uint64() != 2 {
 		t.Fatalf("next = %v, %v", next, err)
@@ -210,17 +213,57 @@ func TestVersionCheckedSuccessorAndRoundTrips(t *testing.T) {
 	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != next {
 		t.Fatalf("unmarshal = %v, %v", decoded, err)
 	}
-	maximum, err := NewVersion(math.MaxUint64)
+	nearMaximum, err := NewVersion(MaxCanonicalInteger - 1)
 	if err != nil {
 		t.Fatal(err)
+	}
+	maximum, err := nearMaximum.Next()
+	if err != nil || maximum.Uint64() != MaxCanonicalInteger || !maximum.Valid() {
+		t.Fatalf("maximum successor = %v, %v", maximum, err)
+	}
+	maximumJSON, err := json.Marshal(maximum)
+	if err != nil || string(maximumJSON) != strconv.FormatUint(MaxCanonicalInteger, 10) {
+		t.Fatalf("maximum JSON marshal = %s, %v", maximumJSON, err)
+	}
+	var maximumDecoded Version
+	if err := json.Unmarshal(maximumJSON, &maximumDecoded); err != nil || maximumDecoded != maximum {
+		t.Fatalf("maximum JSON unmarshal = %v, %v", maximumDecoded, err)
+	}
+	maximumText, err := maximum.MarshalText()
+	if err != nil || string(maximumText) != strconv.FormatUint(MaxCanonicalInteger, 10) {
+		t.Fatalf("maximum text marshal = %s, %v", maximumText, err)
 	}
 	if _, err := maximum.Next(); !errors.Is(err, ErrVersionOverflow) {
 		t.Fatalf("overflow error = %v", err)
 	}
-	for _, text := range []string{"", "0", "01", "+1", "-1"} {
+	aboveMaximum := strconv.FormatUint(MaxCanonicalInteger+1, 10)
+	for _, text := range []string{"", "0", "01", "+1", "-1", aboveMaximum} {
 		if _, err := ParseVersion(text); !errors.Is(err, ErrInvalidVersion) {
 			t.Errorf("ParseVersion(%q) = %v", text, err)
 		}
+	}
+	if _, err := NewVersion(MaxCanonicalInteger + 1); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("above-maximum constructor error = %v", err)
+	}
+	forged := Version{value: MaxCanonicalInteger + 1}
+	if forged.Valid() || forged.String() != "" {
+		t.Fatalf("forged version escaped validity: valid=%v string=%q", forged.Valid(), forged.String())
+	}
+	if _, err := forged.Next(); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("forged successor error = %v", err)
+	}
+	if _, err := forged.MarshalText(); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("forged text marshal error = %v", err)
+	}
+	if _, err := json.Marshal(forged); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("forged JSON marshal error = %v", err)
+	}
+	var rejected Version
+	if err := json.Unmarshal([]byte(aboveMaximum), &rejected); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("above-maximum JSON error = %v", err)
+	}
+	if err := rejected.UnmarshalText([]byte(aboveMaximum)); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("above-maximum text error = %v", err)
 	}
 	if _, err := (Version{}).Next(); !errors.Is(err, ErrInvalidVersion) {
 		t.Fatalf("zero successor error = %v", err)

@@ -110,13 +110,13 @@ func NewAggregateRef[ID aggregateIdentifier](id ID, version Version) (AggregateR
 	if err != nil {
 		return AggregateRef{}, err
 	}
-	if version.IsZero() {
+	if !version.Valid() {
 		return AggregateRef{}, ErrInvalidVersion
 	}
 	return AggregateRef{target: target, version: version}, nil
 }
 
-func (ref AggregateRef) IsZero() bool { return ref.target.IsZero() || ref.version.IsZero() }
+func (ref AggregateRef) IsZero() bool { return ref.target.IsZero() || !ref.version.Valid() }
 
 func (ref AggregateRef) Target() AggregateTarget { return ref.target }
 
@@ -340,6 +340,18 @@ func newAtomicCommitSet(kind CommitSetKind, expectations ...AggregateExpectation
 		if expectation.Target().IsZero() {
 			return AtomicCommitSet{}, ErrInvalidExpectation
 		}
+		switch expectation.kind {
+		case ExpectationMustNotExist:
+			if !expectation.version.IsZero() {
+				return AtomicCommitSet{}, ErrInvalidExpectation
+			}
+		case ExpectationExpectedVersion:
+			if !expectation.version.Valid() {
+				return AtomicCommitSet{}, ErrInvalidExpectation
+			}
+		default:
+			return AtomicCommitSet{}, ErrInvalidExpectation
+		}
 		if index > 0 && cloned[index-1].Target() == expectation.Target() {
 			return AtomicCommitSet{}, ErrDuplicateAggregate
 		}
@@ -509,7 +521,7 @@ func NewSessionBinding(
 		absoluteExpiry: absoluteExpiry.UTC(),
 	}
 	if device != nil {
-		if device.Kind() != AggregateKindDevice || device.IsZero() || deviceTrust.IsZero() {
+		if device.Kind() != AggregateKindDevice || device.IsZero() || !deviceTrust.Valid() {
 			return SessionBinding{}, ErrInvalidSessionBinding
 		}
 		binding.device = *device

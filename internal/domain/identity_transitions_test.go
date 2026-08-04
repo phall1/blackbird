@@ -512,6 +512,9 @@ func TestRehydrationRejectsImpossibleInvitationCeremonyAndPrincipalStates(t *tes
 			params.Status = InstallationInvitationExhausted
 		}},
 		{"unknown status", func(params *InstallationInvitationRehydrationParams) { params.Status = "unknown" }},
+		{"above-canonical version", func(params *InstallationInvitationRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"zero expiry", func(params *InstallationInvitationRehydrationParams) { params.ExpiresAt = time.Time{} }},
 		{"malformed public key", func(params *InstallationInvitationRehydrationParams) {
 			params.InstallationPublicKey = PublicKeyReference{value: " padded "}
@@ -568,6 +571,9 @@ func TestRehydrationRejectsImpossibleInvitationCeremonyAndPrincipalStates(t *tes
 		{"unknown kind", func(params *PrincipalRehydrationParams) { params.Kind = "unknown" }},
 		{"unknown status", func(params *PrincipalRehydrationParams) { params.Status = "unknown" }},
 		{"zero version", func(params *PrincipalRehydrationParams) { params.Version = Version{} }},
+		{"above-canonical version", func(params *PrincipalRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"suspended at creation version", func(params *PrincipalRehydrationParams) {
 			params.Status = PrincipalSuspended
 		}},
@@ -611,6 +617,12 @@ func TestRehydrationRejectsImpossibleDeviceGrantAndWorkspaceStates(t *testing.T)
 		{"trust newer than aggregate", func(params *DeviceRehydrationParams) {
 			params.TrustRevision = mustVersion(t, 2)
 		}},
+		{"above-canonical aggregate version", func(params *DeviceRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
+		{"above-canonical trust revision", func(params *DeviceRehydrationParams) {
+			params.TrustRevision = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"unknown status", func(params *DeviceRehydrationParams) { params.Status = "unknown" }},
 		{"suspended at creation version", func(params *DeviceRehydrationParams) {
 			params.Status = DeviceSuspended
@@ -651,6 +663,11 @@ func TestRehydrationRejectsImpossibleDeviceGrantAndWorkspaceStates(t *testing.T)
 			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: fixture.owner.ID(),
 			Status: GrantRevoked, Version: InitialVersion(), Capabilities: fixture.ownerGrant.Capabilities(),
 		},
+		{
+			ID: fixture.ownerGrant.ID(), InstallationID: fixture.installationID, PrincipalID: fixture.owner.ID(),
+			Status: GrantActive, Version: Version{value: MaxCanonicalInteger + 1},
+			Capabilities: fixture.ownerGrant.Capabilities(),
+		},
 	}
 	for index, params := range grantCases {
 		state, err := RehydrateGrant(params)
@@ -677,6 +694,9 @@ func TestRehydrationRejectsImpossibleDeviceGrantAndWorkspaceStates(t *testing.T)
 		{"missing authority", func(params *WorkspaceRehydrationParams) { params.AuthorityID = AuthorityID{} }},
 		{"unknown status", func(params *WorkspaceRehydrationParams) { params.Status = "unknown" }},
 		{"zero version", func(params *WorkspaceRehydrationParams) { params.Version = Version{} }},
+		{"above-canonical version", func(params *WorkspaceRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"archived at creation version", func(params *WorkspaceRehydrationParams) { params.Status = WorkspaceArchived }},
 	}
 	for _, test := range workspaceCases {
@@ -709,6 +729,9 @@ func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t
 		{"invited with consumed challenge", func(params *MembershipRehydrationParams) { params.Status = MembershipInvited }},
 		{"cross membership challenge", func(params *MembershipRehydrationParams) { params.ID = fixture.ownerMembership.ID() }},
 		{"invalid capabilities", func(params *MembershipRehydrationParams) { params.Capabilities = badCapability }},
+		{"above-canonical version", func(params *MembershipRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"invited without challenge", func(params *MembershipRehydrationParams) {
 			params.Status = MembershipInvited
 			params.AcceptanceChallenge = CeremonyChallenge{}
@@ -746,6 +769,11 @@ func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t
 			ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: fixture.actor.Kind(),
 			Profile: fixture.actor.Profile(), Status: ActorSuspended, Version: InitialVersion(),
 		},
+		{
+			ID: fixture.actor.ID(), WorkspaceID: fixture.workspace.ID(), Kind: fixture.actor.Kind(),
+			Profile: fixture.actor.Profile(), Status: ActorActive,
+			Version: Version{value: MaxCanonicalInteger + 1},
+		},
 	}
 	for index, params := range actorCases {
 		state, err := RehydrateActor(params)
@@ -773,6 +801,9 @@ func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t
 		{"cross actor activation", func(params *ActorDelegationRehydrationParams) { params.ActorID = ActorID{} }},
 		{"missing membership", func(params *ActorDelegationRehydrationParams) { params.MembershipID = MembershipID{} }},
 		{"invalid capabilities", func(params *ActorDelegationRehydrationParams) { params.Capabilities = badCapability }},
+		{"above-canonical version", func(params *ActorDelegationRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"active at creation version", func(params *ActorDelegationRehydrationParams) {
 			params.Version = InitialVersion()
 		}},
@@ -808,6 +839,12 @@ func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t
 		{"unknown status", func(params *ActorSessionRehydrationParams) { params.Status = "unknown" }},
 		{"invalid capabilities", func(params *ActorSessionRehydrationParams) { params.Capabilities = badCapability }},
 		{"invalid binding", func(params *ActorSessionRehydrationParams) { params.Binding.membership = AggregateRef{} }},
+		{"above-canonical version", func(params *ActorSessionRehydrationParams) {
+			params.Version = Version{value: MaxCanonicalInteger + 1}
+		}},
+		{"above-canonical binding revision", func(params *ActorSessionRehydrationParams) {
+			params.Binding.membership.version = Version{value: MaxCanonicalInteger + 1}
+		}},
 		{"malformed binding assurance", func(params *ActorSessionRehydrationParams) {
 			params.Binding.assurance = AssuranceClass{value: "Invalid"}
 		}},
@@ -1878,7 +1915,7 @@ func TestSessionBindsExplicitDeviceTrustRevision(t *testing.T) {
 
 func TestVersionOverflowRejectsIdentityMutationsAtomically(t *testing.T) {
 	fixture := buildIdentityPath(t)
-	maximum := mustVersion(t, ^uint64(0))
+	maximum := mustVersion(t, MaxCanonicalInteger)
 
 	t.Run("installation invitation", func(t *testing.T) {
 		installationID, _ := ParseInstallationID(identityUUID(130))
@@ -1948,6 +1985,33 @@ func TestVersionOverflowRejectsIdentityMutationsAtomically(t *testing.T) {
 			t.Fatalf("result = %#v, error = %v", result, err)
 		}
 	})
+}
+
+func TestForgedAboveCanonicalVersionsRejectIdentityReferenceBoundaries(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	forged := Version{value: MaxCanonicalInteger + 1}
+	deviceID, _ := ParseDeviceID(identityUUID(139))
+
+	if _, err := NewDeviceBoundWorkspaceIdentityAuthorization(
+		fixture.authorityID, fixture.epoch, fixture.installationID, fixture.workspace.ID(), fixture.workload.ID(),
+		testCapabilities(t, fixture.workRead), fixture.policy, fixture.assurance, fixture.now,
+		MaxActorSessionLifetime, deviceID, forged,
+	); !errors.Is(err, ErrInvalidAuthorization) {
+		t.Fatalf("forged authorization trust revision error = %v", err)
+	}
+	device := DeviceState{id: deviceID}
+	if _, err := TrustedDeviceSessionStart(device, forged, InitialVersion()); !errors.Is(err, ErrInvalidAuthorization) {
+		t.Fatalf("forged device aggregate expectation error = %v", err)
+	}
+	if _, err := TrustedDeviceSessionStart(device, InitialVersion(), forged); !errors.Is(err, ErrInvalidAuthorization) {
+		t.Fatalf("forged device trust expectation error = %v", err)
+	}
+	if _, err := NewGrantRevision(fixture.ownerGrant, forged); !errors.Is(err, ErrInvalidIdentityState) {
+		t.Fatalf("forged grant expectation error = %v", err)
+	}
+	if err := checkExpectedVersion(forged, forged); !errors.Is(err, ErrStaleVersion) {
+		t.Fatalf("matching forged versions escaped transition guard: %v", err)
+	}
 }
 
 func TestBeginAndPairDeviceSuccessFacts(t *testing.T) {
