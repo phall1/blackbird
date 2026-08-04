@@ -247,8 +247,8 @@ func DecodeEventEnvelope(data []byte) (RawEventEnvelopeDTO, error) {
 	if event.ActorSessionID != nil && event.ActorSessionID.IsZero() {
 		return RawEventEnvelopeDTO{}, invalid("actor_session_id", "must be nonzero when present")
 	}
-	if event.ActorSessionID != nil && event.ActorID == nil {
-		return RawEventEnvelopeDTO{}, invalid("actor_id", "is required when actor_session_id is present")
+	if (event.ActorID == nil) != (event.ActorSessionID == nil) {
+		return RawEventEnvelopeDTO{}, invalid("actor_id", "actor_id and actor_session_id must appear together")
 	}
 	if event.CausationID != nil && event.CausationID.IsZero() {
 		return RawEventEnvelopeDTO{}, invalid("causation_id", "must be nonzero when present")
@@ -347,6 +347,9 @@ func DecodeInstallationBootstrappedEvent(data []byte) (InstallationBootstrappedE
 	if err != nil {
 		return InstallationBootstrappedEventDTO{}, err
 	}
+	if err := rejectActorAuthorship(event); err != nil {
+		return InstallationBootstrappedEventDTO{}, err
+	}
 	if event.InstallationID == nil || *event.InstallationID != event.Payload.InstallationID {
 		return InstallationBootstrappedEventDTO{}, invalid("payload.installation_id", "must match installation_id scope")
 	}
@@ -387,6 +390,9 @@ func DecodePrincipalRegisteredEvent(data []byte) (PrincipalRegisteredEventDTO, e
 	if err != nil {
 		return PrincipalRegisteredEventDTO{}, err
 	}
+	if err := rejectActorAuthorship(event); err != nil {
+		return PrincipalRegisteredEventDTO{}, err
+	}
 	if event.Payload.PrincipalID.String() != event.Aggregate.ID {
 		return PrincipalRegisteredEventDTO{}, invalid("payload.principal_id", "must match aggregate.id")
 	}
@@ -414,6 +420,9 @@ func DecodeDevicePairingBeganEvent(data []byte) (DevicePairingBeganEventDTO, err
 		true,
 	)
 	if err != nil {
+		return DevicePairingBeganEventDTO{}, err
+	}
+	if err := rejectActorAuthorship(event); err != nil {
 		return DevicePairingBeganEventDTO{}, err
 	}
 	if event.Payload.DeviceID.String() != event.Aggregate.ID {
@@ -447,6 +456,9 @@ func DecodeDevicePairedEvent(data []byte) (DevicePairedEventDTO, error) {
 	if err != nil {
 		return DevicePairedEventDTO{}, err
 	}
+	if err := rejectActorAuthorship(event); err != nil {
+		return DevicePairedEventDTO{}, err
+	}
 	if event.Payload.DeviceID.String() != event.Aggregate.ID {
 		return DevicePairedEventDTO{}, invalid("payload.device_id", "must match aggregate.id")
 	}
@@ -473,6 +485,9 @@ func DecodeWorkspaceCreatedEvent(data []byte) (WorkspaceCreatedEventDTO, error) 
 		false,
 	)
 	if err != nil {
+		return WorkspaceCreatedEventDTO{}, err
+	}
+	if err := rejectActorAuthorship(event); err != nil {
 		return WorkspaceCreatedEventDTO{}, err
 	}
 	if event.Payload.WorkspaceID.String() != event.Aggregate.ID {
@@ -509,6 +524,9 @@ func DecodeWorkspaceMemberInvitedEvent(data []byte) (WorkspaceMemberInvitedEvent
 	if err != nil {
 		return WorkspaceMemberInvitedEventDTO{}, err
 	}
+	if err := rejectActorAuthorship(event); err != nil {
+		return WorkspaceMemberInvitedEventDTO{}, err
+	}
 	if event.Payload.MembershipID.String() != event.Aggregate.ID {
 		return WorkspaceMemberInvitedEventDTO{}, invalid("payload.membership_id", "must match aggregate.id")
 	}
@@ -536,6 +554,9 @@ func DecodeWorkspaceMembershipAcceptedEvent(data []byte) (WorkspaceMembershipAcc
 		false,
 	)
 	if err != nil {
+		return WorkspaceMembershipAcceptedEventDTO{}, err
+	}
+	if err := rejectActorAuthorship(event); err != nil {
 		return WorkspaceMembershipAcceptedEventDTO{}, err
 	}
 	if event.Payload.MembershipID.String() != event.Aggregate.ID {
@@ -810,8 +831,8 @@ func decodeEvent[Payload any](
 	if event.ActorSessionID != nil && event.ActorSessionID.IsZero() {
 		return EventEnvelopeDTO[Payload]{}, invalid("actor_session_id", "must be nonzero when present")
 	}
-	if event.ActorSessionID != nil && event.ActorID == nil {
-		return EventEnvelopeDTO[Payload]{}, invalid("actor_id", "is required when actor_session_id is present")
+	if (event.ActorID == nil) != (event.ActorSessionID == nil) {
+		return EventEnvelopeDTO[Payload]{}, invalid("actor_id", "actor_id and actor_session_id must appear together")
 	}
 	if event.CausationID != nil && event.CausationID.IsZero() {
 		return EventEnvelopeDTO[Payload]{}, invalid("causation_id", "must be nonzero when present")
@@ -837,4 +858,11 @@ func validateWorkspaceMembershipPayload(
 		return invalid("payload.workspace_id", "must match workspace_id")
 	}
 	return validateRequiredID("payload.principal_id", principal)
+}
+
+func rejectActorAuthorship[Payload any](event EventEnvelopeDTO[Payload]) error {
+	if event.ActorID != nil || event.ActorSessionID != nil {
+		return invalid("actor_id", "authority fact must not carry actor or actor_session authorship")
+	}
+	return nil
 }

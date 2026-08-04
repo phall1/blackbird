@@ -567,6 +567,51 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	if _, err := DecodeWorkspaceMembershipAcceptedEvent(mustMarshal(t, ordinaryMembershipAcceptance)); err != nil {
 		t.Fatalf("ordinary WorkspaceMembershipAccepted@2 error = %v, want nil", err)
 	}
+	authorityFacts := []struct {
+		name   string
+		value  []byte
+		decode func([]byte) error
+	}{
+		{name: "installation bootstrapped", value: mustMarshal(t, installation), decode: func(data []byte) error {
+			_, err := DecodeInstallationBootstrappedEvent(data)
+			return err
+		}},
+		{name: "principal registered", value: mustMarshal(t, principal), decode: func(data []byte) error {
+			_, err := DecodePrincipalRegisteredEvent(data)
+			return err
+		}},
+		{name: "device pairing began", value: mustMarshal(t, pairingBegan), decode: func(data []byte) error {
+			_, err := DecodeDevicePairingBeganEvent(data)
+			return err
+		}},
+		{name: "device paired", value: mustMarshal(t, device), decode: func(data []byte) error {
+			_, err := DecodeDevicePairedEvent(data)
+			return err
+		}},
+		{name: "workspace created", value: mustMarshal(t, workspace), decode: func(data []byte) error {
+			_, err := DecodeWorkspaceCreatedEvent(data)
+			return err
+		}},
+		{name: "workspace member invited", value: mustMarshal(t, invited), decode: func(data []byte) error {
+			_, err := DecodeWorkspaceMemberInvitedEvent(data)
+			return err
+		}},
+		{name: "workspace membership accepted", value: mustMarshal(t, accepted), decode: func(data []byte) error {
+			_, err := DecodeWorkspaceMembershipAcceptedEvent(data)
+			return err
+		}},
+	}
+	for _, fact := range authorityFacts {
+		t.Run(fact.name+" rejects actor authorship", func(t *testing.T) {
+			withActor := addTopLevelJSONField(
+				fact.value,
+				`"actor_id":"`+idActor+`","actor_session_id":"`+idSession+`"`,
+			)
+			if err := fact.decode(withActor); !errors.Is(err, ErrInvalidContract) {
+				t.Fatalf("error = %v, want ErrInvalidContract", err)
+			}
+		})
+	}
 	for name, encoded := range map[string][]byte{
 		"device pairing began": mustMarshal(t, pairingBegan),
 		"actor created":        mustMarshal(t, createdActor),
@@ -595,16 +640,19 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	}
 	distinctAuthorActor := createdActor
 	distinctAuthorActor.ActorID = pointer(mustParseActorID(t, idPrincipal))
+	distinctAuthorActor.ActorSessionID = pointer(mustParseActorSessionID(t, idClient))
 	if _, err := DecodeActorCreatedEvent(mustMarshal(t, distinctAuthorActor)); err != nil {
 		t.Fatalf("ActorCreated distinct author actor error = %v, want nil", err)
 	}
 	distinctProposalAuthor := proposed
 	distinctProposalAuthor.ActorID = pointer(mustParseActorID(t, idPrincipal))
+	distinctProposalAuthor.ActorSessionID = pointer(mustParseActorSessionID(t, idClient))
 	if _, err := DecodeActorDelegationProposedEvent(mustMarshal(t, distinctProposalAuthor)); err != nil {
 		t.Fatalf("ActorDelegationProposed distinct author actor error = %v, want nil", err)
 	}
 	distinctActivationAuthor := activated
 	distinctActivationAuthor.ActorID = pointer(mustParseActorID(t, idPrincipal))
+	distinctActivationAuthor.ActorSessionID = pointer(mustParseActorSessionID(t, idClient))
 	if _, err := DecodeActorDelegationActivatedEvent(mustMarshal(t, distinctActivationAuthor)); err != nil {
 		t.Fatalf("ActorDelegationActivated distinct author actor error = %v, want nil", err)
 	}
@@ -632,6 +680,11 @@ func TestW02EventsStrictTypedPayloads(t *testing.T) {
 	sessionWithoutActor.ActorSessionID = pointer(mustParseActorSessionID(t, idSession))
 	if _, err := DecodeActorCreatedEvent(mustMarshal(t, sessionWithoutActor)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("session without author actor error = %v, want ErrInvalidContract", err)
+	}
+	actorWithoutSession := createdActor
+	actorWithoutSession.ActorID = pointer(mustParseActorID(t, idPrincipal))
+	if _, err := DecodeActorCreatedEvent(mustMarshal(t, actorWithoutSession)); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("actor without author session error = %v, want ErrInvalidContract", err)
 	}
 
 	startedAmbiguities := []struct {
