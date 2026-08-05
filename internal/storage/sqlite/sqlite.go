@@ -42,6 +42,7 @@ var (
 	ErrInvalidConfiguration = errors.New("invalid SQLite configuration")
 	ErrEngineMismatch       = errors.New("SQLite engine mismatch")
 	ErrSchemaMismatch       = errors.New("SQLite schema mismatch")
+	errSecurityNoCommit     = errors.New("SQLite security transaction requires rollback")
 
 	//go:embed migrations/*.sql
 	migrations embed.FS
@@ -79,12 +80,19 @@ type Diagnostics struct {
 type Store struct {
 	db           *sql.DB
 	path         string
-	writeLane    chan struct{}
+	writes       writeArbiter
 	securityLane chan struct{}
 	diagnostics  Diagnostics
 	closeOnce    sync.Once
 	closeErr     error
 	releasePath  func()
+}
+
+type writeArbiter struct {
+	sync.Mutex
+	active          bool
+	securityWaiting int
+	changed         chan struct{}
 }
 
 func Open(ctx context.Context, config Config) (*Store, error) {
@@ -128,10 +136,9 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	db.SetMaxIdleConns(maximumReadPoolSize)
 	db.SetConnMaxLifetime(0)
 	store := &Store{
-		db: db, path: config.Path, writeLane: make(chan struct{}, 1),
-		securityLane: make(chan struct{}, 1), releasePath: releasePath,
+		db: db, path: config.Path, securityLane: make(chan struct{}, 1), releasePath: releasePath,
 	}
-	store.writeLane <- struct{}{}
+	store.writes.changed = make(chan struct{})
 	store.securityLane <- struct{}{}
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -537,12 +544,18 @@ func linkedDriverVersion() (string, bool, error) {
 }
 
 func (store *Store) withImmediate(ctx context.Context, apply func(*sql.Tx) error) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-store.writeLane:
+	return store.withImmediatePriority(ctx, false, apply)
+}
+
+func (store *Store) withImmediatePriority(
+	ctx context.Context,
+	security bool,
+	apply func(*sql.Tx) error,
+) error {
+	if err := store.acquireWrite(ctx, security); err != nil {
+		return err
 	}
-	defer func() { store.writeLane <- struct{}{} }()
+	defer store.releaseWrite()
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin SQLite immediate transaction: %w", err)
@@ -555,6 +568,53 @@ func (store *Store) withImmediate(ctx context.Context, apply func(*sql.Tx) error
 		return fmt.Errorf("commit SQLite transaction: %w", err)
 	}
 	return nil
+}
+
+func (store *Store) acquireWrite(ctx context.Context, security bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	registered := false
+	for {
+		store.writes.Lock()
+		if security && !registered {
+			store.writes.securityWaiting++
+			registered = true
+		}
+		if !store.writes.active && (security || store.writes.securityWaiting == 0) {
+			store.writes.active = true
+			if security {
+				store.writes.securityWaiting--
+			}
+			store.writes.Unlock()
+			return nil
+		}
+		changed := store.writes.changed
+		store.writes.Unlock()
+		select {
+		case <-ctx.Done():
+			if registered {
+				store.writes.Lock()
+				store.writes.securityWaiting--
+				store.signalWriteChange()
+				store.writes.Unlock()
+			}
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (store *Store) releaseWrite() {
+	store.writes.Lock()
+	store.writes.active = false
+	store.signalWriteChange()
+	store.writes.Unlock()
+}
+
+func (store *Store) signalWriteChange() {
+	close(store.writes.changed)
+	store.writes.changed = make(chan struct{})
 }
 
 // ExecuteSecurity runs the closed security-only transaction family through a
@@ -580,7 +640,7 @@ func (store *Store) ExecuteSecurity(
 		}
 	}()
 
-	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+	err := store.withImmediatePriority(ctx, true, func(tx *sql.Tx) error {
 		locked, state, err := store.lockSecurityContext(ctx, tx, spec)
 		if err != nil {
 			return err
@@ -593,8 +653,20 @@ func (store *Store) ExecuteSecurity(
 			return err
 		}
 		execution, err = store.applySecurityDecision(ctx, tx, state, decision)
-		return err
+		if err != nil {
+			return err
+		}
+		switch decision.Kind() {
+		case application.SecurityDecisionRollback, application.SecurityDecisionReplay,
+			application.SecurityDecisionSuppressDenial:
+			return errSecurityNoCommit
+		default:
+			return nil
+		}
 	})
+	if errors.Is(err, errSecurityNoCommit) {
+		return execution, nil
+	}
 	if err != nil {
 		return application.SecurityExecution{}, err
 	}

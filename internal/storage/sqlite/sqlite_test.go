@@ -518,11 +518,13 @@ func TestExecuteSecurityDenialSaturationAndReservedAdmission(t *testing.T) {
 
 	// Holding the ordinary writer lane does not consume the independently
 	// reserved security admission token, and cancellation remains bounded.
-	<-store.writeLane
+	if err := store.acquireWrite(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	_, err = store.ExecuteSecurity(ctx, later, auditOrSuppressDenial(t, later))
-	store.writeLane <- struct{}{}
+	store.releaseWrite()
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("reserved admission cancellation error=%v", err)
 	}
@@ -816,6 +818,65 @@ func verifyStoredAuditChain(t *testing.T, store *Store) {
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWriteLanePrioritizesReservedSecurityAdmission(t *testing.T) {
+	t.Parallel()
+	store, err := Open(context.Background(), Config{Path: filepath.Join(t.TempDir(), "blackbird.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := store.acquireWrite(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	order := make(chan string, 2)
+	ordinaryStarted := make(chan struct{})
+	go func() {
+		close(ordinaryStarted)
+		if err := store.acquireWrite(context.Background(), false); err != nil {
+			order <- "ordinary-error"
+			return
+		}
+		order <- "ordinary"
+		store.releaseWrite()
+	}()
+	<-ordinaryStarted
+
+	go func() {
+		if err := store.acquireWrite(context.Background(), true); err != nil {
+			order <- "security-error"
+			return
+		}
+		order <- "security"
+		store.releaseWrite()
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		store.writes.Lock()
+		waiting := store.writes.securityWaiting
+		store.writes.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			store.releaseWrite()
+			t.Fatal("security writer never entered the reserved admission queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.releaseWrite()
+	if first := <-order; first != "security" {
+		t.Fatalf("first admitted writer=%q, want security", first)
+	}
+	if second := <-order; second != "ordinary" {
+		t.Fatalf("second admitted writer=%q, want ordinary", second)
 	}
 }
 

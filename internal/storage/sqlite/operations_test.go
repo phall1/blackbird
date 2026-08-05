@@ -118,8 +118,8 @@ func newOperationStoreAt(t *testing.T, path string) *Store {
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := &Store{db: db, path: path, writeLane: make(chan struct{}, 1)}
-	store.writeLane <- struct{}{}
+	store := &Store{db: db, path: path}
+	store.writes.changed = make(chan struct{})
 	return store
 }
 

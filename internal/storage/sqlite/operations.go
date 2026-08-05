@@ -72,12 +72,10 @@ func (store *Store) Checkpoint(ctx context.Context, mode CheckpointMode) (Checkp
 		if _, bounded := ctx.Deadline(); !bounded {
 			return CheckpointReport{}, errors.New("SQLite truncating checkpoint requires a bounded context")
 		}
-		select {
-		case <-ctx.Done():
-			return CheckpointReport{}, ctx.Err()
-		case <-store.writeLane:
+		if err := store.acquireWrite(ctx, false); err != nil {
+			return CheckpointReport{}, err
 		}
-		defer func() { store.writeLane <- struct{}{} }()
+		defer store.releaseWrite()
 	}
 
 	started := time.Now()
@@ -116,12 +114,10 @@ func (store *Store) FullIntegrityCheck(ctx context.Context) (IntegrityReport, er
 	if _, bounded := ctx.Deadline(); !bounded {
 		return IntegrityReport{Full: true}, errors.New("full SQLite integrity check requires a bounded context")
 	}
-	select {
-	case <-ctx.Done():
-		return IntegrityReport{Full: true}, ctx.Err()
-	case <-store.writeLane:
+	if err := store.acquireWrite(ctx, false); err != nil {
+		return IntegrityReport{Full: true}, err
 	}
-	defer func() { store.writeLane <- struct{}{} }()
+	defer store.releaseWrite()
 
 	started := time.Now()
 	err := store.IntegrityCheck(ctx)
