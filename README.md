@@ -12,13 +12,18 @@ The production core currently includes:
 - pure installation, bootstrap, principal, workspace, membership, actor,
   delegation, device, and actor-session transitions; and
 - strict bounded public command, result, error, and event wire contracts for
-  W0.
+  W0; and
+- the in-progress transport-neutral W0 application contract, including closed
+  unit-of-work declarations, receipt/replay plans, security-only decisions,
+  RFC 8785 result/capsule codecs, and credential-bound identity commits.
 
 These slices have passed their local architecture gates and native macOS/Linux
 CI. They do **not** claim that persistence, supported transports, the complete
 walking slice, an ADR is Verified, or a release candidate exists. W0.4 is the
 application/UnitOfWork boundary; SQLite, PostgreSQL, pairing, HTTP/MCP,
-context, and the integrated proof follow in dependency order.
+context, and the integrated proof follow in dependency order. W0.4 remains in
+progress until its production command/guard/event/audit profiles and complete
+recording-UoW orchestration evidence land.
 
 The implementation authority is
 [`docs/architecture/implementation-plan.md`](../docs/architecture/implementation-plan.md),

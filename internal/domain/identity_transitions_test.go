@@ -29,6 +29,131 @@ func testCapabilities(t *testing.T, capabilities ...Capability) CapabilitySet {
 	return set
 }
 
+func testCredentialDigest(t *testing.T, value string) CredentialDigest {
+	t.Helper()
+	digest, err := NewCredentialDigest([32]byte(FingerprintCommand([]byte(value))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
+func testDeviceCredential(
+	t *testing.T,
+	publicKey PublicKeyReference,
+	transcript CommandFingerprint,
+) DeviceCredentialBinding {
+	t.Helper()
+	binding, err := NewDeviceCredentialBinding(
+		publicKey, testCredentialDigest(t, "device spki:"+publicKey.String()), transcript,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
+func testPairingRedemption(
+	t *testing.T,
+	authorityID AuthorityID,
+	epoch AuthorityEpoch,
+	installationID InstallationID,
+	principalID PrincipalID,
+	deviceID DeviceID,
+	policy PolicyRevision,
+	assurance AssuranceClass,
+	evaluatedAt time.Time,
+	challengeID CeremonyID,
+	transcript CommandFingerprint,
+	publicKey PublicKeyReference,
+) PairingRedemptionAuthorization {
+	t.Helper()
+	authorization, err := NewPairingRedemptionAuthorization(
+		authorityID, epoch, installationID, principalID, deviceID, policy, assurance, evaluatedAt,
+		challengeID, transcript, testDeviceCredential(t, publicKey, transcript),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authorization
+}
+
+func testPresentationCredential(t *testing.T, value string) PresentationCredentialBinding {
+	t.Helper()
+	reference, _ := NewCredentialReference("credential-ref:" + value)
+	audience, _ := NewCredentialAudience("blackbird:" + value)
+	binding, err := NewPresentationCredentialBinding(
+		testCredentialDigest(t, "presentation:"+value), reference, audience, PresentationCredentialVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
+func TestCredentialBindingsAreStrictSecretFreeValues(t *testing.T) {
+	publicKey, _ := NewPublicKeyReference("keyref:credential-test")
+	transcript := FingerprintCommand([]byte("credential transcript"))
+	spki := testCredentialDigest(t, "credential spki")
+	device, err := NewDeviceCredentialBinding(publicKey, spki, transcript)
+	if err != nil || device.Algorithm() != DeviceCredentialAlgorithm ||
+		device.PublicKeyReference() != publicKey || device.SPKIFingerprint() != spki ||
+		device.TranscriptFingerprint() != transcript {
+		t.Fatalf("device credential = %#v, error = %v", device, err)
+	}
+	deviceCases := []struct {
+		name       string
+		publicKey  PublicKeyReference
+		spki       CredentialDigest
+		transcript CommandFingerprint
+	}{
+		{"missing key reference", PublicKeyReference{}, spki, transcript},
+		{"malformed key reference", PublicKeyReference{value: " padded "}, spki, transcript},
+		{"missing spki fingerprint", publicKey, CredentialDigest{}, transcript},
+		{"missing transcript", publicKey, spki, CommandFingerprint{}},
+	}
+	for _, test := range deviceCases {
+		t.Run("device/"+test.name, func(t *testing.T) {
+			binding, bindingErr := NewDeviceCredentialBinding(test.publicKey, test.spki, test.transcript)
+			if !errors.Is(bindingErr, ErrInvalidIdentityMetadata) || !binding.IsZero() {
+				t.Fatalf("binding = %#v, error = %v", binding, bindingErr)
+			}
+		})
+	}
+
+	reference, _ := NewCredentialReference("credential-ref:test")
+	audience, _ := NewCredentialAudience("blackbird:test")
+	presentation, err := NewPresentationCredentialBinding(spki, reference, audience, PresentationCredentialVersion)
+	if err != nil || presentation.Digest() != spki || presentation.Reference() != reference ||
+		presentation.Audience() != audience || presentation.Version() != PresentationCredentialVersion {
+		t.Fatalf("presentation credential = %#v, error = %v", presentation, err)
+	}
+	presentationCases := []struct {
+		name      string
+		digest    CredentialDigest
+		reference CredentialReference
+		audience  CredentialAudience
+		version   uint16
+	}{
+		{"missing digest", CredentialDigest{}, reference, audience, PresentationCredentialVersion},
+		{"missing reference", spki, CredentialReference{}, audience, PresentationCredentialVersion},
+		{"malformed reference", spki, CredentialReference{value: " padded "}, audience, PresentationCredentialVersion},
+		{"missing audience", spki, reference, CredentialAudience{}, PresentationCredentialVersion},
+		{"malformed audience", spki, reference, CredentialAudience{value: " padded "}, PresentationCredentialVersion},
+		{"unsupported version", spki, reference, audience, PresentationCredentialVersion + 1},
+	}
+	for _, test := range presentationCases {
+		t.Run("presentation/"+test.name, func(t *testing.T) {
+			binding, bindingErr := NewPresentationCredentialBinding(
+				test.digest, test.reference, test.audience, test.version,
+			)
+			if !errors.Is(bindingErr, ErrInvalidIdentityMetadata) || !binding.IsZero() {
+				t.Fatalf("binding = %#v, error = %v", binding, bindingErr)
+			}
+		})
+	}
+}
+
 func ownerCapabilitySet(t *testing.T, additional ...Capability) CapabilitySet {
 	t.Helper()
 	capabilities := []Capability{
@@ -94,6 +219,7 @@ func testBootstrapMaterials(
 		DeviceID:              deviceID,
 		DeviceDisplayName:     deviceName,
 		DevicePublicKey:       deviceKey,
+		DeviceSPKIFingerprint: testCredentialDigest(t, "bootstrap device spki:"+deviceKey.String()),
 		OwnerGrantID:          grantID,
 		OwnerCapabilities:     capabilities,
 	})
@@ -215,8 +341,13 @@ func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
 		deviceCeremonyID, CeremonyPurposeDevicePairing, deviceDigest, fixture.owner.ID(), deviceID,
 	)
 	paired, err := PairDevice(PairDeviceInput{
+		Authorization: testPairingRedemption(
+			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(), deviceID,
+			fixture.policy, fixture.assurance, fixture.now, deviceCeremonyID, deviceDigest, deviceKey,
+		),
 		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
-		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(), Proof: deviceProof, EvaluatedAt: fixture.now,
+		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(),
+		ExpectedTrustRevision: began.Device().TrustRevision(), Proof: deviceProof,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +357,7 @@ func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
 		PrincipalID: paired.Device().PrincipalID(), DisplayName: paired.Device().DisplayName(),
 		PublicKeyReference: paired.Device().PublicKeyReference(), Status: paired.Device().Status(),
 		Version: paired.Device().Version(), TrustRevision: paired.Device().TrustRevision(),
-		PairingChallenge: paired.Device().PairingChallenge(),
+		PairingChallenge: paired.Device().PairingChallenge(), CredentialBinding: paired.Device().CredentialBinding(),
 	})
 	if err != nil || rehydratedDevice != paired.Device() {
 		t.Fatalf("device did not round trip: state=%#v error=%v", rehydratedDevice, err)
@@ -293,7 +424,8 @@ func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
 		ID: sessionResult.Session().ID(), ClientInstanceID: sessionResult.Session().ClientInstanceID(),
 		ClientMetadata: sessionResult.Session().ClientMetadata(), Status: sessionResult.Session().Status(),
 		Version: sessionResult.Session().Version(), Binding: sessionResult.Session().Binding(),
-		Capabilities: sessionResult.Session().Capabilities(),
+		Capabilities:           sessionResult.Session().Capabilities(),
+		PresentationCredential: sessionResult.Session().PresentationCredential(),
 	})
 	if err != nil || rehydratedSession.ID() != sessionResult.Session().ID() ||
 		!equalSessionBindings(rehydratedSession.Binding(), sessionResult.Session().Binding()) ||
@@ -357,6 +489,7 @@ func TestRehydrationAcceptsEverySupportedIdentityLifecycleValue(t *testing.T) {
 		deviceCeremonyID, FingerprintCommand([]byte("lifecycle device")), fixture.now.Add(time.Minute),
 		fixture.installationID, fixture.workload.ID(), deviceID,
 	)
+	deviceCredential := testDeviceCredential(t, deviceKey, deviceChallenge.ProofDigest())
 	for _, status := range []DeviceStatus{DevicePending, DeviceTrusted, DeviceSuspended, DeviceRevoked} {
 		pairing := CeremonyChallenge{}
 		version := InitialVersion()
@@ -370,6 +503,12 @@ func TestRehydrationAcceptsEverySupportedIdentityLifecycleValue(t *testing.T) {
 			ID: deviceID, InstallationID: fixture.installationID, PrincipalID: fixture.workload.ID(),
 			DisplayName: deviceName, PublicKeyReference: deviceKey, Status: status,
 			Version: version, TrustRevision: InitialVersion(), PairingChallenge: pairing,
+			CredentialBinding: func() DeviceCredentialBinding {
+				if status == DevicePending {
+					return DeviceCredentialBinding{}
+				}
+				return deviceCredential
+			}(),
 		})
 		if err != nil || state.Status() != status {
 			t.Fatalf("device lifecycle %q rejected: state=%#v error=%v", status, state, err)
@@ -479,7 +618,8 @@ func TestRehydrationAcceptsEverySupportedIdentityLifecycleValue(t *testing.T) {
 			ID: sessionResult.Session().ID(), ClientInstanceID: sessionResult.Session().ClientInstanceID(),
 			ClientMetadata: sessionResult.Session().ClientMetadata(), Status: status,
 			Version: version, Binding: sessionResult.Session().Binding(),
-			Capabilities: sessionResult.Session().Capabilities(),
+			Capabilities:           sessionResult.Session().Capabilities(),
+			PresentationCredential: sessionResult.Session().PresentationCredential(),
 		})
 		if rehydrationErr != nil || state.Status() != status {
 			t.Fatalf("session lifecycle %q rejected: state=%#v error=%v", status, state, rehydrationErr)
@@ -612,7 +752,24 @@ func TestRehydrationRejectsImpossibleDeviceGrantAndWorkspaceStates(t *testing.T)
 		{"pending without pairing", func(params *DeviceRehydrationParams) {
 			params.PairingChallenge = CeremonyChallenge{}
 		}},
+		{"pending with finalized credential", func(params *DeviceRehydrationParams) {
+			params.CredentialBinding = testDeviceCredential(t, deviceKey, deviceChallenge.ProofDigest())
+		}},
 		{"trusted with pending pairing", func(params *DeviceRehydrationParams) { params.Status = DeviceTrusted }},
+		{"trusted without credential", func(params *DeviceRehydrationParams) {
+			params.Status = DeviceTrusted
+			params.Version = mustVersion(t, 2)
+			params.TrustRevision = mustVersion(t, 2)
+			params.PairingChallenge = params.PairingChallenge.consume()
+		}},
+		{"trusted with credential for another key", func(params *DeviceRehydrationParams) {
+			otherKey, _ := NewPublicKeyReference("keyref:another-device")
+			params.Status = DeviceTrusted
+			params.Version = mustVersion(t, 2)
+			params.TrustRevision = mustVersion(t, 2)
+			params.PairingChallenge = params.PairingChallenge.consume()
+			params.CredentialBinding = testDeviceCredential(t, otherKey, deviceChallenge.ProofDigest())
+		}},
 		{"cross principal pairing", func(params *DeviceRehydrationParams) { params.PrincipalID = fixture.owner.ID() }},
 		{"trust newer than aggregate", func(params *DeviceRehydrationParams) {
 			params.TrustRevision = mustVersion(t, 2)
@@ -827,6 +984,7 @@ func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t
 		ID: sessionResult.Session().ID(), ClientInstanceID: sessionResult.Session().ClientInstanceID(),
 		ClientMetadata: sessionResult.Session().ClientMetadata(), Status: ActorSessionActive,
 		Version: InitialVersion(), Binding: sessionResult.Session().Binding(), Capabilities: sessionResult.Session().Capabilities(),
+		PresentationCredential: sessionResult.Session().PresentationCredential(),
 	}
 	sessionCases := []struct {
 		name   string
@@ -839,6 +997,15 @@ func TestRehydrationRejectsImpossibleMembershipActorDelegationAndSessionStates(t
 		{"unknown status", func(params *ActorSessionRehydrationParams) { params.Status = "unknown" }},
 		{"invalid capabilities", func(params *ActorSessionRehydrationParams) { params.Capabilities = badCapability }},
 		{"invalid binding", func(params *ActorSessionRehydrationParams) { params.Binding.membership = AggregateRef{} }},
+		{"missing presentation credential", func(params *ActorSessionRehydrationParams) {
+			params.PresentationCredential = PresentationCredentialBinding{}
+		}},
+		{"malformed presentation credential reference", func(params *ActorSessionRehydrationParams) {
+			params.PresentationCredential.reference = CredentialReference{value: " padded "}
+		}},
+		{"unsupported presentation credential version", func(params *ActorSessionRehydrationParams) {
+			params.PresentationCredential.version = PresentationCredentialVersion + 1
+		}},
 		{"above-canonical version", func(params *ActorSessionRehydrationParams) {
 			params.Version = Version{value: MaxCanonicalInteger + 1}
 		}},
@@ -1102,6 +1269,12 @@ func TestBootstrapInstallationAtomicFactsAndOrigins(t *testing.T) {
 		result.OwnerGrant().Status() != GrantActive {
 		t.Fatalf("incomplete bootstrap result: %#v", result)
 	}
+	credential := result.Device().CredentialBinding()
+	if credential.IsZero() || credential.PublicKeyReference() != deviceKey ||
+		credential.SPKIFingerprint() != proof.DeviceSPKIFingerprint() ||
+		credential.TranscriptFingerprint() != proof.TranscriptFingerprint() {
+		t.Fatalf("bootstrap device credential = %#v", credential)
+	}
 	facts := result.Facts()
 	wantTypes := []EventType{EventTypeInstallationBootstrapped, EventTypePrincipalRegistered, EventTypeDevicePaired}
 	if len(facts) != len(wantTypes) {
@@ -1116,6 +1289,11 @@ func TestBootstrapInstallationAtomicFactsAndOrigins(t *testing.T) {
 		facts[1].Origin().Kind() != AggregateKindPrincipal || facts[1].Origin().Version().Uint64() != 1 ||
 		facts[2].Origin().Kind() != AggregateKindDevice || facts[2].Origin().Version().Uint64() != 1 {
 		t.Fatalf("bootstrap origins are incorrect: %#v", facts)
+	}
+	pairedFact := facts[2].(DevicePairedFact)
+	if pairedFact.DisplayName() != deviceName || pairedFact.TranscriptFingerprint() != proof.TranscriptFingerprint() ||
+		pairedFact.CredentialBinding() != result.Device().CredentialBinding() {
+		t.Fatalf("bootstrap paired fact = %#v", pairedFact)
 	}
 	facts[0] = nil
 	if result.Facts()[0] == nil {
@@ -1370,6 +1548,9 @@ func TestBootstrapTranscriptBoundFieldMutationsRecordDenial(t *testing.T) {
 		{"device id", func(input *BootstrapInstallationInput) { input.Proof.deviceID = otherDevice }},
 		{"device name", func(input *BootstrapInstallationInput) { input.Proof.deviceDisplayName = otherName }},
 		{"device key", func(input *BootstrapInstallationInput) { input.Proof.devicePublicKey = otherKey }},
+		{"device spki fingerprint", func(input *BootstrapInstallationInput) {
+			input.Proof.deviceSPKIFingerprint = CredentialDigest{}
+		}},
 		{"grant id", func(input *BootstrapInstallationInput) { input.Proof.ownerGrantID = otherGrant }},
 		{"grant capabilities", func(input *BootstrapInstallationInput) {
 			input.OwnerGrantCapabilities = ownerCapabilitySet(t, testCapability(t, "altered:capability"))
@@ -1428,6 +1609,7 @@ func baseSessionInput(t *testing.T, fixture identityPathFixture) StartActorSessi
 		Actor: fixture.actor, ExpectedActorVersion: fixture.actor.Version(),
 		Delegation: fixture.delegation, ExpectedDelegationVersion: fixture.delegation.Version(),
 		StartAuthority: authority, AbsoluteExpiry: fixture.now.Add(8 * time.Hour),
+		PresentationCredential: testPresentationCredential(t, "actor-session"),
 	}
 }
 
@@ -1498,7 +1680,8 @@ func TestStartActorSessionHandoffIsAtomicAndNarrowed(t *testing.T) {
 	}
 	fact := facts[0].(ActorSessionStartedFact)
 	if fact.ClientInstanceID() != input.ClientInstanceID || fact.ClientMetadata() != input.ClientMetadata ||
-		!fact.Capabilities().Equal(testCapabilities(t, fixture.workRead)) {
+		!fact.Capabilities().Equal(testCapabilities(t, fixture.workRead)) ||
+		fact.PresentationCredential() != input.PresentationCredential {
 		t.Fatalf("session fact lost client or capability metadata: %#v", fact)
 	}
 }
@@ -1512,6 +1695,7 @@ func TestStartActorSessionTrustedDeviceDoesNotConsumeHandoff(t *testing.T) {
 	device := DeviceState{
 		id: deviceID, installationID: fixture.installationID, principalID: fixture.workload.ID(),
 		displayName: name, publicKey: key, status: DeviceTrusted, version: mustVersion(t, 3), trustRevision: mustVersion(t, 2),
+		credential: testDeviceCredential(t, key, FingerprintCommand([]byte("trusted-device-session"))),
 	}
 	authority, _ := TrustedDeviceSessionStart(device, device.Version(), device.TrustRevision())
 	input.Authorization = fixtureDeviceIdentityAuthorization(
@@ -1566,6 +1750,9 @@ func TestStartActorSessionAdverseMatrixReturnsNoPartialOutcome(t *testing.T) {
 		{"existing active session", func(input *StartActorSessionInput) {
 			input.Session = ActorSessionState{id: input.SessionID, status: ActorSessionActive, version: InitialVersion()}
 		}, ErrStateConflict},
+		{"missing presentation credential", func(input *StartActorSessionInput) {
+			input.PresentationCredential = PresentationCredentialBinding{}
+		}, ErrInvalidArgument},
 		{"lifetime exceeds authorization", func(input *StartActorSessionInput) {
 			input.AbsoluteExpiry = input.Authorization.EvaluatedAt().Add(MaxActorSessionLifetime + time.Second)
 		}, ErrInvalidArgument},
@@ -1878,8 +2065,10 @@ func TestSessionBindsExplicitDeviceTrustRevision(t *testing.T) {
 	fixture := buildIdentityPath(t)
 	input := baseSessionInput(t, fixture)
 	deviceID, _ := ParseDeviceID(identityUUID(120))
+	key, _ := NewPublicKeyReference("keyref:session-device")
 	device := DeviceState{
 		id: deviceID, installationID: fixture.installationID, principalID: fixture.workload.ID(),
+		publicKey: key, credential: testDeviceCredential(t, key, FingerprintCommand([]byte("session-device"))),
 		status: DeviceTrusted, version: mustVersion(t, 5), trustRevision: mustVersion(t, 3),
 	}
 	authority, _ := TrustedDeviceSessionStart(device, device.Version(), device.TrustRevision())
@@ -1969,17 +2158,22 @@ func TestVersionOverflowRejectsIdentityMutationsAtomically(t *testing.T) {
 		deviceID, _ := ParseDeviceID(identityUUID(135))
 		ceremonyID, _ := ParseCeremonyID(identityUUID(136))
 		digest := FingerprintCommand([]byte("overflow pairing"))
+		deviceKey, _ := NewPublicKeyReference("keyref:overflow-pairing")
 		challenge, _ := NewDevicePairingChallenge(
 			ceremonyID, digest, fixture.now.Add(time.Minute), fixture.installationID, fixture.workload.ID(), deviceID,
 		)
 		device := DeviceState{
 			id: deviceID, installationID: fixture.installationID, principalID: fixture.workload.ID(),
-			status: DevicePending, version: maximum, trustRevision: maximum, pairing: challenge,
+			publicKey: deviceKey, status: DevicePending, version: maximum, trustRevision: maximum, pairing: challenge,
 		}
 		proof, _ := NewCeremonyProof(ceremonyID, CeremonyPurposeDevicePairing, digest, fixture.workload.ID(), deviceID)
 		result, err := PairDevice(PairDeviceInput{
+			Authorization: testPairingRedemption(
+				t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.workload.ID(), deviceID,
+				fixture.policy, fixture.assurance, fixture.now, ceremonyID, digest, deviceKey,
+			),
 			Principal: fixture.workload, ExpectedPrincipalVersion: fixture.workload.Version(),
-			Device: device, ExpectedDeviceVersion: maximum, Proof: proof, EvaluatedAt: fixture.now,
+			Device: device, ExpectedDeviceVersion: maximum, ExpectedTrustRevision: maximum, Proof: proof,
 		})
 		if !errors.Is(err, ErrVersionOverflow) || !result.Device().IsZero() || len(result.Facts()) != 0 {
 			t.Fatalf("result = %#v, error = %v", result, err)
@@ -2046,8 +2240,13 @@ func TestBeginAndPairDeviceSuccessFacts(t *testing.T) {
 
 	proof, _ := NewCeremonyProof(ceremonyID, CeremonyPurposeDevicePairing, digest, fixture.owner.ID(), deviceID)
 	paired, err := PairDevice(PairDeviceInput{
+		Authorization: testPairingRedemption(
+			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(), deviceID,
+			fixture.policy, fixture.assurance, fixture.now, ceremonyID, digest, key,
+		),
 		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
-		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(), Proof: proof, EvaluatedAt: fixture.now,
+		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(),
+		ExpectedTrustRevision: began.Device().TrustRevision(), Proof: proof,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2062,7 +2261,9 @@ func TestBeginAndPairDeviceSuccessFacts(t *testing.T) {
 		t.Fatalf("pair facts = %#v", pairFacts)
 	}
 	pairedFact := pairFacts[0].(DevicePairedFact)
-	if pairedFact.TrustRevision().Uint64() != 2 || pairedFact.TranscriptFingerprint() != digest {
+	if pairedFact.TrustRevision().Uint64() != 2 || pairedFact.TranscriptFingerprint() != digest ||
+		pairedFact.DisplayName() != name || paired.Device().CredentialBinding() != testDeviceCredential(t, key, digest) ||
+		pairedFact.CredentialBinding() != paired.Device().CredentialBinding() {
 		t.Fatalf("paired fact = %#v", pairedFact)
 	}
 }
@@ -2128,12 +2329,21 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 	)
 	device := DeviceState{
 		id: deviceID, installationID: fixture.installationID, principalID: fixture.owner.ID(),
+		publicKey: func() PublicKeyReference {
+			key, _ := NewPublicKeyReference("keyref:adverse-pairing")
+			return key
+		}(),
 		status: DevicePending, version: InitialVersion(), trustRevision: InitialVersion(), pairing: challenge,
 	}
 	proof, _ := NewCeremonyProof(ceremonyID, CeremonyPurposeDevicePairing, digest, fixture.owner.ID(), deviceID)
 	base := PairDeviceInput{
+		Authorization: testPairingRedemption(
+			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(), deviceID,
+			fixture.policy, fixture.assurance, fixture.now, ceremonyID, digest, device.PublicKeyReference(),
+		),
 		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
-		Device: device, ExpectedDeviceVersion: device.Version(), Proof: proof, EvaluatedAt: fixture.now,
+		Device: device, ExpectedDeviceVersion: device.Version(),
+		ExpectedTrustRevision: device.TrustRevision(), Proof: proof,
 	}
 	tests := []struct {
 		name   string
@@ -2141,6 +2351,7 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 		match  error
 	}{
 		{"stale", func(input *PairDeviceInput) { input.ExpectedDeviceVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"stale trust", func(input *PairDeviceInput) { input.ExpectedTrustRevision = mustVersion(t, 2) }, ErrStaleVersion},
 		{"revoked", func(input *PairDeviceInput) { input.Device.status = DeviceRevoked }, ErrStateConflict},
 		{"replayed", func(input *PairDeviceInput) {
 			input.Device.status = DeviceTrusted
@@ -2148,6 +2359,24 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 		}, ErrStateConflict},
 		{"cross principal", func(input *PairDeviceInput) {
 			input.Proof.principalID, _ = ParsePrincipalID(identityUUID(162))
+		}, ErrForbidden},
+		{"missing redemption authorization", func(input *PairDeviceInput) {
+			input.Authorization = PairingRedemptionAuthorization{}
+		}, ErrForbidden},
+		{"wrong authority installation", func(input *PairDeviceInput) {
+			input.Authorization.installationID, _ = ParseInstallationID(identityUUID(164))
+		}, ErrForbidden},
+		{"wrong authorized challenge", func(input *PairDeviceInput) {
+			input.Authorization.challengeID, _ = ParseCeremonyID(identityUUID(165))
+		}, ErrStateConflict},
+		{"wrong authorized transcript", func(input *PairDeviceInput) {
+			input.Authorization.transcript = FingerprintCommand([]byte("different transcript"))
+		}, ErrForbidden},
+		{"wrong credential reference", func(input *PairDeviceInput) {
+			input.Authorization.credential.publicKeyReference, _ = NewPublicKeyReference("keyref:wrong-device")
+		}, ErrStateConflict},
+		{"zero credential fingerprint", func(input *PairDeviceInput) {
+			input.Authorization.credential.spkiFingerprint = CredentialDigest{}
 		}, ErrForbidden},
 		{"wrong purpose", func(input *PairDeviceInput) { input.Proof.purpose = CeremonyPurposeMembershipAcceptance }, ErrStateConflict},
 		{"expired", func(input *PairDeviceInput) { input.Device.pairing.expiresAt = fixture.now }, ErrStateConflict},

@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"crypto/sha256"
 	"errors"
 	"sort"
 	"strings"
@@ -59,6 +60,126 @@ func NewPublicKeyReference(value string) (PublicKeyReference, error) {
 }
 
 func (reference PublicKeyReference) String() string { return reference.value }
+
+// CredentialDigest is an already-derived, non-secret SHA-256 value. The
+// application credential preparer owns salting/canonicalization; the domain
+// stores only the fixed-width result and never reusable credential material.
+type CredentialDigest [sha256.Size]byte
+
+func NewCredentialDigest(value [sha256.Size]byte) (CredentialDigest, error) {
+	digest := CredentialDigest(value)
+	if digest.IsZero() {
+		return CredentialDigest{}, ErrInvalidIdentityMetadata
+	}
+	return digest, nil
+}
+
+func (digest CredentialDigest) IsZero() bool { return digest == CredentialDigest{} }
+
+func (digest CredentialDigest) Bytes() [sha256.Size]byte { return [sha256.Size]byte(digest) }
+
+// DeviceCredentialBinding is the finalized, secret-free identity of a paired
+// Ed25519 credential. Pending devices carry only their candidate public-key
+// reference; every trusted or historical paired device carries this binding.
+type DeviceCredentialBinding struct {
+	publicKeyReference PublicKeyReference
+	spkiFingerprint    CredentialDigest
+	transcript         CommandFingerprint
+}
+
+const DeviceCredentialAlgorithm = "ed25519-spki-sha256-v1"
+
+func NewDeviceCredentialBinding(
+	publicKeyReference PublicKeyReference,
+	spkiFingerprint CredentialDigest,
+	transcript CommandFingerprint,
+) (DeviceCredentialBinding, error) {
+	if !validPublicKeyReferenceValue(publicKeyReference) || spkiFingerprint.IsZero() || transcript.IsZero() {
+		return DeviceCredentialBinding{}, ErrInvalidIdentityMetadata
+	}
+	return DeviceCredentialBinding{
+		publicKeyReference: publicKeyReference,
+		spkiFingerprint:    spkiFingerprint,
+		transcript:         transcript,
+	}, nil
+}
+
+func (binding DeviceCredentialBinding) IsZero() bool {
+	return binding.publicKeyReference.valueIsZero() && binding.spkiFingerprint.IsZero() && binding.transcript.IsZero()
+}
+
+func (binding DeviceCredentialBinding) Algorithm() string { return DeviceCredentialAlgorithm }
+func (binding DeviceCredentialBinding) PublicKeyReference() PublicKeyReference {
+	return binding.publicKeyReference
+}
+func (binding DeviceCredentialBinding) SPKIFingerprint() CredentialDigest {
+	return binding.spkiFingerprint
+}
+func (binding DeviceCredentialBinding) TranscriptFingerprint() CommandFingerprint {
+	return binding.transcript
+}
+
+type CredentialReference struct{ value string }
+
+func NewCredentialReference(value string) (CredentialReference, error) {
+	if !validBoundedText(value, 256) {
+		return CredentialReference{}, ErrInvalidIdentityMetadata
+	}
+	return CredentialReference{value: value}, nil
+}
+
+func (reference CredentialReference) String() string { return reference.value }
+
+type CredentialAudience struct{ value string }
+
+func NewCredentialAudience(value string) (CredentialAudience, error) {
+	if !validBoundedText(value, 256) {
+		return CredentialAudience{}, ErrInvalidIdentityMetadata
+	}
+	return CredentialAudience{value: value}, nil
+}
+
+func (audience CredentialAudience) String() string { return audience.value }
+
+// PresentationCredentialBinding is the durable, non-reusable reference to the
+// sender-constrained credential issued for one ActorSession. The bearer value
+// and private key never enter domain state.
+type PresentationCredentialBinding struct {
+	digest    CredentialDigest
+	reference CredentialReference
+	audience  CredentialAudience
+	version   uint16
+}
+
+const PresentationCredentialVersion uint16 = 1
+
+func NewPresentationCredentialBinding(
+	digest CredentialDigest,
+	reference CredentialReference,
+	audience CredentialAudience,
+	version uint16,
+) (PresentationCredentialBinding, error) {
+	if digest.IsZero() || !validBoundedText(reference.String(), 256) ||
+		!validBoundedText(audience.String(), 256) ||
+		version != PresentationCredentialVersion {
+		return PresentationCredentialBinding{}, ErrInvalidIdentityMetadata
+	}
+	return PresentationCredentialBinding{
+		digest: digest, reference: reference, audience: audience, version: version,
+	}, nil
+}
+
+func (binding PresentationCredentialBinding) IsZero() bool {
+	return binding.digest.IsZero() && binding.reference.String() == "" &&
+		binding.audience.String() == "" && binding.version == 0
+}
+
+func (binding PresentationCredentialBinding) Digest() CredentialDigest { return binding.digest }
+func (binding PresentationCredentialBinding) Reference() CredentialReference {
+	return binding.reference
+}
+func (binding PresentationCredentialBinding) Audience() CredentialAudience { return binding.audience }
+func (binding PresentationCredentialBinding) Version() uint16              { return binding.version }
 
 type WorkspaceAlias struct{ value string }
 
@@ -600,22 +721,23 @@ func (state InstallationInvitationState) Status() InstallationInvitationStatus {
 func (state InstallationInvitationState) Version() Version                     { return state.version }
 
 type BootstrapProof struct {
-	invitationID         InvitationID
-	installationID       InstallationID
-	installationKey      PublicKeyReference
-	invitationEvidence   CommandFingerprint
-	transcript           CommandFingerprint
-	clientNonceDigest    CommandFingerprint
-	serverNonceDigest    CommandFingerprint
-	protocol             PairingProtocol
-	role                 BootstrapRole
-	principalID          PrincipalID
-	principalDisplayName DisplayName
-	deviceID             DeviceID
-	deviceDisplayName    DisplayName
-	devicePublicKey      PublicKeyReference
-	ownerGrantID         GrantID
-	ownerCapabilities    CapabilitySet
+	invitationID          InvitationID
+	installationID        InstallationID
+	installationKey       PublicKeyReference
+	invitationEvidence    CommandFingerprint
+	transcript            CommandFingerprint
+	clientNonceDigest     CommandFingerprint
+	serverNonceDigest     CommandFingerprint
+	protocol              PairingProtocol
+	role                  BootstrapRole
+	principalID           PrincipalID
+	principalDisplayName  DisplayName
+	deviceID              DeviceID
+	deviceDisplayName     DisplayName
+	devicePublicKey       PublicKeyReference
+	deviceSPKIFingerprint CredentialDigest
+	ownerGrantID          GrantID
+	ownerCapabilities     CapabilitySet
 }
 
 type BootstrapProofParams struct {
@@ -633,6 +755,7 @@ type BootstrapProofParams struct {
 	DeviceID              DeviceID
 	DeviceDisplayName     DisplayName
 	DevicePublicKey       PublicKeyReference
+	DeviceSPKIFingerprint CredentialDigest
 	OwnerGrantID          GrantID
 	OwnerCapabilities     CapabilitySet
 }
@@ -644,26 +767,28 @@ func NewBootstrapProof(params BootstrapProofParams) (BootstrapProof, error) {
 		!params.Protocol.Valid() || !params.Role.Valid() || params.PrincipalID.IsZero() ||
 		params.PrincipalDisplayName.String() == "" || params.DeviceID.IsZero() ||
 		params.DeviceDisplayName.String() == "" || params.DevicePublicKey.String() == "" ||
+		params.DeviceSPKIFingerprint.IsZero() ||
 		params.OwnerGrantID.IsZero() || params.OwnerCapabilities.IsZero() {
 		return BootstrapProof{}, ErrInvalidCeremonyProof
 	}
 	return BootstrapProof{
-		invitationID:         params.InvitationID,
-		installationID:       params.InstallationID,
-		installationKey:      params.InstallationKey,
-		invitationEvidence:   params.InvitationEvidence,
-		transcript:           params.TranscriptFingerprint,
-		clientNonceDigest:    params.ClientNonceDigest,
-		serverNonceDigest:    params.ServerNonceDigest,
-		protocol:             params.Protocol,
-		role:                 params.Role,
-		principalID:          params.PrincipalID,
-		principalDisplayName: params.PrincipalDisplayName,
-		deviceID:             params.DeviceID,
-		deviceDisplayName:    params.DeviceDisplayName,
-		devicePublicKey:      params.DevicePublicKey,
-		ownerGrantID:         params.OwnerGrantID,
-		ownerCapabilities:    cloneCapabilitySet(params.OwnerCapabilities),
+		invitationID:          params.InvitationID,
+		installationID:        params.InstallationID,
+		installationKey:       params.InstallationKey,
+		invitationEvidence:    params.InvitationEvidence,
+		transcript:            params.TranscriptFingerprint,
+		clientNonceDigest:     params.ClientNonceDigest,
+		serverNonceDigest:     params.ServerNonceDigest,
+		protocol:              params.Protocol,
+		role:                  params.Role,
+		principalID:           params.PrincipalID,
+		principalDisplayName:  params.PrincipalDisplayName,
+		deviceID:              params.DeviceID,
+		deviceDisplayName:     params.DeviceDisplayName,
+		devicePublicKey:       params.DevicePublicKey,
+		deviceSPKIFingerprint: params.DeviceSPKIFingerprint,
+		ownerGrantID:          params.OwnerGrantID,
+		ownerCapabilities:     cloneCapabilitySet(params.OwnerCapabilities),
 	}, nil
 }
 
@@ -681,7 +806,10 @@ func (proof BootstrapProof) PrincipalDisplayName() DisplayName         { return 
 func (proof BootstrapProof) DeviceID() DeviceID                        { return proof.deviceID }
 func (proof BootstrapProof) DeviceDisplayName() DisplayName            { return proof.deviceDisplayName }
 func (proof BootstrapProof) DevicePublicKey() PublicKeyReference       { return proof.devicePublicKey }
-func (proof BootstrapProof) OwnerGrantID() GrantID                     { return proof.ownerGrantID }
+func (proof BootstrapProof) DeviceSPKIFingerprint() CredentialDigest {
+	return proof.deviceSPKIFingerprint
+}
+func (proof BootstrapProof) OwnerGrantID() GrantID { return proof.ownerGrantID }
 func (proof BootstrapProof) OwnerCapabilities() CapabilitySet {
 	return cloneCapabilitySet(proof.ownerCapabilities)
 }
@@ -759,6 +887,94 @@ func (authorization BootstrapGenerationAuthorization) permits(
 	return approval.invitationID == invitation.ID() && approval.installationID == invitation.InstallationID() &&
 		approval.previousGeneration == invitation.BootstrapGenerationID() &&
 		approval.currentGeneration == currentGeneration && !approval.fingerprint.IsZero()
+}
+
+// PairingRedemptionAuthorization is trusted output from the pairing verifier
+// and policy boundary. It is single-purpose and binds the exact authority,
+// challenge, transcript, candidate device, and finalized credential that must
+// be rechecked while the Device and ceremony rows are locked.
+type PairingRedemptionAuthorization struct {
+	authorityID    AuthorityID
+	epoch          AuthorityEpoch
+	installationID InstallationID
+	principalID    PrincipalID
+	deviceID       DeviceID
+	policy         PolicyRevision
+	assurance      AssuranceClass
+	evaluatedAt    time.Time
+	challengeID    CeremonyID
+	transcript     CommandFingerprint
+	credential     DeviceCredentialBinding
+}
+
+func NewPairingRedemptionAuthorization(
+	authorityID AuthorityID,
+	epoch AuthorityEpoch,
+	installationID InstallationID,
+	principalID PrincipalID,
+	deviceID DeviceID,
+	policy PolicyRevision,
+	assurance AssuranceClass,
+	evaluatedAt time.Time,
+	challengeID CeremonyID,
+	transcript CommandFingerprint,
+	credential DeviceCredentialBinding,
+) (PairingRedemptionAuthorization, error) {
+	if authorityID.IsZero() || epoch.IsZero() || installationID.IsZero() || principalID.IsZero() ||
+		deviceID.IsZero() || !validPolicyRevisionValue(policy) || !validAssuranceClassValue(assurance) || evaluatedAt.IsZero() ||
+		challengeID.IsZero() || transcript.IsZero() || !validDeviceCredentialBinding(credential) ||
+		credential.TranscriptFingerprint() != transcript {
+		return PairingRedemptionAuthorization{}, ErrInvalidAuthorization
+	}
+	return PairingRedemptionAuthorization{
+		authorityID: authorityID, epoch: epoch, installationID: installationID,
+		principalID: principalID, deviceID: deviceID, policy: policy, assurance: assurance,
+		evaluatedAt: evaluatedAt.UTC(), challengeID: challengeID, transcript: transcript,
+		credential: credential,
+	}, nil
+}
+
+func (authorization PairingRedemptionAuthorization) AuthorityID() AuthorityID {
+	return authorization.authorityID
+}
+func (authorization PairingRedemptionAuthorization) AuthorityEpoch() AuthorityEpoch {
+	return authorization.epoch
+}
+func (authorization PairingRedemptionAuthorization) InstallationID() InstallationID {
+	return authorization.installationID
+}
+func (authorization PairingRedemptionAuthorization) PrincipalID() PrincipalID {
+	return authorization.principalID
+}
+func (authorization PairingRedemptionAuthorization) DeviceID() DeviceID {
+	return authorization.deviceID
+}
+func (authorization PairingRedemptionAuthorization) PolicyRevision() PolicyRevision {
+	return authorization.policy
+}
+func (authorization PairingRedemptionAuthorization) AssuranceClass() AssuranceClass {
+	return authorization.assurance
+}
+func (authorization PairingRedemptionAuthorization) EvaluatedAt() time.Time {
+	return authorization.evaluatedAt
+}
+func (authorization PairingRedemptionAuthorization) ChallengeID() CeremonyID {
+	return authorization.challengeID
+}
+func (authorization PairingRedemptionAuthorization) TranscriptFingerprint() CommandFingerprint {
+	return authorization.transcript
+}
+func (authorization PairingRedemptionAuthorization) Credential() DeviceCredentialBinding {
+	return authorization.credential
+}
+
+func validPairingRedemptionAuthorization(value PairingRedemptionAuthorization) bool {
+	validated, err := NewPairingRedemptionAuthorization(
+		value.AuthorityID(), value.AuthorityEpoch(), value.InstallationID(), value.PrincipalID(), value.DeviceID(),
+		value.PolicyRevision(), value.AssuranceClass(), value.EvaluatedAt(), value.ChallengeID(),
+		value.TranscriptFingerprint(), value.Credential(),
+	)
+	return err == nil && validated == value
 }
 
 type IdentityAuthorization struct {
@@ -971,18 +1187,20 @@ type DeviceState struct {
 	version        Version
 	trustRevision  Version
 	pairing        CeremonyChallenge
+	credential     DeviceCredentialBinding
 }
 
-func (state DeviceState) IsZero() bool                           { return state.id.IsZero() }
-func (state DeviceState) ID() DeviceID                           { return state.id }
-func (state DeviceState) InstallationID() InstallationID         { return state.installationID }
-func (state DeviceState) PrincipalID() PrincipalID               { return state.principalID }
-func (state DeviceState) DisplayName() DisplayName               { return state.displayName }
-func (state DeviceState) PublicKeyReference() PublicKeyReference { return state.publicKey }
-func (state DeviceState) Status() DeviceStatus                   { return state.status }
-func (state DeviceState) Version() Version                       { return state.version }
-func (state DeviceState) TrustRevision() Version                 { return state.trustRevision }
-func (state DeviceState) PairingChallenge() CeremonyChallenge    { return state.pairing }
+func (state DeviceState) IsZero() bool                               { return state.id.IsZero() }
+func (state DeviceState) ID() DeviceID                               { return state.id }
+func (state DeviceState) InstallationID() InstallationID             { return state.installationID }
+func (state DeviceState) PrincipalID() PrincipalID                   { return state.principalID }
+func (state DeviceState) DisplayName() DisplayName                   { return state.displayName }
+func (state DeviceState) PublicKeyReference() PublicKeyReference     { return state.publicKey }
+func (state DeviceState) Status() DeviceStatus                       { return state.status }
+func (state DeviceState) Version() Version                           { return state.version }
+func (state DeviceState) TrustRevision() Version                     { return state.trustRevision }
+func (state DeviceState) PairingChallenge() CeremonyChallenge        { return state.pairing }
+func (state DeviceState) CredentialBinding() DeviceCredentialBinding { return state.credential }
 
 type GrantStatus string
 
@@ -1185,6 +1403,7 @@ type ActorSessionState struct {
 	version        Version
 	binding        SessionBinding
 	capabilities   CapabilitySet
+	presentation   PresentationCredentialBinding
 }
 
 func (state ActorSessionState) IsZero() bool                       { return state.id.IsZero() }
@@ -1196,6 +1415,9 @@ func (state ActorSessionState) Version() Version                   { return stat
 func (state ActorSessionState) Binding() SessionBinding            { return state.binding }
 func (state ActorSessionState) Capabilities() CapabilitySet {
 	return cloneCapabilitySet(state.capabilities)
+}
+func (state ActorSessionState) PresentationCredential() PresentationCredentialBinding {
+	return state.presentation
 }
 
 // The rehydration parameter types below are deliberately separate from
@@ -1237,6 +1459,7 @@ type DeviceRehydrationParams struct {
 	Version            Version
 	TrustRevision      Version
 	PairingChallenge   CeremonyChallenge
+	CredentialBinding  DeviceCredentialBinding
 }
 
 func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
@@ -1247,14 +1470,23 @@ func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
 	hasPairing := !params.PairingChallenge.IsZero()
+	hasCredential := !params.CredentialBinding.IsZero()
+	if hasCredential && !validDeviceCredentialBinding(params.CredentialBinding) {
+		return DeviceState{}, ErrInvalidIdentityState
+	}
 	if (params.Status == DeviceSuspended || params.Status == DeviceRevoked) && !versionRecordsMutation(params.Version) {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
 	if params.Status == DevicePending {
-		if !hasPairing || params.PairingChallenge.Status() != CeremonyPending {
+		if !hasPairing || params.PairingChallenge.Status() != CeremonyPending || hasCredential {
 			return DeviceState{}, ErrInvalidIdentityState
 		}
-	} else if hasPairing {
+	} else {
+		if !hasCredential || params.CredentialBinding.PublicKeyReference() != params.PublicKeyReference {
+			return DeviceState{}, ErrInvalidIdentityState
+		}
+	}
+	if params.Status != DevicePending && hasPairing {
 		if params.PairingChallenge.Status() != CeremonyConsumed || !versionRecordsMutation(params.Version) ||
 			!versionRecordsMutation(params.TrustRevision) {
 			return DeviceState{}, ErrInvalidIdentityState
@@ -1271,6 +1503,7 @@ func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
 		id: params.ID, installationID: params.InstallationID, principalID: params.PrincipalID,
 		displayName: params.DisplayName, publicKey: params.PublicKeyReference, status: params.Status,
 		version: params.Version, trustRevision: params.TrustRevision, pairing: params.PairingChallenge,
+		credential: params.CredentialBinding,
 	}, nil
 }
 
@@ -1431,13 +1664,14 @@ func RehydrateActorDelegation(
 }
 
 type ActorSessionRehydrationParams struct {
-	ID               ActorSessionID
-	ClientInstanceID ClientInstanceID
-	ClientMetadata   ClientMetadata
-	Status           ActorSessionStatus
-	Version          Version
-	Binding          SessionBinding
-	Capabilities     CapabilitySet
+	ID                     ActorSessionID
+	ClientInstanceID       ClientInstanceID
+	ClientMetadata         ClientMetadata
+	Status                 ActorSessionStatus
+	Version                Version
+	Binding                SessionBinding
+	Capabilities           CapabilitySet
+	PresentationCredential PresentationCredentialBinding
 }
 
 func RehydrateActorSession(params ActorSessionRehydrationParams) (ActorSessionState, error) {
@@ -1446,12 +1680,14 @@ func RehydrateActorSession(params ActorSessionRehydrationParams) (ActorSessionSt
 	if params.ID.IsZero() || params.ClientInstanceID.IsZero() ||
 		!validClientMetadataValue(params.ClientMetadata) || !params.Status.Valid() ||
 		!params.Version.Valid() || !capabilitiesValid || !bindingValid ||
+		!validPresentationCredentialBinding(params.PresentationCredential) ||
 		(params.Status != ActorSessionActive && !versionRecordsMutation(params.Version)) {
 		return ActorSessionState{}, ErrInvalidIdentityState
 	}
 	return ActorSessionState{
 		id: params.ID, clientInstance: params.ClientInstanceID, clientMetadata: params.ClientMetadata,
 		status: params.Status, version: params.Version, binding: binding, capabilities: capabilities,
+		presentation: params.PresentationCredential,
 	}, nil
 }
 
@@ -1468,6 +1704,20 @@ func (reference PublicKeyReference) valueIsZero() bool { return reference.String
 
 func validPublicKeyReferenceValue(value PublicKeyReference) bool {
 	validated, err := NewPublicKeyReference(value.String())
+	return err == nil && validated == value
+}
+
+func validDeviceCredentialBinding(value DeviceCredentialBinding) bool {
+	validated, err := NewDeviceCredentialBinding(
+		value.PublicKeyReference(), value.SPKIFingerprint(), value.TranscriptFingerprint(),
+	)
+	return err == nil && validated == value
+}
+
+func validPresentationCredentialBinding(value PresentationCredentialBinding) bool {
+	validated, err := NewPresentationCredentialBinding(
+		value.Digest(), value.Reference(), value.Audience(), value.Version(),
+	)
 	return err == nil && validated == value
 }
 

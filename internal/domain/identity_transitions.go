@@ -75,17 +75,21 @@ type DevicePairedFact struct {
 	origin        AggregateRef
 	deviceID      DeviceID
 	principalID   PrincipalID
+	displayName   DisplayName
 	transcript    CommandFingerprint
 	trustRevision Version
+	credential    DeviceCredentialBinding
 }
 
-func (DevicePairedFact) Type() EventType                                { return EventTypeDevicePaired }
-func (DevicePairedFact) identityFact()                                  {}
-func (fact DevicePairedFact) Origin() AggregateRef                      { return fact.origin }
-func (fact DevicePairedFact) DeviceID() DeviceID                        { return fact.deviceID }
-func (fact DevicePairedFact) PrincipalID() PrincipalID                  { return fact.principalID }
-func (fact DevicePairedFact) TranscriptFingerprint() CommandFingerprint { return fact.transcript }
-func (fact DevicePairedFact) TrustRevision() Version                    { return fact.trustRevision }
+func (DevicePairedFact) Type() EventType                                 { return EventTypeDevicePaired }
+func (DevicePairedFact) identityFact()                                   {}
+func (fact DevicePairedFact) Origin() AggregateRef                       { return fact.origin }
+func (fact DevicePairedFact) DeviceID() DeviceID                         { return fact.deviceID }
+func (fact DevicePairedFact) PrincipalID() PrincipalID                   { return fact.principalID }
+func (fact DevicePairedFact) DisplayName() DisplayName                   { return fact.displayName }
+func (fact DevicePairedFact) TranscriptFingerprint() CommandFingerprint  { return fact.transcript }
+func (fact DevicePairedFact) TrustRevision() Version                     { return fact.trustRevision }
+func (fact DevicePairedFact) CredentialBinding() DeviceCredentialBinding { return fact.credential }
 
 type WorkspaceCreatedFact struct {
 	origin      AggregateRef
@@ -200,6 +204,7 @@ type ActorSessionStartedFact struct {
 	clientMetadata ClientMetadata
 	binding        SessionBinding
 	capabilities   CapabilitySet
+	presentation   PresentationCredentialBinding
 }
 
 func (ActorSessionStartedFact) Type() EventType                         { return EventTypeActorSessionStarted }
@@ -211,6 +216,9 @@ func (fact ActorSessionStartedFact) ClientMetadata() ClientMetadata     { return
 func (fact ActorSessionStartedFact) Binding() SessionBinding            { return fact.binding }
 func (fact ActorSessionStartedFact) Capabilities() CapabilitySet {
 	return cloneCapabilitySet(fact.capabilities)
+}
+func (fact ActorSessionStartedFact) PresentationCredential() PresentationCredentialBinding {
+	return fact.presentation
 }
 
 func cloneIdentityFacts(facts []IdentityFact) []IdentityFact {
@@ -438,6 +446,13 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 		version:        InitialVersion(),
 		trustRevision:  InitialVersion(),
 	}
+	credential, err := NewDeviceCredentialBinding(
+		input.Proof.DevicePublicKey(), input.Proof.DeviceSPKIFingerprint(), input.Proof.TranscriptFingerprint(),
+	)
+	if err != nil {
+		return BootstrapInstallationResult{}, transitionError(ErrorCodeInvalidArgument, "bootstrap credential binding is invalid")
+	}
+	device.credential = credential
 	grant := GrantState{
 		id:             input.OwnerGrantID,
 		installationID: input.Invitation.InstallationID(),
@@ -476,8 +491,10 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 			origin:        deviceOrigin,
 			deviceID:      input.DeviceID,
 			principalID:   input.PrincipalID,
+			displayName:   device.DisplayName(),
 			transcript:    input.Proof.TranscriptFingerprint(),
 			trustRevision: device.TrustRevision(),
+			credential:    device.CredentialBinding(),
 		},
 	}
 	return BootstrapInstallationResult{
@@ -501,6 +518,7 @@ func bootstrapProofMatches(input BootstrapInstallationInput) bool {
 		proof.Role() == BootstrapRoleInstallationOwner && proof.PrincipalID() == input.PrincipalID &&
 		proof.PrincipalDisplayName() == input.PrincipalDisplayName && proof.DeviceID() == input.DeviceID &&
 		proof.DeviceDisplayName() == input.DeviceDisplayName && proof.DevicePublicKey() == input.DevicePublicKey &&
+		!proof.DeviceSPKIFingerprint().IsZero() &&
 		proof.OwnerGrantID() == input.OwnerGrantID && proof.OwnerCapabilities().Equal(input.OwnerGrantCapabilities)
 }
 
@@ -1185,12 +1203,13 @@ func (result BeginDevicePairingResult) Facts() []IdentityFact {
 }
 
 type PairDeviceInput struct {
+	Authorization            PairingRedemptionAuthorization
 	Principal                PrincipalState
 	ExpectedPrincipalVersion Version
 	Device                   DeviceState
 	ExpectedDeviceVersion    Version
+	ExpectedTrustRevision    Version
 	Proof                    CeremonyProof
-	EvaluatedAt              time.Time
 }
 
 type PairDeviceResult struct {
@@ -1205,21 +1224,34 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 	if err := checkExpectedVersion(input.Device.Version(), input.ExpectedDeviceVersion); err != nil {
 		return PairDeviceResult{}, err
 	}
+	if err := checkExpectedVersion(input.Device.TrustRevision(), input.ExpectedTrustRevision); err != nil {
+		return PairDeviceResult{}, err
+	}
 	if input.Device.Status() != DevicePending {
 		return PairDeviceResult{}, transitionConflict(ConflictState, "device is not pending pairing")
 	}
-	if input.Principal.Status() != PrincipalActive || input.Device.InstallationID() != input.Principal.InstallationID() ||
+	if !validPairingRedemptionAuthorization(input.Authorization) ||
+		input.Authorization.InstallationID() != input.Principal.InstallationID() ||
+		input.Authorization.PrincipalID() != input.Principal.ID() ||
+		input.Authorization.DeviceID() != input.Device.ID() ||
+		input.Authorization.PolicyRevision().String() == "" || input.Authorization.AssuranceClass().String() == "" ||
+		input.Authorization.EvaluatedAt().IsZero() ||
+		input.Principal.Status() != PrincipalActive || input.Device.InstallationID() != input.Principal.InstallationID() ||
 		input.Device.PrincipalID() != input.Principal.ID() || input.Proof.PrincipalID() != input.Principal.ID() ||
 		input.Proof.DeviceID() != input.Device.ID() {
 		return PairDeviceResult{}, transitionError(ErrorCodeForbidden, "device pairing principal does not match")
 	}
 	pairing := input.Device.PairingChallenge()
-	if pairing.InstallationID() != input.Device.InstallationID() ||
+	if input.Authorization.ChallengeID() != pairing.ID() ||
+		input.Authorization.TranscriptFingerprint() != input.Proof.ProofDigest() ||
+		input.Authorization.Credential().TranscriptFingerprint() != input.Proof.ProofDigest() ||
+		input.Authorization.Credential().PublicKeyReference() != input.Device.PublicKeyReference() ||
+		pairing.InstallationID() != input.Device.InstallationID() ||
 		pairing.PrincipalID() != input.Device.PrincipalID() || pairing.DeviceID() != input.Device.ID() {
 		return PairDeviceResult{}, transitionConflict(ConflictReference, "device challenge binding is stale or malformed")
 	}
 	if err := checkCeremony(pairing, input.Proof,
-		CeremonyPurposeDevicePairing, input.EvaluatedAt); err != nil {
+		CeremonyPurposeDevicePairing, input.Authorization.EvaluatedAt()); err != nil {
 		return PairDeviceResult{}, err
 	}
 	nextVersion, err := nextTransitionVersion(input.Device.Version())
@@ -1235,14 +1267,17 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 	device.version = nextVersion
 	device.trustRevision = nextTrustRevision
 	device.pairing = device.pairing.consume()
+	device.credential = input.Authorization.Credential()
 	origin, err := identityOrigin(device.ID(), device.Version())
 	if err != nil {
 		return PairDeviceResult{}, err
 	}
 	fact := DevicePairedFact{
 		origin:   origin,
-		deviceID: device.ID(), principalID: device.PrincipalID(), transcript: input.Proof.ProofDigest(),
+		deviceID: device.ID(), principalID: device.PrincipalID(), displayName: device.DisplayName(),
+		transcript:    input.Proof.ProofDigest(),
 		trustRevision: device.TrustRevision(),
+		credential:    device.CredentialBinding(),
 	}
 	return PairDeviceResult{device: device, facts: []IdentityFact{fact}}, nil
 }
@@ -1271,7 +1306,8 @@ func TrustedDeviceSessionStart(
 	expectedVersion Version,
 	expectedTrustRevision Version,
 ) (SessionStartAuthority, error) {
-	if device.IsZero() || !expectedVersion.Valid() || !expectedTrustRevision.Valid() {
+	if device.IsZero() || !expectedVersion.Valid() || !expectedTrustRevision.Valid() ||
+		!validDeviceCredentialBinding(device.CredentialBinding()) {
 		return SessionStartAuthority{}, ErrInvalidAuthorization
 	}
 	return SessionStartAuthority{
@@ -1323,6 +1359,7 @@ type StartActorSessionInput struct {
 	Grants                    []GrantRevision
 	StartAuthority            SessionStartAuthority
 	AbsoluteExpiry            time.Time
+	PresentationCredential    PresentationCredentialBinding
 }
 
 type StartActorSessionResult struct {
@@ -1343,6 +1380,7 @@ func StartActorSession(input StartActorSessionInput) (StartActorSessionResult, e
 	}
 	if input.SessionID.IsZero() || input.ClientInstanceID.IsZero() ||
 		input.ClientMetadata.Name() == "" || input.AbsoluteExpiry.IsZero() ||
+		!validPresentationCredentialBinding(input.PresentationCredential) ||
 		!input.AbsoluteExpiry.After(input.Authorization.EvaluatedAt()) ||
 		input.AbsoluteExpiry.After(input.Authorization.EvaluatedAt().Add(input.Authorization.MaxSessionLifetime())) ||
 		len(input.Grants) > MaxSessionGrantRevisions {
@@ -1428,7 +1466,8 @@ func StartActorSession(input StartActorSessionInput) (StartActorSessionResult, e
 		if err := checkExpectedVersion(device.TrustRevision(), input.StartAuthority.expectedTrust); err != nil {
 			return StartActorSessionResult{}, err
 		}
-		if device.Status() != DeviceTrusted || device.PrincipalID() != input.Principal.ID() ||
+		if device.Status() != DeviceTrusted || !validDeviceCredentialBinding(device.CredentialBinding()) ||
+			device.PrincipalID() != input.Principal.ID() ||
 			device.InstallationID() != input.Authorization.InstallationID() {
 			return StartActorSessionResult{}, transitionError(ErrorCodeUnauthenticated, "trusted device binding is invalid")
 		}
@@ -1480,6 +1519,7 @@ func StartActorSession(input StartActorSessionInput) (StartActorSessionResult, e
 		version:        InitialVersion(),
 		binding:        binding,
 		capabilities:   effective,
+		presentation:   input.PresentationCredential,
 	}
 	origin, err := identityOrigin(session.ID(), session.Version())
 	if err != nil {
@@ -1488,7 +1528,7 @@ func StartActorSession(input StartActorSessionInput) (StartActorSessionResult, e
 	fact := ActorSessionStartedFact{
 		origin: origin, sessionID: session.ID(),
 		clientInstance: session.ClientInstanceID(), clientMetadata: session.ClientMetadata(),
-		binding: binding, capabilities: session.Capabilities(),
+		binding: binding, capabilities: session.Capabilities(), presentation: session.PresentationCredential(),
 	}
 	return StartActorSessionResult{
 		session:            session,
