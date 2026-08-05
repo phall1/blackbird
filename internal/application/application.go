@@ -36,12 +36,16 @@ const (
 	MaxCommandFacts     = 64
 	MaxCommandEffects   = 64
 
-	MaxReceiptResultBytes   = 2 * 1024
-	MaxAuditMetadataBytes   = 8 * 1024
-	MaxAuditEntryBytes      = 32 * 1024
-	MaxEffectMetadataBytes  = 8 * 1024
-	MaxRecoveryCapsuleBytes = 32 * 1024
-	Ed25519SignatureBytes   = 64
+	MaxReceiptResultBytes    = 2 * 1024
+	MaxAuditMetadataBytes    = 8 * 1024
+	MaxAuditEntryBytes       = 32 * 1024
+	MaxEffectMetadataBytes   = 8 * 1024
+	MaxRecoveryCapsuleBytes  = 32 * 1024
+	Ed25519SignatureBytes    = 64
+	MaxQueryPageSize         = 256
+	MaxContextCollaborators  = 256
+	MaxContextGrantRevisions = 64
+	MaxQueryPayloadBytes     = 256 * 1024
 )
 
 var (
@@ -57,7 +61,299 @@ var (
 	ErrInvalidSecurityDecision    = errors.New("invalid security decision")
 	ErrInvalidSecurityExecution   = errors.New("invalid security execution")
 	ErrApplicationLimitExceeded   = errors.New("application contract limit exceeded")
+	ErrInvalidQuery               = errors.New("invalid application query")
 )
+
+type QueryOperation string
+
+const (
+	QueryContextGet QueryOperation = "context.get.v1"
+	QueryEventsSync QueryOperation = "events.sync.v1"
+)
+
+func (operation QueryOperation) Valid() bool {
+	return operation == QueryContextGet || operation == QueryEventsSync
+}
+
+// EventCursor is deliberately opaque to callers. Only storage adapters may
+// interpret it, and clients may advance only to a cursor returned in a result.
+type EventCursor struct{ value string }
+
+func NewEventCursor(value string) (EventCursor, error) {
+	if !validOpaqueText(value, 1024) {
+		return EventCursor{}, ErrInvalidQuery
+	}
+	return EventCursor{value: value}, nil
+}
+
+func (cursor EventCursor) String() string { return cursor.value }
+func (cursor EventCursor) IsZero() bool   { return cursor.value == "" }
+
+type CheckpointID struct{ value string }
+
+func NewCheckpointID(value string) (CheckpointID, error) {
+	if !validOpaqueText(value, 256) {
+		return CheckpointID{}, ErrInvalidQuery
+	}
+	return CheckpointID{value: value}, nil
+}
+
+func (id CheckpointID) String() string { return id.value }
+func (id CheckpointID) IsZero() bool   { return id.value == "" }
+
+type QuerySubject struct {
+	principal domain.PrincipalID
+	session   domain.ActorSessionID
+}
+
+func NewQuerySubject(principal domain.PrincipalID, session domain.ActorSessionID) (QuerySubject, error) {
+	if principal.IsZero() || session.IsZero() {
+		return QuerySubject{}, ErrInvalidQuery
+	}
+	return QuerySubject{principal: principal, session: session}, nil
+}
+
+func (subject QuerySubject) PrincipalID() domain.PrincipalID       { return subject.principal }
+func (subject QuerySubject) ActorSessionID() domain.ActorSessionID { return subject.session }
+
+type ContextGetQuery struct {
+	subject      QuerySubject
+	checkpointID CheckpointID
+}
+
+func NewContextGetQuery(subject QuerySubject, checkpointID CheckpointID) (ContextGetQuery, error) {
+	if subject.principal.IsZero() || subject.session.IsZero() || checkpointID.IsZero() {
+		return ContextGetQuery{}, ErrInvalidQuery
+	}
+	return ContextGetQuery{subject: subject, checkpointID: checkpointID}, nil
+}
+
+func (query ContextGetQuery) Subject() QuerySubject      { return query.subject }
+func (query ContextGetQuery) CheckpointID() CheckpointID { return query.checkpointID }
+
+type EventsSyncQuery struct {
+	subject QuerySubject
+	after   EventCursor
+	limit   uint16
+}
+
+func NewEventsSyncQuery(subject QuerySubject, after EventCursor, limit uint16) (EventsSyncQuery, error) {
+	if subject.principal.IsZero() || subject.session.IsZero() || limit == 0 || limit > MaxQueryPageSize {
+		return EventsSyncQuery{}, ErrInvalidQuery
+	}
+	return EventsSyncQuery{subject: subject, after: after, limit: limit}, nil
+}
+
+func (query EventsSyncQuery) Subject() QuerySubject    { return query.subject }
+func (query EventsSyncQuery) AfterCursor() EventCursor { return query.after }
+func (query EventsSyncQuery) Limit() uint16            { return query.limit }
+
+type AuthorizationRevision struct {
+	kind    domain.AggregateKind
+	id      string
+	version domain.Version
+}
+
+func NewAuthorizationRevision(kind domain.AggregateKind, id string, version domain.Version) (AuthorizationRevision, error) {
+	if kind == "" || !validOpaqueText(id, 256) || !version.Valid() {
+		return AuthorizationRevision{}, ErrInvalidQuery
+	}
+	return AuthorizationRevision{kind: kind, id: id, version: version}, nil
+}
+
+func (revision AuthorizationRevision) Kind() domain.AggregateKind { return revision.kind }
+func (revision AuthorizationRevision) ID() string                 { return revision.id }
+func (revision AuthorizationRevision) Version() domain.Version    { return revision.version }
+
+type AuthorizedSessionView struct {
+	workspace domain.WorkspaceID
+	principal domain.PrincipalID
+	actor     domain.ActorID
+	session   domain.ActorSessionID
+	policy    domain.PolicyRevision
+	expiresAt time.Time
+	revisions []AuthorizationRevision
+}
+
+func NewAuthorizedSessionView(workspace domain.WorkspaceID, principal domain.PrincipalID, actor domain.ActorID,
+	session domain.ActorSessionID, policy domain.PolicyRevision, expiresAt time.Time,
+	revisions []AuthorizationRevision) (AuthorizedSessionView, error) {
+	if workspace.IsZero() || principal.IsZero() || actor.IsZero() || session.IsZero() ||
+		policy.String() == "" || expiresAt.IsZero() || len(revisions) == 0 || len(revisions) > MaxContextGrantRevisions+4 {
+		return AuthorizedSessionView{}, ErrInvalidQuery
+	}
+	cloned := append([]AuthorizationRevision(nil), revisions...)
+	for index, revision := range cloned {
+		if revision.kind == "" || revision.id == "" || !revision.version.Valid() ||
+			(index > 0 && (cloned[index-1].kind > revision.kind ||
+				(cloned[index-1].kind == revision.kind && cloned[index-1].id >= revision.id))) {
+			return AuthorizedSessionView{}, ErrInvalidQuery
+		}
+	}
+	return AuthorizedSessionView{workspace: workspace, principal: principal, actor: actor, session: session,
+		policy: policy, expiresAt: expiresAt.UTC(), revisions: cloned}, nil
+}
+
+func (view AuthorizedSessionView) WorkspaceID() domain.WorkspaceID       { return view.workspace }
+func (view AuthorizedSessionView) PrincipalID() domain.PrincipalID       { return view.principal }
+func (view AuthorizedSessionView) ActorID() domain.ActorID               { return view.actor }
+func (view AuthorizedSessionView) ActorSessionID() domain.ActorSessionID { return view.session }
+func (view AuthorizedSessionView) PolicyRevision() domain.PolicyRevision { return view.policy }
+func (view AuthorizedSessionView) ExpiresAt() time.Time                  { return view.expiresAt }
+func (view AuthorizedSessionView) AuthorizationRevisions() []AuthorizationRevision {
+	return append([]AuthorizationRevision(nil), view.revisions...)
+}
+
+type ContextRecordKind string
+
+const (
+	ContextRecordWorkspace    ContextRecordKind = "workspace"
+	ContextRecordPrincipal    ContextRecordKind = "principal"
+	ContextRecordActor        ContextRecordKind = "actor"
+	ContextRecordMembership   ContextRecordKind = "membership"
+	ContextRecordDelegation   ContextRecordKind = "actor_delegation"
+	ContextRecordSession      ContextRecordKind = "actor_session"
+	ContextRecordCollaborator ContextRecordKind = "collaborator"
+)
+
+func (kind ContextRecordKind) Valid() bool {
+	switch kind {
+	case ContextRecordWorkspace, ContextRecordPrincipal, ContextRecordActor, ContextRecordMembership,
+		ContextRecordDelegation, ContextRecordSession, ContextRecordCollaborator:
+		return true
+	default:
+		return false
+	}
+}
+
+type ContextRecord struct {
+	kind      ContextRecordKind
+	id        string
+	version   domain.Version
+	canonical []byte
+}
+
+func NewContextRecord(kind ContextRecordKind, id string, version domain.Version, canonical []byte) (ContextRecord, error) {
+	if !kind.Valid() || !validOpaqueText(id, 256) || !version.Valid() || len(canonical) == 0 || len(canonical) > MaxQueryPayloadBytes {
+		return ContextRecord{}, ErrInvalidQuery
+	}
+	return ContextRecord{kind: kind, id: id, version: version, canonical: append([]byte(nil), canonical...)}, nil
+}
+
+func (record ContextRecord) Kind() ContextRecordKind { return record.kind }
+func (record ContextRecord) ID() string              { return record.id }
+func (record ContextRecord) Version() domain.Version { return record.version }
+func (record ContextRecord) CanonicalPayload() []byte {
+	return append([]byte(nil), record.canonical...)
+}
+
+type ContextCheckpoint struct {
+	id      CheckpointID
+	through EventCursor
+	session AuthorizedSessionView
+	records []ContextRecord
+}
+
+func NewContextCheckpoint(id CheckpointID, through EventCursor, session AuthorizedSessionView, records []ContextRecord) (ContextCheckpoint, error) {
+	if id.IsZero() || through.IsZero() || session.session.IsZero() || len(records) == 0 || len(records) > MaxContextCollaborators+6 {
+		return ContextCheckpoint{}, ErrInvalidQuery
+	}
+	cloned := append([]ContextRecord(nil), records...)
+	for index, record := range cloned {
+		if !record.kind.Valid() || len(record.canonical) == 0 ||
+			(index > 0 && (cloned[index-1].kind > record.kind ||
+				(cloned[index-1].kind == record.kind && cloned[index-1].id >= record.id))) {
+			return ContextCheckpoint{}, ErrInvalidQuery
+		}
+		cloned[index].canonical = append([]byte(nil), record.canonical...)
+	}
+	return ContextCheckpoint{id: id, through: through, session: session, records: cloned}, nil
+}
+
+func (checkpoint ContextCheckpoint) CheckpointID() CheckpointID     { return checkpoint.id }
+func (checkpoint ContextCheckpoint) ThroughCursor() EventCursor     { return checkpoint.through }
+func (checkpoint ContextCheckpoint) Session() AuthorizedSessionView { return checkpoint.session }
+func (checkpoint ContextCheckpoint) Records() []ContextRecord {
+	result := append([]ContextRecord(nil), checkpoint.records...)
+	for index := range result {
+		result[index].canonical = append([]byte(nil), result[index].canonical...)
+	}
+	return result
+}
+
+type SyncedEvent struct {
+	id               domain.EventID
+	sequence         uint64
+	eventType        domain.EventType
+	aggregateKind    domain.AggregateKind
+	aggregateID      string
+	aggregateVersion domain.Version
+	payload          []byte
+	recordedAt       time.Time
+}
+
+func NewSyncedEvent(id domain.EventID, sequence uint64, eventType domain.EventType, aggregateKind domain.AggregateKind,
+	aggregateID string, aggregateVersion domain.Version, payload []byte, recordedAt time.Time) (SyncedEvent, error) {
+	if id.IsZero() || sequence == 0 || sequence > MaxCanonicalInteger || eventType == "" || aggregateKind == "" ||
+		!validOpaqueText(aggregateID, 256) || !aggregateVersion.Valid() || len(payload) == 0 ||
+		len(payload) > MaxQueryPayloadBytes || recordedAt.IsZero() {
+		return SyncedEvent{}, ErrInvalidQuery
+	}
+	return SyncedEvent{id: id, sequence: sequence, eventType: eventType, aggregateKind: aggregateKind,
+		aggregateID: aggregateID, aggregateVersion: aggregateVersion, payload: append([]byte(nil), payload...), recordedAt: recordedAt.UTC()}, nil
+}
+
+func (event SyncedEvent) EventID() domain.EventID             { return event.id }
+func (event SyncedEvent) Sequence() uint64                    { return event.sequence }
+func (event SyncedEvent) EventType() domain.EventType         { return event.eventType }
+func (event SyncedEvent) AggregateKind() domain.AggregateKind { return event.aggregateKind }
+func (event SyncedEvent) AggregateID() string                 { return event.aggregateID }
+func (event SyncedEvent) AggregateVersion() domain.Version    { return event.aggregateVersion }
+func (event SyncedEvent) Payload() []byte                     { return append([]byte(nil), event.payload...) }
+func (event SyncedEvent) RecordedAt() time.Time               { return event.recordedAt }
+
+type EventsPage struct {
+	session AuthorizedSessionView
+	after   EventCursor
+	next    EventCursor
+	events  []SyncedEvent
+	hasMore bool
+}
+
+func NewEventsPage(session AuthorizedSessionView, after, next EventCursor, events []SyncedEvent, hasMore bool) (EventsPage, error) {
+	if session.session.IsZero() || next.IsZero() || len(events) > MaxQueryPageSize || (!after.IsZero() && len(events) == 0 && after != next) {
+		return EventsPage{}, ErrInvalidQuery
+	}
+	cloned := append([]SyncedEvent(nil), events...)
+	for index, event := range cloned {
+		if event.id.IsZero() || (index > 0 && cloned[index-1].sequence >= event.sequence) {
+			return EventsPage{}, ErrInvalidQuery
+		}
+		cloned[index].payload = append([]byte(nil), event.payload...)
+	}
+	return EventsPage{session: session, after: after, next: next, events: cloned, hasMore: hasMore}, nil
+}
+
+func (page EventsPage) Session() AuthorizedSessionView { return page.session }
+func (page EventsPage) AfterCursor() EventCursor       { return page.after }
+func (page EventsPage) NextCursor() EventCursor        { return page.next }
+func (page EventsPage) Events() []SyncedEvent {
+	result := append([]SyncedEvent(nil), page.events...)
+	for index := range result {
+		result[index].payload = append([]byte(nil), result[index].payload...)
+	}
+	return result
+}
+func (page EventsPage) HasMore() bool { return page.hasMore }
+
+type QueryStore interface {
+	GetContext(context.Context, ContextGetQuery) (ContextCheckpoint, error)
+	SyncEvents(context.Context, EventsSyncQuery) (EventsPage, error)
+}
+
+type CheckpointIDSource interface {
+	NewCheckpointID() (CheckpointID, error)
+}
 
 // Digest is a non-zero SHA-256 digest used for bounded result, capsule, audit,
 // and effect content. Command semantic fingerprints continue to use the

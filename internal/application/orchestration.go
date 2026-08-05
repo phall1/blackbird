@@ -334,6 +334,44 @@ type OrchestrationDependencies struct {
 	Presentations       PresentationCredentialPreparer
 }
 
+type QueryService struct {
+	store QueryStore
+	ids   CheckpointIDSource
+}
+
+func NewQueryService(store QueryStore, ids CheckpointIDSource) (*QueryService, error) {
+	if isNilInterface(store) || isNilInterface(ids) {
+		return nil, ErrInvalidQuery
+	}
+	return &QueryService{store: store, ids: ids}, nil
+}
+
+func (service *QueryService) GetContext(ctx context.Context, subject QuerySubject) (ContextCheckpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return ContextCheckpoint{}, err
+	}
+	id, err := service.ids.NewCheckpointID()
+	if err != nil {
+		return ContextCheckpoint{}, fmt.Errorf("%w: allocate context checkpoint: %w", ErrOrchestrationDependency, err)
+	}
+	query, err := NewContextGetQuery(subject, id)
+	if err != nil {
+		return ContextCheckpoint{}, err
+	}
+	return service.store.GetContext(ctx, query)
+}
+
+func (service *QueryService) SyncEvents(ctx context.Context, subject QuerySubject, after EventCursor, limit uint16) (EventsPage, error) {
+	if err := ctx.Err(); err != nil {
+		return EventsPage{}, err
+	}
+	query, err := NewEventsSyncQuery(subject, after, limit)
+	if err != nil {
+		return EventsPage{}, err
+	}
+	return service.store.SyncEvents(ctx, query)
+}
+
 func NewOrchestrationService(dependencies OrchestrationDependencies) (*OrchestrationService, error) {
 	if isNilInterface(dependencies.UnitOfWork) || isNilInterface(dependencies.Authentication) ||
 		isNilInterface(dependencies.Policy) || isNilInterface(dependencies.LockedAuthorization) ||

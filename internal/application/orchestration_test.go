@@ -1660,3 +1660,57 @@ func assertExternalOrdering(t *testing.T, operation CommandOperation, order []st
 		t.Fatalf("presentation must be prepared before command authentication: %v", order)
 	}
 }
+
+type queryServiceStore struct{ calls int }
+
+func (store *queryServiceStore) GetContext(context.Context, ContextGetQuery) (ContextCheckpoint, error) {
+	store.calls++
+	return ContextCheckpoint{}, errors.New("query store sentinel")
+}
+
+func (store *queryServiceStore) SyncEvents(context.Context, EventsSyncQuery) (EventsPage, error) {
+	store.calls++
+	return EventsPage{}, errors.New("query store sentinel")
+}
+
+type queryCheckpointIDs struct{ calls int }
+
+func (source *queryCheckpointIDs) NewCheckpointID() (CheckpointID, error) {
+	source.calls++
+	return NewCheckpointID("checkpoint:application-query-test")
+}
+
+func TestQueryServiceValidatesBoundsAndCancellationBeforeDependencies(t *testing.T) {
+	principal, _ := domain.ParsePrincipalID(applicationUUID(980))
+	session, _ := domain.ParseActorSessionID(applicationUUID(981))
+	subject, err := NewQuerySubject(principal, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &queryServiceStore{}
+	ids := &queryCheckpointIDs{}
+	service, err := NewQueryService(store, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err = service.GetContext(cancelled, subject); !errors.Is(err, context.Canceled) {
+		t.Fatalf("context cancellation error=%v", err)
+	}
+	if _, err = service.SyncEvents(cancelled, subject, EventCursor{}, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("event cancellation error=%v", err)
+	}
+	if store.calls != 0 || ids.calls != 0 {
+		t.Fatalf("cancelled query called dependencies store=%d ids=%d", store.calls, ids.calls)
+	}
+	if _, err = service.SyncEvents(context.Background(), subject, EventCursor{}, 0); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("zero event bound error=%v", err)
+	}
+	if _, err = service.SyncEvents(context.Background(), subject, EventCursor{}, MaxQueryPageSize+1); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("oversized event bound error=%v", err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("invalid bounded query reached store %d times", store.calls)
+	}
+}

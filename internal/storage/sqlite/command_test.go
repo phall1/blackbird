@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -15,8 +16,12 @@ import (
 func TestOpenStoreComposesAsProductionUnitOfWork(t *testing.T) {
 	store := openConformanceStore(t)
 	var unit application.UnitOfWork = store
+	var queries application.QueryStore = store
 	if unit != store {
 		t.Fatal("Open did not return the production UnitOfWork implementation")
+	}
+	if queries != store {
+		t.Fatal("Open did not return the production QueryStore implementation")
 	}
 }
 
@@ -612,6 +617,112 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		t.Fatal("actor session fields did not round-trip through normalized storage")
 	}
 
+	t.Run("production context and event queries are authorized bounded and cursor scoped", func(t *testing.T) {
+		if _, err := store.db.Exec(`UPDATE actor_sessions SET capabilities_json = json(?) WHERE session_id = ?`,
+			`["context:read","events:sync"]`, sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+		subject, err := application.NewQuerySubject(workload.ID(), sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointID, _ := application.NewCheckpointID("checkpoint:sqlite-production")
+		contextQuery, _ := application.NewContextGetQuery(subject, checkpointID)
+		checkpoint, err := store.GetContext(context.Background(), contextQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checkpoint.CheckpointID() != checkpointID || checkpoint.ThroughCursor().IsZero() ||
+			checkpoint.Session().WorkspaceID() != workspace.ID() || len(checkpoint.Records()) != 6 {
+			t.Fatalf("unexpected context checkpoint records=%d cursor=%q", len(checkpoint.Records()), checkpoint.ThroughCursor().String())
+		}
+		records := checkpoint.Records()
+		for index := 1; index < len(records); index++ {
+			if records[index-1].Kind() > records[index].Kind() ||
+				(records[index-1].Kind() == records[index].Kind() && records[index-1].ID() >= records[index].ID()) {
+				t.Fatal("context records are not deterministically ordered")
+			}
+		}
+		pageQuery, _ := application.NewEventsSyncQuery(subject, application.EventCursor{}, 2)
+		first, err := store.SyncEvents(context.Background(), pageQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(first.Events()) != 2 || !first.HasMore() || first.NextCursor().IsZero() {
+			t.Fatalf("first event page events=%d has_more=%v", len(first.Events()), first.HasMore())
+		}
+		secondQuery, _ := application.NewEventsSyncQuery(subject, first.NextCursor(), 2)
+		second, err := store.SyncEvents(context.Background(), secondQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(second.Events()) != 2 || second.Events()[0].Sequence() <= first.Events()[1].Sequence() {
+			t.Fatal("event cursor did not advance in journal order")
+		}
+		checkpointSync, _ := application.NewEventsSyncQuery(subject, checkpoint.ThroughCursor(), 2)
+		current, err := store.SyncEvents(context.Background(), checkpointSync)
+		if err != nil || len(current.Events()) != 0 || current.NextCursor() != checkpoint.ThroughCursor() {
+			t.Fatalf("checkpoint continuation events=%d error=%v", len(current.Events()), err)
+		}
+		invalidCursor, _ := application.NewEventCursor("bbec1_not-valid-base64")
+		invalidQuery, _ := application.NewEventsSyncQuery(subject, invalidCursor, 2)
+		_, err = store.SyncEvents(context.Background(), invalidQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorInvalid)
+
+		otherWorkspace, _ := domain.ParseWorkspaceID(commandTestUUID(199))
+		var digest [sha256.Size]byte
+		otherCursor, _ := encodeEventCursor(otherWorkspace, security.epoch, 0, digest)
+		mismatchQuery, _ := application.NewEventsSyncQuery(subject, otherCursor, 2)
+		_, err = store.SyncEvents(context.Background(), mismatchQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorScopeMismatch)
+
+		if _, err = store.db.Exec(`UPDATE authority_streams SET retained_from_sequence = 4
+			WHERE scope_kind = 'workspace' AND scope_id = ?`, workspace.ID().String()); err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.SyncEvents(context.Background(), secondQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
+		if _, err = store.db.Exec(`UPDATE authority_streams SET retained_from_sequence = 1
+			WHERE scope_kind = 'workspace' AND scope_id = ?`, workspace.ID().String()); err != nil {
+			t.Fatal(err)
+		}
+
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err = store.GetContext(cancelled, contextQuery); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled context query error=%v", err)
+		}
+
+		var originalExpiry int64
+		if err = store.db.QueryRow(`SELECT expires_at_us FROM actor_sessions WHERE session_id = ?`, sessionID.String()).Scan(&originalExpiry); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = store.db.Exec(`UPDATE actor_sessions SET expires_at_us = issued_at_us + 1 WHERE session_id = ?`, sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.GetContext(context.Background(), contextQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeSessionExpired)
+		if _, err = store.db.Exec(`UPDATE actor_sessions SET expires_at_us = ? WHERE session_id = ?`, originalExpiry, sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("production queries reject stale session authorization revisions", func(t *testing.T) {
+		subject, _ := application.NewQuerySubject(workload.ID(), sessionID)
+		checkpointID, _ := application.NewCheckpointID("checkpoint:stale-authorization")
+		query, _ := application.NewContextGetQuery(subject, checkpointID)
+		if _, err := store.db.Exec(`UPDATE workspace_memberships SET version = version + 1
+			WHERE membership_id = ?`, membershipID.String()); err != nil {
+			t.Fatal(err)
+		}
+		_, err := store.GetContext(context.Background(), query)
+		assertQueryErrorCode(t, err, domain.ErrorCodeForbidden)
+		if _, err = store.db.Exec(`UPDATE workspace_memberships SET version = version - 1
+			WHERE membership_id = ?`, membershipID.String()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("split receipt identity fails closed", func(t *testing.T) {
 		primary, secondary := specs[3], specs[5]
 		identity := primary.ReceiptIdentity()
@@ -653,6 +764,14 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 			"command_receipts": 11, "domain_events": 15, "audit_entries": 12,
 		})
 	})
+}
+
+func assertQueryErrorCode(t *testing.T, err error, code domain.ErrorCode) {
+	t.Helper()
+	var rejection *domain.CommandError
+	if !errors.As(err, &rejection) || rejection.Code() != code {
+		t.Fatalf("query error=%v, want code %s", err, code)
+	}
 }
 
 func mustExecuteProductionCommand(
