@@ -1092,6 +1092,8 @@ func (service *OrchestrationService) executeBootstrapCommand(
 }
 
 func validateCommandRequest(request CommandRequest, expected CommandOperation) error {
+	attribution, attributed := request.Spec.Authorship().ActorAttribution()
+	authenticatedSession, _, hasAuthenticatedSession := request.Authentication.ActorSession()
 	if request.Spec.CommandOperation() != expected || request.Authentication.operation != expected ||
 		request.Policy.operation != expected || request.Authentication.scope != request.Spec.Scope() ||
 		request.Policy.scope != request.Spec.Scope() || !request.Authentication.valid() ||
@@ -1101,6 +1103,8 @@ func validateCommandRequest(request CommandRequest, expected CommandOperation) e
 		request.Policy.verifiedAt != request.Authentication.verifiedAt ||
 		request.Policy.actorSession != request.Authentication.actorSession ||
 		request.Policy.hasActorSession != request.Authentication.hasActorSession ||
+		attributed != hasAuthenticatedSession ||
+		(attributed && attribution.ActorSessionID() != authenticatedSession) ||
 		request.Policy.policyRevision.String() == "" || request.Policy.policyDigest.IsZero() ||
 		!validAuditRequestContext(request.Audit) ||
 		!commandHashViewMatches(expected, request.HashView) {
