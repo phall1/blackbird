@@ -69,7 +69,7 @@ func validEnvelopeParams(t *testing.T) EventEnvelopeParams {
 	}
 }
 
-func TestW0EventVocabularyIsClosed(t *testing.T) {
+func TestImplementedEventVocabularyIsClosed(t *testing.T) {
 	eventTypes := []EventType{
 		EventTypeInstallationBootstrapped,
 		EventTypePrincipalRegistered,
@@ -84,14 +84,23 @@ func TestW0EventVocabularyIsClosed(t *testing.T) {
 		EventTypeActorDelegationProposed,
 		EventTypeActorDelegationActivated,
 		EventTypeActorSessionStarted,
+		EventTypeWorkRefObserved,
+		EventTypeObjectiveCreated,
+		EventTypeWorkUnitCreated,
+		EventTypeObjectiveActivated,
+		EventTypeRunPlanned,
+		EventTypeRunParticipantInvited,
+		EventTypeRuntimeBindingRequested,
+		EventTypeRunParticipantJoined,
+		EventTypeRunStarted,
 	}
 	for _, eventType := range eventTypes {
 		if !eventType.Valid() {
-			t.Errorf("cataloged W0 event %q is invalid", eventType)
+			t.Errorf("cataloged event %q is invalid", eventType)
 		}
 	}
 	if EventType("ContextCheckpointCreated").Valid() {
-		t.Fatal("non-W0/query-only fact entered the W0 event vocabulary")
+		t.Fatal("uncataloged/query-only fact entered the event vocabulary")
 	}
 }
 

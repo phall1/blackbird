@@ -64,6 +64,71 @@ func writeIdentityState(ctx context.Context, tx pgx.Tx, state application.Identi
 		}
 	case domain.ActorSessionState:
 		tag, err = insertActorSessionState(ctx, tx, value, timestamp)
+	case domain.WorkReferenceState:
+		observation := value.Observation()
+		if current == 1 {
+			tag, err = tx.Exec(ctx, `INSERT INTO work_references(work_reference_id,workspace_id,provider_namespace,
+				provider_object_id,provider_locator,provider_version,selected_fields,adapter_principal_id,observed_at_us,
+				version,created_at_us,updated_at_us) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$11)`,
+				value.ID().String(), value.WorkspaceID().String(), observation.Namespace().String(), observation.ObjectID().String(),
+				observation.Locator().String(), observation.ProviderVersion().String(), observation.Fields().Bytes(),
+				observation.AdapterPrincipalID().String(), timeMicros(observation.ObservedAt()), current, timestamp)
+		} else {
+			tag, err = tx.Exec(ctx, `UPDATE work_references SET provider_locator=$1,provider_version=$2,selected_fields=$3::jsonb,
+				observed_at_us=$4,version=$5,updated_at_us=$6 WHERE work_reference_id=$7 AND provider_namespace=$8
+				AND provider_object_id=$9 AND adapter_principal_id=$10 AND version=$11`, observation.Locator().String(),
+				observation.ProviderVersion().String(), observation.Fields().Bytes(), timeMicros(observation.ObservedAt()), current,
+				timestamp, value.ID().String(), observation.Namespace().String(), observation.ObjectID().String(),
+				observation.AdapterPrincipalID().String(), prior)
+		}
+	case domain.ObjectiveState:
+		if current == 1 {
+			tag, err = tx.Exec(ctx, `INSERT INTO objectives(objective_id,workspace_id,title,acceptance_criteria,status,version,
+				created_at_us,updated_at_us) VALUES($1,$2,$3,$4,$5,$6,$7,$7)`, value.ID().String(),
+				value.WorkspaceID().String(), value.Title(), value.AcceptanceCriteria(), string(value.Status()), current, timestamp)
+		} else {
+			tag, err = tx.Exec(ctx, `UPDATE objectives SET status=$1,version=$2,updated_at_us=$3
+				WHERE objective_id=$4 AND version=$5`, string(value.Status()), current, timestamp, value.ID().String(), prior)
+		}
+	case domain.WorkUnitState:
+		tag, err = tx.Exec(ctx, `INSERT INTO work_units(work_unit_id,workspace_id,objective_id,work_reference_id,title,status,
+			version,created_at_us,updated_at_us) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)`, value.ID().String(),
+			value.WorkspaceID().String(), value.ObjectiveID().String(), value.WorkReferenceID().String(), value.Title(),
+			string(value.Status()), current, timestamp)
+	case domain.RunState:
+		if current == 1 {
+			tag, err = tx.Exec(ctx, `INSERT INTO runs(run_id,workspace_id,objective_id,work_unit_id,operator_actor_id,status,
+				version,created_at_us,updated_at_us) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)`, value.ID().String(),
+				value.WorkspaceID().String(), value.ObjectiveID().String(), value.WorkUnitID().String(), value.OperatorID().String(),
+				string(value.Status()), current, timestamp)
+			if err == nil {
+				for ordinal, participationID := range value.RequiredParticipationIDs() {
+					if _, err = tx.Exec(ctx, `INSERT INTO run_required_participations(workspace_id,run_id,participation_id,
+						roster_ordinal) VALUES($1,$2,$3,$4)`, value.WorkspaceID().String(), value.ID().String(),
+						participationID.String(), ordinal); err != nil {
+						break
+					}
+				}
+			}
+		} else {
+			tag, err = tx.Exec(ctx, `UPDATE runs SET status=$1,version=$2,updated_at_us=$3 WHERE run_id=$4 AND version=$5`,
+				string(value.Status()), current, timestamp, value.ID().String(), prior)
+		}
+	case domain.RunParticipationState:
+		if current == 1 {
+			tag, err = tx.Exec(ctx, `INSERT INTO run_participations(participation_id,run_id,actor_id,role,session_id,status,
+				version,created_at_us,updated_at_us) VALUES($1,$2,$3,$4,NULL,$5,$6,$7,$7)`, value.ID().String(),
+				value.RunID().String(), value.ActorID().String(), value.Role(), string(value.Status()), current, timestamp)
+		} else {
+			tag, err = tx.Exec(ctx, `UPDATE run_participations SET session_id=$1,status=$2,version=$3,updated_at_us=$4
+				WHERE participation_id=$5 AND version=$6`, value.ActorSessionID().String(), string(value.Status()), current,
+				timestamp, value.ID().String(), prior)
+		}
+	case domain.RuntimeBindingState:
+		tag, err = tx.Exec(ctx, `INSERT INTO runtime_bindings(binding_id,run_id,participation_id,session_id,
+			runtime_endpoint_id,status,version,created_at_us,updated_at_us) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
+			value.ID().String(), value.RunID().String(), value.ParticipationID().String(), value.ActorSessionID().String(),
+			value.RuntimeEndpointID().String(), string(value.Status()), current, timestamp)
 	default:
 		return application.ErrInvalidCommandDecision
 	}
@@ -230,7 +295,7 @@ func verifyFinalCommandState(ctx context.Context, tx pgx.Tx, state lockedCommand
 		if err != nil {
 			return fmt.Errorf("verify PostgreSQL command mutation: %w", err)
 		}
-		if persisted.Version() != write.Version() {
+		if persisted.Version() != write.Version() || !sameRunRoster(persisted, write) {
 			return commandReferenceConflict("command mutation changed")
 		}
 	}
@@ -268,7 +333,7 @@ func verifyDurableCommandEvidence(ctx context.Context, tx pgx.Tx, state lockedCo
 		if err != nil {
 			return fmt.Errorf("revalidate PostgreSQL command reference: %w", err)
 		}
-		if current.Version() != observed.Version() {
+		if current.Version() != observed.Version() || !sameRunRoster(current, observed) {
 			return commandReferenceConflict("locked command reference changed")
 		}
 		locked[observed.Target().String()] = current
@@ -338,6 +403,16 @@ func identityStateMatchesEvidence(state application.IdentityState, guard applica
 		case domain.ActorDelegationState:
 			return string(value.Status()) == status
 		case domain.ActorSessionState:
+			return string(value.Status()) == status
+		case domain.ObjectiveState:
+			return string(value.Status()) == status
+		case domain.WorkUnitState:
+			return string(value.Status()) == status
+		case domain.RunState:
+			return string(value.Status()) == status
+		case domain.RunParticipationState:
+			return string(value.Status()) == status
+		case domain.RuntimeBindingState:
 			return string(value.Status()) == status
 		}
 	case application.EvidenceDeviceTrustRevision:

@@ -39,6 +39,13 @@ var (
 	_ identifierBoundary = EventID{}
 	_ identifierBoundary = CorrelationID{}
 	_ identifierBoundary = ClientInstanceID{}
+	_ identifierBoundary = WorkReferenceID{}
+	_ identifierBoundary = ObjectiveID{}
+	_ identifierBoundary = WorkUnitID{}
+	_ identifierBoundary = RunID{}
+	_ identifierBoundary = RunParticipationID{}
+	_ identifierBoundary = RuntimeBindingID{}
+	_ identifierBoundary = RuntimeEndpointID{}
 	_ identifierBoundary = AuthorityEpoch{}
 
 	_ encoding.TextUnmarshaler = (*InstallationID)(nil)
@@ -59,6 +66,13 @@ var (
 	_ encoding.TextUnmarshaler = (*EventID)(nil)
 	_ encoding.TextUnmarshaler = (*CorrelationID)(nil)
 	_ encoding.TextUnmarshaler = (*ClientInstanceID)(nil)
+	_ encoding.TextUnmarshaler = (*WorkReferenceID)(nil)
+	_ encoding.TextUnmarshaler = (*ObjectiveID)(nil)
+	_ encoding.TextUnmarshaler = (*WorkUnitID)(nil)
+	_ encoding.TextUnmarshaler = (*RunID)(nil)
+	_ encoding.TextUnmarshaler = (*RunParticipationID)(nil)
+	_ encoding.TextUnmarshaler = (*RuntimeBindingID)(nil)
+	_ encoding.TextUnmarshaler = (*RuntimeEndpointID)(nil)
 	_ encoding.TextUnmarshaler = (*AuthorityEpoch)(nil)
 )
 
@@ -84,7 +98,16 @@ func TestAllIdentifierKindsStrictlyRoundTrip(t *testing.T) {
 		IdentifierKindEvent:          func(value string) (identifierBoundary, error) { return ParseEventID(value) },
 		IdentifierKindCorrelation:    func(value string) (identifierBoundary, error) { return ParseCorrelationID(value) },
 		IdentifierKindClientInstance: func(value string) (identifierBoundary, error) { return ParseClientInstanceID(value) },
-		IdentifierKindAuthorityEpoch: func(value string) (identifierBoundary, error) { return ParseAuthorityEpoch(value) },
+		IdentifierKindWorkReference:  func(value string) (identifierBoundary, error) { return ParseWorkReferenceID(value) },
+		IdentifierKindObjective:      func(value string) (identifierBoundary, error) { return ParseObjectiveID(value) },
+		IdentifierKindWorkUnit:       func(value string) (identifierBoundary, error) { return ParseWorkUnitID(value) },
+		IdentifierKindRun:            func(value string) (identifierBoundary, error) { return ParseRunID(value) },
+		IdentifierKindRunParticipation: func(value string) (identifierBoundary, error) {
+			return ParseRunParticipationID(value)
+		},
+		IdentifierKindRuntimeBinding:  func(value string) (identifierBoundary, error) { return ParseRuntimeBindingID(value) },
+		IdentifierKindRuntimeEndpoint: func(value string) (identifierBoundary, error) { return ParseRuntimeEndpointID(value) },
+		IdentifierKindAuthorityEpoch:  func(value string) (identifierBoundary, error) { return ParseAuthorityEpoch(value) },
 	}
 
 	for kind, parse := range parsers {
@@ -170,6 +193,9 @@ func TestIdentifierKindsAreNominallyDistinct(t *testing.T) {
 		reflect.TypeFor[BootstrapGenerationID](),
 		reflect.TypeFor[ReceiptID](), reflect.TypeFor[EventID](),
 		reflect.TypeFor[CorrelationID](), reflect.TypeFor[ClientInstanceID](),
+		reflect.TypeFor[WorkReferenceID](), reflect.TypeFor[ObjectiveID](), reflect.TypeFor[WorkUnitID](),
+		reflect.TypeFor[RunID](), reflect.TypeFor[RunParticipationID](), reflect.TypeFor[RuntimeBindingID](),
+		reflect.TypeFor[RuntimeEndpointID](),
 		reflect.TypeFor[AuthorityEpoch](),
 	}
 	seen := make(map[reflect.Type]struct{}, len(types))
@@ -178,6 +204,40 @@ func TestIdentifierKindsAreNominallyDistinct(t *testing.T) {
 			t.Fatalf("duplicate concrete identifier type %v", identifierType)
 		}
 		seen[identifierType] = struct{}{}
+	}
+}
+
+func TestW1AggregateIdentifiersDoNotAliasAcrossKinds(t *testing.T) {
+	workReference, _ := ParseWorkReferenceID(validUUIDV7)
+	objective, _ := ParseObjectiveID(validUUIDV7)
+	workUnit, _ := ParseWorkUnitID(validUUIDV7)
+	run, _ := ParseRunID(validUUIDV7)
+	participation, _ := ParseRunParticipationID(validUUIDV7)
+	binding, _ := ParseRuntimeBindingID(validUUIDV7)
+	endpoint, _ := ParseRuntimeEndpointID(validUUIDV7)
+	targets := []AggregateTarget{}
+	for _, target := range []struct {
+		kind AggregateKind
+		make func() (AggregateTarget, error)
+	}{
+		{AggregateKindWorkReference, func() (AggregateTarget, error) { return NewAggregateTarget(workReference) }},
+		{AggregateKindObjective, func() (AggregateTarget, error) { return NewAggregateTarget(objective) }},
+		{AggregateKindWorkUnit, func() (AggregateTarget, error) { return NewAggregateTarget(workUnit) }},
+		{AggregateKindRun, func() (AggregateTarget, error) { return NewAggregateTarget(run) }},
+		{AggregateKindRunParticipation, func() (AggregateTarget, error) { return NewAggregateTarget(participation) }},
+		{AggregateKindRuntimeBinding, func() (AggregateTarget, error) { return NewAggregateTarget(binding) }},
+		{AggregateKindRuntimeEndpoint, func() (AggregateTarget, error) { return NewAggregateTarget(endpoint) }},
+	} {
+		created, err := target.make()
+		if err != nil || created.Kind() != target.kind || created.ID() != validUUIDV7 {
+			t.Fatalf("target %q = %#v, %v", target.kind, created, err)
+		}
+		for _, prior := range targets {
+			if prior == created || prior.String() == created.String() {
+				t.Fatalf("cross-kind targets aliased: %s and %s", prior, created)
+			}
+		}
+		targets = append(targets, created)
 	}
 }
 

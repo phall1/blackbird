@@ -1004,7 +1004,7 @@ func inspect(ctx context.Context, pool *pgxpool.Pool, config Config) (Diagnostic
 		return Diagnostics{}, err
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = 'blackbird' AND c.relkind = 'r'`).Scan(&tableCount); err != nil || tableCount != 33 {
+		WHERE n.nspname = 'blackbird' AND c.relkind = 'r'`).Scan(&tableCount); err != nil || tableCount != 34 {
 		return Diagnostics{}, fmt.Errorf("%w: table count=%d error=%v", ErrSchemaMismatch, tableCount, err)
 	}
 	if err := verifyPrivileges(ctx, pool); err != nil {

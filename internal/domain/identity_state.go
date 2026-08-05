@@ -54,12 +54,14 @@ type ProviderObservation struct {
 
 func NewProviderObservation(namespace, objectID, locator, providerVersion OpaqueProviderValue,
 	fields EventPayload, adapter PrincipalID, observedAt time.Time) (ProviderObservation, error) {
-	if namespace.String() == "" || objectID.String() == "" || locator.String() == "" ||
-		providerVersion.String() == "" || fields.IsZero() || adapter.IsZero() || observedAt.IsZero() {
+	validatedFields, fieldsErr := NewEventPayload(fields.Bytes())
+	if !validBoundedText(namespace.String(), 4096) || !validBoundedText(objectID.String(), 4096) ||
+		!validBoundedText(locator.String(), 4096) || !validBoundedText(providerVersion.String(), 4096) ||
+		fieldsErr != nil || adapter.IsZero() || observedAt.IsZero() {
 		return ProviderObservation{}, ErrInvalidWorkState
 	}
 	return ProviderObservation{namespace: namespace, objectID: objectID, locator: locator,
-		providerVersion: providerVersion, fields: EventPayload{object: fields.Bytes()}, adapter: adapter,
+		providerVersion: providerVersion, fields: validatedFields, adapter: adapter,
 		observedAt: observedAt.UTC()}, nil
 }
 
@@ -149,13 +151,14 @@ const (
 func (status RunStatus) Valid() bool { return status == RunPlanned || status == RunStarting }
 
 type RunState struct {
-	id          RunID
-	workspaceID WorkspaceID
-	objectiveID ObjectiveID
-	workUnitID  WorkUnitID
-	operatorID  ActorID
-	status      RunStatus
-	version     Version
+	id                       RunID
+	workspaceID              WorkspaceID
+	objectiveID              ObjectiveID
+	workUnitID               WorkUnitID
+	operatorID               ActorID
+	requiredParticipationIDs []RunParticipationID
+	status                   RunStatus
+	version                  Version
 }
 
 func (state RunState) IsZero() bool             { return state.id.IsZero() }
@@ -164,8 +167,11 @@ func (state RunState) WorkspaceID() WorkspaceID { return state.workspaceID }
 func (state RunState) ObjectiveID() ObjectiveID { return state.objectiveID }
 func (state RunState) WorkUnitID() WorkUnitID   { return state.workUnitID }
 func (state RunState) OperatorID() ActorID      { return state.operatorID }
-func (state RunState) Status() RunStatus        { return state.status }
-func (state RunState) Version() Version         { return state.version }
+func (state RunState) RequiredParticipationIDs() []RunParticipationID {
+	return append([]RunParticipationID(nil), state.requiredParticipationIDs...)
+}
+func (state RunState) Status() RunStatus { return state.status }
+func (state RunState) Version() Version  { return state.version }
 
 type RunParticipationStatus string
 
@@ -1961,10 +1967,7 @@ type WorkReferenceRehydrationParams struct {
 
 func RehydrateWorkReference(params WorkReferenceRehydrationParams) (WorkReferenceState, error) {
 	if params.ID.IsZero() || params.WorkspaceID.IsZero() || !params.Version.Valid() ||
-		params.Observation.Namespace().String() == "" || params.Observation.ObjectID().String() == "" ||
-		params.Observation.Locator().String() == "" || params.Observation.ProviderVersion().String() == "" ||
-		params.Observation.Fields().IsZero() || params.Observation.AdapterPrincipalID().IsZero() ||
-		params.Observation.ObservedAt().IsZero() {
+		!validProviderObservation(params.Observation) {
 		return WorkReferenceState{}, ErrInvalidWorkState
 	}
 	return WorkReferenceState{id: params.ID, workspaceID: params.WorkspaceID,
@@ -2003,7 +2006,7 @@ type WorkUnitRehydrationParams struct {
 
 func RehydrateWorkUnit(params WorkUnitRehydrationParams) (WorkUnitState, error) {
 	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.ObjectiveID.IsZero() ||
-		params.WorkReferenceID.IsZero() || !validBoundedText(params.Title, 512) ||
+		!validBoundedText(params.Title, 512) ||
 		params.Status != WorkUnitProposed || params.Version != InitialVersion() {
 		return WorkUnitState{}, ErrInvalidWorkState
 	}
@@ -2012,24 +2015,34 @@ func RehydrateWorkUnit(params WorkUnitRehydrationParams) (WorkUnitState, error) 
 }
 
 type RunRehydrationParams struct {
-	ID          RunID
-	WorkspaceID WorkspaceID
-	ObjectiveID ObjectiveID
-	WorkUnitID  WorkUnitID
-	OperatorID  ActorID
-	Status      RunStatus
-	Version     Version
+	ID                       RunID
+	WorkspaceID              WorkspaceID
+	ObjectiveID              ObjectiveID
+	WorkUnitID               WorkUnitID
+	OperatorID               ActorID
+	RequiredParticipationIDs []RunParticipationID
+	Status                   RunStatus
+	Version                  Version
 }
 
 func RehydrateRun(params RunRehydrationParams) (RunState, error) {
 	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.ObjectiveID.IsZero() ||
 		params.WorkUnitID.IsZero() || params.OperatorID.IsZero() || !params.Status.Valid() || !params.Version.Valid() ||
+		len(params.RequiredParticipationIDs) == 0 || len(params.RequiredParticipationIDs) > MaxRunParticipants ||
 		(params.Status == RunPlanned && params.Version != InitialVersion()) ||
 		(params.Status == RunStarting && params.Version.Uint64() < 2) {
 		return RunState{}, ErrInvalidWorkState
 	}
+	required := append([]RunParticipationID(nil), params.RequiredParticipationIDs...)
+	sort.Slice(required, func(left, right int) bool { return required[left].String() < required[right].String() })
+	for index, id := range required {
+		if id.IsZero() || (index > 0 && required[index-1] == id) {
+			return RunState{}, ErrInvalidWorkState
+		}
+	}
 	return RunState{id: params.ID, workspaceID: params.WorkspaceID, objectiveID: params.ObjectiveID,
-		workUnitID: params.WorkUnitID, operatorID: params.OperatorID, status: params.Status, version: params.Version}, nil
+		workUnitID: params.WorkUnitID, operatorID: params.OperatorID, requiredParticipationIDs: required,
+		status: params.Status, version: params.Version}, nil
 }
 
 type RunParticipationRehydrationParams struct {
@@ -2072,6 +2085,24 @@ func RehydrateRuntimeBinding(params RuntimeBindingRehydrationParams) (RuntimeBin
 	return RuntimeBindingState{id: params.ID, runID: params.RunID, participationID: params.ParticipationID,
 		sessionID: params.ActorSessionID, endpointID: params.RuntimeEndpointID, status: params.Status,
 		version: params.Version}, nil
+}
+
+func validProviderObservation(observation ProviderObservation) bool {
+	namespace, namespaceErr := NewOpaqueProviderValue(observation.Namespace().String())
+	objectID, objectIDErr := NewOpaqueProviderValue(observation.ObjectID().String())
+	locator, locatorErr := NewOpaqueProviderValue(observation.Locator().String())
+	providerVersion, providerVersionErr := NewOpaqueProviderValue(observation.ProviderVersion().String())
+	fields, fieldsErr := NewEventPayload(observation.Fields().Bytes())
+	validated, err := NewProviderObservation(
+		namespace, objectID, locator, providerVersion, fields,
+		observation.AdapterPrincipalID(), observation.ObservedAt(),
+	)
+	return namespaceErr == nil && objectIDErr == nil && locatorErr == nil && providerVersionErr == nil &&
+		fieldsErr == nil && err == nil && validated.namespace == observation.namespace &&
+		validated.objectID == observation.objectID && validated.locator == observation.locator &&
+		validated.providerVersion == observation.providerVersion &&
+		string(validated.fields.object) == string(observation.fields.object) &&
+		validated.adapter == observation.adapter && validated.observedAt.Equal(observation.observedAt)
 }
 
 func validDisplayNameValue(value DisplayName) bool {

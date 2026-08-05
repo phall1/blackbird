@@ -981,6 +981,15 @@ func writeIdentityState(ctx context.Context, tx *sql.Tx, state application.Ident
 				operator_actor_id, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				value.ID().String(), value.WorkspaceID().String(), value.ObjectiveID().String(), value.WorkUnitID().String(),
 				value.OperatorID().String(), string(value.Status()), current, timestamp, timestamp)
+			if err == nil {
+				for ordinal, participationID := range value.RequiredParticipationIDs() {
+					if _, err = tx.ExecContext(ctx, `INSERT INTO run_required_participations(
+						workspace_id, run_id, participation_id, roster_ordinal) VALUES (?, ?, ?, ?)`,
+						value.WorkspaceID().String(), value.ID().String(), participationID.String(), ordinal); err != nil {
+						break
+					}
+				}
+			}
 		} else {
 			result, err = tx.ExecContext(ctx, `UPDATE runs SET status = ?, version = ?, updated_at_us = ?
 				WHERE run_id = ? AND version = ?`, string(value.Status()), current, timestamp, value.ID().String(), prior)
@@ -1268,7 +1277,7 @@ func verifyFinalCommandState(
 		if err != nil {
 			return fmt.Errorf("verify SQLite command mutation: %w", err)
 		}
-		if persisted.Version() != write.Version() {
+		if persisted.Version() != write.Version() || !sameRunRoster(persisted, write) {
 			return commandReferenceConflict("command mutation changed")
 		}
 	}
@@ -1314,7 +1323,7 @@ func verifyDurableCommandEvidence(
 		if err != nil {
 			return fmt.Errorf("revalidate SQLite command reference: %w", err)
 		}
-		if current.Version() != observed.Version() {
+		if current.Version() != observed.Version() || !sameRunRoster(current, observed) {
 			return commandReferenceConflict("locked command reference changed")
 		}
 		locked[observed.Target().String()] = current
@@ -1409,6 +1418,15 @@ func identityStateMatchesEvidence(state application.IdentityState, guard applica
 		return ok && device.TrustRevision() == revision
 	}
 	return false
+}
+
+func sameRunRoster(left, right application.IdentityState) bool {
+	leftRun, leftIsRun := left.Value().(domain.RunState)
+	rightRun, rightIsRun := right.Value().(domain.RunState)
+	if !leftIsRun || !rightIsRun {
+		return leftIsRun == rightIsRun
+	}
+	return slices.Equal(leftRun.RequiredParticipationIDs(), rightRun.RequiredParticipationIDs())
 }
 
 func advanceCommandStream(ctx context.Context, tx *sql.Tx, state lockedCommandState, final domain.StreamDigest, count uint64) error {
@@ -2418,8 +2436,30 @@ func loadRunState(ctx context.Context, tx *sql.Tx, id string) (domain.RunState, 
 	if err != nil {
 		return domain.RunState{}, err
 	}
+	rows, err := tx.QueryContext(ctx, `SELECT participation_id FROM run_required_participations
+		WHERE workspace_id = ? AND run_id = ? ORDER BY roster_ordinal`, workspaceID, runID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	var required []domain.RunParticipationID
+	for rows.Next() {
+		var participationID string
+		if err := rows.Scan(&participationID); err != nil {
+			return domain.RunState{}, err
+		}
+		parsed, err := domain.ParseRunParticipationID(participationID)
+		if err != nil {
+			return domain.RunState{}, err
+		}
+		required = append(required, parsed)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.RunState{}, err
+	}
 	return domain.RehydrateRun(domain.RunRehydrationParams{ID: rid, WorkspaceID: workspace, ObjectiveID: objective,
-		WorkUnitID: workUnit, OperatorID: operator, Status: domain.RunStatus(status), Version: mustVersion(version)})
+		WorkUnitID: workUnit, OperatorID: operator, RequiredParticipationIDs: required,
+		Status: domain.RunStatus(status), Version: mustVersion(version)})
 }
 
 func loadRunParticipationState(ctx context.Context, tx *sql.Tx, id string) (domain.RunParticipationState, error) {

@@ -313,7 +313,8 @@ CREATE TABLE runs (
     version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
-    CHECK ((status = 'planned' AND version = 1) OR (status = 'starting' AND version >= 2))
+    CHECK ((status = 'planned' AND version = 1) OR (status = 'starting' AND version >= 2)),
+    UNIQUE (workspace_id, run_id)
 ) STRICT;
 
 CREATE TABLE run_participations (
@@ -327,8 +328,21 @@ CREATE TABLE run_participations (
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     UNIQUE (run_id, actor_id),
+    UNIQUE (run_id, participation_id),
     CHECK ((status = 'invited' AND session_id IS NULL AND version = 1) OR
            (status = 'active' AND session_id IS NOT NULL AND version >= 2))
+) STRICT;
+
+CREATE TABLE run_required_participations (
+    workspace_id TEXT NOT NULL CHECK (length(workspace_id) = 36),
+    run_id TEXT NOT NULL CHECK (length(run_id) = 36),
+    participation_id TEXT NOT NULL CHECK (length(participation_id) = 36),
+    roster_ordinal INTEGER NOT NULL CHECK (roster_ordinal BETWEEN 0 AND 9007199254740991),
+    PRIMARY KEY (run_id, participation_id),
+    UNIQUE (run_id, roster_ordinal),
+    FOREIGN KEY (workspace_id, run_id) REFERENCES runs(workspace_id, run_id),
+    FOREIGN KEY (run_id, participation_id) REFERENCES run_participations(run_id, participation_id)
+        DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE runtime_bindings (

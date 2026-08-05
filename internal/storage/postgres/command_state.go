@@ -121,6 +121,18 @@ func stateTable(kind domain.AggregateKind) (string, string, error) {
 		return "actor_delegations", "delegation_id", nil
 	case domain.AggregateKindActorSession:
 		return "actor_sessions", "session_id", nil
+	case domain.AggregateKindWorkReference:
+		return "work_references", "work_reference_id", nil
+	case domain.AggregateKindObjective:
+		return "objectives", "objective_id", nil
+	case domain.AggregateKindWorkUnit:
+		return "work_units", "work_unit_id", nil
+	case domain.AggregateKindRun:
+		return "runs", "run_id", nil
+	case domain.AggregateKindRunParticipation:
+		return "run_participations", "participation_id", nil
+	case domain.AggregateKindRuntimeBinding:
+		return "runtime_bindings", "binding_id", nil
 	default:
 		return "", "", application.ErrInvalidCommandContext
 	}
@@ -162,6 +174,18 @@ func loadIdentityState(ctx context.Context, tx pgx.Tx, target domain.AggregateTa
 		value, err = loadDelegationState(ctx, tx, target.ID(), suffix)
 	case domain.AggregateKindActorSession:
 		value, err = loadActorSessionState(ctx, tx, target.ID(), suffix)
+	case domain.AggregateKindWorkReference:
+		value, err = loadWorkReferenceState(ctx, tx, target.ID(), suffix)
+	case domain.AggregateKindObjective:
+		value, err = loadObjectiveState(ctx, tx, target.ID(), suffix)
+	case domain.AggregateKindWorkUnit:
+		value, err = loadWorkUnitState(ctx, tx, target.ID(), suffix)
+	case domain.AggregateKindRun:
+		value, err = loadRunState(ctx, tx, target.ID(), suffix)
+	case domain.AggregateKindRunParticipation:
+		value, err = loadRunParticipationState(ctx, tx, target.ID(), suffix)
+	case domain.AggregateKindRuntimeBinding:
+		value, err = loadRuntimeBindingState(ctx, tx, target.ID(), suffix)
 	default:
 		err = application.ErrInvalidCommandContext
 	}
@@ -169,6 +193,15 @@ func loadIdentityState(ctx context.Context, tx pgx.Tx, target domain.AggregateTa
 		return application.IdentityState{}, err
 	}
 	return application.NewIdentityState(value)
+}
+
+func sameRunRoster(left, right application.IdentityState) bool {
+	leftRun, leftIsRun := left.Value().(domain.RunState)
+	rightRun, rightIsRun := right.Value().(domain.RunState)
+	if !leftIsRun || !rightIsRun {
+		return leftIsRun == rightIsRun
+	}
+	return slices.Equal(leftRun.RequiredParticipationIDs(), rightRun.RequiredParticipationIDs())
 }
 
 func loadInvitationState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.InstallationInvitationState, error) {
@@ -741,4 +774,230 @@ func loadActorSessionState(ctx context.Context, tx pgx.Tx, id, suffix string) (d
 	}
 	return domain.RehydrateActorSession(domain.ActorSessionRehydrationParams{ID: sid, ClientInstanceID: cid, ClientMetadata: metadata,
 		Status: domain.ActorSessionStatus(status), Version: mustVersion(version), Binding: binding, Capabilities: set, PresentationCredential: presentation})
+}
+
+func loadWorkReferenceState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.WorkReferenceState, error) {
+	var referenceID, workspaceID, namespace, objectID, locator, providerVersion, adapterID string
+	var fields []byte
+	var observedAt int64
+	var version uint64
+	err := tx.QueryRow(ctx, `SELECT work_reference_id::text,workspace_id::text,provider_namespace,provider_object_id,
+		provider_locator,provider_version,selected_fields::text,adapter_principal_id::text,observed_at_us,version
+		FROM work_references WHERE work_reference_id=$1`+suffix, id).Scan(&referenceID, &workspaceID, &namespace,
+		&objectID, &locator, &providerVersion, &fields, &adapterID, &observedAt, &version)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	reference, err := domain.ParseWorkReferenceID(referenceID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	adapter, err := domain.ParsePrincipalID(adapterID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	namespaceValue, err := domain.NewOpaqueProviderValue(namespace)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	objectValue, err := domain.NewOpaqueProviderValue(objectID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	locatorValue, err := domain.NewOpaqueProviderValue(locator)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	providerVersionValue, err := domain.NewOpaqueProviderValue(providerVersion)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	payload, err := domain.NewEventPayload(fields)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	observation, err := domain.NewProviderObservation(namespaceValue, objectValue, locatorValue, providerVersionValue,
+		payload, adapter, microsTime(observedAt))
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	return domain.RehydrateWorkReference(domain.WorkReferenceRehydrationParams{ID: reference, WorkspaceID: workspace,
+		Observation: observation, Version: mustVersion(version)})
+}
+
+func loadObjectiveState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.ObjectiveState, error) {
+	var objectiveID, workspaceID, title, criteria, status string
+	var version uint64
+	err := tx.QueryRow(ctx, `SELECT objective_id::text,workspace_id::text,title,acceptance_criteria,status,version
+		FROM objectives WHERE objective_id=$1`+suffix, id).Scan(&objectiveID, &workspaceID, &title, &criteria, &status, &version)
+	if err != nil {
+		return domain.ObjectiveState{}, err
+	}
+	objective, err := domain.ParseObjectiveID(objectiveID)
+	if err != nil {
+		return domain.ObjectiveState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.ObjectiveState{}, err
+	}
+	return domain.RehydrateObjective(domain.ObjectiveRehydrationParams{ID: objective, WorkspaceID: workspace, Title: title,
+		AcceptanceCriteria: criteria, Status: domain.ObjectiveStatus(status), Version: mustVersion(version)})
+}
+
+func loadWorkUnitState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.WorkUnitState, error) {
+	var workUnitID, workspaceID, objectiveID, referenceID, title, status string
+	var version uint64
+	err := tx.QueryRow(ctx, `SELECT work_unit_id::text,workspace_id::text,objective_id::text,work_reference_id::text,
+		title,status,version FROM work_units WHERE work_unit_id=$1`+suffix, id).Scan(&workUnitID, &workspaceID,
+		&objectiveID, &referenceID, &title, &status, &version)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	workUnit, err := domain.ParseWorkUnitID(workUnitID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	objective, err := domain.ParseObjectiveID(objectiveID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	reference, err := domain.ParseWorkReferenceID(referenceID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	return domain.RehydrateWorkUnit(domain.WorkUnitRehydrationParams{ID: workUnit, WorkspaceID: workspace,
+		ObjectiveID: objective, WorkReferenceID: reference, Title: title, Status: domain.WorkUnitStatus(status),
+		Version: mustVersion(version)})
+}
+
+func loadRunState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.RunState, error) {
+	var runID, workspaceID, objectiveID, workUnitID, operatorID, status string
+	var version uint64
+	err := tx.QueryRow(ctx, `SELECT run_id::text,workspace_id::text,objective_id::text,work_unit_id::text,
+		operator_actor_id::text,status,version FROM runs WHERE run_id=$1`+suffix, id).Scan(&runID, &workspaceID,
+		&objectiveID, &workUnitID, &operatorID, &status, &version)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	run, err := domain.ParseRunID(runID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	objective, err := domain.ParseObjectiveID(objectiveID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	workUnit, err := domain.ParseWorkUnitID(workUnitID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	operator, err := domain.ParseActorID(operatorID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	rows, err := tx.Query(ctx, `SELECT participation_id::text FROM run_required_participations
+		WHERE workspace_id=$1 AND run_id=$2 ORDER BY roster_ordinal`+suffix, workspaceID, runID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	defer rows.Close()
+	var required []domain.RunParticipationID
+	for rows.Next() {
+		var participationID string
+		if err := rows.Scan(&participationID); err != nil {
+			return domain.RunState{}, err
+		}
+		parsed, err := domain.ParseRunParticipationID(participationID)
+		if err != nil {
+			return domain.RunState{}, err
+		}
+		required = append(required, parsed)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.RunState{}, err
+	}
+	return domain.RehydrateRun(domain.RunRehydrationParams{ID: run, WorkspaceID: workspace, ObjectiveID: objective,
+		WorkUnitID: workUnit, OperatorID: operator, RequiredParticipationIDs: required,
+		Status: domain.RunStatus(status), Version: mustVersion(version)})
+}
+
+func loadRunParticipationState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.RunParticipationState, error) {
+	var participationID, runID, actorID, role, status string
+	var sessionID sql.NullString
+	var version uint64
+	err := tx.QueryRow(ctx, `SELECT participation_id::text,run_id::text,actor_id::text,role,session_id::text,status,version
+		FROM run_participations WHERE participation_id=$1`+suffix, id).Scan(&participationID, &runID, &actorID,
+		&role, &sessionID, &status, &version)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	participation, err := domain.ParseRunParticipationID(participationID)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	run, err := domain.ParseRunID(runID)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	actor, err := domain.ParseActorID(actorID)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	var session domain.ActorSessionID
+	if sessionID.Valid {
+		session, err = domain.ParseActorSessionID(sessionID.String)
+	}
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	return domain.RehydrateRunParticipation(domain.RunParticipationRehydrationParams{ID: participation, RunID: run,
+		ActorID: actor, Role: role, ActorSessionID: session, Status: domain.RunParticipationStatus(status),
+		Version: mustVersion(version)})
+}
+
+func loadRuntimeBindingState(ctx context.Context, tx pgx.Tx, id, suffix string) (domain.RuntimeBindingState, error) {
+	var bindingID, runID, participationID, sessionID, endpointID, status string
+	var version uint64
+	err := tx.QueryRow(ctx, `SELECT binding_id::text,run_id::text,participation_id::text,session_id::text,
+		runtime_endpoint_id::text,status,version FROM runtime_bindings WHERE binding_id=$1`+suffix, id).Scan(&bindingID,
+		&runID, &participationID, &sessionID, &endpointID, &status, &version)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	binding, err := domain.ParseRuntimeBindingID(bindingID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	run, err := domain.ParseRunID(runID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	participation, err := domain.ParseRunParticipationID(participationID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	session, err := domain.ParseActorSessionID(sessionID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	endpoint, err := domain.ParseRuntimeEndpointID(endpointID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	return domain.RehydrateRuntimeBinding(domain.RuntimeBindingRehydrationParams{ID: binding, RunID: run,
+		ParticipationID: participation, ActorSessionID: session, RuntimeEndpointID: endpoint,
+		Status: domain.RuntimeBindingStatus(status), Version: mustVersion(version)})
 }

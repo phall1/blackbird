@@ -189,6 +189,48 @@ func aggregateRefFromParts(kind domain.AggregateKind, id string, version domain.
 			return domain.AggregateRef{}, e
 		}
 		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindWorkReference:
+		v, e := domain.ParseWorkReferenceID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindObjective:
+		v, e := domain.ParseObjectiveID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindWorkUnit:
+		v, e := domain.ParseWorkUnitID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindRun:
+		v, e := domain.ParseRunID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindRunParticipation:
+		v, e := domain.ParseRunParticipationID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindRuntimeBinding:
+		v, e := domain.ParseRuntimeBindingID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
+	case domain.AggregateKindRuntimeEndpoint:
+		v, e := domain.ParseRuntimeEndpointID(id)
+		if e != nil {
+			return domain.AggregateRef{}, e
+		}
+		return domain.NewAggregateRef(v, version)
 	default:
 		return domain.AggregateRef{}, application.ErrInvalidApplicationContract
 	}

@@ -35,8 +35,8 @@ func TestSchemaStaticallyMatchesSQLiteLogicalTablesAndNativeTypes(t *testing.T) 
 	if strings.Join(postgresTables, ",") != strings.Join(sqliteTables, ",") {
 		t.Fatalf("PostgreSQL tables=%v, SQLite tables=%v", postgresTables, sqliteTables)
 	}
-	if len(postgresTables) != 33 {
-		t.Fatalf("PostgreSQL table count=%d, want 33", len(postgresTables))
+	if len(postgresTables) != 34 {
+		t.Fatalf("PostgreSQL table count=%d, want 34", len(postgresTables))
 	}
 
 	schema := string(postgresBody)
@@ -70,7 +70,7 @@ func TestEmbeddedMigrationChecksumIsStableAndComplete(t *testing.T) {
 		t.Fatal("embedded migration checksum is not its immutable SHA-256")
 	}
 	for _, object := range []string{"schema_migrations", "schema_manifest", "work_references", "objectives",
-		"work_units", "runs", "run_participations", "runtime_bindings", "domain_events", "audit_entries", "outbox_jobs"} {
+		"work_units", "runs", "run_participations", "run_required_participations", "runtime_bindings", "domain_events", "audit_entries", "outbox_jobs"} {
 		if !strings.Contains(string(body), "CREATE TABLE "+object) {
 			t.Errorf("migration does not create %s", object)
 		}

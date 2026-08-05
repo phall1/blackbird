@@ -387,14 +387,18 @@ func (fact RunParticipantJoinedFact) ActorID() ActorID               { return fa
 func (fact RunParticipantJoinedFact) ActorSessionID() ActorSessionID { return fact.sessionID }
 
 type RunStartedFact struct {
-	origin AggregateRef
-	runID  RunID
+	origin         AggregateRef
+	runID          RunID
+	participations []AggregateRef
 }
 
 func (RunStartedFact) Type() EventType           { return EventTypeRunStarted }
 func (RunStartedFact) identityFact()             {}
 func (fact RunStartedFact) Origin() AggregateRef { return fact.origin }
 func (fact RunStartedFact) RunID() RunID         { return fact.runID }
+func (fact RunStartedFact) ParticipationRevisions() []AggregateRef {
+	return append([]AggregateRef(nil), fact.participations...)
+}
 
 func (ActorSessionStartedFact) Type() EventType                         { return EventTypeActorSessionStarted }
 func (ActorSessionStartedFact) identityFact()                           {}
@@ -1737,6 +1741,8 @@ func (result DeviceRevocationResult) Facts() []IdentityFact { return cloneIdenti
 
 type ObserveWorkRefInput struct {
 	Authorization                IdentityAuthorization
+	Adapter                      PrincipalState
+	ExpectedAdapterVersion       Version
 	Workspace                    WorkspaceState
 	ExpectedWorkspaceVersion     Version
 	WorkReference                WorkReferenceState
@@ -1752,12 +1758,19 @@ type ObserveWorkRefResult struct {
 }
 
 func ObserveWorkRef(input ObserveWorkRefInput) (ObserveWorkRefResult, error) {
-	if input.WorkReferenceID.IsZero() || input.Observation.AdapterPrincipalID() != input.Authorization.PrincipalID() ||
+	if input.WorkReferenceID.IsZero() || !validProviderObservation(input.Observation) ||
+		input.Observation.AdapterPrincipalID() != input.Authorization.PrincipalID() ||
 		input.Observation.ObservedAt().After(input.Authorization.EvaluatedAt()) {
 		return ObserveWorkRefResult{}, transitionError(ErrorCodeInvalidArgument, "provider observation is invalid")
 	}
 	if err := checkWorkspaceAuthority(input.Authorization, input.Workspace, input.ExpectedWorkspaceVersion); err != nil {
 		return ObserveWorkRefResult{}, err
+	}
+	if err := checkActivePrincipal(input.Authorization, input.Adapter, input.ExpectedAdapterVersion, Capability{}); err != nil {
+		return ObserveWorkRefResult{}, err
+	}
+	if input.Adapter.Kind() != PrincipalKindService {
+		return ObserveWorkRefResult{}, transitionConflict(ConflictProviderAuthority, "provider adapter is not a service principal")
 	}
 	version := InitialVersion()
 	if !input.WorkReference.IsZero() {
@@ -1780,7 +1793,8 @@ func ObserveWorkRef(input ObserveWorkRefInput) (ObserveWorkRefResult, error) {
 		if err != nil {
 			return ObserveWorkRefResult{}, err
 		}
-	} else if !input.ExpectedWorkReferenceVersion.IsZero() || input.PreviousProviderVersion.String() != "" {
+	} else if !workReferenceStateIsEmpty(input.WorkReference) || !input.ExpectedWorkReferenceVersion.IsZero() ||
+		input.PreviousProviderVersion.String() != "" {
 		return ObserveWorkRefResult{}, transitionConflict(ConflictProviderObservation, "new provider observation has stale predecessor")
 	}
 	state := WorkReferenceState{id: input.WorkReferenceID, workspaceID: input.Workspace.ID(),
@@ -1792,6 +1806,13 @@ func ObserveWorkRef(input ObserveWorkRefInput) (ObserveWorkRefResult, error) {
 	return ObserveWorkRefResult{workReference: state, facts: []IdentityFact{
 		WorkRefObservedFact{origin: origin, workspaceID: state.WorkspaceID(), observation: state.Observation()},
 	}}, nil
+}
+
+func workReferenceStateIsEmpty(state WorkReferenceState) bool {
+	return state.id.IsZero() && state.workspaceID.IsZero() && state.observation.namespace.String() == "" &&
+		state.observation.objectID.String() == "" && state.observation.locator.String() == "" &&
+		state.observation.providerVersion.String() == "" && state.observation.fields.IsZero() &&
+		state.observation.adapter.IsZero() && state.observation.observedAt.IsZero() && state.version.IsZero()
 }
 
 func (result ObserveWorkRefResult) WorkReference() WorkReferenceState { return result.workReference }
@@ -1818,7 +1839,10 @@ type CreateObjectiveAndWorkResult struct {
 }
 
 func CreateObjectiveAndWork(input CreateObjectiveAndWorkInput) (CreateObjectiveAndWorkResult, error) {
-	if !input.Objective.IsZero() || !input.WorkUnit.IsZero() || input.ObjectiveID.IsZero() || input.WorkUnitID.IsZero() ||
+	if !input.Objective.IsZero() || !input.WorkUnit.IsZero() {
+		return CreateObjectiveAndWorkResult{}, transitionConflict(ConflictState, "objective or work unit already exists")
+	}
+	if input.ObjectiveID.IsZero() || input.WorkUnitID.IsZero() ||
 		!validBoundedText(input.ObjectiveTitle, 512) || !validBoundedText(input.AcceptanceCriteria, 8192) ||
 		!validBoundedText(input.WorkUnitTitle, 512) {
 		return CreateObjectiveAndWorkResult{}, transitionError(ErrorCodeInvalidArgument, "objective and work input is invalid")
@@ -1826,17 +1850,24 @@ func CreateObjectiveAndWork(input CreateObjectiveAndWorkInput) (CreateObjectiveA
 	if err := checkWorkSession(input.Session, input.ExpectedSessionVersion); err != nil {
 		return CreateObjectiveAndWorkResult{}, err
 	}
-	if input.WorkReference.IsZero() || input.WorkReference.WorkspaceID() != input.Session.Binding().WorkspaceID() {
-		return CreateObjectiveAndWorkResult{}, transitionConflict(ConflictProviderAuthority, "work reference belongs to another workspace")
+	workspaceID := input.Session.Binding().WorkspaceID()
+	workReferenceID := WorkReferenceID{}
+	if !input.WorkReference.IsZero() {
+		if input.WorkReference.WorkspaceID() != workspaceID {
+			return CreateObjectiveAndWorkResult{}, transitionConflict(ConflictProviderAuthority, "work reference belongs to another workspace")
+		}
+		if err := checkExpectedVersion(input.WorkReference.Version(), input.ExpectedWorkReferenceVersion); err != nil {
+			return CreateObjectiveAndWorkResult{}, err
+		}
+		workReferenceID = input.WorkReference.ID()
+	} else if !workReferenceStateIsEmpty(input.WorkReference) || !input.ExpectedWorkReferenceVersion.IsZero() {
+		return CreateObjectiveAndWorkResult{}, transitionError(ErrorCodeInvalidArgument, "work reference shape is invalid")
 	}
-	if err := checkExpectedVersion(input.WorkReference.Version(), input.ExpectedWorkReferenceVersion); err != nil {
-		return CreateObjectiveAndWorkResult{}, err
-	}
-	objective := ObjectiveState{id: input.ObjectiveID, workspaceID: input.WorkReference.WorkspaceID(),
+	objective := ObjectiveState{id: input.ObjectiveID, workspaceID: workspaceID,
 		title: input.ObjectiveTitle, acceptanceCriteria: input.AcceptanceCriteria,
 		status: ObjectiveDraft, version: InitialVersion()}
 	workUnit := WorkUnitState{id: input.WorkUnitID, workspaceID: objective.WorkspaceID(), objectiveID: objective.ID(),
-		workReferenceID: input.WorkReference.ID(), title: input.WorkUnitTitle,
+		workReferenceID: workReferenceID, title: input.WorkUnitTitle,
 		status: WorkUnitProposed, version: InitialVersion()}
 	objectiveOrigin, _ := identityOrigin(objective.ID(), objective.Version())
 	workOrigin, _ := identityOrigin(workUnit.ID(), workUnit.Version())
@@ -1929,7 +1960,10 @@ type PlanRunWithBindingsResult struct {
 }
 
 func PlanRunWithBindings(input PlanRunWithBindingsInput) (PlanRunWithBindingsResult, error) {
-	if !input.Run.IsZero() || input.RunID.IsZero() || len(input.Participants) == 0 ||
+	if !input.Run.IsZero() {
+		return PlanRunWithBindingsResult{}, transitionConflict(ConflictState, "run already exists")
+	}
+	if input.RunID.IsZero() || len(input.Participants) == 0 ||
 		len(input.Participants) > MaxRunParticipants || len(input.Bindings) == 0 || len(input.Bindings) > MaxRunBindings {
 		return PlanRunWithBindingsResult{}, transitionError(ErrorCodeInvalidArgument, "run plan exceeds its bounded shape")
 	}
@@ -1969,6 +2003,9 @@ func PlanRunWithBindings(input PlanRunWithBindingsInput) (PlanRunWithBindingsRes
 		if _, duplicate := seenActors[plan.Actor.ID()]; duplicate {
 			return PlanRunWithBindingsResult{}, transitionConflict(ConflictParticipant, "actor is invited more than once")
 		}
+		if _, duplicate := byID[plan.ParticipationID]; duplicate {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictParticipant, "participation identity is duplicated")
+		}
 		seenActors[plan.Actor.ID()] = struct{}{}
 		state := RunParticipationState{id: plan.ParticipationID, runID: input.RunID, actorID: plan.Actor.ID(),
 			role: plan.Role, status: RunParticipationInvited, version: InitialVersion()}
@@ -2001,8 +2038,13 @@ func PlanRunWithBindings(input PlanRunWithBindingsInput) (PlanRunWithBindingsRes
 		bindings[index] = RuntimeBindingState{id: plan.BindingID, runID: input.RunID, participationID: participant.ID(),
 			sessionID: plan.SessionID, endpointID: endpoint, status: RuntimeBindingRequested, version: InitialVersion()}
 	}
+	requiredParticipationIDs := make([]RunParticipationID, len(participations))
+	for index, participation := range participations {
+		requiredParticipationIDs[index] = participation.ID()
+	}
 	run := RunState{id: input.RunID, workspaceID: workspace, objectiveID: input.Objective.ID(),
-		workUnitID: input.WorkUnit.ID(), operatorID: input.OperatorSession.Binding().ActorID(), status: RunPlanned, version: InitialVersion()}
+		workUnitID: input.WorkUnit.ID(), operatorID: input.OperatorSession.Binding().ActorID(),
+		requiredParticipationIDs: requiredParticipationIDs, status: RunPlanned, version: InitialVersion()}
 	runOrigin, _ := identityOrigin(run.ID(), run.Version())
 	facts := []IdentityFact{RunPlannedFact{origin: runOrigin, objectiveID: run.ObjectiveID(), workUnitID: run.WorkUnitID(), operatorID: run.OperatorID()}}
 	for _, state := range participations {
@@ -2076,7 +2118,12 @@ type StartRunInput struct {
 	ExpectedOperatorSessionVersion Version
 	Run                            RunState
 	ExpectedRunVersion             Version
-	Participations                 []RunParticipationState
+	Participations                 []RunParticipationSnapshot
+}
+
+type RunParticipationSnapshot struct {
+	Participation   RunParticipationState
+	ExpectedVersion Version
 }
 
 type StartRunResult struct {
@@ -2094,8 +2141,17 @@ func StartRun(input StartRunInput) (StartRunResult, error) {
 	if input.Run.Status() != RunPlanned || input.Run.OperatorID() != input.OperatorSession.Binding().ActorID() || len(input.Participations) == 0 || len(input.Participations) > MaxRunParticipants {
 		return StartRunResult{}, transitionConflict(ConflictParticipant, "run start policy is not satisfied")
 	}
+	required := input.Run.RequiredParticipationIDs()
+	if len(input.Participations) != len(required) {
+		return StartRunResult{}, transitionConflict(ConflictParticipant, "all declared participants must be joined")
+	}
 	seen := make(map[RunParticipationID]struct{}, len(input.Participations))
-	for _, participant := range input.Participations {
+	participationRefs := make([]AggregateRef, 0, len(input.Participations))
+	for _, snapshot := range input.Participations {
+		participant := snapshot.Participation
+		if err := checkExpectedVersion(participant.Version(), snapshot.ExpectedVersion); err != nil {
+			return StartRunResult{}, err
+		}
 		if participant.RunID() != input.Run.ID() || participant.Status() != RunParticipationActive || participant.ActorSessionID().IsZero() {
 			return StartRunResult{}, transitionConflict(ConflictParticipant, "all declared participants must be joined")
 		}
@@ -2103,7 +2159,20 @@ func StartRun(input StartRunInput) (StartRunResult, error) {
 			return StartRunResult{}, transitionConflict(ConflictParticipant, "participation is cited more than once")
 		}
 		seen[participant.ID()] = struct{}{}
+		ref, err := NewAggregateRef(participant.ID(), participant.Version())
+		if err != nil {
+			return StartRunResult{}, transitionConflict(ConflictParticipant, "participation revision is invalid")
+		}
+		participationRefs = append(participationRefs, ref)
 	}
+	for _, participationID := range required {
+		if _, present := seen[participationID]; !present {
+			return StartRunResult{}, transitionConflict(ConflictParticipant, "run start roster does not match its declared policy")
+		}
+	}
+	sort.Slice(participationRefs, func(left, right int) bool {
+		return participationRefs[left].Target().String() < participationRefs[right].Target().String()
+	})
 	next, err := nextTransitionVersion(input.Run.Version())
 	if err != nil {
 		return StartRunResult{}, err
@@ -2111,7 +2180,9 @@ func StartRun(input StartRunInput) (StartRunResult, error) {
 	run := input.Run
 	run.status, run.version = RunStarting, next
 	origin, _ := identityOrigin(run.ID(), run.Version())
-	return StartRunResult{run: run, facts: []IdentityFact{RunStartedFact{origin: origin, runID: run.ID()}}}, nil
+	return StartRunResult{run: run, facts: []IdentityFact{
+		RunStartedFact{origin: origin, runID: run.ID(), participations: participationRefs},
+	}}, nil
 }
 
 func (result StartRunResult) Run() RunState         { return result.run }

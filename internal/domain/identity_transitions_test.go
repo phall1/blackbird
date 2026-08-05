@@ -3093,3 +3093,649 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 		})
 	}
 }
+
+type w1DomainFixture struct {
+	identity        identityPathFixture
+	adapter         PrincipalState
+	adapterAuth     IdentityAuthorization
+	operatorSession ActorSessionState
+	actorA          ActorState
+	actorB          ActorState
+	sessionA        ActorSessionState
+	sessionB        ActorSessionState
+	workReference   WorkReferenceState
+	objective       ObjectiveState
+	workUnit        WorkUnitState
+}
+
+func testProviderAuthority(t *testing.T, fixture identityPathFixture) (PrincipalState, IdentityAuthorization) {
+	t.Helper()
+	adapterID, _ := ParsePrincipalID(identityUUID(500))
+	displayName, _ := NewDisplayName("Beads Adapter")
+	publicKey, _ := NewPublicKeyReference("keyref:beads-adapter")
+	adapter := PrincipalState{
+		id: adapterID, installationID: fixture.installationID, kind: PrincipalKindService,
+		displayName: displayName, publicKey: publicKey, status: PrincipalActive, version: InitialVersion(),
+	}
+	authorization, err := NewWorkspaceIdentityAuthorization(
+		fixture.authorityID, fixture.epoch, fixture.installationID, fixture.workspace.ID(), adapterID,
+		testCapabilities(t, fixture.workRead), fixture.policy, fixture.assurance, fixture.now, MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adapter, authorization
+}
+
+func testProviderObservation(t *testing.T, adapter PrincipalID, version string, observedAt time.Time) ProviderObservation {
+	t.Helper()
+	namespace, _ := NewOpaqueProviderValue("beads")
+	objectID, _ := NewOpaqueProviderValue("bb-proof-001")
+	locator, _ := NewOpaqueProviderValue("workref:beads:bb-proof-001")
+	providerVersion, _ := NewOpaqueProviderValue(version)
+	fields, err := NewEventPayload([]byte(`{"priority":2,"status":"open"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := NewProviderObservation(
+		namespace, objectID, locator, providerVersion, fields, adapter, observedAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return observation
+}
+
+func buildW1DomainFixture(t *testing.T) w1DomainFixture {
+	t.Helper()
+	identity := buildIdentityPath(t)
+	adapter, adapterAuth := testProviderAuthority(t, identity)
+	started, err := StartActorSession(baseSessionInput(t, identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionA := started.Session()
+	actorBID, _ := ParseActorID(identityUUID(501))
+	actorB := identity.actor
+	actorB.id = actorBID
+	sessionBID, _ := ParseActorSessionID(identityUUID(502))
+	sessionB := sessionA
+	sessionB.id = sessionBID
+	sessionB.binding.actor = actorBID
+
+	workReferenceID, _ := ParseWorkReferenceID(identityUUID(503))
+	observed, err := ObserveWorkRef(ObserveWorkRefInput{
+		Authorization: adapterAuth, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(), Workspace: identity.workspace,
+		ExpectedWorkspaceVersion: identity.workspace.Version(), WorkReferenceID: workReferenceID,
+		Observation: testProviderObservation(t, adapter.ID(), "beads-v7", identity.now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectiveID, _ := ParseObjectiveID(identityUUID(504))
+	workUnitID, _ := ParseWorkUnitID(identityUUID(505))
+	created, err := CreateObjectiveAndWork(CreateObjectiveAndWorkInput{
+		Session: sessionA, ExpectedSessionVersion: sessionA.Version(), ObjectiveID: objectiveID,
+		ObjectiveTitle: "Prove W1", AcceptanceCriteria: "Both participants join",
+		WorkUnitID: workUnitID, WorkUnitTitle: "Execute proof", WorkReference: observed.WorkReference(),
+		ExpectedWorkReferenceVersion: observed.WorkReference().Version(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activated, err := ActivateObjective(ActivateObjectiveInput{
+		Session: sessionA, ExpectedSessionVersion: sessionA.Version(), Objective: created.Objective(),
+		ExpectedObjectiveVersion: created.Objective().Version(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w1DomainFixture{
+		identity: identity, adapter: adapter, adapterAuth: adapterAuth,
+		operatorSession: sessionA, actorA: identity.actor, actorB: actorB,
+		sessionA: sessionA, sessionB: sessionB, workReference: observed.WorkReference(),
+		objective: activated.Objective(), workUnit: created.WorkUnit(),
+	}
+}
+
+func w1RunPlan(t *testing.T, fixture w1DomainFixture) PlanRunWithBindingsInput {
+	t.Helper()
+	runID, _ := ParseRunID(identityUUID(510))
+	participationA, _ := ParseRunParticipationID(identityUUID(511))
+	participationB, _ := ParseRunParticipationID(identityUUID(512))
+	bindingA, _ := ParseRuntimeBindingID(identityUUID(513))
+	bindingB, _ := ParseRuntimeBindingID(identityUUID(514))
+	endpointA, _ := ParseRuntimeEndpointID(identityUUID(515))
+	endpointB, _ := ParseRuntimeEndpointID(identityUUID(516))
+	endpointARef, _ := NewAggregateRef(endpointA, InitialVersion())
+	endpointBRef, _ := NewAggregateRef(endpointB, InitialVersion())
+	return PlanRunWithBindingsInput{
+		OperatorSession: fixture.operatorSession, ExpectedOperatorSessionVersion: fixture.operatorSession.Version(),
+		RunID: runID, Objective: fixture.objective, ExpectedObjectiveVersion: fixture.objective.Version(),
+		WorkUnit: fixture.workUnit, ExpectedWorkUnitVersion: fixture.workUnit.Version(),
+		Participants: []RunParticipantPlan{
+			{ParticipationID: participationB, Actor: fixture.actorB, ExpectedActorVersion: fixture.actorB.Version(), Session: fixture.sessionB, ExpectedSessionVersion: fixture.sessionB.Version(), Role: "reviewer"},
+			{ParticipationID: participationA, Actor: fixture.actorA, ExpectedActorVersion: fixture.actorA.Version(), Session: fixture.sessionA, ExpectedSessionVersion: fixture.sessionA.Version(), Role: "builder"},
+		},
+		Bindings: []RuntimeBindingPlan{
+			{BindingID: bindingB, ParticipationID: participationB, SessionID: fixture.sessionB.ID(), Endpoint: endpointBRef},
+			{BindingID: bindingA, ParticipationID: participationA, SessionID: fixture.sessionA.ID(), Endpoint: endpointARef},
+		},
+	}
+}
+
+func TestW1ObserveWorkRefEnforcesProviderAuthorityVersionAndExactFacts(t *testing.T) {
+	fixture := buildIdentityPath(t)
+	adapter, adapterAuth := testProviderAuthority(t, fixture)
+	workReferenceID, _ := ParseWorkReferenceID(identityUUID(520))
+	firstObservation := testProviderObservation(t, adapter.ID(), "beads-v7", fixture.now)
+	first, err := ObserveWorkRef(ObserveWorkRefInput{
+		Authorization: adapterAuth, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(), Workspace: fixture.workspace,
+		ExpectedWorkspaceVersion: fixture.workspace.Version(), WorkReferenceID: workReferenceID,
+		Observation: firstObservation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.WorkReference().Version() != InitialVersion() || first.WorkReference().Observation().ObservedAt().Location() != time.UTC {
+		t.Fatalf("first observation state = %#v", first.WorkReference())
+	}
+	requireFactTypes(t, first.Facts(), EventTypeWorkRefObserved)
+	fact := first.Facts()[0].(WorkRefObservedFact)
+	if fact.Origin().Kind() != AggregateKindWorkReference || fact.Origin().Version() != InitialVersion() ||
+		fact.WorkspaceID() != fixture.workspace.ID() || fact.Observation().ProviderVersion().String() != "beads-v7" ||
+		fact.Observation().AdapterPrincipalID() != adapter.ID() {
+		t.Fatalf("work observation fact = %#v", fact)
+	}
+
+	secondObservation := testProviderObservation(t, adapter.ID(), "beads-v8", fixture.now.Add(time.Second))
+	updateAuthorization := adapterAuth
+	updateAuthorization.evaluatedAt = fixture.now.Add(2 * time.Second)
+	second, err := ObserveWorkRef(ObserveWorkRefInput{
+		Authorization: updateAuthorization, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(), Workspace: fixture.workspace,
+		ExpectedWorkspaceVersion: fixture.workspace.Version(), WorkReference: first.WorkReference(),
+		ExpectedWorkReferenceVersion: first.WorkReference().Version(), WorkReferenceID: workReferenceID,
+		Observation: secondObservation, PreviousProviderVersion: firstObservation.ProviderVersion(),
+	})
+	if err != nil || second.WorkReference().Version().Uint64() != 2 {
+		t.Fatalf("second observation = %#v, %v", second, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ObserveWorkRefInput)
+		match  error
+	}{
+		{"stale aggregate version", func(input *ObserveWorkRefInput) { input.ExpectedWorkReferenceVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"wrong predecessor", func(input *ObserveWorkRefInput) { input.PreviousProviderVersion = secondObservation.ProviderVersion() }, ErrStateConflict},
+		{"duplicate provider version", func(input *ObserveWorkRefInput) { input.Observation = firstObservation }, ErrStateConflict},
+		{"nonadvancing observation time", func(input *ObserveWorkRefInput) { input.Observation.observedAt = firstObservation.ObservedAt() }, ErrStateConflict},
+		{"changed namespace", func(input *ObserveWorkRefInput) { input.Observation.namespace, _ = NewOpaqueProviderValue("github") }, ErrStateConflict},
+		{"changed object", func(input *ObserveWorkRefInput) { input.Observation.objectID, _ = NewOpaqueProviderValue("other") }, ErrStateConflict},
+		{"changed adapter", func(input *ObserveWorkRefInput) { input.Observation.adapter = fixture.workload.ID() }, ErrInvalidArgument},
+		{"stale adapter", func(input *ObserveWorkRefInput) { input.ExpectedAdapterVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"non-service adapter", func(input *ObserveWorkRefInput) { input.Adapter.kind = PrincipalKindHuman }, ErrStateConflict},
+		{"disabled adapter", func(input *ObserveWorkRefInput) { input.Adapter.status = PrincipalDisabled }, ErrForbidden},
+		{"future observation", func(input *ObserveWorkRefInput) { input.Observation.observedAt = fixture.now.Add(3 * time.Second) }, ErrInvalidArgument},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := ObserveWorkRefInput{
+				Authorization: updateAuthorization, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(), Workspace: fixture.workspace,
+				ExpectedWorkspaceVersion: fixture.workspace.Version(), WorkReference: first.WorkReference(),
+				ExpectedWorkReferenceVersion: first.WorkReference().Version(), WorkReferenceID: workReferenceID,
+				Observation: secondObservation, PreviousProviderVersion: firstObservation.ProviderVersion(),
+			}
+			test.mutate(&input)
+			result, transitionErr := ObserveWorkRef(input)
+			if !errors.Is(transitionErr, test.match) || !result.WorkReference().IsZero() || len(result.Facts()) != 0 {
+				t.Fatalf("result = %#v, error = %v", result, transitionErr)
+			}
+		})
+	}
+}
+
+func TestW1CreateObjectiveAndWorkSupportsLinkedAndNoProviderAtomicShapes(t *testing.T) {
+	fixture := buildW1DomainFixture(t)
+	objectiveID, _ := ParseObjectiveID(identityUUID(530))
+	workUnitID, _ := ParseWorkUnitID(identityUUID(531))
+	base := CreateObjectiveAndWorkInput{
+		Session: fixture.sessionA, ExpectedSessionVersion: fixture.sessionA.Version(),
+		ObjectiveID: objectiveID, ObjectiveTitle: "Linked objective", AcceptanceCriteria: "Evidence exists",
+		WorkUnitID: workUnitID, WorkUnitTitle: "Linked work", WorkReference: fixture.workReference,
+		ExpectedWorkReferenceVersion: fixture.workReference.Version(),
+	}
+	linked, err := CreateObjectiveAndWork(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked.Objective().Version() != InitialVersion() || linked.WorkUnit().Version() != InitialVersion() ||
+		linked.WorkUnit().ObjectiveID() != linked.Objective().ID() || linked.WorkUnit().WorkReferenceID() != fixture.workReference.ID() {
+		t.Fatalf("linked commit = %#v", linked)
+	}
+	requireFactTypes(t, linked.Facts(), EventTypeObjectiveCreated, EventTypeWorkUnitCreated)
+	createdFact := linked.Facts()[0].(ObjectiveCreatedFact)
+	workFact := linked.Facts()[1].(WorkUnitCreatedFact)
+	if createdFact.Origin().Kind() != AggregateKindObjective || createdFact.Title() != base.ObjectiveTitle ||
+		createdFact.AcceptanceCriteria() != base.AcceptanceCriteria || workFact.Origin().Kind() != AggregateKindWorkUnit ||
+		workFact.ObjectiveID() != objectiveID || workFact.WorkReferenceID() != fixture.workReference.ID() ||
+		workFact.Title() != base.WorkUnitTitle {
+		t.Fatalf("objective/work facts = %#v", linked.Facts())
+	}
+
+	noProvider := base
+	noProvider.ObjectiveID, _ = ParseObjectiveID(identityUUID(532))
+	noProvider.WorkUnitID, _ = ParseWorkUnitID(identityUUID(533))
+	noProvider.WorkReference = WorkReferenceState{}
+	noProvider.ExpectedWorkReferenceVersion = Version{}
+	native, err := CreateObjectiveAndWork(noProvider)
+	if err != nil || !native.WorkUnit().WorkReferenceID().IsZero() || native.Objective().WorkspaceID() != fixture.identity.workspace.ID() {
+		t.Fatalf("no-provider commit = %#v, %v", native, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*CreateObjectiveAndWorkInput)
+		match  error
+	}{
+		{"existing objective", func(input *CreateObjectiveAndWorkInput) { input.Objective = fixture.objective }, ErrStateConflict},
+		{"existing work unit", func(input *CreateObjectiveAndWorkInput) { input.WorkUnit = fixture.workUnit }, ErrStateConflict},
+		{"stale work reference", func(input *CreateObjectiveAndWorkInput) { input.ExpectedWorkReferenceVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"partial absent reference", func(input *CreateObjectiveAndWorkInput) {
+			input.WorkReference = WorkReferenceState{workspaceID: fixture.identity.workspace.ID()}
+		}, ErrInvalidArgument},
+		{"version without reference", func(input *CreateObjectiveAndWorkInput) { input.WorkReference = WorkReferenceState{} }, ErrInvalidArgument},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := base
+			test.mutate(&input)
+			result, transitionErr := CreateObjectiveAndWork(input)
+			if !errors.Is(transitionErr, test.match) || !result.Objective().IsZero() || !result.WorkUnit().IsZero() || len(result.Facts()) != 0 {
+				t.Fatalf("result = %#v, error = %v", result, transitionErr)
+			}
+		})
+	}
+}
+
+func TestW1PlanJoinAndStartPreserveIndependentAggregateVersionsAndExactFacts(t *testing.T) {
+	fixture := buildW1DomainFixture(t)
+	planned, err := PlanRunWithBindings(w1RunPlan(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	participations := planned.Participations()
+	bindings := planned.Bindings()
+	if planned.Run().Status() != RunPlanned || planned.Run().Version() != InitialVersion() ||
+		len(participations) != 2 || len(bindings) != 2 || len(planned.Run().RequiredParticipationIDs()) != 2 {
+		t.Fatalf("planned commit = %#v", planned)
+	}
+	returnedRoster := planned.Run().RequiredParticipationIDs()
+	returnedRoster[0] = RunParticipationID{}
+	if planned.Run().RequiredParticipationIDs()[0].IsZero() {
+		t.Fatal("run leaked mutable start-policy roster")
+	}
+	requireFactTypes(t, planned.Facts(), EventTypeRunPlanned, EventTypeRunParticipantInvited,
+		EventTypeRunParticipantInvited, EventTypeRuntimeBindingRequested, EventTypeRuntimeBindingRequested)
+	for index, participation := range participations {
+		fact := planned.Facts()[1+index].(RunParticipantInvitedFact)
+		if fact.Origin().Kind() != AggregateKindRunParticipation || fact.Origin().ID() != participation.ID().String() ||
+			fact.RunID() != planned.Run().ID() || fact.ActorID() != participation.ActorID() || fact.Role() != participation.Role() {
+			t.Fatalf("participation fact %d = %#v", index, fact)
+		}
+	}
+	for index, binding := range bindings {
+		fact := planned.Facts()[3+index].(RuntimeBindingRequestedFact)
+		if fact.Origin().Kind() != AggregateKindRuntimeBinding || fact.Origin().ID() != binding.ID().String() ||
+			fact.RunID() != planned.Run().ID() || fact.ParticipationID() != binding.ParticipationID() ||
+			fact.ActorSessionID() != binding.ActorSessionID() || fact.RuntimeEndpointID() != binding.RuntimeEndpointID() {
+			t.Fatalf("binding fact %d = %#v", index, fact)
+		}
+	}
+
+	sessions := map[ActorID]ActorSessionState{fixture.actorA.ID(): fixture.sessionA, fixture.actorB.ID(): fixture.sessionB}
+	joined := make([]RunParticipationState, len(participations))
+	for index, participation := range participations {
+		joinedResult, joinErr := JoinRun(JoinRunInput{
+			Session: sessions[participation.ActorID()], ExpectedSessionVersion: sessions[participation.ActorID()].Version(),
+			Run: planned.Run(), ExpectedRunVersion: planned.Run().Version(), Participation: participation,
+			ExpectedParticipationVersion: participation.Version(),
+		})
+		if joinErr != nil {
+			t.Fatal(joinErr)
+		}
+		joined[index] = joinedResult.Participation()
+		if joined[index].Version().Uint64() != 2 || planned.Run().Version() != InitialVersion() ||
+			participations[1-index].Version() != InitialVersion() {
+			t.Fatal("joining one participation advanced another aggregate")
+		}
+		requireFactTypes(t, joinedResult.Facts(), EventTypeRunParticipantJoined)
+	}
+
+	started, err := StartRun(StartRunInput{
+		OperatorSession: fixture.operatorSession, ExpectedOperatorSessionVersion: fixture.operatorSession.Version(),
+		Run: planned.Run(), ExpectedRunVersion: planned.Run().Version(),
+		Participations: []RunParticipationSnapshot{
+			{Participation: joined[1], ExpectedVersion: joined[1].Version()},
+			{Participation: joined[0], ExpectedVersion: joined[0].Version()},
+		},
+	})
+	if err != nil || started.Run().Status() != RunStarting || started.Run().Version().Uint64() != 2 {
+		t.Fatalf("started run = %#v, %v", started, err)
+	}
+	requireFactTypes(t, started.Facts(), EventTypeRunStarted)
+	startFact := started.Facts()[0].(RunStartedFact)
+	if startFact.Origin().Kind() != AggregateKindRun || startFact.Origin().Version().Uint64() != 2 ||
+		startFact.RunID() != planned.Run().ID() || len(startFact.ParticipationRevisions()) != 2 ||
+		startFact.ParticipationRevisions()[0].Kind() != AggregateKindRunParticipation ||
+		startFact.ParticipationRevisions()[0].Version().Uint64() != 2 {
+		t.Fatalf("start fact = %#v", startFact)
+	}
+}
+
+func TestW1RunPlanRejectsCardinalityDuplicatesAndCrossReferencesAtomically(t *testing.T) {
+	fixture := buildW1DomainFixture(t)
+	base := w1RunPlan(t, fixture)
+	tests := []struct {
+		name   string
+		mutate func(*PlanRunWithBindingsInput)
+		match  error
+	}{
+		{"no participants", func(input *PlanRunWithBindingsInput) { input.Participants = nil }, ErrInvalidArgument},
+		{"no bindings", func(input *PlanRunWithBindingsInput) { input.Bindings = nil }, ErrInvalidArgument},
+		{"too many participants", func(input *PlanRunWithBindingsInput) {
+			input.Participants = make([]RunParticipantPlan, MaxRunParticipants+1)
+		}, ErrInvalidArgument},
+		{"too many bindings", func(input *PlanRunWithBindingsInput) {
+			input.Bindings = make([]RuntimeBindingPlan, MaxRunBindings+1)
+		}, ErrInvalidArgument},
+		{"duplicate participation id", func(input *PlanRunWithBindingsInput) {
+			input.Participants[1].ParticipationID = input.Participants[0].ParticipationID
+		}, ErrStateConflict},
+		{"duplicate actor", func(input *PlanRunWithBindingsInput) {
+			input.Participants[1].Actor = input.Participants[0].Actor
+			input.Participants[1].Session = input.Participants[0].Session
+		}, ErrStateConflict},
+		{"duplicate binding id", func(input *PlanRunWithBindingsInput) { input.Bindings[1].BindingID = input.Bindings[0].BindingID }, ErrStateConflict},
+		{"unknown participation", func(input *PlanRunWithBindingsInput) {
+			input.Bindings[0].ParticipationID, _ = ParseRunParticipationID(identityUUID(599))
+		}, ErrStateConflict},
+		{"wrong participant session", func(input *PlanRunWithBindingsInput) { input.Bindings[0].SessionID = fixture.sessionA.ID() }, ErrStateConflict},
+		{"actor session mismatch", func(input *PlanRunWithBindingsInput) { input.Participants[0].Session = fixture.sessionA }, ErrStateConflict},
+		{"cross-kind endpoint", func(input *PlanRunWithBindingsInput) {
+			input.Bindings[0].Endpoint, _ = NewAggregateRef(fixture.workReference.ID(), InitialVersion())
+		}, ErrStateConflict},
+		{"stale objective", func(input *PlanRunWithBindingsInput) { input.ExpectedObjectiveVersion = InitialVersion() }, ErrStaleVersion},
+		{"stale work unit", func(input *PlanRunWithBindingsInput) { input.ExpectedWorkUnitVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"stale actor", func(input *PlanRunWithBindingsInput) { input.Participants[0].ExpectedActorVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"stale session", func(input *PlanRunWithBindingsInput) {
+			input.Participants[0].ExpectedSessionVersion = mustVersion(t, 2)
+		}, ErrStaleVersion},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := base
+			input.Participants = append([]RunParticipantPlan(nil), base.Participants...)
+			input.Bindings = append([]RuntimeBindingPlan(nil), base.Bindings...)
+			test.mutate(&input)
+			result, transitionErr := PlanRunWithBindings(input)
+			if !errors.Is(transitionErr, test.match) || !result.Run().IsZero() || len(result.Participations()) != 0 ||
+				len(result.Bindings()) != 0 || len(result.Facts()) != 0 {
+				t.Fatalf("result = %#v, error = %v", result, transitionErr)
+			}
+		})
+	}
+}
+
+func TestW1JoinAndStartRejectActorSessionPolicyAndStaleVersions(t *testing.T) {
+	fixture := buildW1DomainFixture(t)
+	planned, err := PlanRunWithBindings(w1RunPlan(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	participation := planned.Participations()[0]
+	matchingSession := fixture.sessionA
+	if participation.ActorID() == fixture.actorB.ID() {
+		matchingSession = fixture.sessionB
+	}
+	joinBase := JoinRunInput{
+		Session: matchingSession, ExpectedSessionVersion: matchingSession.Version(), Run: planned.Run(),
+		ExpectedRunVersion: planned.Run().Version(), Participation: participation,
+		ExpectedParticipationVersion: participation.Version(),
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*JoinRunInput)
+		match  error
+	}{
+		{"wrong actor session", func(input *JoinRunInput) {
+			if input.Session.ID() == fixture.sessionA.ID() {
+				input.Session = fixture.sessionB
+			} else {
+				input.Session = fixture.sessionA
+			}
+		}, ErrStateConflict},
+		{"stale run", func(input *JoinRunInput) { input.ExpectedRunVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"stale participation", func(input *JoinRunInput) { input.ExpectedParticipationVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"stale session", func(input *JoinRunInput) { input.ExpectedSessionVersion = mustVersion(t, 2) }, ErrStaleVersion},
+		{"terminal session", func(input *JoinRunInput) {
+			input.Session.status = ActorSessionEnded
+			input.Session.version = mustVersion(t, 2)
+			input.ExpectedSessionVersion = input.Session.Version()
+		}, ErrStateConflict},
+	} {
+		t.Run("join/"+test.name, func(t *testing.T) {
+			input := joinBase
+			test.mutate(&input)
+			result, transitionErr := JoinRun(input)
+			if !errors.Is(transitionErr, test.match) || !result.Participation().IsZero() || len(result.Facts()) != 0 {
+				t.Fatalf("result = %#v, error = %v", result, transitionErr)
+			}
+		})
+	}
+
+	joined := make([]RunParticipationState, len(planned.Participations()))
+	for index, candidate := range planned.Participations() {
+		session := fixture.sessionA
+		if candidate.ActorID() == fixture.actorB.ID() {
+			session = fixture.sessionB
+		}
+		result, joinErr := JoinRun(JoinRunInput{Session: session, ExpectedSessionVersion: session.Version(), Run: planned.Run(),
+			ExpectedRunVersion: planned.Run().Version(), Participation: candidate, ExpectedParticipationVersion: candidate.Version()})
+		if joinErr != nil {
+			t.Fatal(joinErr)
+		}
+		joined[index] = result.Participation()
+	}
+	startBase := StartRunInput{
+		OperatorSession: fixture.operatorSession, ExpectedOperatorSessionVersion: fixture.operatorSession.Version(),
+		Run: planned.Run(), ExpectedRunVersion: planned.Run().Version(), Participations: []RunParticipationSnapshot{
+			{Participation: joined[0], ExpectedVersion: joined[0].Version()},
+			{Participation: joined[1], ExpectedVersion: joined[1].Version()},
+		},
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*StartRunInput)
+		match  error
+	}{
+		{"missing declared participant", func(input *StartRunInput) { input.Participations = input.Participations[:1] }, ErrStateConflict},
+		{"duplicate participant", func(input *StartRunInput) { input.Participations[1] = input.Participations[0] }, ErrStateConflict},
+		{"stale participant", func(input *StartRunInput) { input.Participations[0].ExpectedVersion = InitialVersion() }, ErrStaleVersion},
+		{"invited participant", func(input *StartRunInput) {
+			input.Participations[0].Participation.status = RunParticipationInvited
+			input.Participations[0].Participation.sessionID = ActorSessionID{}
+		}, ErrStateConflict},
+		{"wrong operator", func(input *StartRunInput) {
+			input.OperatorSession = fixture.sessionB
+			input.ExpectedOperatorSessionVersion = fixture.sessionB.Version()
+		}, ErrStateConflict},
+		{"stale run", func(input *StartRunInput) { input.ExpectedRunVersion = mustVersion(t, 2) }, ErrStaleVersion},
+	} {
+		t.Run("start/"+test.name, func(t *testing.T) {
+			input := startBase
+			input.Participations = append([]RunParticipationSnapshot(nil), startBase.Participations...)
+			test.mutate(&input)
+			result, transitionErr := StartRun(input)
+			if !errors.Is(transitionErr, test.match) || !result.Run().IsZero() || len(result.Facts()) != 0 {
+				t.Fatalf("result = %#v, error = %v", result, transitionErr)
+			}
+		})
+	}
+}
+
+func TestW1RehydrationRoundTripsAndRejectsInvalidLifecycleMatrices(t *testing.T) {
+	fixture := buildW1DomainFixture(t)
+	planned, err := PlanRunWithBindings(w1RunPlan(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	participation := planned.Participations()[0]
+	binding := planned.Bindings()[0]
+
+	rehydratedWorkReference, err := RehydrateWorkReference(WorkReferenceRehydrationParams{
+		ID: fixture.workReference.ID(), WorkspaceID: fixture.workReference.WorkspaceID(),
+		Observation: fixture.workReference.Observation(), Version: fixture.workReference.Version(),
+	})
+	if err != nil || rehydratedWorkReference.ID() != fixture.workReference.ID() {
+		t.Fatalf("work reference round trip = %#v, %v", rehydratedWorkReference, err)
+	}
+	rehydratedObjective, err := RehydrateObjective(ObjectiveRehydrationParams{
+		ID: fixture.objective.ID(), WorkspaceID: fixture.objective.WorkspaceID(), Title: fixture.objective.Title(),
+		AcceptanceCriteria: fixture.objective.AcceptanceCriteria(), Status: fixture.objective.Status(), Version: fixture.objective.Version(),
+	})
+	if err != nil || rehydratedObjective != fixture.objective {
+		t.Fatalf("objective round trip = %#v, %v", rehydratedObjective, err)
+	}
+	rehydratedWorkUnit, err := RehydrateWorkUnit(WorkUnitRehydrationParams{
+		ID: fixture.workUnit.ID(), WorkspaceID: fixture.workUnit.WorkspaceID(), ObjectiveID: fixture.workUnit.ObjectiveID(),
+		WorkReferenceID: fixture.workUnit.WorkReferenceID(), Title: fixture.workUnit.Title(), Status: fixture.workUnit.Status(), Version: fixture.workUnit.Version(),
+	})
+	if err != nil || rehydratedWorkUnit != fixture.workUnit {
+		t.Fatalf("work unit round trip = %#v, %v", rehydratedWorkUnit, err)
+	}
+	rehydratedRun, err := RehydrateRun(RunRehydrationParams{
+		ID: planned.Run().ID(), WorkspaceID: planned.Run().WorkspaceID(), ObjectiveID: planned.Run().ObjectiveID(),
+		WorkUnitID: planned.Run().WorkUnitID(), OperatorID: planned.Run().OperatorID(),
+		RequiredParticipationIDs: planned.Run().RequiredParticipationIDs(), Status: planned.Run().Status(), Version: planned.Run().Version(),
+	})
+	if err != nil || rehydratedRun.ID() != planned.Run().ID() || len(rehydratedRun.RequiredParticipationIDs()) != 2 {
+		t.Fatalf("run round trip = %#v, %v", rehydratedRun, err)
+	}
+	startingRun := planned.Run()
+	startingRun.status = RunStarting
+	startingRun.version = mustVersion(t, 2)
+	if state, stateErr := RehydrateRun(RunRehydrationParams{
+		ID: startingRun.ID(), WorkspaceID: startingRun.WorkspaceID(), ObjectiveID: startingRun.ObjectiveID(),
+		WorkUnitID: startingRun.WorkUnitID(), OperatorID: startingRun.OperatorID(),
+		RequiredParticipationIDs: startingRun.RequiredParticipationIDs(), Status: startingRun.Status(), Version: startingRun.Version(),
+	}); stateErr != nil || state.Status() != RunStarting || state.Version() != startingRun.Version() {
+		t.Fatalf("starting run round trip = %#v, %v", state, stateErr)
+	}
+	rehydratedParticipation, err := RehydrateRunParticipation(RunParticipationRehydrationParams{
+		ID: participation.ID(), RunID: participation.RunID(), ActorID: participation.ActorID(), Role: participation.Role(),
+		ActorSessionID: participation.ActorSessionID(), Status: participation.Status(), Version: participation.Version(),
+	})
+	if err != nil || rehydratedParticipation != participation {
+		t.Fatalf("participation round trip = %#v, %v", rehydratedParticipation, err)
+	}
+	activeParticipation := participation
+	activeParticipation.status = RunParticipationActive
+	activeParticipation.sessionID = binding.ActorSessionID()
+	activeParticipation.version = mustVersion(t, 2)
+	if state, stateErr := RehydrateRunParticipation(RunParticipationRehydrationParams{
+		ID: activeParticipation.ID(), RunID: activeParticipation.RunID(), ActorID: activeParticipation.ActorID(),
+		Role: activeParticipation.Role(), ActorSessionID: activeParticipation.ActorSessionID(),
+		Status: activeParticipation.Status(), Version: activeParticipation.Version(),
+	}); stateErr != nil || state != activeParticipation {
+		t.Fatalf("active participation round trip = %#v, %v", state, stateErr)
+	}
+	rehydratedBinding, err := RehydrateRuntimeBinding(RuntimeBindingRehydrationParams{
+		ID: binding.ID(), RunID: binding.RunID(), ParticipationID: binding.ParticipationID(),
+		ActorSessionID: binding.ActorSessionID(), RuntimeEndpointID: binding.RuntimeEndpointID(), Status: binding.Status(), Version: binding.Version(),
+	})
+	if err != nil || rehydratedBinding != binding {
+		t.Fatalf("binding round trip = %#v, %v", rehydratedBinding, err)
+	}
+
+	invalidObservation := fixture.workReference.Observation()
+	invalidObservation.namespace = OpaqueProviderValue{value: " padded "}
+	if state, stateErr := RehydrateWorkReference(WorkReferenceRehydrationParams{
+		ID: fixture.workReference.ID(), WorkspaceID: fixture.workReference.WorkspaceID(), Observation: invalidObservation,
+		Version: fixture.workReference.Version(),
+	}); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+		t.Fatalf("invalid observation state = %#v, %v", state, stateErr)
+	}
+	if state, stateErr := RehydrateObjective(ObjectiveRehydrationParams{
+		ID: fixture.objective.ID(), WorkspaceID: fixture.objective.WorkspaceID(), Title: fixture.objective.Title(),
+		AcceptanceCriteria: fixture.objective.AcceptanceCriteria(), Status: ObjectiveActive, Version: InitialVersion(),
+	}); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+		t.Fatalf("invalid objective state = %#v, %v", state, stateErr)
+	}
+	if state, stateErr := RehydrateWorkUnit(WorkUnitRehydrationParams{
+		ID: fixture.workUnit.ID(), WorkspaceID: fixture.workUnit.WorkspaceID(), ObjectiveID: fixture.workUnit.ObjectiveID(),
+		Title: fixture.workUnit.Title(), Status: WorkUnitProposed, Version: mustVersion(t, 2),
+	}); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+		t.Fatalf("invalid work unit state = %#v, %v", state, stateErr)
+	}
+	duplicateRoster := planned.Run().RequiredParticipationIDs()
+	duplicateRoster[1] = duplicateRoster[0]
+	if state, stateErr := RehydrateRun(RunRehydrationParams{
+		ID: planned.Run().ID(), WorkspaceID: planned.Run().WorkspaceID(), ObjectiveID: planned.Run().ObjectiveID(),
+		WorkUnitID: planned.Run().WorkUnitID(), OperatorID: planned.Run().OperatorID(), RequiredParticipationIDs: duplicateRoster,
+		Status: RunPlanned, Version: InitialVersion(),
+	}); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+		t.Fatalf("invalid run state = %#v, %v", state, stateErr)
+	}
+	for _, invalidRun := range []RunRehydrationParams{
+		{
+			ID: planned.Run().ID(), WorkspaceID: planned.Run().WorkspaceID(), ObjectiveID: planned.Run().ObjectiveID(),
+			WorkUnitID: planned.Run().WorkUnitID(), OperatorID: planned.Run().OperatorID(),
+			RequiredParticipationIDs: planned.Run().RequiredParticipationIDs(), Status: RunPlanned, Version: mustVersion(t, 2),
+		},
+		{
+			ID: planned.Run().ID(), WorkspaceID: planned.Run().WorkspaceID(), ObjectiveID: planned.Run().ObjectiveID(),
+			WorkUnitID: planned.Run().WorkUnitID(), OperatorID: planned.Run().OperatorID(),
+			RequiredParticipationIDs: planned.Run().RequiredParticipationIDs(), Status: RunStarting, Version: InitialVersion(),
+		},
+		{
+			ID: planned.Run().ID(), WorkspaceID: planned.Run().WorkspaceID(), ObjectiveID: planned.Run().ObjectiveID(),
+			WorkUnitID: planned.Run().WorkUnitID(), OperatorID: planned.Run().OperatorID(),
+			Status: RunPlanned, Version: InitialVersion(),
+		},
+	} {
+		if state, stateErr := RehydrateRun(invalidRun); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+			t.Fatalf("invalid run lifecycle = %#v, %v", state, stateErr)
+		}
+	}
+	if state, stateErr := RehydrateRunParticipation(RunParticipationRehydrationParams{
+		ID: participation.ID(), RunID: participation.RunID(), ActorID: participation.ActorID(), Role: participation.Role(),
+		ActorSessionID: fixture.sessionA.ID(), Status: RunParticipationInvited, Version: InitialVersion(),
+	}); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+		t.Fatalf("invalid participation state = %#v, %v", state, stateErr)
+	}
+	for _, invalidParticipation := range []RunParticipationRehydrationParams{
+		{
+			ID: participation.ID(), RunID: participation.RunID(), ActorID: participation.ActorID(), Role: participation.Role(),
+			Status: RunParticipationActive, Version: mustVersion(t, 2),
+		},
+		{
+			ID: participation.ID(), RunID: participation.RunID(), ActorID: participation.ActorID(), Role: participation.Role(),
+			ActorSessionID: fixture.sessionA.ID(), Status: RunParticipationActive, Version: InitialVersion(),
+		},
+		{
+			ID: participation.ID(), RunID: participation.RunID(), ActorID: participation.ActorID(), Role: " padded ",
+			Status: RunParticipationInvited, Version: InitialVersion(),
+		},
+	} {
+		if state, stateErr := RehydrateRunParticipation(invalidParticipation); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+			t.Fatalf("invalid participation lifecycle = %#v, %v", state, stateErr)
+		}
+	}
+	if state, stateErr := RehydrateRuntimeBinding(RuntimeBindingRehydrationParams{
+		ID: binding.ID(), RunID: binding.RunID(), ParticipationID: binding.ParticipationID(),
+		ActorSessionID: binding.ActorSessionID(), RuntimeEndpointID: binding.RuntimeEndpointID(),
+		Status: RuntimeBindingRequested, Version: mustVersion(t, 2),
+	}); !errors.Is(stateErr, ErrInvalidWorkState) || !state.IsZero() {
+		t.Fatalf("invalid binding state = %#v, %v", state, stateErr)
+	}
+}

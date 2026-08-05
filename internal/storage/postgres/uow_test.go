@@ -67,12 +67,50 @@ func TestPostgreSQLCommandPathIsNativeAndComplete(t *testing.T) {
 		"ReceiptIdentityOrdinary", "ReceiptIdentityProvisioning", "ReceiptIdentityInstallationAdmin",
 		"domain.InstallationInvitationState", "domain.PrincipalState", "domain.DeviceState", "domain.GrantState",
 		"domain.WorkspaceState", "domain.MembershipState", "domain.ActorState", "domain.ActorDelegationState",
-		"domain.ActorSessionState", "VerifyReceiptResult", "VerifyRecoveryCapsule", "EncodeAuditEntry",
+		"domain.ActorSessionState", "domain.WorkReferenceState", "domain.ObjectiveState", "domain.WorkUnitState",
+		"domain.RunState", "domain.RunParticipationState", "domain.RuntimeBindingState",
+		"VerifyReceiptResult", "VerifyRecoveryCapsule", "EncodeAuditEntry",
 		"blackbird.outbox-job/v1", "verifyDurableCommandEvidence", "advanceCommandStream",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("PostgreSQL command path is missing %q", required)
 		}
+	}
+}
+
+func TestRunRosterCASComparisonRequiresExactCanonicalRoster(t *testing.T) {
+	t.Parallel()
+	runID, _ := domain.NewRunID()
+	workspaceID, _ := domain.NewWorkspaceID()
+	objectiveID, _ := domain.NewObjectiveID()
+	workUnitID, _ := domain.NewWorkUnitID()
+	operatorID, _ := domain.NewActorID()
+	participationA, _ := domain.NewRunParticipationID()
+	participationB, _ := domain.NewRunParticipationID()
+	substitute, _ := domain.NewRunParticipationID()
+	rehydrate := func(required ...domain.RunParticipationID) application.IdentityState {
+		run, err := domain.RehydrateRun(domain.RunRehydrationParams{ID: runID, WorkspaceID: workspaceID,
+			ObjectiveID: objectiveID, WorkUnitID: workUnitID, OperatorID: operatorID,
+			RequiredParticipationIDs: required, Status: domain.RunPlanned, Version: domain.InitialVersion()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, err := application.NewIdentityState(run)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+
+	declared := rehydrate(participationB, participationA)
+	if !sameRunRoster(declared, rehydrate(participationA, participationB)) {
+		t.Fatal("canonical roster comparison depends on declaration order")
+	}
+	if sameRunRoster(declared, rehydrate(participationA)) {
+		t.Fatal("roster comparison accepted an omitted participation")
+	}
+	if sameRunRoster(declared, rehydrate(participationA, substitute)) {
+		t.Fatal("roster comparison accepted a substituted participation")
 	}
 }
 
