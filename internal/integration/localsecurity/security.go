@@ -3,6 +3,7 @@
 package localsecurity
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ed25519"
@@ -1465,6 +1466,13 @@ func (verifier *CryptographicProofVerifier) verifyCeremonyProof(
 	defer verifier.challenges.mu.Unlock()
 	record, exists := verifier.challenges.ceremonies[challengeID]
 	subject := denialSubject(envelope, raw)
+	if exists {
+		var device *domain.DeviceID
+		if !record.context.DeviceID.IsZero() {
+			device = &record.context.DeviceID
+		}
+		subject, _ = application.AttributedDenialSubject(record.context.PrincipalID, device)
+	}
 	if !exists || record.consumed || !verifier.challenges.now().Before(record.context.ExpiresAt) ||
 		record.context.Purpose != purpose || ceremonyEnvelope(record.context).unsigned() != envelope.unsigned() {
 		return domain.CeremonyProof{}, subject, false, nil
@@ -1617,6 +1625,10 @@ func decodeProofEnvelope(encoded []byte, destination any) error {
 		return ErrInvalidProof
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
+		return ErrInvalidProof
+	}
+	canonical, err := json.Marshal(destination)
+	if err != nil || !bytes.Equal(encoded, canonical) {
 		return ErrInvalidProof
 	}
 	return nil
