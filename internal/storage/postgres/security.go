@@ -92,7 +92,8 @@ func (store *Store) lockSecurityContext(ctx context.Context, tx pgx.Tx, spec app
 	}
 	if spec.Operation() == application.SecurityInitializeInstallation {
 		var initialized int
-		if err := tx.QueryRow(ctx, "SELECT count(*) FROM scope_guards WHERE scope_kind = 'installation'").Scan(&initialized); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM scope_guards
+			WHERE scope_kind = 'installation' AND scope_id = $1`, spec.Scope().ID()).Scan(&initialized); err != nil {
 			return application.SecurityContext{}, state, fmt.Errorf("read PostgreSQL initialization guard: %w", err)
 		}
 		if initialized != 0 {

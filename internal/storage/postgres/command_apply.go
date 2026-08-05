@@ -93,7 +93,7 @@ func (store *Store) rehydrateReceipt(ctx context.Context, tx pgx.Tx, spec applic
 }
 
 func loadReceiptResources(ctx context.Context, tx pgx.Tx, receipt domain.ReceiptID) ([]domain.AggregateRef, error) {
-	rows, err := tx.Query(ctx, `SELECT aggregate_kind,aggregate_id::text,aggregate_version FROM command_receipt_resources WHERE receipt_id=$1 ORDER BY resource_ordinal FOR SHARE`, receipt.String())
+	rows, err := tx.Query(ctx, `SELECT aggregate_kind,aggregate_id::text,aggregate_version FROM command_receipt_resources WHERE receipt_id=$1 ORDER BY resource_ordinal`, receipt.String())
 	if err != nil {
 		return nil, err
 	}
@@ -174,27 +174,36 @@ func aggregateRefFromParts(kind domain.AggregateKind, id string, version domain.
 	}
 }
 func loadReceiptCeremonies(ctx context.Context, tx pgx.Tx, receipt domain.ReceiptID) ([]domain.CeremonyChallenge, error) {
-	rows, err := tx.Query(ctx, `SELECT c.ceremony_id::text FROM command_receipt_ceremonies r JOIN ceremony_challenges c ON c.ceremony_id=r.ceremony_id WHERE r.receipt_id=$1 ORDER BY r.ceremony_ordinal FOR SHARE OF r,c`, receipt.String())
+	rows, err := tx.Query(ctx, `SELECT c.ceremony_id::text FROM command_receipt_ceremonies r JOIN ceremony_challenges c ON c.ceremony_id=r.ceremony_id WHERE r.receipt_id=$1 ORDER BY r.ceremony_ordinal`, receipt.String())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var result []domain.CeremonyChallenge
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	result := make([]domain.CeremonyChallenge, 0, len(ids))
+	for _, id := range ids {
 		ceremony, err := loadCeremonyWithStatus(ctx, tx, id, domain.CeremonyPending, false)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, ceremony)
 	}
-	return result, rows.Err()
+	return result, nil
 }
 func loadReceiptEventIDs(ctx context.Context, tx pgx.Tx, receipt domain.ReceiptID) ([]domain.EventID, error) {
-	rows, err := tx.Query(ctx, `SELECT event_id::text FROM domain_events WHERE receipt_id=$1 ORDER BY event_index FOR SHARE`, receipt.String())
+	rows, err := tx.Query(ctx, `SELECT event_id::text FROM domain_events WHERE receipt_id=$1 ORDER BY event_index`, receipt.String())
 	if err != nil {
 		return nil, err
 	}

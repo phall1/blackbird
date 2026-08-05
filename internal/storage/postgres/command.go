@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 )
@@ -51,6 +52,15 @@ func (store *Store) ExecuteCommand(
 	spec application.CommandSpec,
 	decide func(application.CommandContext) (application.CommandDecision, error),
 ) (execution application.CommandTransactionExecution, executionErr error) {
+	return store.executeCommand(ctx, spec, decide, 3)
+}
+
+func (store *Store) executeCommand(
+	ctx context.Context,
+	spec application.CommandSpec,
+	decide func(application.CommandContext) (application.CommandDecision, error),
+	retries int,
+) (execution application.CommandTransactionExecution, executionErr error) {
 	if decide == nil || spec.CommandID().IsZero() {
 		return application.CommandTransactionExecution{}, application.ErrInvalidCommandSpec
 	}
@@ -66,6 +76,7 @@ func (store *Store) ExecuteCommand(
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	var postCommitErr error
+	callbackInvoked := false
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", commandScopeLock(spec)); err == nil {
 		var locked application.CommandContext
 		var state lockedCommandState
@@ -79,6 +90,7 @@ func (store *Store) ExecuteCommand(
 				goto commit
 			}
 			var decision application.CommandDecision
+			callbackInvoked = true
 			decision, err = decide(locked)
 			if err == nil {
 				err = application.ValidateCommandDecision(locked, decision)
@@ -97,6 +109,10 @@ func (store *Store) ExecuteCommand(
 		return execution, nil
 	}
 	if err != nil {
+		if retries > 0 && !callbackInvoked && isSerializationFailure(err) {
+			_ = tx.Rollback(context.Background())
+			return store.executeCommand(ctx, spec, decide, retries-1)
+		}
 		return application.CommandTransactionExecution{}, err
 	}
 
@@ -111,6 +127,11 @@ commit:
 		return application.CommandTransactionExecution{}, postCommitErr
 	}
 	return execution, nil
+}
+
+func isSerializationFailure(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) && postgresError.Code == "40001"
 }
 
 func commandScopeLock(spec application.CommandSpec) int64 {
@@ -349,7 +370,7 @@ func queryReceiptHeader(ctx context.Context, tx pgx.Tx, predicate string, args .
 		installation_id::text,principal_id::text,client_instance_id::text,transcript_fingerprint,operation,operation_major,
 		idempotency_key,request_fingerprint,authority_id::text,authority_epoch::text,result_digest,result_canonical,
 		first_event_sequence,last_event_sequence,final_stream_digest,guard_digest,recovery_capsule_canonical,
-		recovery_capsule_digest,recovery_capsule_key_id,recovery_capsule_public_key,committed_at_us FROM command_receipts WHERE ` + predicate + ` FOR SHARE`
+		recovery_capsule_digest,recovery_capsule_key_id,recovery_capsule_public_key,committed_at_us FROM command_receipts WHERE ` + predicate
 	var receiptText, commandText, kind, scopeKind, scopeID, operation, key, authority, epoch string
 	var workspace, installation, principal, client, capsuleKey sql.NullString
 	var transcript, request, resultDigest, resultCanonical, finalDigest, guardDigest, capsuleCanonical, capsuleDigest, capsulePublic []byte
