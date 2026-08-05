@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gowebpki/jcs"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -84,7 +85,11 @@ type mapCommandView map[string]any
 func (mapCommandView) canonicalView()   {}
 func (mapCommandView) commandHashView() {}
 
-func TestCanonicalizeStrictMatchesOfficialRFC8785Vector(t *testing.T) {
+type permissiveEventVerifier struct{}
+
+func (permissiveEventVerifier) VerifyEventDigests(domain.EventEnvelope) error { return nil }
+
+func TestRFC8785MatchesOfficialVectorAndBlackbirdRejectsUnsafeInteger(t *testing.T) {
 	t.Parallel()
 
 	// RFC 8785 section 3.2.2, also retained by the RFC editor's reference
@@ -97,12 +102,15 @@ func TestCanonicalizeStrictMatchesOfficialRFC8785Vector(t *testing.T) {
 }`)
 	expected := []byte(`{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\\\"/"}`)
 
-	canonical, err := canonicalizeStrict(input, MaxCanonicalJSONBytes, MaxCanonicalJSONDepth)
+	canonical, err := jcs.Transform(input)
 	if err != nil {
-		t.Fatalf("canonicalize official vector: %v", err)
+		t.Fatalf("RFC 8785 official vector: %v", err)
 	}
 	if !bytes.Equal(canonical, expected) {
 		t.Fatalf("official vector mismatch:\n got %s\nwant %s", canonical, expected)
+	}
+	if _, err = canonicalizeStrict(input, MaxCanonicalJSONBytes, MaxCanonicalJSONDepth); !errors.Is(err, ErrCanonicalNumber) {
+		t.Fatalf("Blackbird unsafe-integer error = %v", err)
 	}
 }
 
@@ -164,6 +172,7 @@ func TestStrictJSONRejectsAmbiguousOrInvalidInputs(t *testing.T) {
 		{name: "trailing value", input: []byte(`{"a":1} {"b":2}`), want: ErrCanonicalJSON},
 		{name: "unsafe integer", input: []byte(`{"a":9007199254740992}`), want: ErrCanonicalNumber},
 		{name: "negative unsafe integer", input: []byte(`{"a":-9007199254740992}`), want: ErrCanonicalNumber},
+		{name: "unsafe exponent integer", input: []byte(`{"a":1e21}`), want: ErrCanonicalNumber},
 		{name: "non-finite exponent", input: []byte(`{"a":1e999}`), want: ErrCanonicalNumber},
 		{name: "excessive depth", input: []byte(tooDeep), want: ErrCanonicalLimit},
 	}
@@ -1012,6 +1021,124 @@ func TestValidateCanonicalBytesRequiresCanonicalRepresentation(t *testing.T) {
 	}
 	if err := codec.ValidateCanonicalBytes([]byte(`{ "b":2, "a":1 }`), MaxCanonicalJSONBytes); !errors.Is(err, ErrCanonicalEncoding) {
 		t.Fatalf("noncanonical bytes got %v", err)
+	}
+}
+
+func TestProductionEventSemanticMaterializationAndVerification(t *testing.T) {
+	t.Parallel()
+
+	codec := NewProductionCanonicalCodec()
+	eventID, _ := domain.ParseEventID(codecUUID(101))
+	commandID, _ := domain.ParseCommandID(codecUUID(102))
+	authorityID, _ := domain.ParseAuthorityID(codecUUID(103))
+	epoch, _ := domain.ParseAuthorityEpoch(codecUUID(104))
+	workspaceID, _ := domain.ParseWorkspaceID(codecUUID(105))
+	membershipID, _ := domain.ParseMembershipID(codecUUID(106))
+	principalID, _ := domain.ParsePrincipalID(codecUUID(107))
+	receiptID, _ := domain.ParseReceiptID(codecUUID(108))
+	correlationID, _ := domain.ParseCorrelationID(codecUUID(109))
+	scope, _ := domain.WorkspaceScope(workspaceID)
+	aggregate := mustAggregateRef(t, membershipID, domain.InitialVersion())
+	position, _ := domain.NewStreamPosition(7)
+	schema, _ := domain.NewEventSchemaVersion(1)
+	payload, err := domain.NewEventPayload([]byte(`{"membership_id":"0198a0a0-0000-7000-8000-000000000106","principal_id":"0198a0a0-0000-7000-8000-000000000107","workspace_id":"0198a0a0-0000-7000-8000-000000000105"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, _ := domain.NewStreamDigest(sha256.Sum256([]byte("event previous")))
+	placeholderEvent, _ := domain.NewEventDigest(sha256.Sum256([]byte("event placeholder")))
+	placeholderStream, _ := domain.NewStreamDigest(sha256.Sum256([]byte("stream placeholder")))
+	authorization, _ := domain.NewAuthorizationDigest(sha256.Sum256([]byte("event authorization")))
+	params := domain.EventEnvelopeParams{
+		EventID: eventID, CommandID: commandID, AuthorityID: authorityID, AuthorityEpoch: epoch,
+		Scope: scope, StreamPosition: position, PreviousStreamDigest: previous,
+		EventDigest: placeholderEvent, StreamDigest: placeholderStream, Aggregate: aggregate,
+		EventType: domain.EventTypeWorkspaceMembershipAccepted, SchemaVersion: schema, Payload: payload,
+		PrincipalID: principalID, AuthorizationDigest: authorization, CommandReceiptID: receiptID,
+		CorrelationID: correlationID, RecordedAt: time.Date(2026, 8, 5, 12, 0, 0, 123_000_000, time.UTC),
+	}
+	unverified, err := domain.NewEventEnvelope(params, permissiveEventVerifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := eventSemanticView(unverified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventDigest, err := codec.HashEvent(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamDigest, err := codec.ChainStreamDigest(previous, position, eventDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.EventDigest = eventDigest
+	params.StreamDigest = streamDigest
+	trusted, err := codec.MaterializeEvent(params)
+	if err != nil {
+		t.Fatalf("production verifier rejected valid event: %v", err)
+	}
+	if trusted.EventDigest() != eventDigest || trusted.StreamDigest() != streamDigest {
+		t.Fatal("trusted event lost verified digests")
+	}
+	params.EventDigest = placeholderEvent
+	if _, err := codec.MaterializeEvent(params); !errors.Is(err, domain.ErrEventDigestVerification) {
+		t.Fatalf("semantic digest tamper got %v", err)
+	}
+	params.EventDigest = eventDigest
+	params.StreamDigest = placeholderStream
+	if _, err := codec.MaterializeEvent(params); !errors.Is(err, domain.ErrEventDigestVerification) {
+		t.Fatalf("stream digest tamper got %v", err)
+	}
+}
+
+func TestAuditEntryGoldenAndAdversarialVerification(t *testing.T) {
+	t.Parallel()
+
+	codec := NewProductionCanonicalCodec()
+	authority, _ := domain.ParseAuthorityID(codecUUID(111))
+	epoch, _ := domain.ParseAuthorityEpoch(codecUUID(112))
+	installation, _ := domain.ParseInstallationID(codecUUID(113))
+	scope, _ := domain.InstallationScope(installation)
+	operation, _ := domain.NewOperationName(string(CommandRegisterPrincipal))
+	intent, err := NewAuditIntent(
+		operation, AuditCommandApplied, domain.FingerprintCommand([]byte("audit command")), CommandAppliedAuditDetail(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: scope, Sequence: 1, AuthorityID: authority, AuthorityEpoch: epoch,
+		RecordedAt: time.Date(2026, 8, 5, 12, 30, 0, 456_000_000, time.UTC), Intent: intent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, digest, err := codec.EncodeAuditEntry(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCanonical := `{"action":"principal.register.v1","audit_sequence":1,"authority_epoch":"0198a0a0-0000-7000-8000-000000000112","authority_id":"0198a0a0-0000-7000-8000-000000000111","chain_scope_id":"0198a0a0-0000-7000-8000-000000000113","command_fingerprint":"8014e7cf00337fb9652679a3a38ba9564f2019844be1256ea20d6025c38cea94","detail":{"kind":"command_applied","reason":null},"outcome":"command_applied","previous_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","recorded_at":"2026-08-05T12:30:00.456000Z","schema":"blackbird.audit.entry/v1"}`
+	if string(canonical) != wantCanonical {
+		t.Fatalf("audit canonical golden changed:\n got %s\nwant %s", canonical, wantCanonical)
+	}
+	if digest.String() != "0b3b7a6d2e41fe3ff74e93a3d68a5b8d738c7ab8173c55665c400f0bafcd8578" {
+		t.Fatalf("audit digest golden changed: %s", digest.String())
+	}
+	if err := codec.VerifyAuditEntry(Digest{}, canonical, digest); err != nil {
+		t.Fatalf("verify audit genesis: %v", err)
+	}
+	wrongPrevious := DigestBytes([]byte("wrong predecessor"))
+	if err := codec.VerifyAuditEntry(wrongPrevious, canonical, digest); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("wrong predecessor got %v", err)
+	}
+	if err := codec.VerifyAuditEntry(Digest{}, canonical, DigestBytes([]byte("wrong digest"))); !errors.Is(err, ErrCanonicalEncoding) {
+		t.Fatalf("wrong digest got %v", err)
+	}
+	noncanonical := append([]byte(" "), canonical...)
+	if err := codec.VerifyAuditEntry(Digest{}, noncanonical, digest); err == nil {
+		t.Fatal("noncanonical retained audit entry was accepted")
 	}
 }
 

@@ -118,6 +118,8 @@ func TestEventPayloadIsBoundedObjectAndImmutable(t *testing.T) {
 		[]byte(`{"unsafe_integer":9007199254740992}`),
 		[]byte(`{"unsafe_decimal_integer":9007199254740992.0}`),
 		[]byte(`{"unsafe_exponent_integer":9.007199254740992e15}`),
+		[]byte(`{"negative_integer":-1}`),
+		[]byte(`{"fraction":0.1}`),
 		[]byte(`{"unpaired_surrogate":"\ud800"}`),
 	} {
 		if _, err := NewEventPayload(nonIJSON); !errors.Is(err, ErrInvalidEventPayload) {
@@ -278,6 +280,10 @@ func TestEventEnvelopeOwnsCompleteInternalVocabulary(t *testing.T) {
 func TestEventEnvelopeRejectsInvalidRequiredAndSelfCausation(t *testing.T) {
 	if _, err := NewEventEnvelope(validEnvelopeParams(t), nil); !errors.Is(err, ErrEventDigestVerification) {
 		t.Fatalf("missing verifier error = %v", err)
+	}
+	var typedNilVerifier testDigestVerifier
+	if _, err := NewEventEnvelope(validEnvelopeParams(t), typedNilVerifier); !errors.Is(err, ErrEventDigestVerification) {
+		t.Fatalf("typed-nil verifier error = %v", err)
 	}
 	rejected := testDigestVerifier(func(EventEnvelope) error { return errors.New("digest mismatch") })
 	if _, err := NewEventEnvelope(validEnvelopeParams(t), rejected); !errors.Is(err, ErrEventDigestVerification) {

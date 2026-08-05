@@ -858,16 +858,20 @@ type RecoveryCapsulePlan struct {
 // PrepareRecoveryCapsulePlan is called only after signer preflight has
 // completed outside the transaction. SignRecoveryCapsule is post-commit only.
 func PrepareRecoveryCapsulePlan(signer PreparedRecoveryCapsuleSigner) (RecoveryCapsulePlan, error) {
-	if signer == nil || !validOpaqueText(signer.KeyID(), 256) ||
-		len(signer.Ed25519PublicKey()) != ed25519.PublicKeySize {
+	if isNilInterface(signer) {
+		return RecoveryCapsulePlan{}, ErrInvalidCommandSpec
+	}
+	keyID := signer.KeyID()
+	publicKey := signer.Ed25519PublicKey()
+	if !validOpaqueText(keyID, 256) || len(publicKey) != ed25519.PublicKeySize {
 		return RecoveryCapsulePlan{}, ErrInvalidCommandSpec
 	}
 	// Deliberately retain only the immutable key identity. The caller keeps the
 	// prepared signer outside CommandSpec and its transaction callback.
 	return RecoveryCapsulePlan{
 		requirement: RecoveryCapsuleRequired,
-		keyID:       signer.KeyID(),
-		publicKey:   append(ed25519.PublicKey(nil), signer.Ed25519PublicKey()...),
+		keyID:       keyID,
+		publicKey:   append(ed25519.PublicKey(nil), publicKey...),
 	}, nil
 }
 
@@ -944,10 +948,15 @@ func SignRecoveryCapsule(
 	signer PreparedRecoveryCapsuleSigner,
 	draft RecoveryCapsuleDraft,
 ) (RecoveryCapsuleEnvelope, error) {
-	if plan.requirement != RecoveryCapsuleRequired || signer == nil ||
-		plan.keyID != draft.keyID || signer.KeyID() != plan.keyID || draft.digest.IsZero() ||
+	if isNilInterface(signer) {
+		return RecoveryCapsuleEnvelope{}, ErrInvalidApplicationContract
+	}
+	keyID := signer.KeyID()
+	publicKey := signer.Ed25519PublicKey()
+	if plan.requirement != RecoveryCapsuleRequired ||
+		plan.keyID != draft.keyID || keyID != plan.keyID || draft.digest.IsZero() ||
 		len(plan.publicKey) != ed25519.PublicKeySize ||
-		!ed25519.PublicKey(signer.Ed25519PublicKey()).Equal(plan.publicKey) {
+		!ed25519.PublicKey(publicKey).Equal(plan.publicKey) {
 		return RecoveryCapsuleEnvelope{}, ErrInvalidApplicationContract
 	}
 	message, err := RecoveryCapsuleSigningMessage(draft.digest)
@@ -2352,16 +2361,208 @@ type AppliedGuardEvidence struct {
 func NewAppliedGuardEvidence(
 	plan CommandGuardPlan,
 	observed []EvidenceGuard,
-	digest domain.AuthorizationDigest,
 ) (AppliedGuardEvidence, error) {
 	normalized, err := normalizeEvidenceGuards(observed)
-	if err != nil || plan.admissionGeneration.IsZero() || digest.IsZero() ||
+	if err != nil || plan.admissionGeneration.IsZero() ||
 		!equalEvidenceGuards(plan.evidence, normalized) {
+		return AppliedGuardEvidence{}, ErrInvalidCommandContext
+	}
+	digest, err := hashAppliedAuthorizationGuards(plan, normalized)
+	if err != nil {
 		return AppliedGuardEvidence{}, ErrInvalidCommandContext
 	}
 	return AppliedGuardEvidence{
 		plan: cloneGuardPlan(plan), observed: append([]EvidenceGuard(nil), normalized...), digest: digest,
 	}, nil
+}
+
+type authorizationGuardHashRecordV1 struct {
+	Kind             string               `json:"kind"`
+	TargetKind       string               `json:"target_kind"`
+	TargetID         CanonicalIdentifier  `json:"target_id"`
+	Version          *uint64              `json:"version"`
+	GenerationID     *CanonicalIdentifier `json:"generation_id"`
+	GenerationNumber *uint64              `json:"generation_number"`
+	AuthorityEpoch   *CanonicalIdentifier `json:"authority_epoch"`
+	PolicyRevision   *string              `json:"policy_revision"`
+	TrustRevision    *uint64              `json:"trust_revision"`
+	Status           *string              `json:"status"`
+	ConstraintDigest *CanonicalDigest     `json:"constraint_digest"`
+}
+
+type authorizationGuardHashViewV1 struct {
+	Guards []authorizationGuardHashRecordV1 `json:"guards"`
+}
+
+func (authorizationGuardHashViewV1) canonicalView()              {}
+func (authorizationGuardHashViewV1) authorizationGuardHashView() {}
+
+func hashAppliedAuthorizationGuards(
+	plan CommandGuardPlan,
+	observed []EvidenceGuard,
+) (domain.AuthorizationDigest, error) {
+	records := make([]authorizationGuardHashRecordV1, 0,
+		1+len(observed)+len(plan.authorization)+len(plan.references)+len(plan.mutations)+len(plan.ceremonies)+1)
+	scopeID, err := NewCanonicalIdentifier(plan.admissionScope.ID())
+	if err != nil {
+		return domain.AuthorizationDigest{}, err
+	}
+	generation := plan.admissionGeneration.Uint64()
+	records = append(records, authorizationGuardHashRecordV1{
+		Kind: "scope_admission", TargetKind: string(plan.admissionScope.Kind()), TargetID: scopeID,
+		GenerationNumber: &generation,
+	})
+	for _, guard := range observed {
+		record, recordErr := authorizationGuardHashRecord(guard)
+		if recordErr != nil {
+			return domain.AuthorizationDigest{}, recordErr
+		}
+		records = append(records, record)
+	}
+	for _, ref := range plan.authorization {
+		record, recordErr := aggregateGuardHashRecord("authorization_revision", ref.Target(), ref.Version())
+		if recordErr != nil {
+			return domain.AuthorizationDigest{}, recordErr
+		}
+		records = append(records, record)
+	}
+	for _, ref := range plan.references {
+		record, recordErr := aggregateGuardHashRecord("reference_revision", ref.Target(), ref.Version())
+		if recordErr != nil {
+			return domain.AuthorizationDigest{}, recordErr
+		}
+		records = append(records, record)
+	}
+	for _, expectation := range plan.mutations {
+		kind := "aggregate_absent"
+		version := domain.Version{}
+		if expected, hasVersion := expectation.Version(); hasVersion {
+			kind = "aggregate_revision"
+			version = expected
+		}
+		record, recordErr := aggregateGuardHashRecord(kind, expectation.Target(), version)
+		if recordErr != nil {
+			return domain.AuthorizationDigest{}, recordErr
+		}
+		records = append(records, record)
+	}
+	for _, ceremony := range plan.ceremonies {
+		record, recordErr := ceremonyGuardHashRecord(ceremony)
+		if recordErr != nil {
+			return domain.AuthorizationDigest{}, recordErr
+		}
+		records = append(records, record)
+	}
+	if plan.genesis != nil {
+		target, targetErr := NewCanonicalIdentifier(plan.genesis.authorityID.String())
+		if targetErr != nil {
+			return domain.AuthorizationDigest{}, targetErr
+		}
+		epoch, epochErr := NewCanonicalIdentifier(plan.genesis.epoch.String())
+		if epochErr != nil {
+			return domain.AuthorizationDigest{}, epochErr
+		}
+		records = append(records, authorizationGuardHashRecordV1{
+			Kind: "scope_genesis_absent", TargetKind: "authority", TargetID: target,
+			AuthorityEpoch: &epoch,
+		})
+	}
+	sort.Slice(records, func(left, right int) bool {
+		if records[left].Kind != records[right].Kind {
+			return records[left].Kind < records[right].Kind
+		}
+		if records[left].TargetKind != records[right].TargetKind {
+			return records[left].TargetKind < records[right].TargetKind
+		}
+		return records[left].TargetID.String() < records[right].TargetID.String()
+	})
+	return NewProductionCanonicalCodec().HashAuthorizationGuards(authorizationGuardHashViewV1{Guards: records})
+}
+
+func aggregateGuardHashRecord(
+	kind string,
+	target domain.AggregateTarget,
+	version domain.Version,
+) (authorizationGuardHashRecordV1, error) {
+	targetID, err := NewCanonicalIdentifier(target.ID())
+	if err != nil {
+		return authorizationGuardHashRecordV1{}, err
+	}
+	record := authorizationGuardHashRecordV1{Kind: kind, TargetKind: string(target.Kind()), TargetID: targetID}
+	if !version.IsZero() {
+		value := version.Uint64()
+		record.Version = &value
+	}
+	return record, nil
+}
+
+func ceremonyGuardHashRecord(claim CeremonyClaim) (authorizationGuardHashRecordV1, error) {
+	targetID, err := NewCanonicalIdentifier(claim.id.String())
+	if err != nil {
+		return authorizationGuardHashRecordV1{}, err
+	}
+	proof, err := NewCanonicalDigest(hex.EncodeToString(claim.proof[:]))
+	if err != nil {
+		return authorizationGuardHashRecordV1{}, err
+	}
+	purpose := string(claim.purpose)
+	record := authorizationGuardHashRecordV1{
+		Kind: string(claim.kind), TargetKind: "ceremony", TargetID: targetID,
+		Status: &purpose, ConstraintDigest: &proof,
+	}
+	if !claim.ownerRef.IsZero() {
+		version := claim.ownerRef.Version().Uint64()
+		record.Version = &version
+	}
+	return record, nil
+}
+
+func authorizationGuardHashRecord(guard EvidenceGuard) (authorizationGuardHashRecordV1, error) {
+	targetKind := guard.targetKind
+	targetID := guard.targetID
+	if guard.kind == EvidenceCurrentAuthorityEpoch {
+		targetKind = "authority"
+		targetID = guard.authorityID.String()
+	}
+	canonicalTarget, err := NewCanonicalIdentifier(targetID)
+	if err != nil {
+		return authorizationGuardHashRecordV1{}, err
+	}
+	record := authorizationGuardHashRecordV1{
+		Kind: string(guard.kind), TargetKind: targetKind, TargetID: canonicalTarget,
+	}
+	switch guard.kind {
+	case EvidenceCurrentAuthorityEpoch:
+		epoch, epochErr := NewCanonicalIdentifier(guard.authorityEpoch.String())
+		if epochErr != nil {
+			return authorizationGuardHashRecordV1{}, epochErr
+		}
+		record.AuthorityEpoch = &epoch
+	case EvidencePolicyRevision:
+		value := guard.policyRevision.String()
+		record.PolicyRevision = &value
+	case EvidenceLifecycleStatus:
+		value := guard.status
+		record.Status = &value
+	case EvidenceDeviceTrustRevision:
+		value := guard.revision.Uint64()
+		record.TrustRevision = &value
+	case EvidenceCapabilityCeiling, EvidenceResourceConstraint:
+		value, digestErr := CanonicalDigestFromDigest(guard.digest)
+		if digestErr != nil {
+			return authorizationGuardHashRecordV1{}, digestErr
+		}
+		record.ConstraintDigest = &value
+	case EvidenceBootstrapGeneration:
+		value, generationErr := NewCanonicalIdentifier(guard.bootstrapGeneration.String())
+		if generationErr != nil {
+			return authorizationGuardHashRecordV1{}, generationErr
+		}
+		record.GenerationID = &value
+	default:
+		return authorizationGuardHashRecordV1{}, ErrCanonicalProfile
+	}
+	return record, nil
 }
 
 func equalEvidenceGuards(left, right []EvidenceGuard) bool {
@@ -2743,7 +2944,8 @@ type FactIntent struct {
 }
 
 func NewFactIntent(eventID domain.EventID, fact domain.IdentityFact) (FactIntent, error) {
-	if eventID.IsZero() || fact == nil || !identityEventType(fact.Type()) || fact.Origin().IsZero() {
+	if eventID.IsZero() || isNilInterface(fact) || reflect.TypeOf(fact).Kind() != reflect.Struct ||
+		!identityEventType(fact.Type()) || fact.Origin().IsZero() {
 		return FactIntent{}, ErrInvalidCommandDecision
 	}
 	return FactIntent{eventID: eventID, fact: fact}, nil
@@ -3946,21 +4148,19 @@ func NewCommandDenialDraft(
 	class CommandDenialClass,
 	safeReason string,
 	requestFingerprint domain.CommandFingerprint,
-	denialFingerprint Digest,
 	subject DenialSubject,
 	policy *domain.PolicyRevision,
 	correlation domain.CorrelationID,
 ) (CommandDenialDraft, error) {
 	if !operationHasMajor(operation, major) ||
 		!class.Valid() ||
-		!validToken(safeReason, 64) || requestFingerprint.IsZero() || denialFingerprint.IsZero() ||
+		!validToken(safeReason, 64) || requestFingerprint.IsZero() ||
 		(subject.kind != DenialAttributedSubject && subject.kind != DenialUnattributedSource) || correlation.IsZero() {
 		return CommandDenialDraft{}, ErrInvalidSecuritySpec
 	}
 	draft := CommandDenialDraft{
 		operation: operation, operationMajor: major, class: class, reason: safeReason,
-		requestFingerprint: requestFingerprint, denialFingerprint: denialFingerprint,
-		subject: subject, correlation: correlation,
+		requestFingerprint: requestFingerprint, subject: subject, correlation: correlation,
 	}
 	if policy != nil {
 		if policy.String() == "" {
@@ -3999,6 +4199,57 @@ type SecuritySpec struct {
 	initialState   domain.InstallationInvitationState
 	initialization Digest
 	commandDenial  CommandDenialDraft
+}
+
+// BootstrapAttempt is a secret-free, canonically fingerprinted rejected proof.
+// It retains only already-derived transcript, nonce, channel, and proof digests.
+type BootstrapAttempt struct {
+	invitation  domain.InvitationID
+	fingerprint domain.CommandFingerprint
+}
+
+func NewBootstrapAttempt(
+	invitation domain.InvitationID,
+	transcriptHash domain.CommandFingerprint,
+	clientNonceDigest domain.CommandFingerprint,
+	serverNonceDigest domain.CommandFingerprint,
+	channelBindingDigest domain.CommandFingerprint,
+	presentedProofDigest domain.CommandFingerprint,
+) (BootstrapAttempt, error) {
+	if invitation.IsZero() || transcriptHash.IsZero() || clientNonceDigest.IsZero() ||
+		serverNonceDigest.IsZero() || channelBindingDigest.IsZero() || presentedProofDigest.IsZero() {
+		return BootstrapAttempt{}, ErrInvalidSecuritySpec
+	}
+	invitationID, err := NewCanonicalIdentifier(invitation.String())
+	if err != nil {
+		return BootstrapAttempt{}, ErrInvalidSecuritySpec
+	}
+	digests := [...]domain.CommandFingerprint{
+		transcriptHash, clientNonceDigest, serverNonceDigest, channelBindingDigest, presentedProofDigest,
+	}
+	canonical := make([]CanonicalDigest, len(digests))
+	for index, digest := range digests {
+		canonical[index], err = NewCanonicalDigest(hex.EncodeToString(digest[:]))
+		if err != nil {
+			return BootstrapAttempt{}, ErrInvalidSecuritySpec
+		}
+	}
+	view, err := NewBootstrapAttemptViewV1(
+		invitationID, canonical[0], canonical[1], canonical[2], canonical[3], canonical[4],
+	)
+	if err != nil {
+		return BootstrapAttempt{}, ErrInvalidSecuritySpec
+	}
+	digest, err := NewProductionCanonicalCodec().HashBootstrapAttempt(view)
+	if err != nil {
+		return BootstrapAttempt{}, ErrInvalidSecuritySpec
+	}
+	return BootstrapAttempt{invitation: invitation, fingerprint: domain.CommandFingerprint(digest)}, nil
+}
+
+func (attempt BootstrapAttempt) InvitationID() domain.InvitationID { return attempt.invitation }
+func (attempt BootstrapAttempt) Fingerprint() domain.CommandFingerprint {
+	return attempt.fingerprint
 }
 
 func InitializeInstallationSecurity(
@@ -4071,17 +4322,18 @@ func RecordBootstrapDenialSecurity(
 	epoch domain.AuthorityEpoch,
 	admission GuardGeneration,
 	invitation domain.AggregateExpectation,
-	attemptFingerprint domain.CommandFingerprint,
+	attempt BootstrapAttempt,
 ) (SecuritySpec, error) {
 	version, hasVersion := invitation.Version()
 	if scope.IsZero() || scope.Kind() != domain.ScopeKindInstallation || authorityID.IsZero() || epoch.IsZero() ||
 		admission.IsZero() || invitation.Target().Kind() != domain.AggregateKindInvitation || !hasVersion ||
-		version.IsZero() || version.Uint64() >= MaxCanonicalInteger || attemptFingerprint.IsZero() {
+		version.IsZero() || version.Uint64() >= MaxCanonicalInteger || attempt.fingerprint.IsZero() ||
+		invitation.Target().ID() != attempt.invitation.String() {
 		return SecuritySpec{}, ErrInvalidSecuritySpec
 	}
 	return SecuritySpec{
 		operation: SecurityRecordBootstrapDenial, scope: scope, authorityID: authorityID, epoch: epoch,
-		admission: admission, invitation: invitation, attempt: attemptFingerprint,
+		admission: admission, invitation: invitation, attempt: attempt.fingerprint,
 	}, nil
 }
 
@@ -4093,13 +4345,109 @@ func RecordCommandDenialSecurity(
 	draft CommandDenialDraft,
 ) (SecuritySpec, error) {
 	if scope.IsZero() || authorityID.IsZero() || epoch.IsZero() || admission.IsZero() ||
-		draft.operation.String() == "" || draft.denialFingerprint.IsZero() {
+		draft.operation.String() == "" || !draft.denialFingerprint.IsZero() {
 		return SecuritySpec{}, ErrInvalidSecuritySpec
 	}
+	fingerprint, err := hashCommandDenial(scope, authorityID, epoch, admission, draft)
+	if err != nil {
+		return SecuritySpec{}, ErrInvalidSecuritySpec
+	}
+	draft.denialFingerprint = fingerprint
 	return SecuritySpec{
 		operation: SecurityRecordCommandDenial, scope: scope, authorityID: authorityID,
 		epoch: epoch, admission: admission, commandDenial: draft,
 	}, nil
+}
+
+type commandDenialSubjectHashViewV1 struct {
+	Kind       DenialSubjectKind    `json:"kind"`
+	Principal  *CanonicalIdentifier `json:"principal_id"`
+	Device     *CanonicalIdentifier `json:"device_id"`
+	SourceHash *CanonicalDigest     `json:"source_digest"`
+}
+
+type commandDenialHashViewV1 struct {
+	ScopeKind          string                         `json:"scope_kind"`
+	ScopeID            CanonicalIdentifier            `json:"scope_id"`
+	AuthorityID        CanonicalIdentifier            `json:"authority_id"`
+	AuthorityEpoch     CanonicalIdentifier            `json:"authority_epoch"`
+	Admission          uint64                         `json:"admission_generation"`
+	Operation          string                         `json:"operation"`
+	OperationMajor     uint16                         `json:"operation_major"`
+	Class              CommandDenialClass             `json:"rejection_class"`
+	Reason             string                         `json:"reason"`
+	RequestFingerprint CanonicalDigest                `json:"request_fingerprint"`
+	Subject            commandDenialSubjectHashViewV1 `json:"subject"`
+	PolicyRevision     *string                        `json:"policy_revision"`
+	CorrelationID      CanonicalIdentifier            `json:"correlation_id"`
+}
+
+func (commandDenialHashViewV1) canonicalView()         {}
+func (commandDenialHashViewV1) commandDenialHashView() {}
+
+func hashCommandDenial(
+	scope domain.AuthorityScope,
+	authorityID domain.AuthorityID,
+	epoch domain.AuthorityEpoch,
+	admission GuardGeneration,
+	draft CommandDenialDraft,
+) (Digest, error) {
+	scopeID, err := NewCanonicalIdentifier(scope.ID())
+	if err != nil {
+		return Digest{}, err
+	}
+	authority, err := NewCanonicalIdentifier(authorityID.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	authorityEpoch, err := NewCanonicalIdentifier(epoch.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	request, err := NewCanonicalDigest(hex.EncodeToString(draft.requestFingerprint[:]))
+	if err != nil {
+		return Digest{}, err
+	}
+	correlation, err := NewCanonicalIdentifier(draft.correlation.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	subject := commandDenialSubjectHashViewV1{Kind: draft.subject.kind}
+	switch draft.subject.kind {
+	case DenialAttributedSubject:
+		principal, principalErr := NewCanonicalIdentifier(draft.subject.principal.String())
+		if principalErr != nil {
+			return Digest{}, principalErr
+		}
+		subject.Principal = &principal
+		if draft.subject.hasDevice {
+			device, deviceErr := NewCanonicalIdentifier(draft.subject.device.String())
+			if deviceErr != nil {
+				return Digest{}, deviceErr
+			}
+			subject.Device = &device
+		}
+	case DenialUnattributedSource:
+		source, sourceErr := CanonicalDigestFromDigest(draft.subject.source)
+		if sourceErr != nil {
+			return Digest{}, sourceErr
+		}
+		subject.SourceHash = &source
+	default:
+		return Digest{}, ErrCanonicalProfile
+	}
+	var policy *string
+	if draft.hasPolicy {
+		value := draft.policy.String()
+		policy = &value
+	}
+	view := commandDenialHashViewV1{
+		ScopeKind: string(scope.Kind()), ScopeID: scopeID, AuthorityID: authority,
+		AuthorityEpoch: authorityEpoch, Admission: admission.Uint64(), Operation: draft.operation.String(),
+		OperationMajor: draft.operationMajor.Uint16(), Class: draft.class, Reason: draft.reason,
+		RequestFingerprint: request, Subject: subject, PolicyRevision: policy, CorrelationID: correlation,
+	}
+	return NewProductionCanonicalCodec().HashCommandDenial(view)
 }
 
 func (spec SecuritySpec) Operation() SecurityOperation          { return spec.operation }

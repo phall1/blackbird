@@ -1204,6 +1204,7 @@ func (result BeginDevicePairingResult) Facts() []IdentityFact {
 
 type PairDeviceInput struct {
 	Authorization            PairingRedemptionAuthorization
+	CurrentAuthorization     IdentityAuthorization
 	Principal                PrincipalState
 	ExpectedPrincipalVersion Version
 	Device                   DeviceState
@@ -1231,6 +1232,14 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 		return PairDeviceResult{}, transitionConflict(ConflictState, "device is not pending pairing")
 	}
 	if !validPairingRedemptionAuthorization(input.Authorization) ||
+		input.CurrentAuthorization.AuthorityID() != input.Authorization.AuthorityID() ||
+		input.CurrentAuthorization.AuthorityEpoch() != input.Authorization.AuthorityEpoch() ||
+		input.CurrentAuthorization.InstallationID() != input.Authorization.InstallationID() ||
+		input.CurrentAuthorization.PrincipalID() != input.Authorization.PrincipalID() ||
+		input.CurrentAuthorization.PolicyRevision() != input.Authorization.PolicyRevision() ||
+		input.CurrentAuthorization.AssuranceClass() != input.Authorization.AssuranceClass() ||
+		!input.CurrentAuthorization.EvaluatedAt().Equal(input.Authorization.EvaluatedAt()) ||
+		!input.CurrentAuthorization.Capabilities().Contains(DevicePairCapability()) ||
 		input.Authorization.InstallationID() != input.Principal.InstallationID() ||
 		input.Authorization.PrincipalID() != input.Principal.ID() ||
 		input.Authorization.DeviceID() != input.Device.ID() ||
@@ -1251,7 +1260,7 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 		return PairDeviceResult{}, transitionConflict(ConflictReference, "device challenge binding is stale or malformed")
 	}
 	if err := checkCeremony(pairing, input.Proof,
-		CeremonyPurposeDevicePairing, input.Authorization.EvaluatedAt()); err != nil {
+		CeremonyPurposeDevicePairing, input.CurrentAuthorization.EvaluatedAt()); err != nil {
 		return PairDeviceResult{}, err
 	}
 	nextVersion, err := nextTransitionVersion(input.Device.Version())

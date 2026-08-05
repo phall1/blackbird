@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -369,10 +370,8 @@ func validateIJSONValue(decoder *json.Decoder, requireObject bool, depth int) er
 			return ErrInvalidEventPayload
 		}
 		number, parseErr := strconv.ParseFloat(value.String(), 64)
-		if parseErr != nil || math.IsInf(number, 0) || math.IsNaN(number) {
-			return ErrInvalidEventPayload
-		}
-		if math.Trunc(number) == number && math.Abs(number) > float64(MaxCanonicalInteger) {
+		if parseErr != nil || math.IsInf(number, 0) || math.IsNaN(number) ||
+			number < 0 || math.Trunc(number) != number || number > float64(MaxCanonicalInteger) {
 			return ErrInvalidEventPayload
 		}
 		return nil
@@ -497,7 +496,7 @@ type EventDigestVerifier interface {
 }
 
 func NewEventEnvelope(params EventEnvelopeParams, verifier EventDigestVerifier) (EventEnvelope, error) {
-	if verifier == nil {
+	if verifier == nil || nilEventDigestVerifier(verifier) {
 		return EventEnvelope{}, ErrEventDigestVerification
 	}
 	envelope, err := newUnverifiedEventEnvelope(params)
@@ -508,6 +507,16 @@ func NewEventEnvelope(params EventEnvelopeParams, verifier EventDigestVerifier) 
 		return EventEnvelope{}, fmt.Errorf("%w: %w", ErrEventDigestVerification, err)
 	}
 	return envelope, nil
+}
+
+func nilEventDigestVerifier(verifier EventDigestVerifier) bool {
+	value := reflect.ValueOf(verifier)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func newUnverifiedEventEnvelope(params EventEnvelopeParams) (EventEnvelope, error) {

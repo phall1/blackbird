@@ -693,7 +693,7 @@ func validateCeremonyID(field string, id CeremonyIDDTO) error {
 	if id == "" {
 		return invalid(field, "is required")
 	}
-	if _, err := domain.ParseEventID(string(id)); err != nil {
+	if _, err := domain.ParseCeremonyID(string(id)); err != nil {
 		return invalid(field, "must be nonzero UUIDv7 text")
 	}
 	return nil

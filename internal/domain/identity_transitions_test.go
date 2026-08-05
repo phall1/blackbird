@@ -78,6 +78,27 @@ func testPairingRedemption(
 	return authorization
 }
 
+func testPairingCurrentAuthorization(
+	t *testing.T,
+	authorityID AuthorityID,
+	epoch AuthorityEpoch,
+	installationID InstallationID,
+	principalID PrincipalID,
+	policy PolicyRevision,
+	assurance AssuranceClass,
+	evaluatedAt time.Time,
+) IdentityAuthorization {
+	t.Helper()
+	authorization, err := NewIdentityAuthorization(
+		authorityID, epoch, installationID, principalID,
+		testCapabilities(t, DevicePairCapability()), policy, assurance, evaluatedAt, MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authorization
+}
+
 func testPresentationCredential(t *testing.T, value string) PresentationCredentialBinding {
 	t.Helper()
 	reference, _ := NewCredentialReference("credential-ref:" + value)
@@ -344,6 +365,10 @@ func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
 		Authorization: testPairingRedemption(
 			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(), deviceID,
 			fixture.policy, fixture.assurance, fixture.now, deviceCeremonyID, deviceDigest, deviceKey,
+		),
+		CurrentAuthorization: testPairingCurrentAuthorization(
+			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(),
+			fixture.policy, fixture.assurance, fixture.now,
 		),
 		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
 		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(),
@@ -2172,6 +2197,10 @@ func TestVersionOverflowRejectsIdentityMutationsAtomically(t *testing.T) {
 				t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.workload.ID(), deviceID,
 				fixture.policy, fixture.assurance, fixture.now, ceremonyID, digest, deviceKey,
 			),
+			CurrentAuthorization: testPairingCurrentAuthorization(
+				t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.workload.ID(),
+				fixture.policy, fixture.assurance, fixture.now,
+			),
 			Principal: fixture.workload, ExpectedPrincipalVersion: fixture.workload.Version(),
 			Device: device, ExpectedDeviceVersion: maximum, ExpectedTrustRevision: maximum, Proof: proof,
 		})
@@ -2243,6 +2272,10 @@ func TestBeginAndPairDeviceSuccessFacts(t *testing.T) {
 		Authorization: testPairingRedemption(
 			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(), deviceID,
 			fixture.policy, fixture.assurance, fixture.now, ceremonyID, digest, key,
+		),
+		CurrentAuthorization: testPairingCurrentAuthorization(
+			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(),
+			fixture.policy, fixture.assurance, fixture.now,
 		),
 		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
 		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(),
@@ -2341,6 +2374,10 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(), deviceID,
 			fixture.policy, fixture.assurance, fixture.now, ceremonyID, digest, device.PublicKeyReference(),
 		),
+		CurrentAuthorization: testPairingCurrentAuthorization(
+			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(),
+			fixture.policy, fixture.assurance, fixture.now,
+		),
 		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
 		Device: device, ExpectedDeviceVersion: device.Version(),
 		ExpectedTrustRevision: device.TrustRevision(), Proof: proof,
@@ -2362,6 +2399,15 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 		}, ErrForbidden},
 		{"missing redemption authorization", func(input *PairDeviceInput) {
 			input.Authorization = PairingRedemptionAuthorization{}
+		}, ErrForbidden},
+		{"stale authority epoch", func(input *PairDeviceInput) {
+			input.CurrentAuthorization.epoch, _ = ParseAuthorityEpoch(identityUUID(166))
+		}, ErrForbidden},
+		{"stale policy revision", func(input *PairDeviceInput) {
+			input.CurrentAuthorization.policy, _ = NewPolicyRevision("newer-policy")
+		}, ErrForbidden},
+		{"historical verifier evaluation", func(input *PairDeviceInput) {
+			input.CurrentAuthorization.evaluatedAt = input.Authorization.EvaluatedAt().Add(time.Second)
 		}, ErrForbidden},
 		{"wrong authority installation", func(input *PairDeviceInput) {
 			input.Authorization.installationID, _ = ParseInstallationID(identityUUID(164))

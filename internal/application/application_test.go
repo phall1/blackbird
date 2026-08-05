@@ -27,6 +27,7 @@ type bootstrapFixture struct {
 	correlation   domain.CorrelationID
 	invitation    domain.InstallationInvitationState
 	input         domain.BootstrapInstallationInput
+	attempt       BootstrapAttempt
 	result        domain.BootstrapInstallationResult
 	spec          CommandSpec
 	context       CommandContext
@@ -129,6 +130,14 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	attempt, err := NewBootstrapAttempt(
+		invitationID, proof.TranscriptFingerprint(), proof.ClientNonceDigest(), proof.ServerNonceDigest(),
+		domain.FingerprintCommand([]byte("bootstrap channel binding")),
+		domain.FingerprintCommand([]byte("presented bootstrap proof")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	generationAuthorization, _ := domain.SameBootstrapGeneration(generation)
 	input := domain.BootstrapInstallationInput{
 		Invitation: invitation, ExpectedInvitationVersion: invitation.Version(),
@@ -136,7 +145,7 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 		PrincipalID: principalID, PrincipalDisplayName: principalName,
 		DeviceID: deviceID, DeviceDisplayName: deviceName, DevicePublicKey: deviceKey,
 		OwnerGrantID: grantID, OwnerGrantCapabilities: capabilities, Proof: proof,
-		AttemptFingerprint: domain.FingerprintCommand([]byte("valid-attempt")), EvaluatedAt: now.Add(time.Minute),
+		AttemptFingerprint: attempt.Fingerprint(), EvaluatedAt: now.Add(time.Minute),
 	}
 	result, err := domain.BootstrapInstallation(input)
 	if err != nil {
@@ -189,9 +198,7 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 		t.Fatal(err)
 	}
 	invitationState, _ := NewIdentityState(invitation)
-	digestBytes := [32]byte{1}
-	guardDigest, _ := domain.NewAuthorizationDigest(digestBytes)
-	evidence, _ := NewAppliedGuardEvidence(guardPlan, guardPlan.Evidence(), guardDigest)
+	evidence, _ := NewAppliedGuardEvidence(guardPlan, guardPlan.Evidence())
 	commandTime, _ := PersistedCommandAuthorityTime(now.Add(time.Minute))
 	commandContext, err := NewCommandContext(spec, commandTime, []IdentityState{invitationState}, AdmitReceipt(), evidence)
 	if err != nil {
@@ -220,7 +227,7 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 	return bootstrapFixture{
 		now: now, scope: scope, authority: authorityID, epoch: epoch, command: commandID,
 		receipt: receiptID, correlation: correlationID, invitation: invitation,
-		input: input, result: result, spec: spec, context: commandContext, commit: commit, decision: decision,
+		input: input, attempt: attempt, result: result, spec: spec, context: commandContext, commit: commit, decision: decision,
 		resultRecord: resultEnvelope, capsuleSigner: capsuleSigner,
 	}
 }
@@ -663,6 +670,20 @@ func TestActorAttributionIsAnIndivisiblePair(t *testing.T) {
 	}
 }
 
+func TestSealedInterfacesRejectTypedNilAndMutableFactPointers(t *testing.T) {
+	t.Parallel()
+	var signer *testCapsuleSigner
+	if _, err := PrepareRecoveryCapsulePlan(signer); !errors.Is(err, ErrInvalidCommandSpec) {
+		t.Fatalf("typed-nil signer error=%v", err)
+	}
+	fixture := buildBootstrapFixture(t)
+	fact := fixture.result.Facts()[0].(domain.InstallationBootstrappedFact)
+	eventID := fixture.spec.ExpectedFacts()[0].EventID()
+	if _, err := NewFactIntent(eventID, &fact); !errors.Is(err, ErrInvalidCommandDecision) {
+		t.Fatalf("mutable fact pointer error=%v", err)
+	}
+}
+
 func TestCommandContextRejectsUndeclaredState(t *testing.T) {
 	t.Parallel()
 	fixture := buildBootstrapFixture(t)
@@ -994,7 +1015,7 @@ func TestSecurityDenialIsCommittedDataNotCallbackError(t *testing.T) {
 	generation, _ := NewGuardGeneration(1)
 	spec, err := RecordBootstrapDenialSecurity(
 		fixture.scope, fixture.authority, fixture.epoch, generation,
-		invitationTarget, invalidInput.AttemptFingerprint,
+		invitationTarget, fixture.attempt,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1067,6 +1088,93 @@ func TestSecuritySpecificationVariantsAreClosed(t *testing.T) {
 	}
 }
 
+func TestProductionCanonicalFingerprintsAreDerivedAndMutationSensitive(t *testing.T) {
+	t.Parallel()
+	fixture := buildBootstrapFixture(t)
+
+	baselineEvidence, err := NewAppliedGuardEvidence(fixture.spec.Guards(), fixture.spec.Guards().Evidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedPlan := fixture.spec.Guards()
+	changedPlan.admissionGeneration, _ = NewGuardGeneration(changedPlan.admissionGeneration.Uint64() + 1)
+	changedEvidence, err := NewAppliedGuardEvidence(changedPlan, changedPlan.Evidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baselineEvidence.Digest() == changedEvidence.Digest() {
+		t.Fatal("admission generation mutation did not change authorization digest")
+	}
+
+	major, _ := NewOperationMajor(1)
+	subject, _ := UnattributedDenialSource(DigestBytes([]byte("canonical source")))
+	baselineDraft, err := NewCommandDenialDraft(
+		fixture.spec.Operation(), major, DenialAuthentication, "credential_rejected",
+		fixture.spec.RequestFingerprint(), subject, nil, fixture.correlation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineSpec, err := RecordCommandDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch,
+		fixture.spec.Guards().AdmissionGeneration(), baselineDraft,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedDraft := baselineDraft
+	changedDraft.reason = "credential_stale"
+	changedSpec, err := RecordCommandDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch,
+		fixture.spec.Guards().AdmissionGeneration(), changedDraft,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineDenial, _ := baselineSpec.CommandDenial()
+	changedDenial, _ := changedSpec.CommandDenial()
+	if baselineDenial.DenialFingerprint() == changedDenial.DenialFingerprint() {
+		t.Fatal("safe denial reason mutation did not change denial fingerprint")
+	}
+	forgedDraft := baselineDraft
+	forgedDraft.denialFingerprint = DigestBytes([]byte("caller supplied denial fingerprint"))
+	if _, err = RecordCommandDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch,
+		fixture.spec.Guards().AdmissionGeneration(), forgedDraft,
+	); !errors.Is(err, ErrInvalidSecuritySpec) {
+		t.Fatalf("accepted caller-supplied denial fingerprint: %v", err)
+	}
+
+	proof := fixture.input.Proof
+	changedAttempt, err := NewBootstrapAttempt(
+		fixture.invitation.ID(), proof.TranscriptFingerprint(), proof.ClientNonceDigest(),
+		proof.ServerNonceDigest(), domain.FingerprintCommand([]byte("different channel binding")),
+		domain.FingerprintCommand([]byte("presented bootstrap proof")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture.attempt.Fingerprint() == changedAttempt.Fingerprint() {
+		t.Fatal("channel-binding mutation did not change bootstrap attempt fingerprint")
+	}
+	otherInvitation, _ := domain.ParseInvitationID(applicationUUID(141))
+	wrongInvitationAttempt, err := NewBootstrapAttempt(
+		otherInvitation, proof.TranscriptFingerprint(), proof.ClientNonceDigest(), proof.ServerNonceDigest(),
+		domain.FingerprintCommand([]byte("bootstrap channel binding")),
+		domain.FingerprintCommand([]byte("presented bootstrap proof")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectation, _ := domain.ExpectAggregateVersion(fixture.invitation.ID(), fixture.invitation.Version())
+	if _, err = RecordBootstrapDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch,
+		fixture.spec.Guards().AdmissionGeneration(), expectation, wrongInvitationAttempt,
+	); !errors.Is(err, ErrInvalidSecuritySpec) {
+		t.Fatalf("accepted bootstrap fingerprint for another invitation: %v", err)
+	}
+}
+
 func TestOrdinaryDenialAuditIsSeparateBoundedAndFailClosed(t *testing.T) {
 	t.Parallel()
 	fixture := buildBootstrapFixture(t)
@@ -1074,8 +1182,7 @@ func TestOrdinaryDenialAuditIsSeparateBoundedAndFailClosed(t *testing.T) {
 	subject, _ := UnattributedDenialSource(DigestBytes([]byte("keyed channel source")))
 	draft, err := NewCommandDenialDraft(
 		fixture.spec.Operation(), major, DenialAuthentication, "credential_rejected",
-		fixture.spec.RequestFingerprint(), DigestBytes([]byte("canonical denial draft")),
-		subject, nil, fixture.correlation,
+		fixture.spec.RequestFingerprint(), subject, nil, fixture.correlation,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1569,7 +1676,7 @@ func buildOperationDomainPath(t *testing.T) operationDomainPath {
 		t.Fatal(err)
 	}
 	paired, err := domain.PairDevice(domain.PairDeviceInput{
-		Authorization: pairingAuth, Principal: fixture.result.Principal(),
+		Authorization: pairingAuth, CurrentAuthorization: ownerAuth, Principal: fixture.result.Principal(),
 		ExpectedPrincipalVersion: fixture.result.Principal().Version(), Device: pairingBegan.Device(),
 		ExpectedDeviceVersion: pairingBegan.Device().Version(),
 		ExpectedTrustRevision: pairingBegan.Device().TrustRevision(), Proof: pairingProof,
@@ -2057,8 +2164,12 @@ func TestVersionedCommitRejectsResultComputedFromAlternateLockedState(t *testing
 		path.authority, path.epoch, path.installation, locked.PrincipalID(), locked.ID(),
 		path.policy, path.assurance, path.now, challenge.ID(), challenge.ProofDigest(), credential,
 	)
+	currentAuthorization, _ := domain.NewIdentityAuthorization(
+		path.authority, path.epoch, path.installation, locked.PrincipalID(), path.ownerCaps,
+		path.policy, path.assurance, path.now, domain.MaxActorSessionLifetime,
+	)
 	laundered, err := domain.PairDevice(domain.PairDeviceInput{
-		Authorization: authorization, Principal: path.bootstrap.Principal(),
+		Authorization: authorization, CurrentAuthorization: currentAuthorization, Principal: path.bootstrap.Principal(),
 		ExpectedPrincipalVersion: path.bootstrap.Principal().Version(), Device: alternate,
 		ExpectedDeviceVersion: alternate.Version(), ExpectedTrustRevision: alternate.TrustRevision(), Proof: proof,
 	})
@@ -2160,9 +2271,7 @@ func completeOperationPipeline(
 	if err != nil {
 		t.Fatalf("command spec: %v", err)
 	}
-	guardDigestBytes := [32]byte{byte(index + 1), 99}
-	guardDigest, _ := domain.NewAuthorizationDigest(guardDigestBytes)
-	appliedEvidence, err := NewAppliedGuardEvidence(guardPlan, guardPlan.Evidence(), guardDigest)
+	appliedEvidence, err := NewAppliedGuardEvidence(guardPlan, guardPlan.Evidence())
 	if err != nil {
 		t.Fatal(err)
 	}

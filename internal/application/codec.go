@@ -107,6 +107,14 @@ type AuditEntryHashView interface {
 	auditEntryHashView()
 }
 
+// IdentityFactPayloadView is the closed payload catalog for the eleven W0
+// identity facts. Implementations are package-sealed so arbitrary JSON cannot
+// become journal payload material.
+type IdentityFactPayloadView interface {
+	CanonicalView
+	identityFactPayloadView()
+}
+
 // canonicalScalar marks reviewed scalar wrappers whose private state is
 // exposed only through a validating JSON marshaler.
 type canonicalScalar interface{ canonicalScalar() }
@@ -354,6 +362,337 @@ func (ProductionCanonicalCodec) ValidateCanonicalBytes(canonical []byte, maxByte
 		return fmt.Errorf("%w: input is not RFC 8785 canonical", ErrCanonicalEncoding)
 	}
 	return nil
+}
+
+type canonicalEventPayload struct{ canonical []byte }
+
+func (canonicalEventPayload) canonicalScalar() {}
+func (payload canonicalEventPayload) MarshalJSON() ([]byte, error) {
+	if len(payload.canonical) == 0 {
+		return nil, ErrCanonicalProfile
+	}
+	return append([]byte(nil), payload.canonical...), nil
+}
+
+type identityPayloadInstallationBootstrapped struct {
+	InstallationID        CanonicalIdentifier `json:"installation_id"`
+	InvitationID          CanonicalIdentifier `json:"invitation_id"`
+	PrincipalID           CanonicalIdentifier `json:"principal_id"`
+	DeviceID              CanonicalIdentifier `json:"device_id"`
+	GrantID               CanonicalIdentifier `json:"grant_id"`
+	TranscriptFingerprint CanonicalDigest     `json:"transcript_fingerprint"`
+}
+type identityPayloadPrincipalRegistered struct {
+	PrincipalID        CanonicalIdentifier `json:"principal_id"`
+	Kind               string              `json:"kind"`
+	DisplayName        string              `json:"display_name"`
+	PublicKeyReference string              `json:"public_key_reference"`
+}
+type identityPayloadDevicePairingBegan struct {
+	DeviceID           CanonicalIdentifier `json:"device_id"`
+	PrincipalID        CanonicalIdentifier `json:"principal_id"`
+	CeremonyID         CanonicalIdentifier `json:"ceremony_id"`
+	DisplayName        string              `json:"display_name"`
+	PublicKeyReference string              `json:"public_key_reference"`
+}
+type identityPayloadDevicePaired struct {
+	DeviceID                        CanonicalIdentifier `json:"device_id"`
+	PrincipalID                     CanonicalIdentifier `json:"principal_id"`
+	DisplayName                     string              `json:"display_name"`
+	TranscriptFingerprint           CanonicalDigest     `json:"transcript_fingerprint"`
+	TrustRevision                   uint64              `json:"trust_revision"`
+	CredentialAlgorithm             string              `json:"credential_algorithm"`
+	PublicKeyReference              string              `json:"public_key_reference"`
+	SPKIFingerprint                 CanonicalDigest     `json:"spki_fingerprint"`
+	CredentialTranscriptFingerprint CanonicalDigest     `json:"credential_transcript_fingerprint"`
+}
+type identityPayloadWorkspaceCreated struct {
+	WorkspaceID      CanonicalIdentifier `json:"workspace_id"`
+	AuthorityID      CanonicalIdentifier `json:"authority_id"`
+	AuthorityEpoch   CanonicalIdentifier `json:"authority_epoch"`
+	Alias            string              `json:"alias"`
+	DiscoveryLocator string              `json:"discovery_locator"`
+	PolicyRevision   string              `json:"policy_revision"`
+}
+type identityPayloadWorkspaceMemberInvited struct {
+	MembershipID CanonicalIdentifier `json:"membership_id"`
+	WorkspaceID  CanonicalIdentifier `json:"workspace_id"`
+	PrincipalID  CanonicalIdentifier `json:"principal_id"`
+	CeremonyID   CanonicalIdentifier `json:"ceremony_id"`
+	Capabilities []string            `json:"capabilities"`
+}
+type identityPayloadWorkspaceMembershipAccepted struct {
+	MembershipID CanonicalIdentifier `json:"membership_id"`
+	WorkspaceID  CanonicalIdentifier `json:"workspace_id"`
+	PrincipalID  CanonicalIdentifier `json:"principal_id"`
+}
+type identityPayloadActorCreated struct {
+	ActorID     CanonicalIdentifier `json:"actor_id"`
+	WorkspaceID CanonicalIdentifier `json:"workspace_id"`
+	Kind        string              `json:"kind"`
+	DisplayName string              `json:"display_name"`
+}
+type identityPayloadActorDelegationProposed struct {
+	DelegationID CanonicalIdentifier `json:"delegation_id"`
+	WorkspaceID  CanonicalIdentifier `json:"workspace_id"`
+	PrincipalID  CanonicalIdentifier `json:"principal_id"`
+	ActorID      CanonicalIdentifier `json:"actor_id"`
+	CeremonyID   CanonicalIdentifier `json:"ceremony_id"`
+}
+type identityPayloadActorDelegationActivated struct {
+	DelegationID           CanonicalIdentifier `json:"delegation_id"`
+	PrincipalID            CanonicalIdentifier `json:"principal_id"`
+	ActorID                CanonicalIdentifier `json:"actor_id"`
+	SessionStartCeremonyID CanonicalIdentifier `json:"session_start_ceremony_id"`
+}
+type identityPayloadActorSessionStarted struct {
+	SessionID                       CanonicalIdentifier `json:"session_id"`
+	ClientInstanceID                CanonicalIdentifier `json:"client_instance_id"`
+	ClientName                      string              `json:"client_name"`
+	ClientVersion                   string              `json:"client_version"`
+	BindingDigest                   CanonicalDigest     `json:"binding_digest"`
+	Capabilities                    []string            `json:"capabilities"`
+	PresentationCredentialReference string              `json:"presentation_credential_reference"`
+	PresentationCredentialDigest    CanonicalDigest     `json:"presentation_credential_digest"`
+	PresentationCredentialAudience  string              `json:"presentation_credential_audience"`
+	PresentationCredentialVersion   uint16              `json:"presentation_credential_version"`
+}
+
+func (identityPayloadInstallationBootstrapped) canonicalView()              {}
+func (identityPayloadInstallationBootstrapped) identityFactPayloadView()    {}
+func (identityPayloadPrincipalRegistered) canonicalView()                   {}
+func (identityPayloadPrincipalRegistered) identityFactPayloadView()         {}
+func (identityPayloadDevicePairingBegan) canonicalView()                    {}
+func (identityPayloadDevicePairingBegan) identityFactPayloadView()          {}
+func (identityPayloadDevicePaired) canonicalView()                          {}
+func (identityPayloadDevicePaired) identityFactPayloadView()                {}
+func (identityPayloadWorkspaceCreated) canonicalView()                      {}
+func (identityPayloadWorkspaceCreated) identityFactPayloadView()            {}
+func (identityPayloadWorkspaceMemberInvited) canonicalView()                {}
+func (identityPayloadWorkspaceMemberInvited) identityFactPayloadView()      {}
+func (identityPayloadWorkspaceMembershipAccepted) canonicalView()           {}
+func (identityPayloadWorkspaceMembershipAccepted) identityFactPayloadView() {}
+func (identityPayloadActorCreated) canonicalView()                          {}
+func (identityPayloadActorCreated) identityFactPayloadView()                {}
+func (identityPayloadActorDelegationProposed) canonicalView()               {}
+func (identityPayloadActorDelegationProposed) identityFactPayloadView()     {}
+func (identityPayloadActorDelegationActivated) canonicalView()              {}
+func (identityPayloadActorDelegationActivated) identityFactPayloadView()    {}
+func (identityPayloadActorSessionStarted) canonicalView()                   {}
+func (identityPayloadActorSessionStarted) identityFactPayloadView()         {}
+
+func canonicalFactID(text string) (CanonicalIdentifier, error) {
+	identifier, err := NewCanonicalIdentifier(text)
+	if err != nil {
+		return CanonicalIdentifier{}, ErrCanonicalProfile
+	}
+	return identifier, nil
+}
+
+func canonicalFactDigest(bytes [sha256.Size]byte) (CanonicalDigest, error) {
+	return NewCanonicalDigest(hex.EncodeToString(bytes[:]))
+}
+
+func capabilityStrings(set domain.CapabilitySet) []string {
+	values := set.Values()
+	result := make([]string, len(values))
+	for index, value := range values {
+		result[index] = value.String()
+	}
+	return result
+}
+
+// MaterializeIdentityFactPayload materializes the only payload forms accepted
+// by the W0 journal. The returned domain payload contains exact typed JCS bytes.
+func (codec ProductionCanonicalCodec) MaterializeIdentityFactPayload(
+	fact domain.IdentityFact,
+) (domain.EventPayload, error) {
+	view, err := identityFactPayloadView(fact)
+	if err != nil {
+		return domain.EventPayload{}, err
+	}
+	canonical, err := encodeCanonical(view, domain.MaxEventPayloadBytes)
+	if err != nil {
+		return domain.EventPayload{}, err
+	}
+	payload, err := domain.NewEventPayload(canonical)
+	if err != nil {
+		return domain.EventPayload{}, fmt.Errorf("%w: materialize identity fact payload: %v", ErrCanonicalProfile, err)
+	}
+	return payload, nil
+}
+
+func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView, error) {
+	if fact == nil || fact.Origin().IsZero() || fact.Origin().Version().Uint64() > MaxCanonicalInteger {
+		return nil, ErrCanonicalProfile
+	}
+	id := func(text string) CanonicalIdentifier {
+		value, _ := canonicalFactID(text)
+		return value
+	}
+	digest := func(value [sha256.Size]byte) CanonicalDigest {
+		result, _ := canonicalFactDigest(value)
+		return result
+	}
+	switch value := fact.(type) {
+	case domain.InstallationBootstrappedFact:
+		return identityPayloadInstallationBootstrapped{
+			InstallationID: id(value.InstallationID().String()), InvitationID: id(value.InvitationID().String()),
+			PrincipalID: id(value.PrincipalID().String()), DeviceID: id(value.DeviceID().String()),
+			GrantID: id(value.GrantID().String()), TranscriptFingerprint: digest([sha256.Size]byte(value.TranscriptFingerprint())),
+		}, nil
+	case domain.PrincipalRegisteredFact:
+		return identityPayloadPrincipalRegistered{
+			PrincipalID: id(value.PrincipalID().String()), Kind: string(value.PrincipalKind()),
+			DisplayName: value.DisplayName().String(), PublicKeyReference: value.PublicKeyReference().String(),
+		}, nil
+	case domain.DevicePairingBeganFact:
+		return identityPayloadDevicePairingBegan{
+			DeviceID: id(value.DeviceID().String()), PrincipalID: id(value.PrincipalID().String()),
+			CeremonyID: id(value.CeremonyID().String()), DisplayName: value.DisplayName().String(),
+			PublicKeyReference: value.PublicKeyReference().String(),
+		}, nil
+	case domain.DevicePairedFact:
+		credential := value.CredentialBinding()
+		return identityPayloadDevicePaired{
+			DeviceID: id(value.DeviceID().String()), PrincipalID: id(value.PrincipalID().String()),
+			DisplayName: value.DisplayName().String(), TranscriptFingerprint: digest([sha256.Size]byte(value.TranscriptFingerprint())),
+			TrustRevision: value.TrustRevision().Uint64(), CredentialAlgorithm: credential.Algorithm(),
+			PublicKeyReference:              credential.PublicKeyReference().String(),
+			SPKIFingerprint:                 digest(credential.SPKIFingerprint().Bytes()),
+			CredentialTranscriptFingerprint: digest([sha256.Size]byte(credential.TranscriptFingerprint())),
+		}, nil
+	case domain.WorkspaceCreatedFact:
+		return identityPayloadWorkspaceCreated{
+			WorkspaceID: id(value.WorkspaceID().String()), AuthorityID: id(value.AuthorityID().String()),
+			AuthorityEpoch: id(value.AuthorityEpoch().String()), Alias: value.Alias().String(),
+			DiscoveryLocator: value.DiscoveryLocator().String(), PolicyRevision: value.PolicyRevision().String(),
+		}, nil
+	case domain.WorkspaceMemberInvitedFact:
+		return identityPayloadWorkspaceMemberInvited{
+			MembershipID: id(value.MembershipID().String()), WorkspaceID: id(value.WorkspaceID().String()),
+			PrincipalID: id(value.PrincipalID().String()), CeremonyID: id(value.CeremonyID().String()),
+			Capabilities: capabilityStrings(value.Capabilities()),
+		}, nil
+	case domain.WorkspaceMembershipAcceptedFact:
+		return identityPayloadWorkspaceMembershipAccepted{
+			MembershipID: id(value.MembershipID().String()), WorkspaceID: id(value.WorkspaceID().String()),
+			PrincipalID: id(value.PrincipalID().String()),
+		}, nil
+	case domain.ActorCreatedFact:
+		return identityPayloadActorCreated{
+			ActorID: id(value.ActorID().String()), WorkspaceID: id(value.WorkspaceID().String()),
+			Kind: string(value.ActorKind()), DisplayName: value.Profile().DisplayName().String(),
+		}, nil
+	case domain.ActorDelegationProposedFact:
+		return identityPayloadActorDelegationProposed{
+			DelegationID: id(value.DelegationID().String()), WorkspaceID: id(value.WorkspaceID().String()),
+			PrincipalID: id(value.PrincipalID().String()), ActorID: id(value.ActorID().String()),
+			CeremonyID: id(value.CeremonyID().String()),
+		}, nil
+	case domain.ActorDelegationActivatedFact:
+		return identityPayloadActorDelegationActivated{
+			DelegationID: id(value.DelegationID().String()), PrincipalID: id(value.PrincipalID().String()),
+			ActorID: id(value.ActorID().String()), SessionStartCeremonyID: id(value.SessionStartCeremonyID().String()),
+		}, nil
+	case domain.ActorSessionStartedFact:
+		bindingDigest, digestErr := hashSessionFactBinding(value)
+		if digestErr != nil {
+			return nil, digestErr
+		}
+		presentation := value.PresentationCredential()
+		return identityPayloadActorSessionStarted{
+			SessionID: id(value.SessionID().String()), ClientInstanceID: id(value.ClientInstanceID().String()),
+			ClientName: value.ClientMetadata().Name(), ClientVersion: value.ClientMetadata().Version(),
+			BindingDigest: bindingDigest, Capabilities: capabilityStrings(value.Capabilities()),
+			PresentationCredentialReference: presentation.Reference().String(),
+			PresentationCredentialDigest:    digest(presentation.Digest().Bytes()),
+			PresentationCredentialAudience:  presentation.Audience().String(),
+			PresentationCredentialVersion:   presentation.Version(),
+		}, nil
+	default:
+		return nil, ErrCanonicalProfile
+	}
+}
+
+func hashSessionFactBinding(fact domain.ActorSessionStartedFact) (CanonicalDigest, error) {
+	binding := fact.Binding()
+	presentation := fact.PresentationCredential()
+	identifier := func(text string) (CanonicalIdentifier, error) { return NewCanonicalIdentifier(text) }
+	client, err := identifier(fact.ClientInstanceID().String())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	authority, err := identifier(binding.AuthorityID().String())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	epoch, err := identifier(binding.AuthorityEpoch().String())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	workspace, err := identifier(binding.WorkspaceID().String())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	principal, err := identifier(binding.PrincipalID().String())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	actor, err := identifier(binding.ActorID().String())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	membership, err := receiptResource(binding.MembershipRevision())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	delegation, err := receiptResource(binding.DelegationRevision())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	grants, err := receiptGrantResources(binding.GrantRevisions())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	issuedAt, err := NewCanonicalInstant(binding.IssuedAt())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	expiry, err := NewCanonicalInstant(binding.AbsoluteExpiry())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	presentationDigest, err := canonicalFactDigest(presentation.Digest().Bytes())
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	view := receiptSessionBindingHashView{
+		Schema: "blackbird.session-binding/v1", ClientInstanceID: client, AuthorityID: authority,
+		AuthorityEpoch: epoch, WorkspaceID: workspace, PrincipalID: principal, ActorID: actor,
+		Membership: membership, Delegation: delegation, Grants: grants,
+		PolicyRevision: binding.PolicyRevision().String(), AssuranceClass: binding.AssuranceClass().String(),
+		IssuedAt: issuedAt, AbsoluteExpiry: expiry,
+		PresentationCredentialReference: presentation.Reference().String(),
+		PresentationCredentialDigest:    presentationDigest,
+		PresentationCredentialAudience:  presentation.Audience().String(),
+		PresentationCredentialVersion:   presentation.Version(),
+	}
+	if device, present := binding.DeviceRevision(); present {
+		deviceWire, deviceErr := receiptResource(device)
+		trust, hasTrust := binding.DeviceTrustRevision()
+		if deviceErr != nil || !hasTrust || !trust.Valid() {
+			return CanonicalDigest{}, ErrCanonicalProfile
+		}
+		trustValue := trust.Uint64()
+		view.Device = &deviceWire
+		view.DeviceTrustRevision = &trustValue
+	}
+	canonical, err := encodeCanonical(view, MaxRecoveryCapsuleBytes)
+	if err != nil {
+		return CanonicalDigest{}, err
+	}
+	return NewCanonicalDigest(digestCanonical(sessionBindingDomain, canonical).String())
 }
 
 func decodeCanonicalDocument(canonical []byte, maxBytes int, target any) error {
@@ -659,10 +998,11 @@ func validateJSONNumber(text string) error {
 	if err != nil || math.IsInf(number, 0) || math.IsNaN(number) {
 		return ErrCanonicalNumber
 	}
-	// A token without a decimal point or exponent expresses an integer and
-	// must remain exact in every I-JSON consumer. Exponent/fraction tokens are
-	// RFC 8785 binary64 values; production typed views forbid float fields.
-	if !strings.ContainsAny(text, ".eE") && math.Abs(number) > float64(MaxCanonicalInteger) {
+	// Integer semantics are constrained regardless of source spelling. An
+	// exponent or decimal point must not bypass the interoperable range.
+	// Fractional RFC 8785 vectors remain valid; production typed views forbid
+	// floating fields in Blackbird hash schemas.
+	if math.Trunc(number) == number && (number < 0 || number > float64(MaxCanonicalInteger)) {
 		return ErrCanonicalNumber
 	}
 	return nil
@@ -797,6 +1137,42 @@ func (digest *CanonicalDigest) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	*digest = validated
+	return nil
+}
+
+// CanonicalAuditHash is lowercase SHA-256 text and, unlike CanonicalDigest,
+// permits the all-zero audit-genesis predecessor required by ADR-0007.
+type CanonicalAuditHash struct{ text string }
+
+func NewCanonicalAuditHash(text string) (CanonicalAuditHash, error) {
+	if len(text) != hex.EncodedLen(sha256.Size) || strings.ToLower(text) != text {
+		return CanonicalAuditHash{}, ErrCanonicalIdentifier
+	}
+	decoded, err := hex.DecodeString(text)
+	if err != nil || len(decoded) != sha256.Size {
+		return CanonicalAuditHash{}, ErrCanonicalIdentifier
+	}
+	return CanonicalAuditHash{text: text}, nil
+}
+func (hash CanonicalAuditHash) String() string { return hash.text }
+func (CanonicalAuditHash) canonicalScalar()    {}
+func (hash CanonicalAuditHash) MarshalJSON() ([]byte, error) {
+	validated, err := NewCanonicalAuditHash(hash.text)
+	if err != nil || validated != hash {
+		return nil, ErrCanonicalIdentifier
+	}
+	return json.Marshal(hash.text)
+}
+func (hash *CanonicalAuditHash) UnmarshalJSON(raw []byte) error {
+	var text string
+	if hash == nil || json.Unmarshal(raw, &text) != nil {
+		return ErrCanonicalIdentifier
+	}
+	validated, err := NewCanonicalAuditHash(text)
+	if err != nil {
+		return err
+	}
+	*hash = validated
 	return nil
 }
 
@@ -1650,6 +2026,396 @@ func (W0ReceiptResultView) canonicalView()         {}
 func (W0ReceiptResultView) canonicalScalar()       {}
 func (W0ReceiptResultView) receiptResultHashView() {}
 
+type eventSemanticViewV1 struct {
+	Schema              string                `json:"schema"`
+	EventID             CanonicalIdentifier   `json:"event_id"`
+	CommandID           CanonicalIdentifier   `json:"command_id"`
+	AuthorityID         CanonicalIdentifier   `json:"authority_id"`
+	AuthorityEpoch      CanonicalIdentifier   `json:"authority_epoch"`
+	ScopeKind           string                `json:"scope_kind"`
+	ScopeID             CanonicalIdentifier   `json:"scope_id"`
+	StreamSequence      uint64                `json:"stream_sequence"`
+	AggregateKind       string                `json:"aggregate_kind"`
+	AggregateID         CanonicalIdentifier   `json:"aggregate_id"`
+	AggregateVersion    uint64                `json:"aggregate_version"`
+	EventIndex          uint16                `json:"event_index"`
+	EventType           string                `json:"event_type"`
+	EventSchema         uint16                `json:"event_schema"`
+	Payload             canonicalEventPayload `json:"payload"`
+	PrincipalID         CanonicalIdentifier   `json:"principal_id"`
+	ActorSessionID      *CanonicalIdentifier  `json:"actor_session_id"`
+	AuthorizationDigest CanonicalDigest       `json:"authorization_digest"`
+	CommandReceiptID    CanonicalIdentifier   `json:"command_receipt_id"`
+	CausationEventID    *CanonicalIdentifier  `json:"causation_event_id"`
+	CorrelationID       CanonicalIdentifier   `json:"correlation_id"`
+	RecordedAt          CanonicalInstant      `json:"recorded_at"`
+}
+
+func (eventSemanticViewV1) canonicalView()         {}
+func (eventSemanticViewV1) eventSemanticHashView() {}
+
+func eventSemanticView(event domain.EventEnvelope) (eventSemanticViewV1, error) {
+	if !event.StreamPosition().Valid() || event.Aggregate().IsZero() {
+		return eventSemanticViewV1{}, ErrCanonicalProfile
+	}
+	payload := event.Payload().Bytes()
+	if err := validateIdentityPayload(event.EventType(), payload); err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	id := func(text string) (CanonicalIdentifier, error) { return NewCanonicalIdentifier(text) }
+	eventID, err := id(event.EventID().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	commandID, err := id(event.CommandID().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	authorityID, err := id(event.AuthorityID().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	epoch, err := id(event.AuthorityEpoch().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	scopeID, err := id(event.Scope().ID())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	aggregateID, err := id(event.Aggregate().ID())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	principalID, err := id(event.PrincipalID().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	receiptID, err := id(event.CommandReceiptID().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	correlationID, err := id(event.CorrelationID().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	authorization, err := NewCanonicalDigest(event.AuthorizationDigest().String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	recordedAt, err := NewCanonicalInstant(event.RecordedAt())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	view := eventSemanticViewV1{
+		Schema: domain.EventEnvelopeSchema, EventID: eventID, CommandID: commandID,
+		AuthorityID: authorityID, AuthorityEpoch: epoch, ScopeKind: string(event.Scope().Kind()), ScopeID: scopeID,
+		StreamSequence: event.StreamPosition().Uint64(), AggregateKind: string(event.Aggregate().Kind()),
+		AggregateID: aggregateID, AggregateVersion: event.Aggregate().Version().Uint64(), EventIndex: event.EventIndex(),
+		EventType: string(event.EventType()), EventSchema: event.SchemaVersion().Uint16(),
+		Payload: canonicalEventPayload{canonical: append([]byte(nil), payload...)}, PrincipalID: principalID,
+		AuthorizationDigest: authorization, CommandReceiptID: receiptID, CorrelationID: correlationID, RecordedAt: recordedAt,
+	}
+	if actor, present := event.ActorSessionID(); present {
+		value, idErr := id(actor.String())
+		if idErr != nil {
+			return eventSemanticViewV1{}, idErr
+		}
+		view.ActorSessionID = &value
+	}
+	if cause, present := event.CausationEventID(); present {
+		value, idErr := id(cause.String())
+		if idErr != nil {
+			return eventSemanticViewV1{}, idErr
+		}
+		view.CausationEventID = &value
+	}
+	return view, nil
+}
+
+func validateIdentityPayload(eventType domain.EventType, canonical []byte) error {
+	var target any
+	switch eventType {
+	case domain.EventTypeInstallationBootstrapped:
+		target = &identityPayloadInstallationBootstrapped{}
+	case domain.EventTypePrincipalRegistered:
+		target = &identityPayloadPrincipalRegistered{}
+	case domain.EventTypeDevicePairingBegan:
+		target = &identityPayloadDevicePairingBegan{}
+	case domain.EventTypeDevicePaired:
+		target = &identityPayloadDevicePaired{}
+	case domain.EventTypeWorkspaceCreated:
+		target = &identityPayloadWorkspaceCreated{}
+	case domain.EventTypeWorkspaceMemberInvited:
+		target = &identityPayloadWorkspaceMemberInvited{}
+	case domain.EventTypeWorkspaceMembershipAccepted:
+		target = &identityPayloadWorkspaceMembershipAccepted{}
+	case domain.EventTypeActorCreated:
+		target = &identityPayloadActorCreated{}
+	case domain.EventTypeActorDelegationProposed:
+		target = &identityPayloadActorDelegationProposed{}
+	case domain.EventTypeActorDelegationActivated:
+		target = &identityPayloadActorDelegationActivated{}
+	case domain.EventTypeActorSessionStarted:
+		target = &identityPayloadActorSessionStarted{}
+	default:
+		return ErrCanonicalProfile
+	}
+	if err := decodeCanonicalDocument(canonical, domain.MaxEventPayloadBytes, target); err != nil {
+		return err
+	}
+	if !validIdentityPayload(target) {
+		return ErrCanonicalProfile
+	}
+	view, ok := target.(CanonicalView)
+	if !ok {
+		return ErrCanonicalProfile
+	}
+	reencoded, err := encodeCanonical(view, domain.MaxEventPayloadBytes)
+	if err != nil || !bytes.Equal(reencoded, canonical) {
+		return fmt.Errorf("%w: retained identity payload mismatch", ErrCanonicalEncoding)
+	}
+	return nil
+}
+
+func validIdentityPayload(payload any) bool {
+	validIDs := func(values ...CanonicalIdentifier) bool {
+		for _, value := range values {
+			if value.String() == "" {
+				return false
+			}
+		}
+		return true
+	}
+	validCapabilities := func(values []string) bool {
+		if len(values) == 0 || len(values) > domain.MaxIdentityCapabilities {
+			return false
+		}
+		capabilities := make([]domain.Capability, len(values))
+		for index, value := range values {
+			capability, err := domain.NewCapability(value)
+			if err != nil {
+				return false
+			}
+			capabilities[index] = capability
+		}
+		set, err := domain.NewCapabilitySet(capabilities...)
+		if err != nil {
+			return false
+		}
+		canonical := capabilityStrings(set)
+		return reflect.DeepEqual(values, canonical)
+	}
+	switch value := payload.(type) {
+	case *identityPayloadInstallationBootstrapped:
+		return validIDs(value.InstallationID, value.InvitationID, value.PrincipalID, value.DeviceID, value.GrantID) &&
+			value.TranscriptFingerprint.String() != ""
+	case *identityPayloadPrincipalRegistered:
+		return validIDs(value.PrincipalID) && validOpaqueText(value.Kind, 64) &&
+			validOpaqueText(value.DisplayName, 256) && validOpaqueText(value.PublicKeyReference, 4096)
+	case *identityPayloadDevicePairingBegan:
+		return validIDs(value.DeviceID, value.PrincipalID, value.CeremonyID) &&
+			validOpaqueText(value.DisplayName, 256) && validOpaqueText(value.PublicKeyReference, 4096)
+	case *identityPayloadDevicePaired:
+		return validIDs(value.DeviceID, value.PrincipalID) && validOpaqueText(value.DisplayName, 256) &&
+			value.TranscriptFingerprint.String() != "" && value.TrustRevision > 0 && value.TrustRevision <= MaxCanonicalInteger &&
+			value.CredentialAlgorithm == domain.DeviceCredentialAlgorithm && validOpaqueText(value.PublicKeyReference, 4096) &&
+			value.SPKIFingerprint.String() != "" && value.CredentialTranscriptFingerprint.String() != ""
+	case *identityPayloadWorkspaceCreated:
+		return validIDs(value.WorkspaceID, value.AuthorityID, value.AuthorityEpoch) && validOpaqueText(value.Alias, 256) &&
+			validOpaqueText(value.DiscoveryLocator, 4096) && validOpaqueText(value.PolicyRevision, 256)
+	case *identityPayloadWorkspaceMemberInvited:
+		return validIDs(value.MembershipID, value.WorkspaceID, value.PrincipalID, value.CeremonyID) &&
+			validCapabilities(value.Capabilities)
+	case *identityPayloadWorkspaceMembershipAccepted:
+		return validIDs(value.MembershipID, value.WorkspaceID, value.PrincipalID)
+	case *identityPayloadActorCreated:
+		return validIDs(value.ActorID, value.WorkspaceID) && validOpaqueText(value.Kind, 64) &&
+			validOpaqueText(value.DisplayName, 256)
+	case *identityPayloadActorDelegationProposed:
+		return validIDs(value.DelegationID, value.WorkspaceID, value.PrincipalID, value.ActorID, value.CeremonyID)
+	case *identityPayloadActorDelegationActivated:
+		return validIDs(value.DelegationID, value.PrincipalID, value.ActorID, value.SessionStartCeremonyID)
+	case *identityPayloadActorSessionStarted:
+		return validIDs(value.SessionID, value.ClientInstanceID) && validOpaqueText(value.ClientName, 128) &&
+			validOpaqueText(value.ClientVersion, 128) && value.BindingDigest.String() != "" &&
+			validCapabilities(value.Capabilities) && validOpaqueText(value.PresentationCredentialReference, 256) &&
+			value.PresentationCredentialDigest.String() != "" && validOpaqueText(value.PresentationCredentialAudience, 256) &&
+			value.PresentationCredentialVersion == domain.PresentationCredentialVersion
+	default:
+		return false
+	}
+}
+
+// VerifyEventDigests implements domain.EventDigestVerifier and is the reviewed
+// production boundary used by domain.NewEventEnvelope.
+func (codec ProductionCanonicalCodec) VerifyEventDigests(event domain.EventEnvelope) error {
+	view, err := eventSemanticView(event)
+	if err != nil {
+		return err
+	}
+	eventDigest, err := codec.HashEvent(view)
+	if err != nil || eventDigest != event.EventDigest() {
+		return fmt.Errorf("%w: event semantic digest mismatch", ErrCanonicalEncoding)
+	}
+	streamDigest, err := codec.ChainStreamDigest(event.PreviousStreamDigest(), event.StreamPosition(), eventDigest)
+	if err != nil || streamDigest != event.StreamDigest() {
+		return fmt.Errorf("%w: event stream digest mismatch", ErrCanonicalEncoding)
+	}
+	return nil
+}
+
+// MaterializeEvent is the production construction path: callers supply the
+// allocated journal fields, while the reviewed codec is installed as the
+// mandatory verifier and cannot be substituted at this boundary.
+func (codec ProductionCanonicalCodec) MaterializeEvent(
+	params domain.EventEnvelopeParams,
+) (domain.EventEnvelope, error) {
+	return domain.NewEventEnvelope(params, codec)
+}
+
+const auditEntrySchemaV1 = "blackbird.audit.entry/v1"
+
+type auditDetailWire struct {
+	Kind   string  `json:"kind"`
+	Reason *string `json:"reason"`
+}
+
+type AuditEntryParams struct {
+	ChainScopeID      domain.AuthorityScope
+	Sequence          uint64
+	AuthorityID       domain.AuthorityID
+	AuthorityEpoch    domain.AuthorityEpoch
+	RecordedAt        time.Time
+	Intent            AuditIntent
+	PreviousEntryHash Digest
+}
+
+type AuditEntryViewV1 struct {
+	Schema             string              `json:"schema"`
+	ChainScopeID       CanonicalIdentifier `json:"chain_scope_id"`
+	AuditSequence      uint64              `json:"audit_sequence"`
+	AuthorityID        CanonicalIdentifier `json:"authority_id"`
+	AuthorityEpoch     CanonicalIdentifier `json:"authority_epoch"`
+	RecordedAt         CanonicalInstant    `json:"recorded_at"`
+	Action             string              `json:"action"`
+	Outcome            string              `json:"outcome"`
+	CommandFingerprint CanonicalDigest     `json:"command_fingerprint"`
+	Detail             auditDetailWire     `json:"detail"`
+	PreviousEntryHash  CanonicalAuditHash  `json:"previous_entry_hash"`
+}
+
+func (AuditEntryViewV1) canonicalView()      {}
+func (AuditEntryViewV1) auditEntryHashView() {}
+
+func NewAuditEntryViewV1(params AuditEntryParams) (AuditEntryViewV1, error) {
+	if params.ChainScopeID.IsZero() || params.Sequence == 0 || params.Sequence > MaxCanonicalInteger ||
+		params.AuthorityID.IsZero() || params.AuthorityEpoch.IsZero() || params.RecordedAt.IsZero() ||
+		params.Intent.Operation().String() == "" || params.Intent.Fingerprint().IsZero() {
+		return AuditEntryViewV1{}, ErrCanonicalProfile
+	}
+	scopeID, err := NewCanonicalIdentifier(params.ChainScopeID.ID())
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	authorityID, err := NewCanonicalIdentifier(params.AuthorityID.String())
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	epoch, err := NewCanonicalIdentifier(params.AuthorityEpoch.String())
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	recordedAt, err := NewCanonicalInstant(params.RecordedAt)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	fingerprint, err := commandFingerprintText(params.Intent.Fingerprint())
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	previousBytes := params.PreviousEntryHash[:]
+	previous, err := NewCanonicalAuditHash(hex.EncodeToString(previousBytes))
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	detail := params.Intent.Detail()
+	wireDetail := auditDetailWire{Kind: string(detail.Kind())}
+	if reason := detail.SafeReason(); reason != "" {
+		reasonCopy := reason
+		wireDetail.Reason = &reasonCopy
+	}
+	view := AuditEntryViewV1{
+		Schema: auditEntrySchemaV1, ChainScopeID: scopeID, AuditSequence: params.Sequence,
+		AuthorityID: authorityID, AuthorityEpoch: epoch, RecordedAt: recordedAt,
+		Action: params.Intent.Operation().String(), Outcome: string(params.Intent.Outcome()),
+		CommandFingerprint: fingerprint, Detail: wireDetail, PreviousEntryHash: previous,
+	}
+	if !view.valid() {
+		return AuditEntryViewV1{}, ErrCanonicalProfile
+	}
+	return view, nil
+}
+
+func (view AuditEntryViewV1) valid() bool {
+	if view.Schema != auditEntrySchemaV1 || view.ChainScopeID.String() == "" || view.AuditSequence == 0 ||
+		view.AuditSequence > MaxCanonicalInteger || view.AuthorityID.String() == "" || view.AuthorityEpoch.String() == "" ||
+		view.RecordedAt.String() == "" || !validOpaqueText(view.Action, 256) || view.CommandFingerprint.String() == "" ||
+		view.PreviousEntryHash.String() == "" {
+		return false
+	}
+	switch AuditOutcome(view.Outcome) {
+	case AuditCommandApplied:
+		return view.Detail.Kind == string(AuditDetailCommandApplied) && view.Detail.Reason == nil
+	case AuditSecurityMutation:
+		return view.Detail.Kind == string(AuditDetailSecurityMutation) && view.Detail.Reason != nil && validToken(*view.Detail.Reason, 64)
+	case AuditSecurityDenied:
+		return view.Detail.Kind == string(AuditDetailSecurityDenied) && view.Detail.Reason != nil && validToken(*view.Detail.Reason, 64)
+	default:
+		return false
+	}
+}
+
+func (view AuditEntryViewV1) MarshalJSON() ([]byte, error) {
+	if !view.valid() {
+		return nil, ErrCanonicalProfile
+	}
+	type wire AuditEntryViewV1
+	return json.Marshal(wire(view))
+}
+
+func (codec ProductionCanonicalCodec) EncodeAuditEntry(view AuditEntryViewV1) ([]byte, Digest, error) {
+	canonical, err := encodeCanonical(view, MaxAuditMetadataBytes)
+	if err != nil {
+		return nil, Digest{}, err
+	}
+	return canonical, digestCanonical(auditEntryDomain, canonical), nil
+}
+
+// VerifyAuditEntry validates the closed retained schema, predecessor binding,
+// canonical representation, and domain-separated entry hash.
+func (codec ProductionCanonicalCodec) VerifyAuditEntry(previous Digest, canonicalEntry []byte, expected Digest) error {
+	if expected.IsZero() {
+		return ErrCanonicalProfile
+	}
+	var view AuditEntryViewV1
+	if err := decodeCanonicalDocument(canonicalEntry, MaxAuditMetadataBytes, &view); err != nil {
+		return err
+	}
+	if !view.valid() {
+		return ErrCanonicalProfile
+	}
+	previousText := hex.EncodeToString(previous[:])
+	if view.PreviousEntryHash.String() != previousText {
+		return fmt.Errorf("%w: audit predecessor mismatch", ErrCanonicalProfile)
+	}
+	canonical, digest, err := codec.EncodeAuditEntry(view)
+	if err != nil || digest != expected || !bytes.Equal(canonical, canonicalEntry) {
+		return fmt.Errorf("%w: retained audit entry mismatch", ErrCanonicalEncoding)
+	}
+	return nil
+}
+
 func (codec ProductionCanonicalCodec) HashCommand(view CommandHashView) (domain.CommandFingerprint, error) {
 	digest, err := codec.hashTyped(commandFingerprintDomain, view, MaxCanonicalJSONBytes)
 	return domain.CommandFingerprint(digest), err
@@ -1684,7 +2450,7 @@ func (codec ProductionCanonicalCodec) HashBootstrapAttempt(view BootstrapAttempt
 }
 
 func (codec ProductionCanonicalCodec) HashEvent(view EventSemanticHashView) (domain.EventDigest, error) {
-	digest, err := codec.hashTyped(eventDigestDomain, view, domain.MaxEventPayloadBytes)
+	digest, err := codec.hashTyped(eventDigestDomain, view, MaxCanonicalJSONBytes)
 	if err != nil {
 		return domain.EventDigest{}, err
 	}
