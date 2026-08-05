@@ -612,6 +612,22 @@ func bindCommandAuditContext(
 	return audit
 }
 
+// BindCommandAuditContext attaches trusted transport and authentication
+// evidence to a command audit seed before the transaction finalizes it.
+func BindCommandAuditContext(
+	audit AuditIntent,
+	spec CommandSpec,
+	request AuditRequestContext,
+	authentication AuthenticationEvidence,
+) (AuditIntent, error) {
+	if spec.commandID.IsZero() || audit.operation != spec.operation || audit.fingerprint != spec.requestFingerprint ||
+		!validAuditRequestContext(request) || !validAuditProvenanceEvidence(authentication.provenance) ||
+		authentication.principal != spec.authorship.principal {
+		return AuditIntent{}, ErrInvalidApplicationContract
+	}
+	return bindCommandAuditContext(audit, CommandRequest{Spec: spec, Audit: request}, authentication), nil
+}
+
 func transactionMatchesDecision(
 	spec CommandSpec,
 	execution CommandTransactionExecution,
