@@ -78,6 +78,9 @@ func (store *Store) ExecuteCommand(
 	if errors.Is(err, errCommandNoCommit) {
 		return execution, nil
 	}
+	if errors.Is(err, ErrCommitIndeterminate) {
+		return application.IndeterminateCommandTransactionExecution(spec)
+	}
 	if err != nil {
 		return application.CommandTransactionExecution{}, err
 	}

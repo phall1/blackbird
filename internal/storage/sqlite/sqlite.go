@@ -42,6 +42,7 @@ var (
 	ErrInvalidConfiguration = errors.New("invalid SQLite configuration")
 	ErrEngineMismatch       = errors.New("SQLite engine mismatch")
 	ErrSchemaMismatch       = errors.New("SQLite schema mismatch")
+	ErrCommitIndeterminate  = errors.New("SQLite commit outcome is indeterminate")
 	errSecurityNoCommit     = errors.New("SQLite security transaction requires rollback")
 
 	//go:embed migrations/*.sql
@@ -565,6 +566,9 @@ func (store *Store) withImmediatePriority(
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		if ctx.Err() == nil && !errors.Is(err, sql.ErrTxDone) {
+			return fmt.Errorf("%w: %v", ErrCommitIndeterminate, err)
+		}
 		return fmt.Errorf("commit SQLite transaction: %w", err)
 	}
 	return nil
