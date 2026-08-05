@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -262,25 +263,37 @@ func filesystemName(stat syscall.Statfs_t) string {
 }
 
 func verifyAdvisoryLocks(path string) error {
-	first, err := os.OpenFile(path, os.O_RDWR, 0)
+	probe := func() (*sql.DB, error) {
+		db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: time.Millisecond}))
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		return db, nil
+	}
+	first, err := probe()
 	if err != nil {
-		return fmt.Errorf("%w: open database lock probe: %v", ErrFilesystemQualification, err)
+		return fmt.Errorf("%w: open SQLite lock probe: %v", ErrFilesystemQualification, err)
 	}
 	defer func() { _ = first.Close() }()
-	second, err := os.OpenFile(path, os.O_RDWR, 0)
+	second, err := probe()
 	if err != nil {
-		return fmt.Errorf("%w: open competing database lock probe: %v", ErrFilesystemQualification, err)
+		return fmt.Errorf("%w: open competing SQLite lock probe: %v", ErrFilesystemQualification, err)
 	}
 	defer func() { _ = second.Close() }()
-	if err := syscall.Flock(int(first.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return fmt.Errorf("%w: acquire advisory lock: %v", ErrFilesystemQualification, err)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultBusyTimeout)
+	defer cancel()
+	firstTx, err := first.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("%w: begin SQLite lock probe: %v", ErrFilesystemQualification, err)
 	}
-	defer func() { _ = syscall.Flock(int(first.Fd()), syscall.LOCK_UN) }()
-	if err := syscall.Flock(int(second.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-		_ = syscall.Flock(int(second.Fd()), syscall.LOCK_UN)
-		return fmt.Errorf("%w: filesystem did not enforce competing advisory locks", ErrFilesystemQualification)
-	} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-		return fmt.Errorf("%w: competing advisory lock returned %v", ErrFilesystemQualification, err)
+	defer func() { _ = firstTx.Rollback() }()
+	if competing, err := second.BeginTx(ctx, nil); err == nil {
+		_ = competing.Rollback()
+		return fmt.Errorf("%w: filesystem did not enforce competing SQLite write locks", ErrFilesystemQualification)
+	} else if ctx.Err() != nil {
+		return fmt.Errorf("%w: competing SQLite lock probe exceeded its bound: %v", ErrFilesystemQualification, ctx.Err())
 	}
 	return nil
 }
