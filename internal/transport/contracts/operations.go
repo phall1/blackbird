@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -92,75 +93,150 @@ func (provenance AuthenticationAuditProvenance) FederationEnvelopeID() (string, 
 // It deliberately retains no plaintext secret, access token, assertion, or
 // reusable bearer credential.
 type AuthenticationEvidence struct {
-	principal          domain.PrincipalID
-	device             domain.DeviceID
-	hasDevice          bool
-	actorSession       domain.ActorSessionID
-	hasActorSession    bool
-	credentialRevision domain.Version
-	grantsRevision     domain.Version
-	channelBinding     ChannelBindingDigest
-	audience           AuthenticationAudience
-	auditProvenance    AuthenticationAuditProvenance
+	principal                domain.PrincipalID
+	principalRevision        domain.Version
+	device                   domain.DeviceID
+	deviceRevision           domain.Version
+	deviceTrustRevision      domain.Version
+	deviceRevocationRevision domain.Version
+	credentialFingerprint    domain.CredentialDigest
+	hasDevice                bool
+	actorSession             domain.ActorSessionID
+	actorSessionRevision     domain.Version
+	hasActorSession          bool
+	grantRevisions           []domain.AggregateRef
+	channelBinding           ChannelBindingDigest
+	audience                 AuthenticationAudience
+	auditProvenance          AuthenticationAuditProvenance
+	verifiedAt               time.Time
 }
 
-func NewAuthenticationEvidence(
-	principal domain.PrincipalID,
-	device *domain.DeviceID,
-	actorSession *domain.ActorSessionID,
-	credentialRevision domain.Version,
-	grantsRevision domain.Version,
-	channelBinding ChannelBindingDigest,
-	audience AuthenticationAudience,
-	auditProvenance AuthenticationAuditProvenance,
-) (AuthenticationEvidence, error) {
-	if principal.IsZero() || !credentialRevision.Valid() || !grantsRevision.Valid() ||
-		channelBinding.String() == "" || audience.String() == "" || auditProvenance.sourceAuthority.IsZero() {
+type AuthenticationEvidenceParams struct {
+	PrincipalID              domain.PrincipalID
+	PrincipalRevision        domain.Version
+	DeviceID                 *domain.DeviceID
+	DeviceRevision           domain.Version
+	DeviceTrustRevision      domain.Version
+	DeviceRevocationRevision domain.Version
+	CredentialFingerprint    domain.CredentialDigest
+	ActorSessionID           *domain.ActorSessionID
+	ActorSessionRevision     domain.Version
+	GrantRevisions           []domain.AggregateRef
+	ChannelBinding           ChannelBindingDigest
+	Audience                 AuthenticationAudience
+	AuditProvenance          AuthenticationAuditProvenance
+	VerifiedAt               time.Time
+}
+
+func NewAuthenticationEvidence(params AuthenticationEvidenceParams) (AuthenticationEvidence, error) {
+	if params.PrincipalID.IsZero() || !params.PrincipalRevision.Valid() ||
+		params.ChannelBinding.String() == "" || params.Audience.String() == "" ||
+		params.AuditProvenance.sourceAuthority.IsZero() || params.VerifiedAt.IsZero() {
 		return AuthenticationEvidence{}, invalid("authentication_evidence", "contains invalid trusted evidence")
 	}
 	evidence := AuthenticationEvidence{
-		principal: principal, credentialRevision: credentialRevision, grantsRevision: grantsRevision,
-		channelBinding: channelBinding, audience: audience, auditProvenance: auditProvenance,
+		principal: params.PrincipalID, principalRevision: params.PrincipalRevision,
+		channelBinding: params.ChannelBinding, audience: params.Audience,
+		auditProvenance: params.AuditProvenance, verifiedAt: params.VerifiedAt.UTC(),
 	}
-	if device != nil {
-		if device.IsZero() {
-			return AuthenticationEvidence{}, invalid("device_id", "must be a nonzero UUIDv7 device ID when present")
+	if params.DeviceID != nil {
+		if params.DeviceID.IsZero() || !params.DeviceRevision.Valid() || !params.DeviceTrustRevision.Valid() ||
+			!params.DeviceRevocationRevision.Valid() || params.CredentialFingerprint.IsZero() {
+			return AuthenticationEvidence{}, invalid("device_evidence", "must contain a complete valid device evidence tuple")
 		}
-		evidence.device, evidence.hasDevice = *device, true
+		evidence.device, evidence.hasDevice = *params.DeviceID, true
+		evidence.deviceRevision, evidence.deviceTrustRevision = params.DeviceRevision, params.DeviceTrustRevision
+		evidence.deviceRevocationRevision = params.DeviceRevocationRevision
+		evidence.credentialFingerprint = params.CredentialFingerprint
+	} else if !params.DeviceRevision.IsZero() || !params.DeviceTrustRevision.IsZero() ||
+		!params.DeviceRevocationRevision.IsZero() || !params.CredentialFingerprint.IsZero() {
+		return AuthenticationEvidence{}, invalid("device_evidence", "must be absent when device_id is absent")
 	}
-	if actorSession != nil {
-		if actorSession.IsZero() {
-			return AuthenticationEvidence{}, invalid("actor_session_id", "must be a nonzero UUIDv7 actor-session ID when present")
+	if params.ActorSessionID != nil {
+		if params.ActorSessionID.IsZero() || !params.ActorSessionRevision.Valid() {
+			return AuthenticationEvidence{}, invalid("actor_session_evidence", "must contain a complete valid actor-session evidence tuple")
 		}
-		evidence.actorSession, evidence.hasActorSession = *actorSession, true
+		evidence.actorSession, evidence.actorSessionRevision, evidence.hasActorSession =
+			*params.ActorSessionID, params.ActorSessionRevision, true
+	} else if !params.ActorSessionRevision.IsZero() {
+		return AuthenticationEvidence{}, invalid("actor_session_evidence", "must be absent when actor_session_id is absent")
+	}
+	evidence.grantRevisions = append([]domain.AggregateRef(nil), params.GrantRevisions...)
+	slices.SortFunc(evidence.grantRevisions, func(left, right domain.AggregateRef) int {
+		return strings.Compare(left.Target().String(), right.Target().String())
+	})
+	for index, revision := range evidence.grantRevisions {
+		if revision.IsZero() || revision.Kind() != domain.AggregateKindGrant ||
+			(index > 0 && evidence.grantRevisions[index-1].Target() == revision.Target()) {
+			return AuthenticationEvidence{}, invalid("grant_revisions", "must contain unique valid grant aggregate revisions")
+		}
 	}
 	return evidence, nil
 }
 
 func (evidence AuthenticationEvidence) Valid() bool {
-	if evidence.principal.IsZero() || !evidence.credentialRevision.Valid() || !evidence.grantsRevision.Valid() ||
-		evidence.channelBinding.String() == "" || evidence.audience.String() == "" || evidence.auditProvenance.sourceAuthority.IsZero() {
+	params := AuthenticationEvidenceParams{
+		PrincipalID: evidence.principal, PrincipalRevision: evidence.principalRevision,
+		DeviceRevision: evidence.deviceRevision, DeviceTrustRevision: evidence.deviceTrustRevision,
+		DeviceRevocationRevision: evidence.deviceRevocationRevision, CredentialFingerprint: evidence.credentialFingerprint,
+		ActorSessionRevision: evidence.actorSessionRevision, GrantRevisions: evidence.grantRevisions,
+		ChannelBinding: evidence.channelBinding, Audience: evidence.audience,
+		AuditProvenance: evidence.auditProvenance, VerifiedAt: evidence.verifiedAt,
+	}
+	if evidence.hasDevice {
+		device := evidence.device
+		params.DeviceID = &device
+	} else if !evidence.device.IsZero() {
 		return false
 	}
-	return (!evidence.hasDevice && evidence.device.IsZero() || evidence.hasDevice && !evidence.device.IsZero()) &&
-		(!evidence.hasActorSession && evidence.actorSession.IsZero() || evidence.hasActorSession && !evidence.actorSession.IsZero()) &&
-		(!evidence.auditProvenance.hasEnvelope && evidence.auditProvenance.federationEnvelope == "" ||
-			evidence.auditProvenance.hasEnvelope && validCanonicalIdentifier(evidence.auditProvenance.federationEnvelope, maxFederationEnvelopeIDBytes))
+	if evidence.hasActorSession {
+		session := evidence.actorSession
+		params.ActorSessionID = &session
+	} else if !evidence.actorSession.IsZero() {
+		return false
+	}
+	validated, err := NewAuthenticationEvidence(params)
+	return err == nil && slices.Equal(validated.grantRevisions, evidence.grantRevisions)
 }
 
 func (evidence AuthenticationEvidence) PrincipalID() domain.PrincipalID { return evidence.principal }
+
+func (evidence AuthenticationEvidence) PrincipalRevision() domain.Version {
+	return evidence.principalRevision
+}
+
 func (evidence AuthenticationEvidence) DeviceID() (domain.DeviceID, bool) {
 	return evidence.device, evidence.hasDevice
 }
+
+func (evidence AuthenticationEvidence) DeviceRevision() (domain.Version, bool) {
+	return evidence.deviceRevision, evidence.hasDevice
+}
+
+func (evidence AuthenticationEvidence) DeviceTrustRevision() (domain.Version, bool) {
+	return evidence.deviceTrustRevision, evidence.hasDevice
+}
+
+func (evidence AuthenticationEvidence) DeviceRevocationRevision() (domain.Version, bool) {
+	return evidence.deviceRevocationRevision, evidence.hasDevice
+}
+
+func (evidence AuthenticationEvidence) CredentialFingerprint() (domain.CredentialDigest, bool) {
+	return evidence.credentialFingerprint, evidence.hasDevice
+}
+
 func (evidence AuthenticationEvidence) ActorSessionID() (domain.ActorSessionID, bool) {
 	return evidence.actorSession, evidence.hasActorSession
 }
-func (evidence AuthenticationEvidence) CredentialRevision() domain.Version {
-	return evidence.credentialRevision
+
+func (evidence AuthenticationEvidence) ActorSessionRevision() (domain.Version, bool) {
+	return evidence.actorSessionRevision, evidence.hasActorSession
 }
-func (evidence AuthenticationEvidence) GrantsRevision() domain.Version {
-	return evidence.grantsRevision
+
+func (evidence AuthenticationEvidence) GrantRevisions() []domain.AggregateRef {
+	return append([]domain.AggregateRef(nil), evidence.grantRevisions...)
 }
+
 func (evidence AuthenticationEvidence) ChannelBindingDigest() ChannelBindingDigest {
 	return evidence.channelBinding
 }
@@ -168,6 +244,8 @@ func (evidence AuthenticationEvidence) Audience() AuthenticationAudience { retur
 func (evidence AuthenticationEvidence) AuditProvenance() AuthenticationAuditProvenance {
 	return evidence.auditProvenance
 }
+
+func (evidence AuthenticationEvidence) VerifiedAt() time.Time { return evidence.verifiedAt }
 
 func validCanonicalIdentifier(value string, maximum int) bool {
 	if value == "" || len(value) > maximum || strings.ToLower(value) != value {

@@ -2,6 +2,7 @@ package contracts
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -54,23 +55,52 @@ func TestAuthenticationEvidenceIsSealedTypedAndComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAuthenticationAuditProvenance() error = %v", err)
 	}
-	credentialRevision, _ := domain.NewVersion(2)
-	grantsRevision, _ := domain.NewVersion(3)
-	evidence, err := NewAuthenticationEvidence(
-		principal, &device, &session, credentialRevision, grantsRevision, binding, audience, provenance,
-	)
+	principalRevision, _ := domain.NewVersion(2)
+	deviceRevision, _ := domain.NewVersion(3)
+	trustRevision, _ := domain.NewVersion(4)
+	revocationRevision, _ := domain.NewVersion(5)
+	sessionRevision, _ := domain.NewVersion(6)
+	credentialFingerprint, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("public credential identity")))
+	grantOne, _ := domain.NewAggregateRef(mustParseGrantID(t, idGrant), domain.InitialVersion())
+	grantTwo, _ := domain.NewAggregateRef(mustParseGrantID(t, idInvitation), principalRevision)
+	inputGrants := []domain.AggregateRef{grantOne, grantTwo}
+	verifiedAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	evidence, err := NewAuthenticationEvidence(AuthenticationEvidenceParams{
+		PrincipalID: principal, PrincipalRevision: principalRevision,
+		DeviceID: &device, DeviceRevision: deviceRevision, DeviceTrustRevision: trustRevision,
+		DeviceRevocationRevision: revocationRevision, CredentialFingerprint: credentialFingerprint,
+		ActorSessionID: &session, ActorSessionRevision: sessionRevision, GrantRevisions: inputGrants,
+		ChannelBinding: binding, Audience: audience, AuditProvenance: provenance, VerifiedAt: verifiedAt,
+	})
 	if err != nil {
 		t.Fatalf("NewAuthenticationEvidence() error = %v", err)
 	}
+	inputGrants[0] = domain.AggregateRef{}
 	gotDevice, hasDevice := evidence.DeviceID()
+	gotDeviceRevision, hasDeviceRevision := evidence.DeviceRevision()
+	gotTrustRevision, hasTrustRevision := evidence.DeviceTrustRevision()
+	gotRevocationRevision, hasRevocationRevision := evidence.DeviceRevocationRevision()
+	gotFingerprint, hasFingerprint := evidence.CredentialFingerprint()
 	gotSession, hasSession := evidence.ActorSessionID()
+	gotSessionRevision, hasSessionRevision := evidence.ActorSessionRevision()
 	gotEnvelope, hasEnvelope := evidence.AuditProvenance().FederationEnvelopeID()
 	if !evidence.Valid() || evidence.PrincipalID() != principal || !hasDevice || gotDevice != device ||
-		!hasSession || gotSession != session || evidence.CredentialRevision() != credentialRevision ||
-		evidence.GrantsRevision() != grantsRevision || evidence.ChannelBindingDigest() != binding ||
+		evidence.PrincipalRevision() != principalRevision || !hasDeviceRevision || gotDeviceRevision != deviceRevision ||
+		!hasTrustRevision || gotTrustRevision != trustRevision || !hasRevocationRevision || gotRevocationRevision != revocationRevision ||
+		!hasFingerprint || gotFingerprint != credentialFingerprint || !hasSession || gotSession != session ||
+		!hasSessionRevision || gotSessionRevision != sessionRevision || evidence.ChannelBindingDigest() != binding ||
 		evidence.Audience() != audience || evidence.AuditProvenance().SourceAuthorityID() != authority ||
-		!hasEnvelope || gotEnvelope != envelopeID {
+		!hasEnvelope || gotEnvelope != envelopeID || evidence.VerifiedAt() != verifiedAt {
 		t.Fatalf("authentication evidence accessors lost trusted values: %#v", evidence)
+	}
+	wantGrants := []domain.AggregateRef{grantTwo, grantOne}
+	if grants := evidence.GrantRevisions(); !reflect.DeepEqual(grants, wantGrants) {
+		t.Fatalf("GrantRevisions() = %#v, want canonical %#v", grants, wantGrants)
+	} else {
+		grants[0] = domain.AggregateRef{}
+		if !reflect.DeepEqual(evidence.GrantRevisions(), wantGrants) {
+			t.Fatal("GrantRevisions() exposed mutable evidence storage")
+		}
 	}
 	if (AuthenticationEvidence{}).Valid() {
 		t.Fatal("zero AuthenticationEvidence is valid")
@@ -84,6 +114,11 @@ func TestAuthenticationEvidenceConstructorsRejectInvalidValues(t *testing.T) {
 	binding, _ := NewChannelBindingDigest(strings.Repeat("a", 64))
 	audience, _ := NewAuthenticationAudience("blackbird-product-api")
 	provenance, _ := NewAuthenticationAuditProvenance(authority, nil)
+	verifiedAt := time.Now().Add(-time.Minute)
+	valid := AuthenticationEvidenceParams{
+		PrincipalID: principal, PrincipalRevision: domain.InitialVersion(), ChannelBinding: binding,
+		Audience: audience, AuditProvenance: provenance, VerifiedAt: verifiedAt,
+	}
 
 	if _, err := NewChannelBindingDigest(strings.Repeat("A", 64)); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("uppercase channel binding error = %v, want ErrInvalidContract", err)
@@ -97,10 +132,103 @@ func TestAuthenticationEvidenceConstructorsRejectInvalidValues(t *testing.T) {
 	if _, err := NewAuthenticationAuditProvenance(domain.AuthorityID{}, nil); !errors.Is(err, ErrInvalidContract) {
 		t.Fatalf("zero authority error = %v, want ErrInvalidContract", err)
 	}
-	if _, err := NewAuthenticationEvidence(
-		principal, nil, nil, domain.Version{}, domain.InitialVersion(), binding, audience, provenance,
-	); !errors.Is(err, ErrInvalidContract) {
-		t.Fatalf("zero credential revision error = %v, want ErrInvalidContract", err)
+
+	tests := []struct {
+		name string
+		edit func(*AuthenticationEvidenceParams)
+	}{
+		{name: "zero principal", edit: func(params *AuthenticationEvidenceParams) { params.PrincipalID = domain.PrincipalID{} }},
+		{name: "zero principal revision", edit: func(params *AuthenticationEvidenceParams) { params.PrincipalRevision = domain.Version{} }},
+		{name: "zero verified at", edit: func(params *AuthenticationEvidenceParams) { params.VerifiedAt = time.Time{} }},
+		{name: "device facts without device", edit: func(params *AuthenticationEvidenceParams) { params.DeviceRevision = domain.InitialVersion() }},
+		{name: "session revision without session", edit: func(params *AuthenticationEvidenceParams) { params.ActorSessionRevision = domain.InitialVersion() }},
+		{name: "zero grant", edit: func(params *AuthenticationEvidenceParams) { params.GrantRevisions = []domain.AggregateRef{{}} }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			params := valid
+			test.edit(&params)
+			if _, err := NewAuthenticationEvidence(params); !errors.Is(err, ErrInvalidContract) {
+				t.Fatalf("error = %v, want ErrInvalidContract", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticationEvidenceRejectsInconsistentOptionalAndGrantEvidence(t *testing.T) {
+	t.Parallel()
+	principal := mustParsePrincipalID(t, idPrincipal)
+	device := mustParseDeviceID(t, idDevice)
+	session := mustParseActorSessionID(t, idSession)
+	authority := mustParseAuthorityID(t, idAuthority)
+	binding, _ := NewChannelBindingDigest(strings.Repeat("c", 64))
+	audience, _ := NewAuthenticationAudience("blackbird-product-api")
+	provenance, _ := NewAuthenticationAuditProvenance(authority, nil)
+	fingerprint, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("credential fingerprint")))
+	grant, _ := domain.NewAggregateRef(mustParseGrantID(t, idGrant), domain.InitialVersion())
+	crossKind, _ := domain.NewAggregateRef(principal, domain.InitialVersion())
+	base := AuthenticationEvidenceParams{
+		PrincipalID: principal, PrincipalRevision: domain.InitialVersion(), DeviceID: &device,
+		DeviceRevision: domain.InitialVersion(), DeviceTrustRevision: domain.InitialVersion(),
+		DeviceRevocationRevision: domain.InitialVersion(), CredentialFingerprint: fingerprint,
+		ActorSessionID: &session, ActorSessionRevision: domain.InitialVersion(), GrantRevisions: []domain.AggregateRef{grant},
+		ChannelBinding: binding, Audience: audience, AuditProvenance: provenance, VerifiedAt: time.Now().Add(-time.Minute),
+	}
+	tests := []struct {
+		name string
+		edit func(*AuthenticationEvidenceParams)
+	}{
+		{name: "zero device", edit: func(params *AuthenticationEvidenceParams) { params.DeviceID = &domain.DeviceID{} }},
+		{name: "missing device revision", edit: func(params *AuthenticationEvidenceParams) { params.DeviceRevision = domain.Version{} }},
+		{name: "missing trust revision", edit: func(params *AuthenticationEvidenceParams) { params.DeviceTrustRevision = domain.Version{} }},
+		{name: "missing revocation revision", edit: func(params *AuthenticationEvidenceParams) { params.DeviceRevocationRevision = domain.Version{} }},
+		{name: "missing credential fingerprint", edit: func(params *AuthenticationEvidenceParams) { params.CredentialFingerprint = domain.CredentialDigest{} }},
+		{name: "zero actor session", edit: func(params *AuthenticationEvidenceParams) { params.ActorSessionID = &domain.ActorSessionID{} }},
+		{name: "missing actor session revision", edit: func(params *AuthenticationEvidenceParams) { params.ActorSessionRevision = domain.Version{} }},
+		{name: "duplicate grant", edit: func(params *AuthenticationEvidenceParams) {
+			params.GrantRevisions = []domain.AggregateRef{grant, grant}
+		}},
+		{name: "cross-kind grant", edit: func(params *AuthenticationEvidenceParams) { params.GrantRevisions = []domain.AggregateRef{crossKind} }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			params := base
+			test.edit(&params)
+			if _, err := NewAuthenticationEvidence(params); !errors.Is(err, ErrInvalidContract) {
+				t.Fatalf("error = %v, want ErrInvalidContract", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticationEvidenceValidRejectsForgedInternalState(t *testing.T) {
+	t.Parallel()
+	principal := mustParsePrincipalID(t, idPrincipal)
+	authority := mustParseAuthorityID(t, idAuthority)
+	binding, _ := NewChannelBindingDigest(strings.Repeat("d", 64))
+	audience, _ := NewAuthenticationAudience("blackbird-product-api")
+	provenance, _ := NewAuthenticationAuditProvenance(authority, nil)
+	evidence, err := NewAuthenticationEvidence(AuthenticationEvidenceParams{
+		PrincipalID: principal, PrincipalRevision: domain.InitialVersion(), ChannelBinding: binding,
+		Audience: audience, AuditProvenance: provenance, VerifiedAt: time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := evidence
+	forged.hasDevice = true
+	if forged.Valid() {
+		t.Fatal("forged device presence is valid")
+	}
+	forged = evidence
+	forged.hasActorSession = true
+	if forged.Valid() {
+		t.Fatal("forged actor-session presence is valid")
+	}
+	forged = evidence
+	forged.verifiedAt = time.Time{}
+	if forged.Valid() {
+		t.Fatal("forged zero verification timestamp is valid")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/transport/contracts"
@@ -63,9 +64,10 @@ func validAuthenticationEvidence() AuthenticationEvidence {
 	if err != nil {
 		panic(err)
 	}
-	evidence, err := contracts.NewAuthenticationEvidence(
-		principal, nil, nil, domain.InitialVersion(), domain.InitialVersion(), binding, audience, provenance,
-	)
+	evidence, err := contracts.NewAuthenticationEvidence(contracts.AuthenticationEvidenceParams{
+		PrincipalID: principal, PrincipalRevision: domain.InitialVersion(), ChannelBinding: binding,
+		Audience: audience, AuditProvenance: provenance, VerifiedAt: time.Now().Add(-time.Second),
+	})
 	if err != nil {
 		panic(err)
 	}
