@@ -1176,8 +1176,18 @@ func TestReceiptSnapshotRejectsMetadataOutsideSealedResult(t *testing.T) {
 		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleRequired, RecoveryCapsule: draft,
 	}
-	if _, err := NewReceiptSnapshot(valid); err != nil {
+	receipt, err := NewReceiptSnapshot(valid)
+	if err != nil {
 		t.Fatal(err)
+	}
+	execution, err := CommittedCapsulePendingCommandExecution(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, resultCursor, ok := execution.ResultView()
+	if !ok || resultCursor != valid.EventCursor || view.AcceptedAt().IsZero() || len(view.Resources()) != 3 {
+		t.Fatalf("command execution result ok=%t cursor=%q accepted=%s resources=%d", ok,
+			resultCursor.String(), view.AcceptedAt(), len(view.Resources()))
 	}
 	otherAuthority, _ := domain.ParseAuthorityID(applicationUUID(91))
 	otherFingerprint := domain.FingerprintCommand([]byte("different-command"))
@@ -1186,6 +1196,7 @@ func TestReceiptSnapshotRejectsMetadataOutsideSealedResult(t *testing.T) {
 	wrongLast, _ := domain.NewStreamPosition(2)
 	wrongEvents, _ := NewEventRange(first, wrongLast, 2)
 	mutations := []func(*ReceiptSnapshotParams){
+		func(params *ReceiptSnapshotParams) { params.EventCursor = EventCursor{} },
 		func(params *ReceiptSnapshotParams) { params.AuthorityID = otherAuthority },
 		func(params *ReceiptSnapshotParams) { params.RequestFingerprint = otherFingerprint },
 		func(params *ReceiptSnapshotParams) { params.GuardDigest = otherGuard },

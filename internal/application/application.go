@@ -367,15 +367,25 @@ func NewContextCheckpointPage(checkpoint ContextCheckpoint, head EventCursor) (C
 }
 
 func NewContextDeltaPage(deltas []ContextDelta, next, head EventCursor, hasMore bool) (ContextPage, error) {
-	if len(deltas) == 0 || len(deltas) > MaxQueryPageSize || next.IsZero() || head.IsZero() {
+	if len(deltas) == 0 || len(deltas) > MaxQueryPageSize || next.IsZero() || head.IsZero() ||
+		(!hasMore && next != head) {
 		return ContextPage{}, ErrInvalidQuery
 	}
 	cloned := append([]ContextDelta(nil), deltas...)
+	seenEvents := make(map[domain.EventID]struct{}, len(cloned))
+	seenCursors := make(map[EventCursor]struct{}, len(cloned))
 	for index := range cloned {
-		if cloned[index].eventID.IsZero() || cloned[index].after.IsZero() ||
-			(index > 0 && cloned[index-1].after == cloned[index].after) {
+		if cloned[index].eventID.IsZero() || cloned[index].after.IsZero() {
 			return ContextPage{}, ErrInvalidQuery
 		}
+		if _, duplicate := seenEvents[cloned[index].eventID]; duplicate {
+			return ContextPage{}, ErrInvalidQuery
+		}
+		if _, duplicate := seenCursors[cloned[index].after]; duplicate {
+			return ContextPage{}, ErrInvalidQuery
+		}
+		seenEvents[cloned[index].eventID] = struct{}{}
+		seenCursors[cloned[index].after] = struct{}{}
 		cloned[index].value = append([]byte(nil), cloned[index].value...)
 	}
 	if cloned[len(cloned)-1].after != next {
@@ -484,7 +494,8 @@ type EventsPage struct {
 }
 
 func NewEventsPage(session AuthorizedSessionView, after, next, head EventCursor, events []SyncedEvent, hasMore bool) (EventsPage, error) {
-	if session.session.IsZero() || next.IsZero() || head.IsZero() || len(events) > MaxQueryPageSize || (!after.IsZero() && len(events) == 0 && after != next) {
+	if session.session.IsZero() || next.IsZero() || head.IsZero() || len(events) > MaxQueryPageSize ||
+		(!after.IsZero() && len(events) == 0 && after != next) || (!hasMore && next != head) {
 		return EventsPage{}, ErrInvalidQuery
 	}
 	cloned := append([]SyncedEvent(nil), events...)

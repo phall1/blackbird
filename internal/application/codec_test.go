@@ -1309,6 +1309,56 @@ func TestReceiptResultReadViewIsTypedSealedAndImmutable(t *testing.T) {
 	}
 }
 
+func TestReceiptResultReadViewCoversAllW0CommandResults(t *testing.T) {
+	t.Parallel()
+	fixture := newReceiptFixture(t)
+	tests := []struct {
+		operation W0ReceiptOperation
+		resources []domain.AggregateKind
+		events    int
+		ceremony  domain.CeremonyPurpose
+		session   bool
+	}{
+		{ReceiptOperationInstallationBootstrap, []domain.AggregateKind{domain.AggregateKindPrincipal, domain.AggregateKindDevice, domain.AggregateKindGrant}, 3, "", false},
+		{ReceiptOperationPrincipalRegister, []domain.AggregateKind{domain.AggregateKindPrincipal}, 1, "", false},
+		{ReceiptOperationDevicePairingBegin, []domain.AggregateKind{domain.AggregateKindDevice}, 1, domain.CeremonyPurposeDevicePairing, false},
+		{ReceiptOperationDevicePair, []domain.AggregateKind{domain.AggregateKindDevice}, 1, "", false},
+		{ReceiptOperationWorkspaceCreate, []domain.AggregateKind{domain.AggregateKindWorkspace, domain.AggregateKindMembership}, 3, "", false},
+		{ReceiptOperationWorkspaceMemberInvite, []domain.AggregateKind{domain.AggregateKindMembership}, 1, domain.CeremonyPurposeMembershipAcceptance, false},
+		{ReceiptOperationWorkspaceMembershipAccept, []domain.AggregateKind{domain.AggregateKindMembership}, 1, "", false},
+		{ReceiptOperationActorCreate, []domain.AggregateKind{domain.AggregateKindActor}, 1, "", false},
+		{ReceiptOperationActorDelegationPropose, []domain.AggregateKind{domain.AggregateKindActorDelegation}, 1, domain.CeremonyPurposeDelegationActivation, false},
+		{ReceiptOperationActorDelegationActivate, []domain.AggregateKind{domain.AggregateKindActorDelegation}, 1, domain.CeremonyPurposeActorSessionStart, false},
+		{ReceiptOperationActorSessionStart, []domain.AggregateKind{domain.AggregateKindActorSession}, 1, "", true},
+	}
+	codec := NewProductionCanonicalCodec()
+	for _, test := range tests {
+		t.Run(string(test.operation), func(t *testing.T) {
+			params := fixture.paramsFor(t, test.operation, test.resources, test.events, test.ceremony)
+			document, err := codec.EncodeReceiptResult(mustReceiptResultView(t, params))
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, ok := document.ResultView()
+			if !ok || view.Operation() != test.operation || len(view.Resources()) != len(test.resources) ||
+				len(view.EventIDs()) != test.events || len(view.IssuedCeremonies()) != btoi(test.ceremony.Valid()) {
+				t.Fatal("incomplete typed result view")
+			}
+			_, client, presentation, hasSession := view.Session()
+			if hasSession != test.session || hasSession != (!client.IsZero() && !presentation.IsZero()) {
+				t.Fatal("session result view drift")
+			}
+		})
+	}
+}
+
+func btoi(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func mustReceiptResultView(t *testing.T, params W0ReceiptResultParams) W0ReceiptResultView {
 	t.Helper()
 	view, err := NewW0ReceiptResultView(params)
