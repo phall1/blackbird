@@ -47,11 +47,11 @@ func (preparer orchestrationAuthentication) PrepareAuthentication(
 	if err != nil {
 		return AuthenticationDecision{}, err
 	}
-	principal := preparer.principal
-	if principal.IsZero() {
-		principal = requestPrincipal(request)
+	request.provenance = provenance
+	if !preparer.principal.IsZero() {
+		request.principal = preparer.principal
 	}
-	evidence, err := NewAuthenticationEvidence(principal, nil, provenance)
+	evidence, err := NewAuthenticationEvidence(request)
 	if err != nil {
 		return AuthenticationDecision{}, err
 	}
@@ -76,11 +76,6 @@ func (preparer orchestrationRejectedAuthentication) PrepareAuthentication(
 		return AuthenticationDecision{}, err
 	}
 	return RejectedAuthentication(rejection, subject, provenance)
-}
-
-func requestPrincipal(request AuthenticationRequest) domain.PrincipalID {
-	principal, _ := domain.ParsePrincipalID(applicationUUID(5))
-	return principal
 }
 
 func orchestrationAuditContext(t *testing.T) AuditRequestContext {
@@ -341,10 +336,49 @@ type orchestrationPresentations struct {
 
 func (preparer orchestrationPresentations) PreparePresentationCredential(
 	context.Context,
-	CommandOperation,
+	PresentationCredentialRequest,
 ) (domain.PresentationCredentialBinding, error) {
 	preparer.trap.external("presentation")
 	return preparer.binding, nil
+}
+
+type orchestrationDelivery struct{}
+
+func (orchestrationDelivery) DeliverPresentationCredential(context.Context, string, []byte) error {
+	return nil
+}
+
+func orchestrationPreparationRequests(
+	t *testing.T,
+	operation CommandOperation,
+	scope domain.AuthorityScope,
+	principal domain.PrincipalID,
+	principalRevision domain.Version,
+	authority domain.AuthorityID,
+) (AuthenticationRequest, PolicyPreparationRequest) {
+	t.Helper()
+	provenance, err := NewAuditProvenanceEvidence(authority, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audience, err := domain.NewCredentialAudience("blackbird:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authentication, err := NewAuthenticationRequest(AuthenticationRequestParams{
+		Operation: operation, Scope: scope, PrincipalID: principal, PrincipalRevision: principalRevision,
+		ChannelBinding: DigestBytes([]byte("orchestration channel binding")), Audience: audience,
+		AuditProvenance: provenance, VerifiedAt: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, _ := domain.NewPolicyRevision("policy-1")
+	policy, err := NewPolicyPreparationRequest(authentication, revision, DigestBytes([]byte("prepared policy")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authentication, policy
 }
 
 type orchestrationUOWMode uint8
@@ -637,10 +671,20 @@ func orchestrationFixture(t *testing.T, mode orchestrationUOWMode) (
 		t.Fatal(err)
 	}
 	evidence, _ := NewBootstrapProofEvidence([]byte("proof"))
+	authentication, policy := orchestrationPreparationRequests(
+		t, CommandBootstrapInstallation, fixture.scope, fixture.input.PrincipalID,
+		domain.InitialVersion(), fixture.spec.AuthorityID(),
+	)
+	authentication.device, authentication.hasDevice = fixture.input.DeviceID, true
+	authentication.deviceRevision = domain.InitialVersion()
+	authentication.deviceTrustRevision = domain.InitialVersion()
+	authentication.deviceRevokeRevision = domain.InitialVersion()
+	authentication.credentialFingerprint = fixture.input.Proof.DeviceSPKIFingerprint()
+	policy, _ = NewPolicyPreparationRequest(authentication, policy.PolicyRevision(), policy.PolicyDigest())
 	request := BootstrapInstallationRequest{
 		CommandRequest: CommandRequest{Spec: fixture.spec, HashView: view,
-			Authentication: AuthenticationRequest{Operation: CommandBootstrapInstallation, Scope: fixture.scope},
-			Policy:         PolicyPreparationRequest{Operation: CommandBootstrapInstallation, Scope: fixture.scope},
+			Authentication: authentication,
+			Policy:         policy,
 			Audit:          orchestrationAuditContext(t)},
 		ProofEvidence: evidence, GenerationAuthorization: fixture.input.GenerationAuthorization,
 		InvitationID: fixture.input.Invitation.ID(), PrincipalID: fixture.input.PrincipalID,
@@ -910,8 +954,8 @@ func TestOrchestrationRejectsLaunderedBootstrapRequestBeforeExternalPreparation(
 		name   string
 		mutate func(*BootstrapInstallationRequest)
 	}{
-		{"authentication scope", func(request *BootstrapInstallationRequest) { request.Authentication.Scope = domain.AuthorityScope{} }},
-		{"policy scope", func(request *BootstrapInstallationRequest) { request.Policy.Scope = domain.AuthorityScope{} }},
+		{"authentication scope", func(request *BootstrapInstallationRequest) { request.Authentication.scope = domain.AuthorityScope{} }},
+		{"policy scope", func(request *BootstrapInstallationRequest) { request.Policy.scope = domain.AuthorityScope{} }},
 		{"protocol capabilities", func(request *BootstrapInstallationRequest) { request.ProtocolCapabilities = []string{"laundered"} }},
 		{"authorship principal", func(request *BootstrapInstallationRequest) {
 			request.Spec.authorship.principal, _ = domain.ParsePrincipalID(applicationUUID(99))
@@ -1039,10 +1083,21 @@ func buildOrchestrationHandlerCases(t *testing.T, path operationDomainPath) []or
 	pendingDevice := path.pairingBegan.Device()
 
 	makeRequest := func(pipeline completedOperationPipeline, view CommandHashView) CommandRequest {
+		principalRevision := domain.InitialVersion()
+		for _, state := range pipeline.context.States() {
+			if principal, ok := state.Value().(domain.PrincipalState); ok && principal.ID() == pipeline.spec.Authorship().PrincipalID() {
+				principalRevision = principal.Version()
+				break
+			}
+		}
+		authentication, policy := orchestrationPreparationRequests(
+			t, pipeline.caseDefinition.operation, pipeline.spec.Scope(), pipeline.spec.Authorship().PrincipalID(),
+			principalRevision, pipeline.spec.AuthorityID(),
+		)
 		return CommandRequest{
 			Spec: pipeline.spec, HashView: view,
-			Authentication: AuthenticationRequest{Operation: pipeline.caseDefinition.operation, Scope: pipeline.spec.Scope()},
-			Policy:         PolicyPreparationRequest{Operation: pipeline.caseDefinition.operation, Scope: pipeline.spec.Scope()},
+			Authentication: authentication,
+			Policy:         policy,
 			Audit:          orchestrationAuditContext(t),
 		}
 	}
@@ -1227,7 +1282,8 @@ func buildOrchestrationHandlerCases(t *testing.T, path operationDomainPath) []or
 			pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
 			request := StartActorSessionRequest{CommandRequest: makeRequest(pipeline, view), SessionID: session.ID(), ClientInstanceID: session.ClientInstanceID(),
 				ClientMetadata: session.ClientMetadata(), WorkspaceID: workspace.ID(), PrincipalID: workload.ID(), MembershipID: member.ID(), ActorID: actor.ID(),
-				DelegationID: delegation.ID(), StartAuthorityKind: domain.SessionStartByHandoff, HandoffProofEvidence: evidence, AbsoluteExpiry: path.now.Add(8 * time.Hour)}
+				DelegationID: delegation.ID(), StartAuthorityKind: domain.SessionStartByHandoff, HandoffProofEvidence: evidence, AbsoluteExpiry: path.now.Add(8 * time.Hour),
+				PresentationDeliveryReference: "orchestration-session", PresentationDelivery: orchestrationDelivery{}}
 			result = append(result, orchestrationHandlerCase{definition.operation, pipeline,
 				func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
 					return service.StartActorSession(ctx, request)

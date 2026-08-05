@@ -67,34 +67,504 @@ var (
 )
 
 var (
-	_ application.RecoveryCapsuleSignerLookup = (*VaultRecoveryCapsuleSignerLookup)(nil)
-	_ application.EffectPlanner               = BoundedEffectPlanner{}
-	_ application.DenialSecurityPolicy        = StrictDenialSecurityPolicy{}
-	_ application.BootstrapProofVerifier      = (*CryptographicProofVerifier)(nil)
-	_ application.CeremonyProofVerifier       = (*CryptographicProofVerifier)(nil)
-	_ application.PairingRedemptionVerifier   = (*CryptographicProofVerifier)(nil)
+	_ application.AuthenticationPreparer         = (*AuthenticationPreparer)(nil)
+	_ application.PolicyPreparer                 = (*PolicyPreparer)(nil)
+	_ application.CurrentLockedAuthorization     = (*LockedAuthorization)(nil)
+	_ application.ReplayDisclosureAuthorization  = (*ReplayAuthorization)(nil)
+	_ application.PresentationCredentialPreparer = (*GeneratedPresentationCredentialPreparer)(nil)
+	_ application.RecoveryCapsuleSignerLookup    = (*VaultRecoveryCapsuleSignerLookup)(nil)
+	_ application.EffectPlanner                  = BoundedEffectPlanner{}
+	_ application.DenialSecurityPolicy           = StrictDenialSecurityPolicy{}
+	_ application.BootstrapProofVerifier         = (*CryptographicProofVerifier)(nil)
+	_ application.CeremonyProofVerifier          = (*CryptographicProofVerifier)(nil)
+	_ application.PairingRedemptionVerifier      = (*CryptographicProofVerifier)(nil)
 )
 
 // ProductionOrchestrationAdapters is the securely composable subset of the
 // non-storage orchestration dependencies supported by the current application
 // contracts.
 type ProductionOrchestrationAdapters struct {
-	SignerLookup  application.RecoveryCapsuleSignerLookup
-	EffectPlanner application.EffectPlanner
-	DenialPolicy  application.DenialSecurityPolicy
+	Authentication      application.AuthenticationPreparer
+	Policy              application.PolicyPreparer
+	LockedAuthorization application.CurrentLockedAuthorization
+	ReplayDisclosure    application.ReplayDisclosureAuthorization
+	Presentations       application.PresentationCredentialPreparer
+	SignerLookup        application.RecoveryCapsuleSignerLookup
+	EffectPlanner       application.EffectPlanner
+	DenialPolicy        application.DenialSecurityPolicy
 }
 
 func NewProductionOrchestrationAdapters(
 	vault *CredentialVault,
 	references map[string]CredentialReference,
+	authentication *AuthenticationRegistry,
+	policies *PolicyRegistry,
+	assurance domain.AssuranceClass,
+	maxSessionLifetime time.Duration,
 ) (ProductionOrchestrationAdapters, error) {
 	signers, err := NewVaultRecoveryCapsuleSignerLookup(vault, references)
 	if err != nil {
 		return ProductionOrchestrationAdapters{}, err
 	}
+	authenticationPreparer, err := NewAuthenticationPreparer(authentication)
+	if err != nil {
+		return ProductionOrchestrationAdapters{}, err
+	}
+	policyPreparer, err := NewPolicyPreparer(policies)
+	if err != nil {
+		return ProductionOrchestrationAdapters{}, err
+	}
+	authorizer, err := NewLockedAuthorization(assurance, maxSessionLifetime)
+	if err != nil {
+		return ProductionOrchestrationAdapters{}, err
+	}
+	presentations, err := NewGeneratedPresentationCredentialPreparer(rand.Reader)
+	if err != nil {
+		return ProductionOrchestrationAdapters{}, err
+	}
 	return ProductionOrchestrationAdapters{
-		SignerLookup: signers, EffectPlanner: BoundedEffectPlanner{}, DenialPolicy: StrictDenialSecurityPolicy{},
+		Authentication: authenticationPreparer, Policy: policyPreparer,
+		LockedAuthorization: authorizer, ReplayDisclosure: &ReplayAuthorization{authorization: authorizer},
+		Presentations: presentations,
+		SignerLookup:  signers, EffectPlanner: BoundedEffectPlanner{}, DenialPolicy: StrictDenialSecurityPolicy{},
 	}, nil
+}
+
+type AuthenticationRegistry struct {
+	mu      sync.RWMutex
+	current map[string]application.AuthenticationRequest
+}
+
+func NewAuthenticationRegistry() *AuthenticationRegistry {
+	return &AuthenticationRegistry{current: make(map[string]application.AuthenticationRequest)}
+}
+
+func (registry *AuthenticationRegistry) Register(request application.AuthenticationRequest) error {
+	key, err := authenticationRequestKey(request)
+	if registry == nil || err != nil {
+		return ErrInvalidAccess
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.current[key] = request
+	return nil
+}
+
+func (registry *AuthenticationRegistry) Revoke(request application.AuthenticationRequest) error {
+	key, err := authenticationRequestKey(request)
+	if registry == nil || err != nil {
+		return ErrInvalidAccess
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, exists := registry.current[key]; !exists {
+		return ErrAccessDenied
+	}
+	delete(registry.current, key)
+	return nil
+}
+
+func authenticationRequestKey(request application.AuthenticationRequest) (string, error) {
+	if request.Operation() == "" || request.Scope().IsZero() || request.PrincipalID().IsZero() ||
+		request.PrincipalRevision().IsZero() || request.ChannelBinding().IsZero() ||
+		request.Audience().String() == "" || request.VerifiedAt().IsZero() {
+		return "", ErrInvalidAccess
+	}
+	device, deviceVersion, trust, revoke, credential, hasDevice := request.Device()
+	session, sessionVersion, hasSession := request.ActorSession()
+	key := fmt.Sprintf("%v\x00%v\x00%v\x00%v\x00%v\x00%v\x00%v\x00%v\x00%v\x00%v\x00%x\x00%v\x00%v\x00%v\x00%x\x00%v\x00%v",
+		request.Operation(), request.Scope().Kind(), request.Scope().ID(), request.PrincipalID(), request.PrincipalRevision(),
+		device, deviceVersion, hasDevice, trust, revoke, credential.Bytes(), session, sessionVersion.Uint64(), hasSession,
+		request.ChannelBinding(), request.Audience().String(), request.VerifiedAt().UTC().Format(time.RFC3339Nano))
+	for _, revision := range request.GrantRevisions() {
+		key += "\x00" + revision.Target().String() + "@" + revision.Version().String()
+	}
+	return key, nil
+}
+
+type AuthenticationPreparer struct{ registry *AuthenticationRegistry }
+
+func NewAuthenticationPreparer(registry *AuthenticationRegistry) (*AuthenticationPreparer, error) {
+	if registry == nil {
+		return nil, ErrSecurityDependency
+	}
+	return &AuthenticationPreparer{registry: registry}, nil
+}
+
+func (preparer *AuthenticationPreparer) PrepareAuthentication(
+	ctx context.Context,
+	request application.AuthenticationRequest,
+) (application.AuthenticationDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return application.AuthenticationDecision{}, err
+	}
+	key, err := authenticationRequestKey(request)
+	if err != nil || preparer == nil || preparer.registry == nil {
+		return application.AuthenticationDecision{}, ErrAccessDenied
+	}
+	preparer.registry.mu.RLock()
+	registered, exists := preparer.registry.current[key]
+	preparer.registry.mu.RUnlock()
+	if !exists || registered.VerifiedAt() != request.VerifiedAt() {
+		return application.AuthenticationDecision{}, ErrAccessDenied
+	}
+	evidence, err := application.NewAuthenticationEvidence(registered)
+	if err != nil {
+		return application.AuthenticationDecision{}, ErrAccessDenied
+	}
+	return application.ValidAuthentication(evidence)
+}
+
+type policyRecord struct {
+	revision domain.PolicyRevision
+	digest   application.Digest
+}
+
+type PolicyRegistry struct {
+	mu      sync.RWMutex
+	current map[domain.AuthorityScope]policyRecord
+}
+
+func NewPolicyRegistry() *PolicyRegistry {
+	return &PolicyRegistry{current: make(map[domain.AuthorityScope]policyRecord)}
+}
+
+func (registry *PolicyRegistry) Register(
+	scope domain.AuthorityScope,
+	revision domain.PolicyRevision,
+	digest application.Digest,
+) error {
+	if registry == nil || scope.IsZero() || revision.String() == "" || digest.IsZero() {
+		return ErrInvalidAccess
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.current[scope] = policyRecord{revision: revision, digest: digest}
+	return nil
+}
+
+type PolicyPreparer struct{ registry *PolicyRegistry }
+
+func NewPolicyPreparer(registry *PolicyRegistry) (*PolicyPreparer, error) {
+	if registry == nil {
+		return nil, ErrSecurityDependency
+	}
+	return &PolicyPreparer{registry: registry}, nil
+}
+
+func (preparer *PolicyPreparer) PreparePolicy(
+	ctx context.Context,
+	request application.PolicyPreparationRequest,
+) (application.PreparedPolicy, error) {
+	if err := ctx.Err(); err != nil {
+		return application.PreparedPolicy{}, err
+	}
+	if preparer == nil || preparer.registry == nil || request.Operation() == "" || request.Scope().IsZero() ||
+		request.PrincipalID().IsZero() || request.ChannelBinding().IsZero() || request.Audience().String() == "" ||
+		request.VerifiedAt().IsZero() {
+		return application.PreparedPolicy{}, ErrAccessDenied
+	}
+	preparer.registry.mu.RLock()
+	current, exists := preparer.registry.current[request.Scope()]
+	preparer.registry.mu.RUnlock()
+	if !exists || current.revision != request.PolicyRevision() || current.digest != request.PolicyDigest() {
+		return application.PreparedPolicy{}, ErrAccessDenied
+	}
+	return application.NewPreparedPolicy(current.revision, current.digest)
+}
+
+type LockedAuthorization struct {
+	assurance          domain.AssuranceClass
+	maxSessionLifetime time.Duration
+}
+
+func NewLockedAuthorization(
+	assurance domain.AssuranceClass,
+	maxSessionLifetime time.Duration,
+) (*LockedAuthorization, error) {
+	if assurance.String() == "" || maxSessionLifetime <= 0 || maxSessionLifetime > domain.MaxActorSessionLifetime {
+		return nil, ErrSecurityDependency
+	}
+	return &LockedAuthorization{assurance: assurance, maxSessionLifetime: maxSessionLifetime}, nil
+}
+
+func (authorization *LockedAuthorization) AuthorizeLocked(
+	locked application.CommandContext,
+	authentication application.AuthenticationEvidence,
+	policy application.PreparedPolicy,
+) (domain.IdentityAuthorization, error) {
+	return authorization.authorize(locked, authentication, policy, false)
+}
+
+func (authorization *LockedAuthorization) authorize(
+	locked application.CommandContext,
+	authentication application.AuthenticationEvidence,
+	policy application.PreparedPolicy,
+	replay bool,
+) (domain.IdentityAuthorization, error) {
+	if authorization == nil || authorization.assurance.String() == "" || policy.Revision().String() == "" || policy.Digest().IsZero() {
+		return domain.IdentityAuthorization{}, ErrAccessDenied
+	}
+	now, present := locked.AuthorityTime()
+	if replay {
+		now, present = locked.DisclosureTime()
+	}
+	if !present {
+		return domain.IdentityAuthorization{}, ErrAccessDenied
+	}
+	request := authentication.Request()
+	if request.VerifiedAt().After(now) || request.Scope() != locked.Spec().Scope() ||
+		request.Operation() != locked.Spec().CommandOperation() || request.PrincipalID() != locked.Spec().Authorship().PrincipalID() {
+		return domain.IdentityAuthorization{}, ErrAccessDenied
+	}
+	states := locked.States()
+	var principal domain.PrincipalState
+	var workspace domain.WorkspaceState
+	var membership domain.MembershipState
+	var delegation domain.ActorDelegationState
+	var session domain.ActorSessionState
+	grants := make(map[domain.AggregateTarget]domain.GrantState)
+	devices := make(map[domain.DeviceID]domain.DeviceState)
+	actors := make(map[domain.ActorID]domain.ActorState)
+	for _, state := range states {
+		switch value := state.Value().(type) {
+		case domain.PrincipalState:
+			if value.ID() == request.PrincipalID() {
+				principal = value
+			}
+		case domain.DeviceState:
+			devices[value.ID()] = value
+		case domain.WorkspaceState:
+			if value.ID().String() == request.Scope().ID() {
+				workspace = value
+			}
+		case domain.MembershipState:
+			if value.PrincipalID() == request.PrincipalID() {
+				membership = value
+			}
+		case domain.ActorState:
+			actors[value.ID()] = value
+		case domain.ActorDelegationState:
+			if value.PrincipalID() == request.PrincipalID() {
+				delegation = value
+			}
+		case domain.ActorSessionState:
+			if id, _, ok := request.ActorSession(); ok && value.ID() == id {
+				session = value
+			}
+		case domain.GrantState:
+			grants[state.Target()] = value
+		}
+	}
+	if principal.IsZero() || principal.Status() != domain.PrincipalActive || principal.Version() != request.PrincipalRevision() {
+		return domain.IdentityAuthorization{}, ErrAccessDenied
+	}
+	installation := principal.InstallationID()
+	var deviceID domain.DeviceID
+	var deviceTrust domain.Version
+	if expectedID, expectedVersion, expectedTrust, expectedRevoke, fingerprint, hasDevice := request.Device(); hasDevice {
+		device, exists := devices[expectedID]
+		if !exists || device.Status() != domain.DeviceTrusted || device.PrincipalID() != request.PrincipalID() ||
+			device.InstallationID() != installation || device.Version() != expectedVersion ||
+			device.TrustRevision() != expectedTrust || device.RevocationRevision() != expectedRevoke ||
+			!device.AcceptsCredential(fingerprint, request.VerifiedAt()) {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		deviceID, deviceTrust = expectedID, expectedTrust
+	}
+	capabilitySets := make([]domain.CapabilitySet, 0, 4)
+	for _, revision := range request.GrantRevisions() {
+		grant, exists := grants[revision.Target()]
+		if !exists || grant.Status() != domain.GrantActive || grant.Version() != revision.Version() ||
+			grant.PrincipalID() != request.PrincipalID() || grant.InstallationID() != installation ||
+			(!grant.WorkspaceID().IsZero() && grant.WorkspaceID().String() != request.Scope().ID()) {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		capabilitySets = append(capabilitySets, grant.Capabilities())
+	}
+	assurance := authorization.assurance
+	if request.Scope().Kind() == domain.ScopeKindWorkspace {
+		if workspace.IsZero() || workspace.Status() != domain.WorkspaceActive || workspace.InstallationID() != installation ||
+			workspace.AuthorityID() != locked.Spec().AuthorityID() || workspace.AuthorityEpoch() != locked.Spec().RequestedEpoch() ||
+			workspace.PolicyRevision() != policy.Revision() {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		if !membership.IsZero() {
+			if membership.Status() != domain.MembershipActive || membership.WorkspaceID() != workspace.ID() {
+				return domain.IdentityAuthorization{}, ErrAccessDenied
+			}
+			capabilitySets = append(capabilitySets, membership.Capabilities())
+		}
+	}
+	if sessionID, sessionVersion, hasSession := request.ActorSession(); hasSession {
+		if session.IsZero() || session.ID() != sessionID || session.Version() != sessionVersion ||
+			session.Status() != domain.ActorSessionActive || !now.Before(session.Binding().AbsoluteExpiry()) ||
+			session.Binding().PrincipalID() != request.PrincipalID() || session.Binding().WorkspaceID().String() != request.Scope().ID() ||
+			session.Binding().AuthorityID() != locked.Spec().AuthorityID() || session.Binding().AuthorityEpoch() != locked.Spec().RequestedEpoch() ||
+			session.Binding().PolicyRevision() != policy.Revision() || session.PresentationCredential().Audience() != request.Audience() {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		membershipRef := session.Binding().MembershipRevision()
+		delegationRef := session.Binding().DelegationRevision()
+		actor := actors[session.Binding().ActorID()]
+		if membership.IsZero() || membership.ID().String() != membershipRef.ID() || membership.Version() != membershipRef.Version() ||
+			delegation.IsZero() || delegation.ID().String() != delegationRef.ID() || delegation.Version() != delegationRef.Version() ||
+			delegation.Status() != domain.DelegationActive || actor.IsZero() || actor.Status() != domain.ActorActive ||
+			actor.ID() != delegation.ActorID() || delegation.MembershipID() != membership.ID() {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		if boundDevice, bound := session.Binding().DeviceRevision(); bound {
+			device, exists := devices[deviceID]
+			boundTrust, _ := session.Binding().DeviceTrustRevision()
+			if !exists || boundDevice.ID() != device.ID().String() || boundDevice.Version() != device.Version() || boundTrust != device.TrustRevision() {
+				return domain.IdentityAuthorization{}, ErrAccessDenied
+			}
+		}
+		if !sameAggregateRefs(session.Binding().GrantRevisions(), request.GrantRevisions()) {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		capabilitySets = append(capabilitySets, delegation.Capabilities(), session.Capabilities())
+		assurance = session.Binding().AssuranceClass()
+	}
+	capabilities, err := intersectCapabilities(capabilitySets)
+	if err != nil {
+		return domain.IdentityAuthorization{}, ErrAccessDenied
+	}
+	if request.Scope().Kind() == domain.ScopeKindInstallation {
+		return domain.NewIdentityAuthorization(
+			locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation, request.PrincipalID(),
+			capabilities, policy.Revision(), assurance, now, authorization.maxSessionLifetime,
+		)
+	}
+	if request.Scope().Kind() != domain.ScopeKindWorkspace {
+		return domain.IdentityAuthorization{}, ErrAccessDenied
+	}
+	if requestDevice, _, _, _, _, hasDevice := request.Device(); hasDevice {
+		return domain.NewDeviceBoundWorkspaceIdentityAuthorization(
+			locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation, workspace.ID(), request.PrincipalID(),
+			capabilities, policy.Revision(), assurance, now, authorization.maxSessionLifetime, requestDevice, deviceTrust,
+		)
+	}
+	return domain.NewWorkspaceIdentityAuthorization(
+		locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation, workspace.ID(), request.PrincipalID(),
+		capabilities, policy.Revision(), assurance, now, authorization.maxSessionLifetime,
+	)
+}
+
+func intersectCapabilities(sets []domain.CapabilitySet) (domain.CapabilitySet, error) {
+	if len(sets) == 0 {
+		return domain.CapabilitySet{}, ErrAccessDenied
+	}
+	values := sets[0].Values()
+	for _, set := range sets[1:] {
+		kept := values[:0]
+		for _, capability := range values {
+			if set.Contains(capability) {
+				kept = append(kept, capability)
+			}
+		}
+		values = kept
+	}
+	if len(values) == 0 {
+		return domain.CapabilitySet{}, ErrAccessDenied
+	}
+	return domain.NewCapabilitySet(values...)
+}
+
+func sameAggregateRefs(left, right []domain.AggregateRef) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+type ReplayAuthorization struct{ authorization *LockedAuthorization }
+
+func NewReplayAuthorization(authorization *LockedAuthorization) (*ReplayAuthorization, error) {
+	if authorization == nil {
+		return nil, ErrSecurityDependency
+	}
+	return &ReplayAuthorization{authorization: authorization}, nil
+}
+
+func (authorization *ReplayAuthorization) AuthorizeReplay(
+	locked application.CommandContext,
+	authentication application.AuthenticationEvidence,
+	policy application.PreparedPolicy,
+) (application.ReplayDisclosure, error) {
+	if authorization == nil || authorization.authorization == nil ||
+		locked.ReceiptResolution().Kind() != application.ReceiptExactReplay {
+		return "", ErrAccessDenied
+	}
+	if _, err := authorization.authorization.authorize(locked, authentication, policy, true); err != nil {
+		return "", err
+	}
+	return application.ReplayDiscloseResult, nil
+}
+
+type GeneratedPresentationCredentialPreparer struct {
+	mu     sync.Mutex
+	random io.Reader
+	used   map[string]struct{}
+}
+
+func NewGeneratedPresentationCredentialPreparer(random io.Reader) (*GeneratedPresentationCredentialPreparer, error) {
+	if random == nil {
+		return nil, ErrSecurityDependency
+	}
+	return &GeneratedPresentationCredentialPreparer{random: random, used: make(map[string]struct{})}, nil
+}
+
+func (preparer *GeneratedPresentationCredentialPreparer) PreparePresentationCredential(
+	ctx context.Context,
+	request application.PresentationCredentialRequest,
+) (domain.PresentationCredentialBinding, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.PresentationCredentialBinding{}, err
+	}
+	if preparer == nil || preparer.random == nil || request.Operation() != application.CommandStartActorSession ||
+		request.PrincipalID().IsZero() || request.SessionID().IsZero() || request.Audience().String() == "" ||
+		request.ChannelBinding().IsZero() || request.DeliveryReference() == "" {
+		return domain.PresentationCredentialBinding{}, ErrInvalidAccess
+	}
+	preparer.mu.Lock()
+	defer preparer.mu.Unlock()
+	if _, exists := preparer.used[request.DeliveryReference()]; exists {
+		return domain.PresentationCredentialBinding{}, ErrAccessDenied
+	}
+	preparer.used[request.DeliveryReference()] = struct{}{}
+	secret := make([]byte, sha256.Size)
+	if _, err := io.ReadFull(preparer.random, secret); err != nil {
+		clear(secret)
+		return domain.PresentationCredentialBinding{}, ErrSecurityDependency
+	}
+	defer clear(secret)
+	device, hasDevice := request.DeviceID()
+	bound := hmac.New(sha256.New, secret)
+	_, _ = fmt.Fprintf(bound, "blackbird-presentation/v1\x00%s\x00%s\x00%s\x00%t\x00%s\x00%x",
+		request.PrincipalID(), request.SessionID(), device, hasDevice, request.Audience().String(), request.ChannelBinding())
+	digestBytes := [sha256.Size]byte(bound.Sum(nil))
+	digest, err := domain.NewCredentialDigest(digestBytes)
+	if err != nil {
+		return domain.PresentationCredentialBinding{}, ErrSecurityDependency
+	}
+	reference, err := domain.NewCredentialReference("presentation:" + request.DeliveryReference())
+	if err != nil {
+		return domain.PresentationCredentialBinding{}, ErrInvalidCredential
+	}
+	binding, err := domain.NewPresentationCredentialBinding(digest, reference, request.Audience(), domain.PresentationCredentialVersion)
+	if err != nil {
+		return domain.PresentationCredentialBinding{}, ErrInvalidCredential
+	}
+	if err := request.Deliver(ctx, secret); err != nil {
+		return domain.PresentationCredentialBinding{}, fmt.Errorf("%w: credential delivery", ErrSecurityDependency)
+	}
+	return binding, nil
 }
 
 // VaultRecoveryCapsuleSignerLookup resolves public key identity during

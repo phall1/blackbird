@@ -707,14 +707,18 @@ func TestVaultRecoveryCapsuleSignerLookupRejectsForgeryAndRedacts(t *testing.T) 
 	}
 	credential.Destroy()
 
+	assurance, _ := domain.NewAssuranceClass("hardware_key")
 	adapters, err := NewProductionOrchestrationAdapters(
 		vault, map[string]CredentialReference{"recovery-v1": reference},
+		NewAuthenticationRegistry(), NewPolicyRegistry(), assurance, domain.MaxActorSessionLifetime,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lookup := adapters.SignerLookup
-	if adapters.EffectPlanner == nil || adapters.DenialPolicy == nil {
+	if adapters.EffectPlanner == nil || adapters.DenialPolicy == nil || adapters.Authentication == nil ||
+		adapters.Policy == nil || adapters.LockedAuthorization == nil || adapters.ReplayDisclosure == nil ||
+		adapters.Presentations == nil {
 		t.Fatal("production adapter constructor omitted a supported dependency")
 	}
 	signer, err := lookup.PrepareRecoveryCapsuleSigner(t.Context(), "recovery-v1")

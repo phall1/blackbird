@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/phall1/blackbird/internal/domain"
@@ -14,19 +15,199 @@ import (
 
 var ErrOrchestrationDependency = errors.New("application orchestration dependency failed")
 
-// AuthenticationRequest and PolicyPreparationRequest contain only routing and
-// operation metadata. Command bodies never provide trusted identity evidence.
 type AuthenticationRequest struct {
-	Operation CommandOperation
-	Scope     domain.AuthorityScope
+	operation             CommandOperation
+	scope                 domain.AuthorityScope
+	principal             domain.PrincipalID
+	principalRevision     domain.Version
+	device                domain.DeviceID
+	deviceRevision        domain.Version
+	deviceTrustRevision   domain.Version
+	deviceRevokeRevision  domain.Version
+	credentialFingerprint domain.CredentialDigest
+	hasDevice             bool
+	actorSession          domain.ActorSessionID
+	actorSessionRevision  domain.Version
+	hasActorSession       bool
+	grantRevisions        []domain.AggregateRef
+	channelBinding        Digest
+	audience              domain.CredentialAudience
+	provenance            AuditProvenanceEvidence
+	verifiedAt            time.Time
 }
 
 type PolicyPreparationRequest struct {
-	Operation CommandOperation
-	Scope     domain.AuthorityScope
+	operation       CommandOperation
+	scope           domain.AuthorityScope
+	principal       domain.PrincipalID
+	actorSession    domain.ActorSessionID
+	hasActorSession bool
+	channelBinding  Digest
+	audience        domain.CredentialAudience
+	policyRevision  domain.PolicyRevision
+	policyDigest    Digest
+	verifiedAt      time.Time
+}
+
+type AuthenticationRequestParams struct {
+	Operation             CommandOperation
+	Scope                 domain.AuthorityScope
+	PrincipalID           domain.PrincipalID
+	PrincipalRevision     domain.Version
+	DeviceID              *domain.DeviceID
+	DeviceRevision        domain.Version
+	DeviceTrustRevision   domain.Version
+	DeviceRevokeRevision  domain.Version
+	CredentialFingerprint domain.CredentialDigest
+	ActorSessionID        *domain.ActorSessionID
+	ActorSessionRevision  domain.Version
+	GrantRevisions        []domain.AggregateRef
+	ChannelBinding        Digest
+	Audience              domain.CredentialAudience
+	AuditProvenance       AuditProvenanceEvidence
+	VerifiedAt            time.Time
+}
+
+func NewAuthenticationRequest(params AuthenticationRequestParams) (AuthenticationRequest, error) {
+	if _, ok := commandContract(params.Operation); !ok || params.Scope.IsZero() || params.PrincipalID.IsZero() ||
+		!params.PrincipalRevision.Valid() || params.ChannelBinding.IsZero() || params.Audience.String() == "" ||
+		!validAuditProvenanceEvidence(params.AuditProvenance) || params.VerifiedAt.IsZero() {
+		return AuthenticationRequest{}, ErrInvalidApplicationContract
+	}
+	request := AuthenticationRequest{
+		operation: params.Operation, scope: params.Scope, principal: params.PrincipalID,
+		principalRevision: params.PrincipalRevision, channelBinding: params.ChannelBinding,
+		audience: params.Audience, provenance: params.AuditProvenance, verifiedAt: params.VerifiedAt.UTC(),
+	}
+	if params.DeviceID != nil {
+		if params.DeviceID.IsZero() || !params.DeviceRevision.Valid() || !params.DeviceTrustRevision.Valid() ||
+			!params.DeviceRevokeRevision.Valid() || params.CredentialFingerprint.IsZero() {
+			return AuthenticationRequest{}, ErrInvalidApplicationContract
+		}
+		request.device, request.hasDevice = *params.DeviceID, true
+		request.deviceRevision, request.deviceTrustRevision = params.DeviceRevision, params.DeviceTrustRevision
+		request.deviceRevokeRevision, request.credentialFingerprint = params.DeviceRevokeRevision, params.CredentialFingerprint
+	} else if !params.DeviceRevision.IsZero() || !params.DeviceTrustRevision.IsZero() ||
+		!params.DeviceRevokeRevision.IsZero() || !params.CredentialFingerprint.IsZero() {
+		return AuthenticationRequest{}, ErrInvalidApplicationContract
+	}
+	if params.ActorSessionID != nil {
+		if params.ActorSessionID.IsZero() || !params.ActorSessionRevision.Valid() {
+			return AuthenticationRequest{}, ErrInvalidApplicationContract
+		}
+		request.actorSession, request.actorSessionRevision, request.hasActorSession =
+			*params.ActorSessionID, params.ActorSessionRevision, true
+	} else if !params.ActorSessionRevision.IsZero() {
+		return AuthenticationRequest{}, ErrInvalidApplicationContract
+	}
+	request.grantRevisions = append([]domain.AggregateRef(nil), params.GrantRevisions...)
+	slices.SortFunc(request.grantRevisions, func(left, right domain.AggregateRef) int {
+		return strings.Compare(left.Target().String(), right.Target().String())
+	})
+	for index, revision := range request.grantRevisions {
+		if revision.IsZero() || revision.Kind() != domain.AggregateKindGrant ||
+			(index > 0 && request.grantRevisions[index-1].Target() == revision.Target()) {
+			return AuthenticationRequest{}, ErrInvalidApplicationContract
+		}
+	}
+	return request, nil
+}
+
+func NewPolicyPreparationRequest(
+	authentication AuthenticationRequest,
+	revision domain.PolicyRevision,
+	digest Digest,
+) (PolicyPreparationRequest, error) {
+	if !authentication.valid() || revision.String() == "" || digest.IsZero() {
+		return PolicyPreparationRequest{}, ErrInvalidApplicationContract
+	}
+	return PolicyPreparationRequest{
+		operation: authentication.operation, scope: authentication.scope, principal: authentication.principal,
+		actorSession: authentication.actorSession, hasActorSession: authentication.hasActorSession,
+		channelBinding: authentication.channelBinding, audience: authentication.audience,
+		policyRevision: revision, policyDigest: digest, verifiedAt: authentication.verifiedAt,
+	}, nil
+}
+
+func (request AuthenticationRequest) Operation() CommandOperation     { return request.operation }
+func (request AuthenticationRequest) Scope() domain.AuthorityScope    { return request.scope }
+func (request AuthenticationRequest) PrincipalID() domain.PrincipalID { return request.principal }
+func (request AuthenticationRequest) PrincipalRevision() domain.Version {
+	return request.principalRevision
+}
+func (request AuthenticationRequest) Device() (domain.DeviceID, domain.Version, domain.Version, domain.Version, domain.CredentialDigest, bool) {
+	return request.device, request.deviceRevision, request.deviceTrustRevision, request.deviceRevokeRevision,
+		request.credentialFingerprint, request.hasDevice
+}
+func (request AuthenticationRequest) ActorSession() (domain.ActorSessionID, domain.Version, bool) {
+	return request.actorSession, request.actorSessionRevision, request.hasActorSession
+}
+func (request AuthenticationRequest) GrantRevisions() []domain.AggregateRef {
+	return append([]domain.AggregateRef(nil), request.grantRevisions...)
+}
+func (request AuthenticationRequest) ChannelBinding() Digest              { return request.channelBinding }
+func (request AuthenticationRequest) Audience() domain.CredentialAudience { return request.audience }
+func (request AuthenticationRequest) AuditProvenance() AuditProvenanceEvidence {
+	return request.provenance
+}
+func (request AuthenticationRequest) VerifiedAt() time.Time { return request.verifiedAt }
+
+func (request AuthenticationRequest) valid() bool {
+	validated, err := NewAuthenticationRequest(AuthenticationRequestParams{
+		Operation: request.operation, Scope: request.scope, PrincipalID: request.principal,
+		PrincipalRevision: request.principalRevision, GrantRevisions: request.grantRevisions,
+		ChannelBinding: request.channelBinding, Audience: request.audience,
+		AuditProvenance: request.provenance, VerifiedAt: request.verifiedAt,
+	})
+	if request.hasDevice {
+		device := request.device
+		validated, err = NewAuthenticationRequest(AuthenticationRequestParams{
+			Operation: request.operation, Scope: request.scope, PrincipalID: request.principal,
+			PrincipalRevision: request.principalRevision, DeviceID: &device, DeviceRevision: request.deviceRevision,
+			DeviceTrustRevision: request.deviceTrustRevision, DeviceRevokeRevision: request.deviceRevokeRevision,
+			CredentialFingerprint: request.credentialFingerprint, GrantRevisions: request.grantRevisions,
+			ChannelBinding: request.channelBinding, Audience: request.audience,
+			AuditProvenance: request.provenance, VerifiedAt: request.verifiedAt,
+		})
+	}
+	if err != nil {
+		return false
+	}
+	if request.hasActorSession {
+		session := request.actorSession
+		params := AuthenticationRequestParams{
+			Operation: request.operation, Scope: request.scope, PrincipalID: request.principal,
+			PrincipalRevision: request.principalRevision, ActorSessionID: &session,
+			ActorSessionRevision: request.actorSessionRevision, GrantRevisions: request.grantRevisions,
+			ChannelBinding: request.channelBinding, Audience: request.audience,
+			AuditProvenance: request.provenance, VerifiedAt: request.verifiedAt,
+		}
+		if request.hasDevice {
+			device := request.device
+			params.DeviceID, params.DeviceRevision, params.DeviceTrustRevision = &device, request.deviceRevision, request.deviceTrustRevision
+			params.DeviceRevokeRevision, params.CredentialFingerprint = request.deviceRevokeRevision, request.credentialFingerprint
+		}
+		validated, err = NewAuthenticationRequest(params)
+	}
+	return err == nil && validated.operation == request.operation
+}
+
+func (request PolicyPreparationRequest) Operation() CommandOperation     { return request.operation }
+func (request PolicyPreparationRequest) Scope() domain.AuthorityScope    { return request.scope }
+func (request PolicyPreparationRequest) PrincipalID() domain.PrincipalID { return request.principal }
+func (request PolicyPreparationRequest) PolicyRevision() domain.PolicyRevision {
+	return request.policyRevision
+}
+func (request PolicyPreparationRequest) PolicyDigest() Digest                { return request.policyDigest }
+func (request PolicyPreparationRequest) ChannelBinding() Digest              { return request.channelBinding }
+func (request PolicyPreparationRequest) Audience() domain.CredentialAudience { return request.audience }
+func (request PolicyPreparationRequest) VerifiedAt() time.Time               { return request.verifiedAt }
+func (request PolicyPreparationRequest) ActorSession() (domain.ActorSessionID, bool) {
+	return request.actorSession, request.hasActorSession
 }
 
 type AuthenticationEvidence struct {
+	request    AuthenticationRequest
 	principal  domain.PrincipalID
 	device     domain.DeviceID
 	hasDevice  bool
@@ -49,11 +230,11 @@ type AuthenticationDecision struct {
 }
 
 func ValidAuthentication(evidence AuthenticationEvidence) (AuthenticationDecision, error) {
-	if evidence.principal.IsZero() {
+	if !evidence.request.valid() {
 		return AuthenticationDecision{}, ErrInvalidApplicationContract
 	}
 	return AuthenticationDecision{
-		kind: AuthenticationValid, evidence: evidence, auditProvenance: evidence.provenance,
+		kind: AuthenticationValid, evidence: evidence, auditProvenance: evidence.request.provenance,
 	}, nil
 }
 
@@ -83,31 +264,46 @@ func (decision AuthenticationDecision) provenance() AuditProvenanceEvidence {
 	return decision.auditProvenance
 }
 
-func NewAuthenticationEvidence(
-	principal domain.PrincipalID,
-	device *domain.DeviceID,
-	provenance AuditProvenanceEvidence,
-) (AuthenticationEvidence, error) {
-	if principal.IsZero() || !validAuditProvenanceEvidence(provenance) {
+func NewAuthenticationEvidence(value any, legacy ...any) (AuthenticationEvidence, error) {
+	if request, ok := value.(AuthenticationRequest); ok && len(legacy) == 0 {
+		if !request.valid() {
+			return AuthenticationEvidence{}, ErrInvalidApplicationContract
+		}
+		return AuthenticationEvidence{
+			request: request, principal: request.principal, device: request.device,
+			hasDevice: request.hasDevice, provenance: request.provenance,
+		}, nil
+	}
+	principal, principalOK := value.(domain.PrincipalID)
+	if !principalOK || principal.IsZero() || len(legacy) != 2 {
+		return AuthenticationEvidence{}, ErrInvalidApplicationContract
+	}
+	device, deviceOK := legacy[0].(*domain.DeviceID)
+	provenance, provenanceOK := legacy[1].(AuditProvenanceEvidence)
+	if !provenanceOK || !validAuditProvenanceEvidence(provenance) ||
+		(deviceOK && device != nil && device.IsZero()) {
 		return AuthenticationEvidence{}, ErrInvalidApplicationContract
 	}
 	evidence := AuthenticationEvidence{principal: principal, provenance: provenance}
-	if device != nil {
-		if device.IsZero() {
-			return AuthenticationEvidence{}, ErrInvalidApplicationContract
-		}
+	if deviceOK && device != nil {
 		evidence.device, evidence.hasDevice = *device, true
+	} else if !deviceOK && legacy[0] != nil {
+		return AuthenticationEvidence{}, ErrInvalidApplicationContract
 	}
 	return evidence, nil
 }
 
 func (evidence AuthenticationEvidence) PrincipalID() domain.PrincipalID { return evidence.principal }
+func (evidence AuthenticationEvidence) PrincipalRevision() domain.Version {
+	return evidence.request.principalRevision
+}
 func (evidence AuthenticationEvidence) DeviceID() (domain.DeviceID, bool) {
 	return evidence.device, evidence.hasDevice
 }
 func (evidence AuthenticationEvidence) AuditProvenance() AuditProvenanceEvidence {
 	return evidence.provenance
 }
+func (evidence AuthenticationEvidence) Request() AuthenticationRequest { return evidence.request }
 
 type PreparedPolicy struct {
 	revision domain.PolicyRevision
@@ -148,7 +344,73 @@ type DenialSecurityPolicy interface {
 }
 
 type PresentationCredentialPreparer interface {
-	PreparePresentationCredential(context.Context, CommandOperation) (domain.PresentationCredentialBinding, error)
+	PreparePresentationCredential(context.Context, PresentationCredentialRequest) (domain.PresentationCredentialBinding, error)
+}
+
+type PresentationCredentialDelivery interface {
+	DeliverPresentationCredential(context.Context, string, []byte) error
+}
+
+type PresentationCredentialRequest struct {
+	operation      CommandOperation
+	principal      domain.PrincipalID
+	device         domain.DeviceID
+	hasDevice      bool
+	session        domain.ActorSessionID
+	audience       domain.CredentialAudience
+	channelBinding Digest
+	deliveryRef    string
+	delivery       PresentationCredentialDelivery
+}
+
+func NewPresentationCredentialRequest(
+	operation CommandOperation,
+	principal domain.PrincipalID,
+	device *domain.DeviceID,
+	session domain.ActorSessionID,
+	audience domain.CredentialAudience,
+	channelBinding Digest,
+	deliveryReference string,
+	delivery PresentationCredentialDelivery,
+) (PresentationCredentialRequest, error) {
+	if operation != CommandStartActorSession || principal.IsZero() || session.IsZero() ||
+		audience.String() == "" || channelBinding.IsZero() || deliveryReference == "" ||
+		len(deliveryReference) > 256 || strings.TrimSpace(deliveryReference) != deliveryReference || isNilInterface(delivery) {
+		return PresentationCredentialRequest{}, ErrInvalidApplicationContract
+	}
+	request := PresentationCredentialRequest{
+		operation: operation, principal: principal, session: session, audience: audience,
+		channelBinding: channelBinding, deliveryRef: deliveryReference, delivery: delivery,
+	}
+	if device != nil {
+		if device.IsZero() {
+			return PresentationCredentialRequest{}, ErrInvalidApplicationContract
+		}
+		request.device, request.hasDevice = *device, true
+	}
+	return request, nil
+}
+
+func (request PresentationCredentialRequest) Operation() CommandOperation { return request.operation }
+func (request PresentationCredentialRequest) PrincipalID() domain.PrincipalID {
+	return request.principal
+}
+func (request PresentationCredentialRequest) DeviceID() (domain.DeviceID, bool) {
+	return request.device, request.hasDevice
+}
+func (request PresentationCredentialRequest) SessionID() domain.ActorSessionID {
+	return request.session
+}
+func (request PresentationCredentialRequest) Audience() domain.CredentialAudience {
+	return request.audience
+}
+func (request PresentationCredentialRequest) ChannelBinding() Digest    { return request.channelBinding }
+func (request PresentationCredentialRequest) DeliveryReference() string { return request.deliveryRef }
+func (request PresentationCredentialRequest) Deliver(ctx context.Context, credential []byte) error {
+	if isNilInterface(request.delivery) {
+		return ErrInvalidApplicationContract
+	}
+	return request.delivery.DeliverPresentationCredential(ctx, request.deliveryRef, credential)
 }
 
 type RecoveryCapsuleSignerLookup interface {
@@ -595,8 +857,8 @@ func authorizationMatchesCommand(
 	spec CommandSpec,
 	locked CommandContext,
 ) bool {
-	if authentication.principal != spec.authorship.principal ||
-		authorization.PrincipalID() != authentication.principal ||
+	if authentication.request.principal != spec.authorship.principal ||
+		authorization.PrincipalID() != authentication.request.principal ||
 		authorization.AuthorityID() != spec.authorityID || authorization.AuthorityEpoch() != spec.requestedEpoch ||
 		authorization.PolicyRevision() != policy.revision || !authorshipGuardsMatch(spec) {
 		return false
@@ -619,7 +881,7 @@ func authorizationMatchesCommand(
 		return false
 	}
 	device, _, hasDevice := authorization.AuthenticatedDevice()
-	return hasDevice == authentication.hasDevice && (!hasDevice || device == authentication.device)
+	return hasDevice == authentication.request.hasDevice && (!hasDevice || device == authentication.request.device)
 }
 
 func authorshipGuardsMatch(spec CommandSpec) bool {
@@ -830,9 +1092,17 @@ func (service *OrchestrationService) executeBootstrapCommand(
 }
 
 func validateCommandRequest(request CommandRequest, expected CommandOperation) error {
-	if request.Spec.CommandOperation() != expected || request.Authentication.Operation != expected ||
-		request.Policy.Operation != expected || request.Authentication.Scope != request.Spec.Scope() ||
-		request.Policy.Scope != request.Spec.Scope() || !validAuditRequestContext(request.Audit) ||
+	if request.Spec.CommandOperation() != expected || request.Authentication.operation != expected ||
+		request.Policy.operation != expected || request.Authentication.scope != request.Spec.Scope() ||
+		request.Policy.scope != request.Spec.Scope() || !request.Authentication.valid() ||
+		request.Policy.principal != request.Authentication.principal ||
+		request.Policy.channelBinding != request.Authentication.channelBinding ||
+		request.Policy.audience != request.Authentication.audience ||
+		request.Policy.verifiedAt != request.Authentication.verifiedAt ||
+		request.Policy.actorSession != request.Authentication.actorSession ||
+		request.Policy.hasActorSession != request.Authentication.hasActorSession ||
+		request.Policy.policyRevision.String() == "" || request.Policy.policyDigest.IsZero() ||
+		!validAuditRequestContext(request.Audit) ||
 		!commandHashViewMatches(expected, request.HashView) {
 		return ErrInvalidCommandSpec
 	}
@@ -1027,7 +1297,7 @@ func (service *OrchestrationService) rollbackDecision(
 	if err != nil {
 		return CommandDecision{}, err
 	}
-	security, err = bindSecurityAuditContext(security, request.Audit, authentication.provenance)
+	security, err = bindSecurityAuditContext(security, request.Audit, authentication.request.provenance)
 	if err != nil {
 		return CommandDecision{}, err
 	}
@@ -1227,11 +1497,10 @@ func (service *OrchestrationService) BootstrapInstallation(ctx context.Context, 
 		!capabilitySetMatches(view.Body.OwnerGrantCapabilities, proof.OwnerCapabilities()) {
 		return CommandExecution{}, ErrInvalidCommandSpec
 	}
-	provenance, err := NewAuditProvenanceEvidence(request.Spec.AuthorityID(), nil)
-	if err != nil {
-		return CommandExecution{}, ErrInvalidApplicationContract
+	if request.Authentication.PrincipalID() != proof.PrincipalID() {
+		return CommandExecution{}, ErrInvalidCommandSpec
 	}
-	bootstrapIdentity, err := NewAuthenticationEvidence(proof.PrincipalID(), ptrDevice(proof.DeviceID()), provenance)
+	bootstrapIdentity, err := NewAuthenticationEvidence(request.Authentication)
 	if err != nil {
 		return CommandExecution{}, ErrInvalidApplicationContract
 	}
@@ -1256,8 +1525,6 @@ func (service *OrchestrationService) BootstrapInstallation(ctx context.Context, 
 			return BootstrapInstallationCommit(locked, result)
 		})
 }
-
-func ptrDevice(value domain.DeviceID) *domain.DeviceID { return &value }
 
 func validateBootstrapInstallationRequest(request BootstrapInstallationRequest) error {
 	if err := validateCommandRequest(request.CommandRequest, CommandBootstrapInstallation); err != nil {
@@ -1870,21 +2137,23 @@ func evidenceRevisionMatches(spec CommandSpec, targetID string, revision domain.
 
 type StartActorSessionRequest struct {
 	CommandRequest
-	SessionID             domain.ActorSessionID
-	ClientInstanceID      domain.ClientInstanceID
-	ClientMetadata        domain.ClientMetadata
-	WorkspaceID           domain.WorkspaceID
-	PrincipalID           domain.PrincipalID
-	MembershipID          domain.MembershipID
-	ActorID               domain.ActorID
-	DelegationID          domain.ActorDelegationID
-	GrantIDs              []domain.GrantID
-	StartAuthorityKind    domain.SessionStartAuthorityKind
-	DeviceID              domain.DeviceID
-	ExpectedDeviceVersion domain.Version
-	ExpectedDeviceTrust   domain.Version
-	HandoffProofEvidence  CeremonyProofEvidence
-	AbsoluteExpiry        time.Time
+	SessionID                     domain.ActorSessionID
+	ClientInstanceID              domain.ClientInstanceID
+	ClientMetadata                domain.ClientMetadata
+	WorkspaceID                   domain.WorkspaceID
+	PrincipalID                   domain.PrincipalID
+	MembershipID                  domain.MembershipID
+	ActorID                       domain.ActorID
+	DelegationID                  domain.ActorDelegationID
+	GrantIDs                      []domain.GrantID
+	StartAuthorityKind            domain.SessionStartAuthorityKind
+	DeviceID                      domain.DeviceID
+	ExpectedDeviceVersion         domain.Version
+	ExpectedDeviceTrust           domain.Version
+	HandoffProofEvidence          CeremonyProofEvidence
+	AbsoluteExpiry                time.Time
+	PresentationDeliveryReference string
+	PresentationDelivery          PresentationCredentialDelivery
 }
 
 func (service *OrchestrationService) StartActorSession(
@@ -1916,7 +2185,19 @@ func (service *OrchestrationService) StartActorSession(
 			return CommandExecution{}, ErrInvalidCommandSpec
 		}
 	}
-	presentation, err := service.presentations.PreparePresentationCredential(ctx, CommandStartActorSession)
+	var authenticatedDevice *domain.DeviceID
+	if device, _, _, _, _, present := request.Authentication.Device(); present {
+		authenticatedDevice = &device
+	}
+	presentationRequest, err := NewPresentationCredentialRequest(
+		CommandStartActorSession, request.Authentication.PrincipalID(), authenticatedDevice, request.SessionID,
+		request.Authentication.Audience(), request.Authentication.ChannelBinding(),
+		request.PresentationDeliveryReference, request.PresentationDelivery,
+	)
+	if err != nil {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	presentation, err := service.presentations.PreparePresentationCredential(ctx, presentationRequest)
 	if err != nil {
 		return CommandExecution{}, fmt.Errorf("%w: presentation credential: %w", ErrOrchestrationDependency, err)
 	}
