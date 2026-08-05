@@ -1160,6 +1160,18 @@ func TestSecurityDenialIsCommittedDataNotCallbackError(t *testing.T) {
 	if err != nil || decision.Kind() != SecurityDecisionDeny {
 		t.Fatalf("security decision=%s error=%v", decision.Kind(), err)
 	}
+	if err := ValidateSecurityDecision(securityContext, decision); err != nil {
+		t.Fatalf("valid locked decision rejected: %v", err)
+	}
+	substitutedContext, err := NewSecurityContext(
+		spec, fixture.now.Add(2*time.Minute), fixture.invitation, FreshSecurityAttempt(), DenialAdmission{}, guardDigest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSecurityDecision(substitutedContext, decision); !errors.Is(err, ErrInvalidSecurityDecision) {
+		t.Fatalf("cross-context decision accepted: %v", err)
+	}
 	record, ok := decision.Denial()
 	if !ok || record.InvitationVersion().Uint64() != 2 {
 		t.Fatalf("security denial record=%+v ok=%t", record, ok)
@@ -1174,6 +1186,9 @@ func TestSecurityDenialIsCommittedDataNotCallbackError(t *testing.T) {
 	replayDecision, err := ReplayBootstrapDenialSecurity(replayContext)
 	if err != nil || replayDecision.Kind() != SecurityDecisionReplay {
 		t.Fatalf("denial replay decision=%s error=%v", replayDecision.Kind(), err)
+	}
+	if err := ValidateSecurityDecision(replayContext, replayDecision); err != nil {
+		t.Fatalf("valid replay decision rejected: %v", err)
 	}
 }
 

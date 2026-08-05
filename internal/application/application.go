@@ -5624,6 +5624,42 @@ func (decision SecurityDecision) Rejection() (*domain.CommandError, bool) {
 	return decision.rejection, decision.kind == SecurityDecisionRollback
 }
 
+// ValidateSecurityDecision proves that a callback decision was constructed
+// from this exact locked context without exposing private audit bindings to a
+// storage adapter.
+func ValidateSecurityDecision(locked SecurityContext, decision SecurityDecision) error {
+	seed := AuditIntent{
+		operation: decision.audit.operation, outcome: decision.audit.outcome,
+		fingerprint: decision.audit.fingerprint, detail: decision.audit.detail,
+	}
+	var (
+		expected SecurityDecision
+		err      error
+	)
+	switch decision.kind {
+	case SecurityDecisionInitialize:
+		expected, err = InitializeSecurity(locked, seed)
+	case SecurityDecisionGeneration:
+		expected, err = ChangeBootstrapGenerationSecurity(locked, seed)
+	case SecurityDecisionDeny:
+		expected, err = DenyBootstrapSecurity(locked, decision.invitation, seed)
+	case SecurityDecisionAuditDenial:
+		expected, err = AuditCommandDenialSecurity(locked, seed)
+	case SecurityDecisionSuppressDenial:
+		expected, err = SuppressCommandDenialSecurity(locked)
+	case SecurityDecisionReplay:
+		expected, err = ReplayBootstrapDenialSecurity(locked)
+	case SecurityDecisionRollback:
+		expected, err = RollbackSecurity(locked, decision.rejection)
+	default:
+		err = ErrInvalidSecurityDecision
+	}
+	if err != nil || !reflect.DeepEqual(expected, decision) {
+		return ErrInvalidSecurityDecision
+	}
+	return nil
+}
+
 type SecurityExecutionKind string
 
 const (
