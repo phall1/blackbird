@@ -2,16 +2,185 @@ package contracts
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/phall1/blackbird/internal/domain"
 )
 
-// AuthenticationEvidence is verified transport evidence. Adapters pass it
-// through without interpreting it or deriving identity from request bodies.
-type AuthenticationEvidence interface {
-	AuthenticationEvidence()
+const (
+	maxAuthenticationAudienceBytes = 256
+	maxFederationEnvelopeIDBytes   = 256
+)
+
+// ChannelBindingDigest is the SHA-256 digest of the verified proof-bound
+// channel binding. It contains no credential or reusable bearer material.
+type ChannelBindingDigest struct{ value [sha256.Size]byte }
+
+func NewChannelBindingDigest(encoded string) (ChannelBindingDigest, error) {
+	if len(encoded) != hex.EncodedLen(sha256.Size) || strings.ToLower(encoded) != encoded {
+		return ChannelBindingDigest{}, invalid("channel_binding_digest", "must be nonzero lowercase SHA-256 text")
+	}
+	var value [sha256.Size]byte
+	if _, err := hex.Decode(value[:], []byte(encoded)); err != nil || value == [sha256.Size]byte{} {
+		return ChannelBindingDigest{}, invalid("channel_binding_digest", "must be nonzero lowercase SHA-256 text")
+	}
+	return ChannelBindingDigest{value: value}, nil
+}
+
+func (digest ChannelBindingDigest) String() string {
+	if digest.value == [sha256.Size]byte{} {
+		return ""
+	}
+	return hex.EncodeToString(digest.value[:])
+}
+
+// AuthenticationAudience is the exact resource-server audience validated by
+// the authenticator. Equality is byte-for-byte; it is never inferred from a
+// request target or operation body.
+type AuthenticationAudience struct{ value string }
+
+func NewAuthenticationAudience(value string) (AuthenticationAudience, error) {
+	if !validCanonicalIdentifier(value, maxAuthenticationAudienceBytes) {
+		return AuthenticationAudience{}, invalid("audience", "must be a canonical audience identifier")
+	}
+	return AuthenticationAudience{value: value}, nil
+}
+
+func (audience AuthenticationAudience) String() string { return audience.value }
+
+// AuthenticationAuditProvenance identifies the authority that established
+// trust and, for federated authentication, the already-validated envelope.
+type AuthenticationAuditProvenance struct {
+	sourceAuthority    domain.AuthorityID
+	federationEnvelope string
+	hasEnvelope        bool
+}
+
+func NewAuthenticationAuditProvenance(
+	sourceAuthority domain.AuthorityID,
+	federationEnvelopeID *string,
+) (AuthenticationAuditProvenance, error) {
+	if sourceAuthority.IsZero() {
+		return AuthenticationAuditProvenance{}, invalid("audit_provenance.source_authority_id", "must be a nonzero UUIDv7 authority ID")
+	}
+	provenance := AuthenticationAuditProvenance{sourceAuthority: sourceAuthority}
+	if federationEnvelopeID != nil {
+		if !validCanonicalIdentifier(*federationEnvelopeID, maxFederationEnvelopeIDBytes) {
+			return AuthenticationAuditProvenance{}, invalid("audit_provenance.federation_envelope_id", "must be a canonical identifier")
+		}
+		provenance.federationEnvelope = *federationEnvelopeID
+		provenance.hasEnvelope = true
+	}
+	return provenance, nil
+}
+
+func (provenance AuthenticationAuditProvenance) SourceAuthorityID() domain.AuthorityID {
+	return provenance.sourceAuthority
+}
+
+func (provenance AuthenticationAuditProvenance) FederationEnvelopeID() (string, bool) {
+	return provenance.federationEnvelope, provenance.hasEnvelope
+}
+
+// AuthenticationEvidence is the immutable result of cryptographic
+// authentication. Its zero value is invalid, and only this package can create
+// a valid value, so transports cannot manufacture trusted identity evidence.
+// It deliberately retains no plaintext secret, access token, assertion, or
+// reusable bearer credential.
+type AuthenticationEvidence struct {
+	principal          domain.PrincipalID
+	device             domain.DeviceID
+	hasDevice          bool
+	actorSession       domain.ActorSessionID
+	hasActorSession    bool
+	credentialRevision domain.Version
+	grantsRevision     domain.Version
+	channelBinding     ChannelBindingDigest
+	audience           AuthenticationAudience
+	auditProvenance    AuthenticationAuditProvenance
+}
+
+func NewAuthenticationEvidence(
+	principal domain.PrincipalID,
+	device *domain.DeviceID,
+	actorSession *domain.ActorSessionID,
+	credentialRevision domain.Version,
+	grantsRevision domain.Version,
+	channelBinding ChannelBindingDigest,
+	audience AuthenticationAudience,
+	auditProvenance AuthenticationAuditProvenance,
+) (AuthenticationEvidence, error) {
+	if principal.IsZero() || !credentialRevision.Valid() || !grantsRevision.Valid() ||
+		channelBinding.String() == "" || audience.String() == "" || auditProvenance.sourceAuthority.IsZero() {
+		return AuthenticationEvidence{}, invalid("authentication_evidence", "contains invalid trusted evidence")
+	}
+	evidence := AuthenticationEvidence{
+		principal: principal, credentialRevision: credentialRevision, grantsRevision: grantsRevision,
+		channelBinding: channelBinding, audience: audience, auditProvenance: auditProvenance,
+	}
+	if device != nil {
+		if device.IsZero() {
+			return AuthenticationEvidence{}, invalid("device_id", "must be a nonzero UUIDv7 device ID when present")
+		}
+		evidence.device, evidence.hasDevice = *device, true
+	}
+	if actorSession != nil {
+		if actorSession.IsZero() {
+			return AuthenticationEvidence{}, invalid("actor_session_id", "must be a nonzero UUIDv7 actor-session ID when present")
+		}
+		evidence.actorSession, evidence.hasActorSession = *actorSession, true
+	}
+	return evidence, nil
+}
+
+func (evidence AuthenticationEvidence) Valid() bool {
+	if evidence.principal.IsZero() || !evidence.credentialRevision.Valid() || !evidence.grantsRevision.Valid() ||
+		evidence.channelBinding.String() == "" || evidence.audience.String() == "" || evidence.auditProvenance.sourceAuthority.IsZero() {
+		return false
+	}
+	return (!evidence.hasDevice && evidence.device.IsZero() || evidence.hasDevice && !evidence.device.IsZero()) &&
+		(!evidence.hasActorSession && evidence.actorSession.IsZero() || evidence.hasActorSession && !evidence.actorSession.IsZero()) &&
+		(!evidence.auditProvenance.hasEnvelope && evidence.auditProvenance.federationEnvelope == "" ||
+			evidence.auditProvenance.hasEnvelope && validCanonicalIdentifier(evidence.auditProvenance.federationEnvelope, maxFederationEnvelopeIDBytes))
+}
+
+func (evidence AuthenticationEvidence) PrincipalID() domain.PrincipalID { return evidence.principal }
+func (evidence AuthenticationEvidence) DeviceID() (domain.DeviceID, bool) {
+	return evidence.device, evidence.hasDevice
+}
+func (evidence AuthenticationEvidence) ActorSessionID() (domain.ActorSessionID, bool) {
+	return evidence.actorSession, evidence.hasActorSession
+}
+func (evidence AuthenticationEvidence) CredentialRevision() domain.Version {
+	return evidence.credentialRevision
+}
+func (evidence AuthenticationEvidence) GrantsRevision() domain.Version {
+	return evidence.grantsRevision
+}
+func (evidence AuthenticationEvidence) ChannelBindingDigest() ChannelBindingDigest {
+	return evidence.channelBinding
+}
+func (evidence AuthenticationEvidence) Audience() AuthenticationAudience { return evidence.audience }
+func (evidence AuthenticationEvidence) AuditProvenance() AuthenticationAuditProvenance {
+	return evidence.auditProvenance
+}
+
+func validCanonicalIdentifier(value string, maximum int) bool {
+	if value == "" || len(value) > maximum || strings.ToLower(value) != value {
+		return false
+	}
+	for index, character := range []byte(value) {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') ||
+			(index > 0 && strings.ContainsRune("-_.:/", rune(character))) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type InstallationBootstrapHandler interface {

@@ -35,6 +35,75 @@ const (
 
 var fixtureTime = time.Date(2026, 8, 4, 12, 0, 0, 123_000_000, time.UTC)
 
+func TestAuthenticationEvidenceIsSealedTypedAndComplete(t *testing.T) {
+	t.Parallel()
+	principal := mustParsePrincipalID(t, idPrincipal)
+	device := mustParseDeviceID(t, idDevice)
+	session := mustParseActorSessionID(t, idSession)
+	authority := mustParseAuthorityID(t, idAuthority)
+	binding, err := NewChannelBindingDigest(strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatalf("NewChannelBindingDigest() error = %v", err)
+	}
+	audience, err := NewAuthenticationAudience("blackbird-product-api")
+	if err != nil {
+		t.Fatalf("NewAuthenticationAudience() error = %v", err)
+	}
+	envelopeID := "federation-envelope/v1"
+	provenance, err := NewAuthenticationAuditProvenance(authority, &envelopeID)
+	if err != nil {
+		t.Fatalf("NewAuthenticationAuditProvenance() error = %v", err)
+	}
+	credentialRevision, _ := domain.NewVersion(2)
+	grantsRevision, _ := domain.NewVersion(3)
+	evidence, err := NewAuthenticationEvidence(
+		principal, &device, &session, credentialRevision, grantsRevision, binding, audience, provenance,
+	)
+	if err != nil {
+		t.Fatalf("NewAuthenticationEvidence() error = %v", err)
+	}
+	gotDevice, hasDevice := evidence.DeviceID()
+	gotSession, hasSession := evidence.ActorSessionID()
+	gotEnvelope, hasEnvelope := evidence.AuditProvenance().FederationEnvelopeID()
+	if !evidence.Valid() || evidence.PrincipalID() != principal || !hasDevice || gotDevice != device ||
+		!hasSession || gotSession != session || evidence.CredentialRevision() != credentialRevision ||
+		evidence.GrantsRevision() != grantsRevision || evidence.ChannelBindingDigest() != binding ||
+		evidence.Audience() != audience || evidence.AuditProvenance().SourceAuthorityID() != authority ||
+		!hasEnvelope || gotEnvelope != envelopeID {
+		t.Fatalf("authentication evidence accessors lost trusted values: %#v", evidence)
+	}
+	if (AuthenticationEvidence{}).Valid() {
+		t.Fatal("zero AuthenticationEvidence is valid")
+	}
+}
+
+func TestAuthenticationEvidenceConstructorsRejectInvalidValues(t *testing.T) {
+	t.Parallel()
+	principal := mustParsePrincipalID(t, idPrincipal)
+	authority := mustParseAuthorityID(t, idAuthority)
+	binding, _ := NewChannelBindingDigest(strings.Repeat("a", 64))
+	audience, _ := NewAuthenticationAudience("blackbird-product-api")
+	provenance, _ := NewAuthenticationAuditProvenance(authority, nil)
+
+	if _, err := NewChannelBindingDigest(strings.Repeat("A", 64)); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("uppercase channel binding error = %v, want ErrInvalidContract", err)
+	}
+	if _, err := NewChannelBindingDigest(strings.Repeat("0", 64)); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("zero channel binding error = %v, want ErrInvalidContract", err)
+	}
+	if _, err := NewAuthenticationAudience(" bearer-secret "); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("invalid audience error = %v, want ErrInvalidContract", err)
+	}
+	if _, err := NewAuthenticationAuditProvenance(domain.AuthorityID{}, nil); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("zero authority error = %v, want ErrInvalidContract", err)
+	}
+	if _, err := NewAuthenticationEvidence(
+		principal, nil, nil, domain.Version{}, domain.InitialVersion(), binding, audience, provenance,
+	); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("zero credential revision error = %v, want ErrInvalidContract", err)
+	}
+}
+
 func TestInstallationBootstrapRequestStrictBoundary(t *testing.T) {
 	t.Parallel()
 

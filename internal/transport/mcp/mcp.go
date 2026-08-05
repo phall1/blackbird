@@ -170,7 +170,7 @@ func registerTool[Request, Result any](server *sdkmcp.Server, name, operation st
 	}, func(ctx context.Context, request *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
 		transportRequestID := newRequestID()
 		evidence, failure, authErr := authenticator.Authenticate(ctx, operation, transportRequestID)
-		if authErr != nil || isNil(evidence) == (failure == nil) {
+		if authErr != nil || evidence.Valid() == (failure != nil) {
 			return toolFailure(internalFailure(transportRequestID)), nil
 		}
 		if failure != nil {
@@ -218,7 +218,7 @@ func registerResources(server *sdkmcp.Server, dependencies Dependencies) {
 		}
 		requestID := resourceRequestID(request.Params.URI)
 		evidence, failure, authErr := dependencies.Authenticator.Authenticate(ctx, contracts.OperationContextGet, requestID)
-		if authErr != nil || isNil(evidence) == (failure == nil) {
+		if authErr != nil || evidence.Valid() == (failure != nil) {
 			return resourceResult(request.Params.URI, internalFailure(requestID))
 		}
 		if failure != nil {

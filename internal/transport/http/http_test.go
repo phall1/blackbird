@@ -16,10 +16,6 @@ import (
 
 const actorSessionID = "01b8e094-9888-7000-8000-00000000001f"
 
-type testEvidence struct{}
-
-func (testEvidence) AuthenticationEvidence() {}
-
 type testAuthenticator struct {
 	operation string
 	seenDone  bool
@@ -38,12 +34,42 @@ func (authenticator *testAuthenticator) Authenticate(
 	if authenticator.failure != nil {
 		failure := *authenticator.failure
 		failure.RequestID = requestID
-		return nil, &failure, authenticator.err
+		return AuthenticationEvidence{}, &failure, authenticator.err
 	}
 	if authenticator.err != nil {
-		return nil, nil, authenticator.err
+		return AuthenticationEvidence{}, nil, authenticator.err
 	}
-	return testEvidence{}, nil, nil
+	return validAuthenticationEvidence(), nil, nil
+}
+
+func validAuthenticationEvidence() AuthenticationEvidence {
+	principal, err := domain.ParsePrincipalID("01b8e094-9888-7000-8000-000000000004")
+	if err != nil {
+		panic(err)
+	}
+	authority, err := domain.ParseAuthorityID("01b8e094-9888-7000-8000-000000000003")
+	if err != nil {
+		panic(err)
+	}
+	binding, err := contracts.NewChannelBindingDigest(strings.Repeat("a", 64))
+	if err != nil {
+		panic(err)
+	}
+	audience, err := contracts.NewAuthenticationAudience("blackbird-product-api")
+	if err != nil {
+		panic(err)
+	}
+	provenance, err := contracts.NewAuthenticationAuditProvenance(authority, nil)
+	if err != nil {
+		panic(err)
+	}
+	evidence, err := contracts.NewAuthenticationEvidence(
+		principal, nil, nil, domain.InitialVersion(), domain.InitialVersion(), binding, audience, provenance,
+	)
+	if err != nil {
+		panic(err)
+	}
+	return evidence
 }
 
 type testHandlers struct {

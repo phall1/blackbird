@@ -174,7 +174,7 @@ func serveOperation[Request, Result any](
 		authenticationRequest.Body = nil
 		authenticationRequest.GetBody = nil
 		evidence, failure, err := authenticator.Authenticate(request.Context(), authenticationRequest, operation, requestID)
-		if err != nil || isNil(evidence) == (failure == nil) {
+		if err != nil || evidence.Valid() == (failure != nil) {
 			writeProblem(writer, internalFailure(requestID))
 			return
 		}
