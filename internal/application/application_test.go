@@ -939,6 +939,20 @@ func TestQueryDTOViewsRetainCompleteDeterministicData(t *testing.T) {
 	if _, err = NewContextGetQuery(subject, checkpointID, cursor, 0); !errors.Is(err, ErrInvalidQuery) {
 		t.Fatalf("zero context limit error=%v", err)
 	}
+	record, _ := NewContextRecord(ContextRecordWorkspace, workspace.String(), domain.InitialVersion(), []byte(`{"state":"active"}`))
+	checkpoint, err := NewContextCheckpoint(ContextCheckpointParams{
+		CheckpointID: checkpointID, AuthorityID: authority, AuthorityEpoch: epoch, ThroughCursor: cursor,
+		ProjectionVersion: 1, ServerTime: time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC),
+		Session: AuthorizedSessionView{session: session}, Records: []ContextRecord{record},
+	})
+	if err != nil || checkpoint.AuthorityID() != authority || checkpoint.AuthorityEpoch() != epoch ||
+		checkpoint.ProjectionVersion() != 1 || checkpoint.ServerTime().IsZero() {
+		t.Fatalf("context checkpoint=%+v error=%v", checkpoint, err)
+	}
+	checkpointPage, err := NewContextCheckpointPage(checkpoint, cursor)
+	if err != nil || checkpointPage.HeadCursor() != cursor || checkpointPage.NextCursor() != cursor {
+		t.Fatalf("checkpoint page=%+v error=%v", checkpointPage, err)
+	}
 
 	scope, _ := domain.WorkspaceScope(workspace)
 	position, _ := domain.NewStreamPosition(7)
@@ -973,6 +987,10 @@ func TestQueryDTOViewsRetainCompleteDeterministicData(t *testing.T) {
 	invalid := SyncedEventParams{EventID: eventID}
 	if _, err = NewSyncedEvent(invalid); !errors.Is(err, ErrInvalidQuery) {
 		t.Fatalf("incomplete event error=%v", err)
+	}
+	target, _ := domain.NewAggregateTarget(workspace)
+	if _, err = NewContextDelta(eventID, ContextDeltaUpsert, target, domain.InitialVersion(), []byte(`[]`), head); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("non-object context delta error=%v", err)
 	}
 }
 

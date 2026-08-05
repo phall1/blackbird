@@ -366,7 +366,19 @@ func (service *QueryService) GetContext(
 	if err != nil {
 		return ContextPage{}, err
 	}
-	return service.store.GetContext(ctx, query)
+	page, err := service.store.GetContext(ctx, query)
+	if err == nil || cursor.IsZero() {
+		return page, err
+	}
+	var rejection *domain.CommandError
+	if !errors.As(err, &rejection) || rejection.Code() != domain.ErrorCodeCursorExpired {
+		return ContextPage{}, err
+	}
+	checkpointQuery, queryErr := NewContextGetQuery(subject, id, EventCursor{}, limit)
+	if queryErr != nil {
+		return ContextPage{}, queryErr
+	}
+	return service.store.GetContext(ctx, checkpointQuery)
 }
 
 func (service *QueryService) SyncEvents(ctx context.Context, subject QuerySubject, after EventCursor, limit uint16) (EventsPage, error) {

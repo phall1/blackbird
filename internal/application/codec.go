@@ -312,17 +312,21 @@ func (codec ProductionCanonicalCodec) MaterializeReceiptResult(
 		PresentationCredential: plan.PresentationCredential(),
 	})
 	if err != nil {
-		return ResultEnvelope{}, err
+		return ResultEnvelope{}, fmt.Errorf("materialize receipt view: %w", err)
 	}
 	document, err := codec.EncodeReceiptResult(view)
 	if err != nil {
-		return ResultEnvelope{}, err
+		return ResultEnvelope{}, fmt.Errorf("encode materialized receipt: %w", err)
 	}
 	envelope, err := NewResultEnvelope(document)
 	if err != nil {
-		return ResultEnvelope{}, err
+		return ResultEnvelope{}, fmt.Errorf("seal materialized receipt: %w", err)
 	}
-	return bindResultEnvelopePlan(envelope, plan)
+	bound, err := bindResultEnvelopePlan(envelope, plan)
+	if err != nil {
+		return ResultEnvelope{}, fmt.Errorf("bind materialized receipt plan: %w", err)
+	}
+	return bound, nil
 }
 
 // RecoveryCapsuleDocument is a sealed, canonical, profile-bound unsigned
@@ -1019,7 +1023,232 @@ func (codec ProductionCanonicalCodec) VerifyReceiptResult(
 		!bytes.Equal(expected.CanonicalBytes(), canonical) {
 		return ResultEnvelope{}, fmt.Errorf("%w: retained receipt body does not match replay plan", ErrCanonicalProfile)
 	}
-	return expected, nil
+	rehydratedView, err := rehydrateReceiptResultView(wire, binding.ExpectedPlan())
+	if err != nil {
+		return ResultEnvelope{}, fmt.Errorf("%w: retained receipt typed view: %v", ErrCanonicalProfile, err)
+	}
+	rehydratedDocument, err := codec.EncodeReceiptResult(rehydratedView)
+	if err != nil || rehydratedDocument.Digest() != expectedDigest ||
+		!bytes.Equal(rehydratedDocument.CanonicalBytes(), canonical) {
+		return ResultEnvelope{}, fmt.Errorf("%w: retained receipt typed roundtrip mismatch", ErrCanonicalProfile)
+	}
+	rehydrated, err := NewResultEnvelope(rehydratedDocument)
+	if err != nil {
+		return ResultEnvelope{}, fmt.Errorf("%w: retained receipt typed envelope", ErrCanonicalProfile)
+	}
+	return bindResultEnvelopePlan(rehydrated, binding.ExpectedPlan())
+}
+
+func rehydrateReceiptResultView(wire receiptResultWire, plan ReceiptResultPlan) (W0ReceiptResultView, error) {
+	authorityID, err := domain.ParseAuthorityID(wire.AuthorityID.String())
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	authorityEpoch, err := domain.ParseAuthorityEpoch(wire.AuthorityEpoch.String())
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	var scope domain.AuthorityScope
+	switch domain.ScopeKind(wire.ScopeKind) {
+	case domain.ScopeKindInstallation:
+		installationID, parseErr := domain.ParseInstallationID(wire.ScopeID.String())
+		if parseErr != nil {
+			return W0ReceiptResultView{}, parseErr
+		}
+		scope, err = domain.InstallationScope(installationID)
+	case domain.ScopeKindWorkspace:
+		workspaceID, parseErr := domain.ParseWorkspaceID(wire.ScopeID.String())
+		if parseErr != nil {
+			return W0ReceiptResultView{}, parseErr
+		}
+		scope, err = domain.WorkspaceScope(workspaceID)
+	default:
+		return W0ReceiptResultView{}, ErrCanonicalProfile
+	}
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	acceptedAt, err := NewCanonicalInstant(wire.AcceptedAt.Time())
+	if err != nil || acceptedAt != wire.AcceptedAt {
+		return W0ReceiptResultView{}, ErrCanonicalProfile
+	}
+	commandBytes, err := hex.DecodeString(wire.CommandFingerprint.String())
+	if err != nil || len(commandBytes) != sha256.Size {
+		return W0ReceiptResultView{}, ErrCanonicalProfile
+	}
+	var commandArray [sha256.Size]byte
+	copy(commandArray[:], commandBytes)
+	commandFingerprint := domain.CommandFingerprint(commandArray)
+	if commandFingerprint.IsZero() {
+		return W0ReceiptResultView{}, ErrCanonicalProfile
+	}
+	authorizationDigest, err := domain.ParseAuthorizationDigest(wire.AuthorizationDigest.String())
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	resources := make([]domain.AggregateRef, len(wire.Resources))
+	for index, resourceWire := range wire.Resources {
+		version, versionErr := domain.NewVersion(resourceWire.Version)
+		if versionErr != nil {
+			return W0ReceiptResultView{}, versionErr
+		}
+		resources[index], err = aggregateReceiptRef(domain.AggregateKind(resourceWire.Kind), resourceWire.ID.String(), version)
+		if err != nil {
+			return W0ReceiptResultView{}, err
+		}
+	}
+	ceremonies, err := rehydrateReceiptCeremonies(wire.IssuedCeremonies, plan.IssuedCeremonies())
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	firstPosition, err := domain.NewStreamPosition(wire.Events.FirstPosition)
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	lastPosition, err := domain.NewStreamPosition(wire.Events.LastPosition)
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	eventIDs := make([]domain.EventID, len(wire.Events.EventIDs))
+	for index, eventIDWire := range wire.Events.EventIDs {
+		eventIDs[index], err = domain.ParseEventID(eventIDWire.String())
+		if err != nil {
+			return W0ReceiptResultView{}, err
+		}
+	}
+	finalStreamDigest, err := domain.ParseStreamDigest(wire.Events.FinalStreamDigest.String())
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	sessionBinding, sessionClient, presentation, err := rehydrateReceiptSession(wire.SessionBinding, plan)
+	if err != nil {
+		return W0ReceiptResultView{}, err
+	}
+	view, err := NewW0ReceiptResultView(W0ReceiptResultParams{
+		Operation: CommandOperation(wire.Operation), AuthorityID: authorityID, AuthorityEpoch: authorityEpoch,
+		Scope: scope, AcceptedAt: acceptedAt.Time(), CommandFingerprint: commandFingerprint,
+		AuthorizationDigest: authorizationDigest, Resources: resources, IssuedCeremonies: ceremonies,
+		FirstEventPosition: firstPosition, LastEventPosition: lastPosition, EventIDs: eventIDs,
+		FinalStreamDigest: finalStreamDigest, SessionBinding: sessionBinding, SessionClient: sessionClient,
+		PresentationCredential: presentation,
+	})
+	if err != nil || view.result.operation != plan.Operation() || view.result.authorityID != plan.AuthorityID() ||
+		view.result.authorityEpoch != plan.AuthorityEpoch() || view.result.scope != plan.Scope() ||
+		!view.result.acceptedAt.Equal(plan.AcceptedAt()) {
+		return W0ReceiptResultView{}, ErrCanonicalProfile
+	}
+	return view, nil
+}
+
+func rehydrateReceiptCeremonies(
+	wires []receiptCeremonyWire,
+	expected []domain.CeremonyChallenge,
+) ([]domain.CeremonyChallenge, error) {
+	if len(wires) != len(expected) {
+		return nil, ErrCanonicalProfile
+	}
+	result := make([]domain.CeremonyChallenge, len(wires))
+	for index, wire := range wires {
+		ceremonyID, err := domain.ParseCeremonyID(wire.ID.String())
+		if err != nil {
+			return nil, err
+		}
+		expiresAt, err := NewCanonicalInstant(wire.ExpiresAt.Time())
+		if err != nil || expiresAt != wire.ExpiresAt {
+			return nil, ErrCanonicalProfile
+		}
+		basis := expected[index]
+		result[index], err = domain.RehydrateCeremonyChallenge(domain.CeremonyChallengeRehydrationParams{
+			ID: ceremonyID, Purpose: domain.CeremonyPurpose(wire.Purpose), ProofDigest: basis.ProofDigest(),
+			ExpiresAt: expiresAt.Time(), Status: basis.Status(), InstallationID: basis.InstallationID(),
+			WorkspaceID: basis.WorkspaceID(), PrincipalID: basis.PrincipalID(), MembershipID: basis.MembershipID(),
+			ActorID: basis.ActorID(), DelegationID: basis.DelegationID(), DeviceID: basis.DeviceID(),
+		})
+		if err != nil || result[index] != basis {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	return result, nil
+}
+
+func rehydrateReceiptSession(
+	wire *receiptSessionBindingWire,
+	plan ReceiptResultPlan,
+) (*domain.SessionBinding, domain.ClientInstanceID, domain.PresentationCredentialBinding, error) {
+	basis, expectedClient, hasSession := plan.Session()
+	if (wire != nil) != hasSession {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, ErrCanonicalProfile
+	}
+	if wire == nil {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, nil
+	}
+	client, err := domain.ParseClientInstanceID(wire.ClientInstanceID.String())
+	if err != nil || client != expectedClient {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, ErrCanonicalProfile
+	}
+	membership, err := rehydrateAggregateRef(basis.MembershipRevision())
+	if err != nil {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, err
+	}
+	delegation, err := rehydrateAggregateRef(basis.DelegationRevision())
+	if err != nil {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, err
+	}
+	grants := basis.GrantRevisions()
+	for index := range grants {
+		grants[index], err = rehydrateAggregateRef(grants[index])
+		if err != nil {
+			return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, err
+		}
+	}
+	var device *domain.AggregateRef
+	deviceTrust := domain.Version{}
+	if basisDevice, hasDevice := basis.DeviceRevision(); hasDevice {
+		rehydratedDevice, deviceErr := rehydrateAggregateRef(basisDevice)
+		trust, hasTrust := basis.DeviceTrustRevision()
+		if deviceErr != nil || !hasTrust {
+			return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, ErrCanonicalProfile
+		}
+		deviceTrust, err = domain.NewVersion(trust.Uint64())
+		if err != nil {
+			return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, err
+		}
+		device = &rehydratedDevice
+	}
+	policy, policyErr := domain.NewPolicyRevision(basis.PolicyRevision().String())
+	assurance, assuranceErr := domain.NewAssuranceClass(basis.AssuranceClass().String())
+	authorityID, authorityErr := domain.ParseAuthorityID(basis.AuthorityID().String())
+	authorityEpoch, epochErr := domain.ParseAuthorityEpoch(basis.AuthorityEpoch().String())
+	workspaceID, workspaceErr := domain.ParseWorkspaceID(basis.WorkspaceID().String())
+	principalID, principalErr := domain.ParsePrincipalID(basis.PrincipalID().String())
+	actorID, actorErr := domain.ParseActorID(basis.ActorID().String())
+	issuedAt, issuedErr := NewCanonicalInstant(basis.IssuedAt())
+	absoluteExpiry, expiryErr := NewCanonicalInstant(basis.AbsoluteExpiry())
+	if policyErr != nil || assuranceErr != nil || authorityErr != nil || epochErr != nil ||
+		workspaceErr != nil || principalErr != nil || actorErr != nil || issuedErr != nil || expiryErr != nil {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, ErrCanonicalProfile
+	}
+	binding, err := domain.NewSessionBinding(
+		authorityID, authorityEpoch, workspaceID, principalID, actorID, membership, delegation, device,
+		deviceTrust, grants, policy, assurance, issuedAt.Time(), absoluteExpiry.Time(),
+	)
+	if err != nil {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, err
+	}
+	presentationBasis := plan.PresentationCredential()
+	digest, digestErr := domain.NewCredentialDigest(presentationBasis.Digest().Bytes())
+	reference, referenceErr := domain.NewCredentialReference(presentationBasis.Reference().String())
+	audience, audienceErr := domain.NewCredentialAudience(presentationBasis.Audience().String())
+	if digestErr != nil || referenceErr != nil || audienceErr != nil {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, ErrCanonicalProfile
+	}
+	presentation, err := domain.NewPresentationCredentialBinding(
+		digest, reference, audience, presentationBasis.Version(),
+	)
+	if err != nil || presentation != presentationBasis {
+		return nil, domain.ClientInstanceID{}, domain.PresentationCredentialBinding{}, ErrCanonicalProfile
+	}
+	return &binding, client, presentation, nil
 }
 
 // VerifyRecoveryCapsule rehydrates an unsigned stored draft only after
@@ -1587,7 +1816,7 @@ type CommandCeremony struct {
 }
 
 func commandHashContext(operation CommandOperation, params W0CommandHashContextParams) (commandHashContextWire, error) {
-	contract, exists := operationContracts[operation]
+	contract, exists := commandContract(operation)
 	expectedScope := StreamScopeKind(contract.scope)
 	if !exists || !params.ScopeKind.Valid() || params.ScopeKind != expectedScope ||
 		params.ScopeID.String() == "" || params.PrincipalID.String() == "" ||
@@ -2129,6 +2358,12 @@ const (
 	ReceiptOperationActorDelegationPropose    = CommandProposeActorDelegation
 	ReceiptOperationActorDelegationActivate   = CommandActivateActorDelegation
 	ReceiptOperationActorSessionStart         = CommandStartActorSession
+	ReceiptOperationWorkRefObserve            = CommandObserveWorkRef
+	ReceiptOperationObjectiveAndWorkCreate    = CommandCreateObjectiveAndWork
+	ReceiptOperationObjectiveActivate         = CommandActivateObjective
+	ReceiptOperationRunPlanWithBindings       = CommandPlanRunWithBindings
+	ReceiptOperationRunParticipationJoin      = CommandJoinRun
+	ReceiptOperationRunStart                  = CommandStartRun
 )
 
 type receiptOperationCatalog struct {
@@ -2138,6 +2373,7 @@ type receiptOperationCatalog struct {
 	eventCount      int
 	capsuleRequired bool
 	sessionRequired bool
+	variablePlan    bool
 }
 
 func receiptCatalog(operation W0ReceiptOperation) (receiptOperationCatalog, bool) {
@@ -2188,9 +2424,184 @@ func receiptCatalog(operation W0ReceiptOperation) (receiptOperationCatalog, bool
 		catalog := singleResourceCatalog(workspace, domain.AggregateKindActorSession, true)
 		catalog.sessionRequired = true
 		return catalog, true
+	case ReceiptOperationWorkRefObserve:
+		return singleResourceCatalog(workspace, domain.AggregateKindWorkReference, false), true
+	case ReceiptOperationObjectiveAndWorkCreate:
+		return receiptOperationCatalog{scopeKind: workspace, resourceKinds: []domain.AggregateKind{
+			domain.AggregateKindObjective, domain.AggregateKindWorkUnit}, eventCount: 2}, true
+	case ReceiptOperationObjectiveActivate:
+		return singleResourceCatalog(workspace, domain.AggregateKindObjective, false), true
+	case ReceiptOperationRunPlanWithBindings:
+		return receiptOperationCatalog{scopeKind: workspace, variablePlan: true}, true
+	case ReceiptOperationRunParticipationJoin:
+		return singleResourceCatalog(workspace, domain.AggregateKindRunParticipation, false), true
+	case ReceiptOperationRunStart:
+		return singleResourceCatalog(workspace, domain.AggregateKindRun, false), true
 	default:
 		return receiptOperationCatalog{}, false
 	}
+}
+
+func receiptShape(catalog receiptOperationCatalog, resources []domain.AggregateRef) ([]domain.AggregateKind, int, bool) {
+	if !catalog.variablePlan {
+		return catalog.resourceKinds, catalog.eventCount, len(resources) == len(catalog.resourceKinds)
+	}
+	if len(resources) < 3 || len(resources) > 1+domain.MaxRunParticipants+domain.MaxRunBindings {
+		return nil, 0, false
+	}
+	kinds := make([]domain.AggregateKind, len(resources))
+	runs, participants, bindings := 0, 0, 0
+	for index, resource := range resources {
+		kinds[index] = resource.Kind()
+		switch resource.Kind() {
+		case domain.AggregateKindRun:
+			runs++
+			if index != 0 {
+				return nil, 0, false
+			}
+		case domain.AggregateKindRunParticipation:
+			participants++
+			if bindings != 0 {
+				return nil, 0, false
+			}
+		case domain.AggregateKindRuntimeBinding:
+			bindings++
+		default:
+			return nil, 0, false
+		}
+	}
+	return kinds, len(resources), runs == 1 && participants > 0 && participants <= domain.MaxRunParticipants &&
+		bindings > 0 && bindings <= domain.MaxRunBindings
+}
+
+func receiptWireShape(catalog receiptOperationCatalog, resources []receiptResourceWire) ([]domain.AggregateKind, int, bool) {
+	if !catalog.variablePlan {
+		return catalog.resourceKinds, catalog.eventCount, len(resources) == len(catalog.resourceKinds)
+	}
+	refs := make([]domain.AggregateRef, len(resources))
+	for index, resource := range resources {
+		version, err := domain.NewVersion(resource.Version)
+		if err != nil {
+			return nil, 0, false
+		}
+		ref, err := aggregateReceiptRef(domain.AggregateKind(resource.Kind), resource.ID.String(), version)
+		if err != nil {
+			return nil, 0, false
+		}
+		refs[index] = ref
+	}
+	return receiptShape(catalog, refs)
+}
+
+func aggregateReceiptRef(kind domain.AggregateKind, id string, version domain.Version) (domain.AggregateRef, error) {
+	switch kind {
+	case domain.AggregateKindInstallation:
+		value, err := domain.ParseInstallationID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindWorkspace:
+		value, err := domain.ParseWorkspaceID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindPrincipal:
+		value, err := domain.ParsePrincipalID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindDevice:
+		value, err := domain.ParseDeviceID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindMembership:
+		value, err := domain.ParseMembershipID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindActor:
+		value, err := domain.ParseActorID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindActorDelegation:
+		value, err := domain.ParseActorDelegationID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindActorSession:
+		value, err := domain.ParseActorSessionID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindGrant:
+		value, err := domain.ParseGrantID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindInvitation:
+		value, err := domain.ParseInvitationID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindWorkReference:
+		value, err := domain.ParseWorkReferenceID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindObjective:
+		value, err := domain.ParseObjectiveID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindWorkUnit:
+		value, err := domain.ParseWorkUnitID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRun:
+		value, err := domain.ParseRunID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRunParticipation:
+		value, err := domain.ParseRunParticipationID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRuntimeBinding:
+		value, err := domain.ParseRuntimeBindingID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	default:
+		return domain.AggregateRef{}, ErrCanonicalProfile
+	}
+}
+
+func rehydrateAggregateRef(ref domain.AggregateRef) (domain.AggregateRef, error) {
+	version, err := domain.NewVersion(ref.Version().Uint64())
+	if err != nil {
+		return domain.AggregateRef{}, err
+	}
+	return aggregateReceiptRef(ref.Kind(), ref.ID(), version)
 }
 
 func singleResourceCatalog(
@@ -2457,7 +2868,11 @@ func NewW0ReceiptResultView(params W0ReceiptResultParams) (W0ReceiptResultView, 
 	if err != nil {
 		return W0ReceiptResultView{}, err
 	}
-	resources, err := receiptResources(params.Resources, catalog.resourceKinds)
+	resourceKinds, eventCount, shapeValid := receiptShape(catalog, params.Resources)
+	if !shapeValid {
+		return W0ReceiptResultView{}, ErrCanonicalProfile
+	}
+	resources, err := receiptResources(params.Resources, resourceKinds)
 	if err != nil {
 		return W0ReceiptResultView{}, err
 	}
@@ -2465,7 +2880,7 @@ func NewW0ReceiptResultView(params W0ReceiptResultParams) (W0ReceiptResultView, 
 	if err != nil {
 		return W0ReceiptResultView{}, err
 	}
-	events, err := receiptEventRange(params, catalog.eventCount)
+	events, err := receiptEventRange(params, eventCount)
 	if err != nil {
 		return W0ReceiptResultView{}, err
 	}
@@ -2510,6 +2925,35 @@ func receiptResources(
 ) ([]receiptResourceWire, error) {
 	if len(provided) != len(expected) {
 		return nil, ErrCanonicalProfile
+	}
+	repeatedKinds := false
+	expectedKinds := make(map[domain.AggregateKind]struct{}, len(expected))
+	for _, kind := range expected {
+		if _, duplicate := expectedKinds[kind]; duplicate {
+			repeatedKinds = true
+		}
+		expectedKinds[kind] = struct{}{}
+	}
+	if repeatedKinds {
+		result := make([]receiptResourceWire, 0, len(expected))
+		seen := make(map[string]struct{}, len(provided))
+		for index, resource := range provided {
+			if resource.IsZero() || resource.Kind() != expected[index] ||
+				resource.Version().Uint64() > MaxCanonicalInteger {
+				return nil, ErrCanonicalProfile
+			}
+			key := string(resource.Kind()) + "\x00" + resource.ID()
+			if _, duplicate := seen[key]; duplicate {
+				return nil, ErrCanonicalProfile
+			}
+			seen[key] = struct{}{}
+			wire, err := receiptResource(resource)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, wire)
+		}
+		return result, nil
 	}
 	byKind := make(map[domain.AggregateKind]domain.AggregateRef, len(provided))
 	for _, resource := range provided {
@@ -2760,19 +3204,20 @@ func (view W0ReceiptResultView) Operation() CommandOperation {
 func (view W0ReceiptResultView) valid() bool {
 	wire := view.wire
 	catalog, exists := receiptCatalog(W0ReceiptOperation(wire.Operation))
+	resourceKinds, eventCount, shapeValid := receiptWireShape(catalog, wire.Resources)
 	if !exists || wire.Schema != receiptResultSchemaV1 || wire.Outcome != "applied" ||
+		!shapeValid ||
 		wire.ScopeKind != string(catalog.scopeKind) || wire.CapsuleRequired != catalog.capsuleRequired ||
 		(wire.SessionBinding != nil) != catalog.sessionRequired ||
 		wire.Resources == nil || wire.IssuedCeremonies == nil || wire.Events.EventIDs == nil ||
-		len(wire.Resources) != len(catalog.resourceKinds) ||
 		len(wire.IssuedCeremonies) != len(catalog.ceremonyPurpose) ||
-		len(wire.Events.EventIDs) != catalog.eventCount || wire.Events.Count != uint16(catalog.eventCount) ||
+		len(wire.Events.EventIDs) != eventCount || wire.Events.Count != uint16(eventCount) ||
 		wire.Events.FirstPosition == 0 ||
 		wire.Events.LastPosition < wire.Events.FirstPosition ||
-		wire.Events.LastPosition-wire.Events.FirstPosition+1 != uint64(catalog.eventCount) {
+		wire.Events.LastPosition-wire.Events.FirstPosition+1 != uint64(eventCount) {
 		return false
 	}
-	for index, kind := range catalog.resourceKinds {
+	for index, kind := range resourceKinds {
 		if !validReceiptResourceWire(wire.Resources[index], kind) {
 			return false
 		}
@@ -3903,7 +4348,7 @@ func (view AuditEntryViewV1) valid() bool {
 
 func auditActionMatchesInvocation(action string, invocation auditInvocationWire) bool {
 	if invocation.Kind == AuditInvocationCommand {
-		_, exists := operationContracts[CommandOperation(action)]
+		_, exists := commandContract(CommandOperation(action))
 		return exists
 	}
 	if invocation.SecurityOperation == nil {
@@ -3919,7 +4364,7 @@ func auditActionMatchesInvocation(action string, invocation auditInvocationWire)
 	case SecurityRecordBootstrapDenial:
 		return action == "installation.bootstrap.v1"
 	case SecurityRecordCommandDenial:
-		_, exists := operationContracts[CommandOperation(action)]
+		_, exists := commandContract(CommandOperation(action))
 		return exists
 	default:
 		return false

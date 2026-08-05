@@ -1339,24 +1339,115 @@ func TestReceiptResultReadViewCoversAllW0CommandResults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			view, ok := document.ResultView()
-			if !ok || view.Operation() != test.operation || len(view.Resources()) != len(test.resources) ||
-				len(view.EventIDs()) != test.events || len(view.IssuedCeremonies()) != btoi(test.ceremony.Valid()) {
-				t.Fatal("incomplete typed result view")
+			persisted := document.CanonicalBytes()
+			verified, err := codec.VerifyReceiptResult(
+				persisted, document.Digest(), receiptReplayBindingForParams(t, params),
+			)
+			if err != nil {
+				t.Fatalf("verify persisted result: %v", err)
 			}
-			_, client, presentation, hasSession := view.Session()
-			if hasSession != test.session || hasSession != (!client.IsZero() && !presentation.IsZero()) {
+			view, ok := verified.ResultView()
+			if !ok || view.Operation() != test.operation || view.AuthorityID() != params.AuthorityID ||
+				view.AuthorityEpoch() != params.AuthorityEpoch || view.Scope() != params.Scope ||
+				!view.AcceptedAt().Equal(params.AcceptedAt) ||
+				!reflect.DeepEqual(view.Resources(), params.Resources) ||
+				!reflect.DeepEqual(view.IssuedCeremonies(), params.IssuedCeremonies) ||
+				view.FirstEventPosition() != params.FirstEventPosition ||
+				view.LastEventPosition() != params.LastEventPosition ||
+				!reflect.DeepEqual(view.EventIDs(), params.EventIDs) ||
+				view.FinalStreamDigest() != params.FinalStreamDigest ||
+				view.CapsuleRequired() != document.wire.CapsuleRequired {
+				t.Fatal("persisted receipt did not rehydrate its complete typed result view")
+			}
+			binding, client, presentation, hasSession := view.Session()
+			if hasSession != test.session || hasSession != (!client.IsZero() && !presentation.IsZero()) ||
+				(hasSession && (!reflect.DeepEqual(binding, *params.SessionBinding) ||
+					client != params.SessionClient || presentation != params.PresentationCredential)) {
 				t.Fatal("session result view drift")
 			}
 		})
 	}
 }
 
-func btoi(value bool) int {
-	if value {
-		return 1
+func TestVerifyReceiptResultRejectsMalformedAndCrossBoundWire(t *testing.T) {
+	t.Parallel()
+	fixture := newReceiptFixture(t)
+	params := fixture.paramsFor(
+		t, ReceiptOperationWorkspaceCreate,
+		[]domain.AggregateKind{domain.AggregateKindWorkspace, domain.AggregateKindMembership}, 3, "",
+	)
+	codec := NewProductionCanonicalCodec()
+	document, err := codec.EncodeReceiptResult(mustReceiptResultView(t, params))
+	if err != nil {
+		t.Fatal(err)
 	}
-	return 0
+	binding := receiptReplayBindingForParams(t, params)
+	malformed := bytes.Replace(
+		document.CanonicalBytes(),
+		[]byte(`"scope_id":"`+params.Scope.ID()+`"`),
+		[]byte(`"scope_id":"not-a-uuid"`), 1,
+	)
+	if _, err := codec.VerifyReceiptResult(malformed, document.Digest(), binding); err == nil {
+		t.Fatal("malformed typed scope identifier was accepted")
+	}
+
+	forgedView := mustReceiptResultView(t, params)
+	forgedView.wire.Resources = append([]receiptResourceWire(nil), forgedView.wire.Resources...)
+	forgedView.wire.Resources[0].ID = mustCanonicalID(t, fixture.actor.String())
+	forged, err := codec.EncodeReceiptResult(forgedView)
+	if err != nil {
+		t.Fatalf("encode cross-bound wire fixture: %v", err)
+	}
+	if _, err := codec.VerifyReceiptResult(forged.CanonicalBytes(), forged.Digest(), binding); err == nil {
+		t.Fatal("workspace resource forged from an actor identifier was accepted")
+	}
+}
+
+func receiptReplayBindingForParams(t *testing.T, params W0ReceiptResultParams) ReceiptResultReplayBinding {
+	t.Helper()
+	operation, err := domain.NewOperationName(string(params.Operation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandID, err := domain.ParseCommandID(codecUUID(900))
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, err := NewOperationMajor(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := NewEventRange(params.FirstEventPosition, params.LastEventPosition, uint16(len(params.EventIDs)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirement := RecoveryCapsuleNotApplicable
+	if catalog, exists := receiptCatalog(params.Operation); exists && catalog.capsuleRequired {
+		requirement = RecoveryCapsuleRequired
+	}
+	plan := ReceiptResultPlan{
+		operation: params.Operation, commandID: commandID, operationMajor: major,
+		authorityID: params.AuthorityID, authorityEpoch: params.AuthorityEpoch, scope: params.Scope,
+		acceptedAt: params.AcceptedAt, commandFingerprint: params.CommandFingerprint,
+		authorizationDigest: params.AuthorizationDigest,
+		resources:           append([]domain.AggregateRef(nil), params.Resources...),
+		issuedCeremonies:    append([]domain.CeremonyChallenge(nil), params.IssuedCeremonies...),
+		eventIDs:            append([]domain.EventID(nil), params.EventIDs...),
+		capsulePlan:         RecoveryCapsulePlan{requirement: requirement},
+		sessionClient:       params.SessionClient, presentation: params.PresentationCredential,
+		hasSession: params.SessionBinding != nil,
+	}
+	if params.SessionBinding != nil {
+		plan.sessionBinding = *params.SessionBinding
+	}
+	return ReceiptResultReplayBinding{
+		originalCommandID: commandID, operation: params.Operation, operationMajor: major,
+		identity:           ReceiptIdentity{scope: params.Scope, operation: operation},
+		requestFingerprint: params.CommandFingerprint, authorityID: params.AuthorityID,
+		authorityEpoch: params.AuthorityEpoch, guardDigest: params.AuthorizationDigest,
+		events: events, finalStreamDigest: params.FinalStreamDigest,
+		capsulePlan: RecoveryCapsulePlan{requirement: requirement}, expectedPlan: plan,
+	}
 }
 
 func mustReceiptResultView(t *testing.T, params W0ReceiptResultParams) W0ReceiptResultView {

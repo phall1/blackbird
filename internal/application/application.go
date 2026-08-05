@@ -337,11 +337,20 @@ type ContextDelta struct {
 func NewContextDelta(eventID domain.EventID, deltaType ContextDeltaType, resource domain.AggregateTarget,
 	version domain.Version, value []byte, after EventCursor) (ContextDelta, error) {
 	if eventID.IsZero() || !deltaType.Valid() || resource.IsZero() || !version.Valid() ||
-		len(value) == 0 || len(value) > MaxQueryPayloadBytes || after.IsZero() {
+		!validQueryJSONObject(value) || after.IsZero() {
 		return ContextDelta{}, ErrInvalidQuery
 	}
 	return ContextDelta{eventID: eventID, deltaType: deltaType, resource: resource, version: version,
 		value: append([]byte(nil), value...), after: after}, nil
+}
+
+func validQueryJSONObject(value []byte) bool {
+	if len(value) == 0 || len(value) > MaxQueryPayloadBytes {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(value))
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' &&
+		validateStrictJSON([]byte(trimmed), MaxQueryPayloadBytes, MaxCanonicalJSONDepth) == nil
 }
 
 func (delta ContextDelta) EventID() domain.EventID          { return delta.eventID }
@@ -438,7 +447,7 @@ func NewSyncedEvent(params SyncedEventParams) (SyncedEvent, error) {
 		!params.OriginPosition.Valid() || params.Aggregate.IsZero() || params.PrincipalID.IsZero() ||
 		params.CommandID.IsZero() || params.CorrelationID.IsZero() || params.OccurredAt.IsZero() ||
 		params.RecordedAt.IsZero() || params.RecordedAt.Before(params.OccurredAt) ||
-		len(params.Payload) == 0 || len(params.Payload) > MaxQueryPayloadBytes {
+		!validQueryJSONObject(params.Payload) {
 		return SyncedEvent{}, ErrInvalidQuery
 	}
 	if params.ActorID != nil && params.ActorID.IsZero() || params.ActorSessionID != nil && params.ActorSessionID.IsZero() ||
@@ -1553,6 +1562,12 @@ const (
 	CommandBeginDevicePairing        CommandOperation = "pairing.challenge.issue.v1"
 	CommandPairDevice                CommandOperation = "pairing.challenge.redeem.v1"
 	CommandStartActorSession         CommandOperation = "session.start.v1"
+	CommandObserveWorkRef            CommandOperation = "work_ref.observe.v1"
+	CommandCreateObjectiveAndWork    CommandOperation = "objective_and_work.create.v1"
+	CommandActivateObjective         CommandOperation = "objective.activate.v1"
+	CommandPlanRunWithBindings       CommandOperation = "run.plan_with_bindings.v1"
+	CommandJoinRun                   CommandOperation = "run_participation.join.v1"
+	CommandStartRun                  CommandOperation = "run.start.v1"
 )
 
 type operationContract struct {
@@ -1701,6 +1716,29 @@ var operationContracts = map[CommandOperation]operationContract{
 			domain.AggregateKindActorSession: 1,
 		},
 	},
+}
+
+var w1OperationContracts = map[CommandOperation]operationContract{
+	CommandObserveWorkRef:         w1Contract(CommandObserveWorkRef, AuthorshipAuthority),
+	CommandCreateObjectiveAndWork: w1Contract(CommandCreateObjectiveAndWork, AuthorshipWork),
+	CommandActivateObjective:      w1Contract(CommandActivateObjective, AuthorshipWork),
+	CommandPlanRunWithBindings:    w1Contract(CommandPlanRunWithBindings, AuthorshipWork),
+	CommandJoinRun:                w1Contract(CommandJoinRun, AuthorshipWork),
+	CommandStartRun:               w1Contract(CommandStartRun, AuthorshipWork),
+}
+
+func commandContract(operation CommandOperation) (operationContract, bool) {
+	if contract, exists := operationContracts[operation]; exists {
+		return contract, true
+	}
+	contract, exists := w1OperationContracts[operation]
+	return contract, exists
+}
+
+func w1Contract(operation CommandOperation, authorship AuthorshipClass) operationContract {
+	return operationContract{operation: operation, receipt: ReceiptIdentityOrdinary, scope: domain.ScopeKindWorkspace,
+		authorship: authorship, attribution: attributionOptional, recovery: RecoveryCapsuleNotApplicable,
+		timeClass: AuthorityTimeOrdinary}
 }
 
 func standardEvidenceMinimums(lifecycle, ceilings int) map[EvidenceGuardKind]int {
@@ -1862,7 +1900,7 @@ type CommandSpec struct {
 }
 
 func NewCommandSpec(params CommandSpecParams) (CommandSpec, error) {
-	contract, cataloged := operationContracts[CommandOperation(params.Operation.String())]
+	contract, cataloged := commandContract(CommandOperation(params.Operation.String()))
 	if params.Scope.IsZero() || params.AuthorityID.IsZero() || params.RequestedEpoch.IsZero() ||
 		params.CommandID.IsZero() || params.ReceiptID.IsZero() || params.Operation.String() == "" ||
 		!operationHasMajor(params.Operation, params.OperationMajor) || params.ReceiptIdentity.kind == "" ||
@@ -1952,6 +1990,9 @@ func matchesOperationContract(params CommandSpecParams, contract operationContra
 	if contract.attribution == attributionForbidden && params.Authorship.hasActor {
 		return false
 	}
+	if isW1Operation(contract.operation) {
+		return matchesW1OperationContract(params, contract.operation)
+	}
 	if params.Authorship.hasActor && (params.Authorship.actor.IsZero() || params.Authorship.actorSession.IsZero()) {
 		return false
 	}
@@ -1978,6 +2019,95 @@ func matchesOperationContract(params CommandSpecParams, contract operationContra
 		return false
 	}
 	return true
+}
+
+func isW1Operation(operation CommandOperation) bool {
+	switch operation {
+	case CommandObserveWorkRef, CommandCreateObjectiveAndWork, CommandActivateObjective,
+		CommandPlanRunWithBindings, CommandJoinRun, CommandStartRun:
+		return true
+	default:
+		return false
+	}
+}
+
+func matchesW1OperationContract(params CommandSpecParams, operation CommandOperation) bool {
+	mutations := params.Guards.mutations
+	references := params.Guards.references
+	facts := params.ExpectedFacts
+	if params.Guards.genesis != nil || params.Guards.admissionScope != params.Scope || len(params.Guards.ceremonies) != 0 ||
+		len(params.Guards.disclosure) == 0 || len(params.Guards.evidence) < 2 {
+		return false
+	}
+	countMutations := func(kind domain.AggregateKind, expectation *domain.ExpectationKind) int {
+		count := 0
+		for _, mutation := range mutations {
+			if mutation.Target().Kind() == kind && (expectation == nil || mutation.Kind() == *expectation) {
+				count++
+			}
+		}
+		return count
+	}
+	countRefs := func(kind domain.AggregateKind) int {
+		count := 0
+		for _, ref := range references {
+			if ref.Kind() == kind {
+				count++
+			}
+		}
+		return count
+	}
+	factTypes := func(types ...domain.EventType) bool {
+		if len(facts) != len(types) {
+			return false
+		}
+		for i := range types {
+			if facts[i].EventType() != types[i] {
+				return false
+			}
+		}
+		return true
+	}
+	absent, expected := domain.ExpectationMustNotExist, domain.ExpectationExpectedVersion
+	switch operation {
+	case CommandObserveWorkRef:
+		return len(mutations) == 1 && countMutations(domain.AggregateKindWorkReference, nil) == 1 &&
+			(mutations[0].Kind() == absent || mutations[0].Kind() == expected) && factTypes(domain.EventTypeWorkRefObserved)
+	case CommandCreateObjectiveAndWork:
+		return len(mutations) == 2 && countMutations(domain.AggregateKindObjective, &absent) == 1 &&
+			countMutations(domain.AggregateKindWorkUnit, &absent) == 1 && countRefs(domain.AggregateKindWorkReference) == 1 &&
+			factTypes(domain.EventTypeObjectiveCreated, domain.EventTypeWorkUnitCreated)
+	case CommandActivateObjective:
+		return len(mutations) == 1 && countMutations(domain.AggregateKindObjective, &expected) == 1 && factTypes(domain.EventTypeObjectiveActivated)
+	case CommandPlanRunWithBindings:
+		participants := countMutations(domain.AggregateKindRunParticipation, &absent)
+		bindings := countMutations(domain.AggregateKindRuntimeBinding, &absent)
+		if participants == 0 || participants > domain.MaxRunParticipants || bindings == 0 || bindings > domain.MaxRunBindings ||
+			len(mutations) != 1+participants+bindings || countMutations(domain.AggregateKindRun, &absent) != 1 ||
+			countRefs(domain.AggregateKindObjective) != 1 || countRefs(domain.AggregateKindWorkUnit) != 1 ||
+			len(facts) != 1+participants+bindings || facts[0].EventType() != domain.EventTypeRunPlanned {
+			return false
+		}
+		for i := 0; i < participants; i++ {
+			if facts[1+i].EventType() != domain.EventTypeRunParticipantInvited {
+				return false
+			}
+		}
+		for i := 0; i < bindings; i++ {
+			if facts[1+participants+i].EventType() != domain.EventTypeRuntimeBindingRequested {
+				return false
+			}
+		}
+		return true
+	case CommandJoinRun:
+		return len(mutations) == 1 && countMutations(domain.AggregateKindRunParticipation, &expected) == 1 &&
+			countRefs(domain.AggregateKindRun) == 1 && factTypes(domain.EventTypeRunParticipantJoined)
+	case CommandStartRun:
+		return len(mutations) == 1 && countMutations(domain.AggregateKindRun, &expected) == 1 &&
+			countRefs(domain.AggregateKindRunParticipation) > 0 && factTypes(domain.EventTypeRunStarted)
+	default:
+		return false
+	}
 }
 
 func matchesDisclosureContract(
@@ -3031,7 +3161,7 @@ func NewReceiptResultReplayBinding(
 	spec CommandSpec,
 	params ReceiptResultReplayBindingParams,
 ) (ReceiptResultReplayBinding, error) {
-	contract, cataloged := operationContracts[spec.commandOperation]
+	contract, cataloged := commandContract(spec.commandOperation)
 	if !cataloged || params.OriginalCommandID.IsZero() || params.AcceptedAuthorityID.IsZero() ||
 		params.AcceptedAuthorityEpoch.IsZero() || params.GuardDigest.IsZero() || params.FinalStreamDigest.IsZero() ||
 		params.Events.count != uint16(len(spec.expectedFacts)) || params.Events.count != uint16(len(contract.facts)) ||
@@ -3138,7 +3268,7 @@ type ReceiptSnapshot struct {
 }
 
 func NewReceiptSnapshot(params ReceiptSnapshotParams) (ReceiptSnapshot, error) {
-	contract, cataloged := operationContracts[CommandOperation(params.Identity.operation.String())]
+	contract, cataloged := commandContract(CommandOperation(params.Identity.operation.String()))
 	if params.ReceiptID.IsZero() || params.CommandID.IsZero() || params.Identity.kind == "" ||
 		params.RequestFingerprint.IsZero() || params.Result.IsZero() || params.AuthorityID.IsZero() ||
 		params.AuthorityEpoch.IsZero() || params.GuardDigest.IsZero() || params.Events.count == 0 ||
@@ -3994,9 +4124,63 @@ func lockedTransitionMatches(operation CommandOperation, prior, next IdentitySta
 		return beforeOK && afterOK && before.ID() == after.ID() &&
 			before.InstallationID() == after.InstallationID() && before.PrincipalID() == after.PrincipalID() &&
 			before.DisplayName() == after.DisplayName() && before.PublicKeyReference() == after.PublicKeyReference()
+	case CommandObserveWorkRef:
+		before, beforeOK := prior.value.(domain.WorkReferenceState)
+		after, afterOK := next.value.(domain.WorkReferenceState)
+		return beforeOK && afterOK && before.ID() == after.ID() && before.WorkspaceID() == after.WorkspaceID() &&
+			before.Observation().Namespace() == after.Observation().Namespace() &&
+			before.Observation().ObjectID() == after.Observation().ObjectID() &&
+			before.Observation().AdapterPrincipalID() == after.Observation().AdapterPrincipalID()
+	case CommandActivateObjective:
+		before, beforeOK := prior.value.(domain.ObjectiveState)
+		after, afterOK := next.value.(domain.ObjectiveState)
+		return beforeOK && afterOK && before.ID() == after.ID() && before.WorkspaceID() == after.WorkspaceID() &&
+			before.Title() == after.Title() && before.AcceptanceCriteria() == after.AcceptanceCriteria()
+	case CommandJoinRun:
+		before, beforeOK := prior.value.(domain.RunParticipationState)
+		after, afterOK := next.value.(domain.RunParticipationState)
+		return beforeOK && afterOK && before.ID() == after.ID() && before.RunID() == after.RunID() &&
+			before.ActorID() == after.ActorID() && before.Role() == after.Role()
+	case CommandStartRun:
+		before, beforeOK := prior.value.(domain.RunState)
+		after, afterOK := next.value.(domain.RunState)
+		return beforeOK && afterOK && before.ID() == after.ID() && before.WorkspaceID() == after.WorkspaceID() &&
+			before.ObjectiveID() == after.ObjectiveID() && before.WorkUnitID() == after.WorkUnitID() &&
+			before.OperatorID() == after.OperatorID()
 	default:
 		return false
 	}
+}
+
+func ObserveWorkRefCommit(commandContext CommandContext, result domain.ObserveWorkRefResult) (OperationCommit, error) {
+	return newOperationCommit(commandContext, CommandObserveWorkRef, []any{result.WorkReference()}, result.Facts())
+}
+
+func CreateObjectiveAndWorkCommit(commandContext CommandContext, result domain.CreateObjectiveAndWorkResult) (OperationCommit, error) {
+	return newOperationCommit(commandContext, CommandCreateObjectiveAndWork, []any{result.Objective(), result.WorkUnit()}, result.Facts())
+}
+
+func ActivateObjectiveCommit(commandContext CommandContext, result domain.ActivateObjectiveResult) (OperationCommit, error) {
+	return newOperationCommit(commandContext, CommandActivateObjective, []any{result.Objective()}, result.Facts())
+}
+
+func PlanRunWithBindingsCommit(commandContext CommandContext, result domain.PlanRunWithBindingsResult) (OperationCommit, error) {
+	values := []any{result.Run()}
+	for _, participation := range result.Participations() {
+		values = append(values, participation)
+	}
+	for _, binding := range result.Bindings() {
+		values = append(values, binding)
+	}
+	return newOperationCommit(commandContext, CommandPlanRunWithBindings, values, result.Facts())
+}
+
+func JoinRunCommit(commandContext CommandContext, result domain.JoinRunResult) (OperationCommit, error) {
+	return newOperationCommit(commandContext, CommandJoinRun, []any{result.Participation()}, result.Facts())
+}
+
+func StartRunCommit(commandContext CommandContext, result domain.StartRunResult) (OperationCommit, error) {
+	return newOperationCommit(commandContext, CommandStartRun, []any{result.Run()}, result.Facts())
 }
 
 func BootstrapInstallationCommit(
@@ -4303,7 +4487,7 @@ func NewStoredReceiptResultPlan(
 	spec CommandSpec,
 	params StoredReceiptResultPlanParams,
 ) (ReceiptResultPlan, error) {
-	contract, cataloged := operationContracts[spec.commandOperation]
+	contract, cataloged := commandContract(spec.commandOperation)
 	if !cataloged || params.OriginalCommandID.IsZero() || params.AcceptedAuthorityID.IsZero() ||
 		params.AcceptedAuthorityEpoch.IsZero() || params.AcceptedAt.IsZero() ||
 		params.AuthorizationDigest.IsZero() ||

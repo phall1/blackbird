@@ -1681,6 +1681,42 @@ func (source *queryCheckpointIDs) NewCheckpointID() (CheckpointID, error) {
 	return NewCheckpointID("checkpoint:application-query-test")
 }
 
+type expiringContextStore struct {
+	cursors []EventCursor
+}
+
+func (store *expiringContextStore) GetContext(_ context.Context, query ContextGetQuery) (ContextPage, error) {
+	store.cursors = append(store.cursors, query.Cursor())
+	if !query.Cursor().IsZero() {
+		rejection, _ := domain.NewCommandError(domain.ErrorCodeCursorExpired, "expired", nil)
+		return ContextPage{}, rejection
+	}
+	return ContextPage{}, nil
+}
+
+func (*expiringContextStore) SyncEvents(context.Context, EventsSyncQuery) (EventsPage, error) {
+	return EventsPage{}, nil
+}
+
+func TestQueryServiceFallsBackToCheckpointForExpiredContextCursor(t *testing.T) {
+	principal, _ := domain.ParsePrincipalID(applicationUUID(982))
+	session, _ := domain.ParseActorSessionID(applicationUUID(983))
+	subject, _ := NewQuerySubject(principal, session)
+	cursor, _ := NewEventCursor("bbec1_expired")
+	store := &expiringContextStore{}
+	ids := &queryCheckpointIDs{}
+	service, err := NewQueryService(store, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.GetContext(context.Background(), subject, cursor, 32); err != nil {
+		t.Fatal(err)
+	}
+	if ids.calls != 1 || len(store.cursors) != 2 || store.cursors[0] != cursor || !store.cursors[1].IsZero() {
+		t.Fatalf("checkpoint fallback ids=%d cursors=%v", ids.calls, store.cursors)
+	}
+}
+
 func TestQueryServiceValidatesBoundsAndCancellationBeforeDependencies(t *testing.T) {
 	principal, _ := domain.ParsePrincipalID(applicationUUID(980))
 	session, _ := domain.ParseActorSessionID(applicationUUID(981))
