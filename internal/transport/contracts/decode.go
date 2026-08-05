@@ -116,7 +116,7 @@ func validateNoDuplicateJSONKeys(data []byte) error {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if err := walkJSONValue(decoder, 0); err != nil {
+	if err := walkJSONValue(decoder, 1); err != nil {
 		return err
 	}
 	if token, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -188,9 +188,6 @@ func decodeHexQuad(data []byte, start int) (uint16, bool) {
 }
 
 func walkJSONValue(decoder *json.Decoder, depth int) error {
-	if depth > maxJSONNestingDepth {
-		return fmt.Errorf("JSON nesting exceeds %d levels", maxJSONNestingDepth)
-	}
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -201,6 +198,9 @@ func walkJSONValue(decoder *json.Decoder, depth int) error {
 			return validateJSONNumber(number)
 		}
 		return nil
+	}
+	if depth > maxJSONNestingDepth {
+		return fmt.Errorf("JSON nesting exceeds %d levels", maxJSONNestingDepth)
 	}
 	switch delimiter {
 	case '{':
@@ -284,7 +284,7 @@ func requireTopLevelJSONMembers(data []byte, required ...string) error {
 				found[member] = true
 			}
 		}
-		if err := walkJSONValue(decoder, 1); err != nil {
+		if err := walkJSONValue(decoder, 2); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidJSON, err)
 		}
 	}
