@@ -1,8 +1,9 @@
-// Package localsecurity implements the cryptographic boundary for Blackbird's
-// local pairing profile. It deliberately does not perform key persistence.
+// Package localsecurity implements the credential-vault and cryptographic
+// boundary for Blackbird's local pairing profile.
 package localsecurity
 
 import (
+	"crypto"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
@@ -14,8 +15,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/lexfrei/keychain"
 )
 
 const (
@@ -23,17 +29,317 @@ const (
 	sessionExporterLabel = "EXPORTER-Blackbird-Session-v1"
 	transcriptDomain     = "blackbird-pairing-transcript/v1"
 	bindingSize          = 32
+	credentialService    = "com.phall1.blackbird.credentials.v1"
+	credentialIDMaxBytes = 128
 )
 
 var (
-	ErrInvalidKeyMaterial = errors.New("invalid Ed25519 key material")
-	ErrInvalidCertificate = errors.New("invalid local certificate")
-	ErrInvalidPin         = errors.New("invalid peer SPKI pin")
-	ErrPeerVerification   = errors.New("pinned TLS peer verification failed")
-	ErrExporter           = errors.New("TLS exporter unavailable")
-	ErrInvalidTranscript  = errors.New("invalid pairing transcript")
-	ErrInvalidProof       = errors.New("invalid pairing proof")
+	ErrInvalidKeyMaterial  = errors.New("invalid Ed25519 key material")
+	ErrInvalidCertificate  = errors.New("invalid local certificate")
+	ErrInvalidPin          = errors.New("invalid peer SPKI pin")
+	ErrPeerVerification    = errors.New("pinned TLS peer verification failed")
+	ErrExporter            = errors.New("TLS exporter unavailable")
+	ErrInvalidTranscript   = errors.New("invalid pairing transcript")
+	ErrInvalidProof        = errors.New("invalid pairing proof")
+	ErrInvalidCredential   = errors.New("invalid credential reference")
+	ErrCredentialExists    = errors.New("credential already exists")
+	ErrCredentialNotFound  = errors.New("credential not found")
+	ErrVaultUnavailable    = errors.New("OS credential vault unavailable")
+	ErrCredentialDestroyed = errors.New("credential key material destroyed")
 )
+
+// CredentialKind identifies a long-lived local Ed25519 credential class.
+type CredentialKind string
+
+const (
+	InstallationCredential CredentialKind = "installation"
+	DeviceCredential       CredentialKind = "device"
+)
+
+// CredentialReference is an opaque, non-secret handle suitable for persisted
+// metadata. It never contains seed material.
+type CredentialReference struct {
+	kind       CredentialKind
+	identifier string
+}
+
+// NewCredentialReference validates an application identifier and builds a
+// handle for an installation or device credential.
+func NewCredentialReference(kind CredentialKind, identifier string) (CredentialReference, error) {
+	if kind != InstallationCredential && kind != DeviceCredential || !validCredentialIdentifier(identifier) {
+		return CredentialReference{}, ErrInvalidCredential
+	}
+	return CredentialReference{kind: kind, identifier: identifier}, nil
+}
+
+func InstallationCredentialReference(identifier string) (CredentialReference, error) {
+	return NewCredentialReference(InstallationCredential, identifier)
+}
+
+func DeviceCredentialReference(identifier string) (CredentialReference, error) {
+	return NewCredentialReference(DeviceCredential, identifier)
+}
+
+func (reference CredentialReference) Kind() CredentialKind { return reference.kind }
+
+func (reference CredentialReference) String() string {
+	if reference.kind == "" || reference.identifier == "" {
+		return ""
+	}
+	return "credential:" + string(reference.kind) + ":" + reference.identifier
+}
+
+func (reference CredentialReference) account() string {
+	return "ed25519-seed/v1/" + string(reference.kind) + "/" + reference.identifier
+}
+
+// SecretStore is the injectable byte-oriented vault surface. Implementations
+// must not log, persist outside a protected vault, or retain caller buffers.
+type SecretStore interface {
+	Set(service, account string, secret []byte) error
+	Get(service, account string) ([]byte, error)
+	Delete(service, account string) error
+}
+
+type osSecretStore struct {
+	keychain *keychain.Keychain
+}
+
+func (store osSecretStore) Set(service, account string, secret []byte) error {
+	return store.keychain.Set(service, account, secret)
+}
+
+func (store osSecretStore) Get(service, account string) ([]byte, error) {
+	return store.keychain.Get(service, account)
+}
+
+func (store osSecretStore) Delete(service, account string) error {
+	return store.keychain.Delete(service, account)
+}
+
+// CredentialVault owns local Ed25519 seed lifecycle operations. Operations are
+// serialized so create and rotate semantics are deterministic within a process.
+type CredentialVault struct {
+	mu     sync.Mutex
+	store  SecretStore
+	random io.Reader
+}
+
+// NewOSCredentialVault uses the silent, native, CGo-free platform keychain.
+// It deliberately does not enable the macOS CLI fallback because that fallback
+// places the secret in a process argument.
+func NewOSCredentialVault() *CredentialVault {
+	return NewCredentialVault(osSecretStore{keychain: keychain.New()}, rand.Reader)
+}
+
+// NewCredentialVault injects a vault and entropy source. Supplying nil causes
+// lifecycle calls to fail closed with ErrVaultUnavailable.
+func NewCredentialVault(store SecretStore, random io.Reader) *CredentialVault {
+	return &CredentialVault{store: store, random: random}
+}
+
+// Ed25519Credential keeps a loaded seed inside this boundary and implements
+// crypto.Signer. Call Destroy as soon as the signing lifetime ends. Go cannot
+// guarantee zeroization of copies made by the runtime or operating system.
+type Ed25519Credential struct {
+	mu        sync.RWMutex
+	reference CredentialReference
+	seed      [ed25519.SeedSize]byte
+	destroyed bool
+}
+
+func (credential *Ed25519Credential) Reference() CredentialReference {
+	if credential == nil {
+		return CredentialReference{}
+	}
+	return credential.reference
+}
+
+func (credential *Ed25519Credential) String() string   { return "[REDACTED Ed25519 credential]" }
+func (credential *Ed25519Credential) GoString() string { return credential.String() }
+
+func (credential *Ed25519Credential) Public() crypto.PublicKey {
+	publicKey, err := credential.PublicKey()
+	if err != nil {
+		return nil
+	}
+	return publicKey
+}
+
+func (credential *Ed25519Credential) PublicKey() (ed25519.PublicKey, error) {
+	if credential == nil {
+		return nil, ErrCredentialDestroyed
+	}
+	credential.mu.RLock()
+	defer credential.mu.RUnlock()
+	if credential.destroyed {
+		return nil, ErrCredentialDestroyed
+	}
+	privateKey := ed25519.NewKeyFromSeed(credential.seed[:])
+	defer clear(privateKey)
+	return append(ed25519.PublicKey(nil), privateKey[ed25519.SeedSize:]...), nil
+}
+
+func (credential *Ed25519Credential) Sign(_ io.Reader, message []byte, options crypto.SignerOpts) ([]byte, error) {
+	if credential == nil {
+		return nil, ErrCredentialDestroyed
+	}
+	if options != nil && options.HashFunc() != crypto.Hash(0) {
+		return nil, ErrInvalidKeyMaterial
+	}
+	credential.mu.RLock()
+	defer credential.mu.RUnlock()
+	if credential.destroyed {
+		return nil, ErrCredentialDestroyed
+	}
+	privateKey := ed25519.NewKeyFromSeed(credential.seed[:])
+	defer clear(privateKey)
+	return ed25519.Sign(privateKey, message), nil
+}
+
+func (credential *Ed25519Credential) NewCertificate(validity CertificateValidity) (tls.Certificate, SPKIPin, error) {
+	publicKey, err := credential.PublicKey()
+	if err != nil {
+		return tls.Certificate{}, SPKIPin{}, err
+	}
+	return newCertificate(publicKey, credential, validity)
+}
+
+func (credential *Ed25519Credential) Destroy() {
+	if credential == nil {
+		return
+	}
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	clear(credential.seed[:])
+	credential.destroyed = true
+}
+
+func (vault *CredentialVault) CreateCredential(reference CredentialReference) (*Ed25519Credential, error) {
+	return vault.create(reference, false)
+}
+
+func (vault *CredentialVault) LoadCredential(reference CredentialReference) (*Ed25519Credential, error) {
+	if err := validateCredentialReference(reference); err != nil {
+		return nil, err
+	}
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	return vault.load(reference)
+}
+
+func (vault *CredentialVault) RotateCredential(reference CredentialReference) (*Ed25519Credential, error) {
+	return vault.create(reference, true)
+}
+
+func (vault *CredentialVault) DeleteCredential(reference CredentialReference) error {
+	if err := validateCredentialReference(reference); err != nil {
+		return err
+	}
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	material, err := vault.get(reference)
+	if err != nil {
+		return err
+	}
+	clear(material)
+	if err := vault.store.Delete(credentialService, reference.account()); err != nil {
+		return vaultError("delete", err)
+	}
+	return nil
+}
+
+func (vault *CredentialVault) create(reference CredentialReference, rotate bool) (*Ed25519Credential, error) {
+	if err := validateCredentialReference(reference); err != nil {
+		return nil, err
+	}
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	material, err := vault.get(reference)
+	switch {
+	case err == nil:
+		clear(material)
+		if !rotate {
+			return nil, ErrCredentialExists
+		}
+	case errors.Is(err, ErrCredentialNotFound):
+		if rotate {
+			return nil, err
+		}
+	default:
+		return nil, err
+	}
+	if vault.random == nil {
+		return nil, fmt.Errorf("%w: entropy source is not configured", ErrVaultUnavailable)
+	}
+	var seed [ed25519.SeedSize]byte
+	if _, err := io.ReadFull(vault.random, seed[:]); err != nil {
+		clear(seed[:])
+		return nil, fmt.Errorf("%w: generate Ed25519 seed", ErrVaultUnavailable)
+	}
+	if err := vault.store.Set(credentialService, reference.account(), seed[:]); err != nil {
+		clear(seed[:])
+		return nil, vaultError("store", err)
+	}
+	credential := &Ed25519Credential{reference: reference, seed: seed}
+	clear(seed[:])
+	return credential, nil
+}
+
+func (vault *CredentialVault) load(reference CredentialReference) (*Ed25519Credential, error) {
+	material, err := vault.get(reference)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(material)
+	if len(material) != ed25519.SeedSize {
+		return nil, ErrInvalidKeyMaterial
+	}
+	credential := &Ed25519Credential{reference: reference}
+	copy(credential.seed[:], material)
+	return credential, nil
+}
+
+func (vault *CredentialVault) get(reference CredentialReference) ([]byte, error) {
+	if vault == nil || vault.store == nil {
+		return nil, fmt.Errorf("%w: no credential store is configured", ErrVaultUnavailable)
+	}
+	material, err := vault.store.Get(credentialService, reference.account())
+	if err != nil {
+		clear(material)
+		return nil, vaultError("read", err)
+	}
+	return material, nil
+}
+
+func vaultError(operation string, err error) error {
+	if errors.Is(err, keychain.ErrNotFound) || errors.Is(err, ErrCredentialNotFound) {
+		return ErrCredentialNotFound
+	}
+	return fmt.Errorf("%w: cannot %s credential: %w", ErrVaultUnavailable, operation, err)
+}
+
+func validateCredentialReference(reference CredentialReference) error {
+	if reference.kind != InstallationCredential && reference.kind != DeviceCredential ||
+		!validCredentialIdentifier(reference.identifier) {
+		return ErrInvalidCredential
+	}
+	return nil
+}
+
+func validCredentialIdentifier(identifier string) bool {
+	if identifier == "" || len(identifier) > credentialIDMaxBytes || strings.TrimSpace(identifier) != identifier {
+		return false
+	}
+	for _, value := range identifier {
+		if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
+			value >= '0' && value <= '9' || value == '-' || value == '_' || value == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
 
 // SPKIPin is SHA-256 over the canonical DER SubjectPublicKeyInfo encoding.
 type SPKIPin [sha256.Size]byte
@@ -59,6 +365,14 @@ func NewCertificate(keyMaterial []byte, validity CertificateValidity) (tls.Certi
 		return tls.Certificate{}, SPKIPin{}, err
 	}
 	publicKey := privateKey.Public().(ed25519.PublicKey)
+	return newCertificate(publicKey, privateKey, validity)
+}
+
+func newCertificate(
+	publicKey ed25519.PublicKey,
+	privateKey crypto.Signer,
+	validity CertificateValidity,
+) (tls.Certificate, SPKIPin, error) {
 	pin, err := PinPublicKey(publicKey)
 	if err != nil {
 		return tls.Certificate{}, SPKIPin{}, err
@@ -280,8 +594,15 @@ func validateLocalCertificate(certificate tls.Certificate) error {
 		}
 	}
 	publicKey, ok := leaf.PublicKey.(ed25519.PublicKey)
-	privateKey, privateOK := certificate.PrivateKey.(ed25519.PrivateKey)
-	if !ok || !privateOK || !validPrivateKey(privateKey) || !privateKey.Public().(ed25519.PublicKey).Equal(publicKey) {
+	signer, signerOK := certificate.PrivateKey.(crypto.Signer)
+	if !ok || !signerOK {
+		return ErrInvalidCertificate
+	}
+	signerPublicKey, publicOK := signer.Public().(ed25519.PublicKey)
+	if !publicOK || len(signerPublicKey) != ed25519.PublicKeySize || !signerPublicKey.Equal(publicKey) {
+		return ErrInvalidCertificate
+	}
+	if privateKey, privateOK := certificate.PrivateKey.(ed25519.PrivateKey); privateOK && !validPrivateKey(privateKey) {
 		return ErrInvalidCertificate
 	}
 	return nil

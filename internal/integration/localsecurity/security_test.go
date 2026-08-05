@@ -2,16 +2,142 @@ package localsecurity
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestCredentialVaultLifecycle(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeSecretStore()
+	firstSeed := sha256.Sum256([]byte("installation seed v1"))
+	secondSeed := sha256.Sum256([]byte("installation seed v2"))
+	vault := NewCredentialVault(store, bytes.NewReader(append(firstSeed[:], secondSeed[:]...)))
+	reference, err := InstallationCredentialReference("0198-installation")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := vault.CreateCredential(reference)
+	if err != nil {
+		t.Fatalf("CreateCredential: %v", err)
+	}
+	defer created.Destroy()
+	assertCredentialPublicKey(t, created, firstSeed)
+	if _, err := vault.CreateCredential(reference); !errors.Is(err, ErrCredentialExists) {
+		t.Fatalf("duplicate CreateCredential error = %v", err)
+	}
+
+	loaded, err := vault.LoadCredential(reference)
+	if err != nil {
+		t.Fatalf("LoadCredential: %v", err)
+	}
+	assertCredentialPublicKey(t, loaded, firstSeed)
+	loaded.Destroy()
+	if _, err := loaded.PublicKey(); !errors.Is(err, ErrCredentialDestroyed) {
+		t.Fatalf("destroyed PublicKey error = %v", err)
+	}
+	if _, err := loaded.Sign(nil, []byte("message"), crypto.Hash(0)); !errors.Is(err, ErrCredentialDestroyed) {
+		t.Fatalf("destroyed Sign error = %v", err)
+	}
+	if got := fmt.Sprintf("%v %#v", loaded, loaded); strings.Contains(got, fmt.Sprintf("%x", firstSeed)) {
+		t.Fatal("credential formatting exposed seed material")
+	}
+
+	rotated, err := vault.RotateCredential(reference)
+	if err != nil {
+		t.Fatalf("RotateCredential: %v", err)
+	}
+	defer rotated.Destroy()
+	assertCredentialPublicKey(t, rotated, secondSeed)
+	reloaded, err := vault.LoadCredential(reference)
+	if err != nil {
+		t.Fatalf("LoadCredential after rotation: %v", err)
+	}
+	defer reloaded.Destroy()
+	assertCredentialPublicKey(t, reloaded, secondSeed)
+
+	certificate, pin, err := reloaded.NewCertificate(testValidity())
+	if err != nil {
+		t.Fatalf("credential NewCertificate: %v", err)
+	}
+	if _, err := PairingServerTLSConfig(certificate); err != nil {
+		t.Fatalf("credential-backed certificate rejected: %v", err)
+	}
+	publicKey, err := reloaded.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPin, err := PinPublicKey(publicKey)
+	if err != nil || pin != wantPin {
+		t.Fatalf("credential certificate pin = %x, want %x, error = %v", pin, wantPin, err)
+	}
+
+	if err := vault.DeleteCredential(reference); err != nil {
+		t.Fatalf("DeleteCredential: %v", err)
+	}
+	if _, err := vault.LoadCredential(reference); !errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("load deleted credential error = %v", err)
+	}
+	if err := vault.DeleteCredential(reference); !errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("delete absent credential error = %v", err)
+	}
+	if _, err := vault.RotateCredential(reference); !errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("rotate absent credential error = %v", err)
+	}
+}
+
+func TestCredentialVaultKindsValidationAndFailureSemantics(t *testing.T) {
+	t.Parallel()
+
+	for _, invalid := range []string{"", " leading", "has/slash", "has:colon", strings.Repeat("a", 129)} {
+		if _, err := DeviceCredentialReference(invalid); !errors.Is(err, ErrInvalidCredential) {
+			t.Fatalf("DeviceCredentialReference(%q) error = %v", invalid, err)
+		}
+	}
+	if _, err := NewCredentialReference("provider", "valid-id"); !errors.Is(err, ErrInvalidCredential) {
+		t.Fatalf("unsupported credential kind error = %v", err)
+	}
+
+	installation, _ := InstallationCredentialReference("same-id")
+	device, _ := DeviceCredentialReference("same-id")
+	store := newFakeSecretStore()
+	vault := NewCredentialVault(store, bytes.NewReader(make([]byte, 2*ed25519.SeedSize)))
+	installationCredential, err := vault.CreateCredential(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer installationCredential.Destroy()
+	deviceCredential, err := vault.CreateCredential(device)
+	if err != nil {
+		t.Fatalf("device and installation references collided: %v", err)
+	}
+	defer deviceCredential.Destroy()
+
+	unavailable := NewCredentialVault(&fakeSecretStore{getErr: errors.New("vault offline")}, bytes.NewReader(nil))
+	if _, err := unavailable.LoadCredential(installation); !errors.Is(err, ErrVaultUnavailable) || strings.Contains(err.Error(), installation.identifier) {
+		t.Fatalf("unavailable vault error = %v", err)
+	}
+	if _, err := NewCredentialVault(nil, nil).LoadCredential(installation); !errors.Is(err, ErrVaultUnavailable) {
+		t.Fatalf("nil vault error = %v", err)
+	}
+
+	corruptStore := newFakeSecretStore()
+	corruptStore.values[credentialService+"\x00"+device.account()] = []byte("not an Ed25519 seed")
+	if _, err := NewCredentialVault(corruptStore, nil).LoadCredential(device); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("corrupt seed error = %v", err)
+	}
+}
 
 func TestCertificateAndCanonicalSPKIPin(t *testing.T) {
 	t.Parallel()
@@ -343,4 +469,66 @@ func handshake(clientConfig, serverConfig *tls.Config) (tls.ConnectionState, tls
 	_ = client.Close()
 	serverOutcome := <-serverResult
 	return clientState, serverOutcome.state, clientErr, serverOutcome.err
+}
+
+func assertCredentialPublicKey(t *testing.T, credential *Ed25519Credential, seed [ed25519.SeedSize]byte) {
+	t.Helper()
+	got, err := credential.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	defer clear(privateKey)
+	want := privateKey.Public().(ed25519.PublicKey)
+	if !got.Equal(want) {
+		t.Fatal("credential public key does not match generated seed")
+	}
+}
+
+type fakeSecretStore struct {
+	mu        sync.Mutex
+	values    map[string][]byte
+	getErr    error
+	setErr    error
+	deleteErr error
+}
+
+func newFakeSecretStore() *fakeSecretStore {
+	return &fakeSecretStore{values: make(map[string][]byte)}
+}
+
+func (store *fakeSecretStore) Set(service, account string, secret []byte) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.setErr != nil {
+		return store.setErr
+	}
+	if store.values == nil {
+		store.values = make(map[string][]byte)
+	}
+	store.values[service+"\x00"+account] = append([]byte(nil), secret...)
+	return nil
+}
+
+func (store *fakeSecretStore) Get(service, account string) ([]byte, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.getErr != nil {
+		return nil, store.getErr
+	}
+	secret, ok := store.values[service+"\x00"+account]
+	if !ok {
+		return nil, ErrCredentialNotFound
+	}
+	return append([]byte(nil), secret...), nil
+}
+
+func (store *fakeSecretStore) Delete(service, account string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.deleteErr != nil {
+		return store.deleteErr
+	}
+	delete(store.values, service+"\x00"+account)
+	return nil
 }
