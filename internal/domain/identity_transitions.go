@@ -274,6 +274,128 @@ type ActorSessionStartedFact struct {
 	presentation   PresentationCredentialBinding
 }
 
+type WorkRefObservedFact struct {
+	origin      AggregateRef
+	workspaceID WorkspaceID
+	observation ProviderObservation
+}
+
+func (WorkRefObservedFact) Type() EventType                       { return EventTypeWorkRefObserved }
+func (WorkRefObservedFact) identityFact()                         {}
+func (fact WorkRefObservedFact) Origin() AggregateRef             { return fact.origin }
+func (fact WorkRefObservedFact) WorkspaceID() WorkspaceID         { return fact.workspaceID }
+func (fact WorkRefObservedFact) Observation() ProviderObservation { return fact.observation }
+
+type ObjectiveCreatedFact struct {
+	origin             AggregateRef
+	workspaceID        WorkspaceID
+	title              string
+	acceptanceCriteria string
+}
+
+func (ObjectiveCreatedFact) Type() EventType                 { return EventTypeObjectiveCreated }
+func (ObjectiveCreatedFact) identityFact()                   {}
+func (fact ObjectiveCreatedFact) Origin() AggregateRef       { return fact.origin }
+func (fact ObjectiveCreatedFact) WorkspaceID() WorkspaceID   { return fact.workspaceID }
+func (fact ObjectiveCreatedFact) Title() string              { return fact.title }
+func (fact ObjectiveCreatedFact) AcceptanceCriteria() string { return fact.acceptanceCriteria }
+
+type WorkUnitCreatedFact struct {
+	origin          AggregateRef
+	workspaceID     WorkspaceID
+	objectiveID     ObjectiveID
+	workReferenceID WorkReferenceID
+	title           string
+}
+
+func (WorkUnitCreatedFact) Type() EventType                       { return EventTypeWorkUnitCreated }
+func (WorkUnitCreatedFact) identityFact()                         {}
+func (fact WorkUnitCreatedFact) Origin() AggregateRef             { return fact.origin }
+func (fact WorkUnitCreatedFact) WorkspaceID() WorkspaceID         { return fact.workspaceID }
+func (fact WorkUnitCreatedFact) ObjectiveID() ObjectiveID         { return fact.objectiveID }
+func (fact WorkUnitCreatedFact) WorkReferenceID() WorkReferenceID { return fact.workReferenceID }
+func (fact WorkUnitCreatedFact) Title() string                    { return fact.title }
+
+type ObjectiveActivatedFact struct {
+	origin      AggregateRef
+	objectiveID ObjectiveID
+}
+
+func (ObjectiveActivatedFact) Type() EventType               { return EventTypeObjectiveActivated }
+func (ObjectiveActivatedFact) identityFact()                 {}
+func (fact ObjectiveActivatedFact) Origin() AggregateRef     { return fact.origin }
+func (fact ObjectiveActivatedFact) ObjectiveID() ObjectiveID { return fact.objectiveID }
+
+type RunPlannedFact struct {
+	origin      AggregateRef
+	objectiveID ObjectiveID
+	workUnitID  WorkUnitID
+	operatorID  ActorID
+}
+
+func (RunPlannedFact) Type() EventType               { return EventTypeRunPlanned }
+func (RunPlannedFact) identityFact()                 {}
+func (fact RunPlannedFact) Origin() AggregateRef     { return fact.origin }
+func (fact RunPlannedFact) ObjectiveID() ObjectiveID { return fact.objectiveID }
+func (fact RunPlannedFact) WorkUnitID() WorkUnitID   { return fact.workUnitID }
+func (fact RunPlannedFact) OperatorID() ActorID      { return fact.operatorID }
+
+type RunParticipantInvitedFact struct {
+	origin  AggregateRef
+	runID   RunID
+	actorID ActorID
+	role    string
+}
+
+func (RunParticipantInvitedFact) Type() EventType           { return EventTypeRunParticipantInvited }
+func (RunParticipantInvitedFact) identityFact()             {}
+func (fact RunParticipantInvitedFact) Origin() AggregateRef { return fact.origin }
+func (fact RunParticipantInvitedFact) RunID() RunID         { return fact.runID }
+func (fact RunParticipantInvitedFact) ActorID() ActorID     { return fact.actorID }
+func (fact RunParticipantInvitedFact) Role() string         { return fact.role }
+
+type RuntimeBindingRequestedFact struct {
+	origin          AggregateRef
+	runID           RunID
+	participationID RunParticipationID
+	sessionID       ActorSessionID
+	endpointID      RuntimeEndpointID
+}
+
+func (RuntimeBindingRequestedFact) Type() EventType           { return EventTypeRuntimeBindingRequested }
+func (RuntimeBindingRequestedFact) identityFact()             {}
+func (fact RuntimeBindingRequestedFact) Origin() AggregateRef { return fact.origin }
+func (fact RuntimeBindingRequestedFact) RunID() RunID         { return fact.runID }
+func (fact RuntimeBindingRequestedFact) ParticipationID() RunParticipationID {
+	return fact.participationID
+}
+func (fact RuntimeBindingRequestedFact) ActorSessionID() ActorSessionID       { return fact.sessionID }
+func (fact RuntimeBindingRequestedFact) RuntimeEndpointID() RuntimeEndpointID { return fact.endpointID }
+
+type RunParticipantJoinedFact struct {
+	origin    AggregateRef
+	runID     RunID
+	actorID   ActorID
+	sessionID ActorSessionID
+}
+
+func (RunParticipantJoinedFact) Type() EventType                     { return EventTypeRunParticipantJoined }
+func (RunParticipantJoinedFact) identityFact()                       {}
+func (fact RunParticipantJoinedFact) Origin() AggregateRef           { return fact.origin }
+func (fact RunParticipantJoinedFact) RunID() RunID                   { return fact.runID }
+func (fact RunParticipantJoinedFact) ActorID() ActorID               { return fact.actorID }
+func (fact RunParticipantJoinedFact) ActorSessionID() ActorSessionID { return fact.sessionID }
+
+type RunStartedFact struct {
+	origin AggregateRef
+	runID  RunID
+}
+
+func (RunStartedFact) Type() EventType           { return EventTypeRunStarted }
+func (RunStartedFact) identityFact()             {}
+func (fact RunStartedFact) Origin() AggregateRef { return fact.origin }
+func (fact RunStartedFact) RunID() RunID         { return fact.runID }
+
 func (ActorSessionStartedFact) Type() EventType                         { return EventTypeActorSessionStarted }
 func (ActorSessionStartedFact) identityFact()                           {}
 func (fact ActorSessionStartedFact) Origin() AggregateRef               { return fact.origin }
@@ -1612,6 +1734,395 @@ func RevokeDevice(command DeviceRevocationCommand) (DeviceRevocationResult, erro
 
 func (result DeviceRevocationResult) Device() DeviceState   { return result.device }
 func (result DeviceRevocationResult) Facts() []IdentityFact { return cloneIdentityFacts(result.facts) }
+
+type ObserveWorkRefInput struct {
+	Authorization                IdentityAuthorization
+	Workspace                    WorkspaceState
+	ExpectedWorkspaceVersion     Version
+	WorkReference                WorkReferenceState
+	ExpectedWorkReferenceVersion Version
+	WorkReferenceID              WorkReferenceID
+	Observation                  ProviderObservation
+	PreviousProviderVersion      OpaqueProviderValue
+}
+
+type ObserveWorkRefResult struct {
+	workReference WorkReferenceState
+	facts         []IdentityFact
+}
+
+func ObserveWorkRef(input ObserveWorkRefInput) (ObserveWorkRefResult, error) {
+	if input.WorkReferenceID.IsZero() || input.Observation.AdapterPrincipalID() != input.Authorization.PrincipalID() ||
+		input.Observation.ObservedAt().After(input.Authorization.EvaluatedAt()) {
+		return ObserveWorkRefResult{}, transitionError(ErrorCodeInvalidArgument, "provider observation is invalid")
+	}
+	if err := checkWorkspaceAuthority(input.Authorization, input.Workspace, input.ExpectedWorkspaceVersion); err != nil {
+		return ObserveWorkRefResult{}, err
+	}
+	version := InitialVersion()
+	if !input.WorkReference.IsZero() {
+		if err := checkExpectedVersion(input.WorkReference.Version(), input.ExpectedWorkReferenceVersion); err != nil {
+			return ObserveWorkRefResult{}, err
+		}
+		current := input.WorkReference.Observation()
+		if input.WorkReference.ID() != input.WorkReferenceID || input.WorkReference.WorkspaceID() != input.Workspace.ID() ||
+			current.Namespace() != input.Observation.Namespace() || current.ObjectID() != input.Observation.ObjectID() ||
+			current.AdapterPrincipalID() != input.Observation.AdapterPrincipalID() {
+			return ObserveWorkRefResult{}, transitionConflict(ConflictProviderAuthority, "provider observation authority changed")
+		}
+		if input.PreviousProviderVersion != current.ProviderVersion() ||
+			input.Observation.ProviderVersion() == current.ProviderVersion() ||
+			!input.Observation.ObservedAt().After(current.ObservedAt()) {
+			return ObserveWorkRefResult{}, transitionConflict(ConflictProviderObservation, "provider observation is stale or regressed")
+		}
+		var err error
+		version, err = nextTransitionVersion(input.WorkReference.Version())
+		if err != nil {
+			return ObserveWorkRefResult{}, err
+		}
+	} else if !input.ExpectedWorkReferenceVersion.IsZero() || input.PreviousProviderVersion.String() != "" {
+		return ObserveWorkRefResult{}, transitionConflict(ConflictProviderObservation, "new provider observation has stale predecessor")
+	}
+	state := WorkReferenceState{id: input.WorkReferenceID, workspaceID: input.Workspace.ID(),
+		observation: input.Observation, version: version}
+	origin, err := identityOrigin(state.ID(), state.Version())
+	if err != nil {
+		return ObserveWorkRefResult{}, err
+	}
+	return ObserveWorkRefResult{workReference: state, facts: []IdentityFact{
+		WorkRefObservedFact{origin: origin, workspaceID: state.WorkspaceID(), observation: state.Observation()},
+	}}, nil
+}
+
+func (result ObserveWorkRefResult) WorkReference() WorkReferenceState { return result.workReference }
+func (result ObserveWorkRefResult) Facts() []IdentityFact             { return cloneIdentityFacts(result.facts) }
+
+type CreateObjectiveAndWorkInput struct {
+	Session                      ActorSessionState
+	ExpectedSessionVersion       Version
+	Objective                    ObjectiveState
+	ObjectiveID                  ObjectiveID
+	ObjectiveTitle               string
+	AcceptanceCriteria           string
+	WorkUnit                     WorkUnitState
+	WorkUnitID                   WorkUnitID
+	WorkUnitTitle                string
+	WorkReference                WorkReferenceState
+	ExpectedWorkReferenceVersion Version
+}
+
+type CreateObjectiveAndWorkResult struct {
+	objective ObjectiveState
+	workUnit  WorkUnitState
+	facts     []IdentityFact
+}
+
+func CreateObjectiveAndWork(input CreateObjectiveAndWorkInput) (CreateObjectiveAndWorkResult, error) {
+	if !input.Objective.IsZero() || !input.WorkUnit.IsZero() || input.ObjectiveID.IsZero() || input.WorkUnitID.IsZero() ||
+		!validBoundedText(input.ObjectiveTitle, 512) || !validBoundedText(input.AcceptanceCriteria, 8192) ||
+		!validBoundedText(input.WorkUnitTitle, 512) {
+		return CreateObjectiveAndWorkResult{}, transitionError(ErrorCodeInvalidArgument, "objective and work input is invalid")
+	}
+	if err := checkWorkSession(input.Session, input.ExpectedSessionVersion); err != nil {
+		return CreateObjectiveAndWorkResult{}, err
+	}
+	if input.WorkReference.IsZero() || input.WorkReference.WorkspaceID() != input.Session.Binding().WorkspaceID() {
+		return CreateObjectiveAndWorkResult{}, transitionConflict(ConflictProviderAuthority, "work reference belongs to another workspace")
+	}
+	if err := checkExpectedVersion(input.WorkReference.Version(), input.ExpectedWorkReferenceVersion); err != nil {
+		return CreateObjectiveAndWorkResult{}, err
+	}
+	objective := ObjectiveState{id: input.ObjectiveID, workspaceID: input.WorkReference.WorkspaceID(),
+		title: input.ObjectiveTitle, acceptanceCriteria: input.AcceptanceCriteria,
+		status: ObjectiveDraft, version: InitialVersion()}
+	workUnit := WorkUnitState{id: input.WorkUnitID, workspaceID: objective.WorkspaceID(), objectiveID: objective.ID(),
+		workReferenceID: input.WorkReference.ID(), title: input.WorkUnitTitle,
+		status: WorkUnitProposed, version: InitialVersion()}
+	objectiveOrigin, _ := identityOrigin(objective.ID(), objective.Version())
+	workOrigin, _ := identityOrigin(workUnit.ID(), workUnit.Version())
+	return CreateObjectiveAndWorkResult{objective: objective, workUnit: workUnit, facts: []IdentityFact{
+		ObjectiveCreatedFact{origin: objectiveOrigin, workspaceID: objective.WorkspaceID(), title: objective.Title(), acceptanceCriteria: objective.AcceptanceCriteria()},
+		WorkUnitCreatedFact{origin: workOrigin, workspaceID: workUnit.WorkspaceID(), objectiveID: workUnit.ObjectiveID(), workReferenceID: workUnit.WorkReferenceID(), title: workUnit.Title()},
+	}}, nil
+}
+
+func (result CreateObjectiveAndWorkResult) Objective() ObjectiveState { return result.objective }
+func (result CreateObjectiveAndWorkResult) WorkUnit() WorkUnitState   { return result.workUnit }
+func (result CreateObjectiveAndWorkResult) Facts() []IdentityFact {
+	return cloneIdentityFacts(result.facts)
+}
+
+type ActivateObjectiveInput struct {
+	Session                  ActorSessionState
+	ExpectedSessionVersion   Version
+	Objective                ObjectiveState
+	ExpectedObjectiveVersion Version
+}
+
+type ActivateObjectiveResult struct {
+	objective ObjectiveState
+	facts     []IdentityFact
+}
+
+func ActivateObjective(input ActivateObjectiveInput) (ActivateObjectiveResult, error) {
+	if err := checkWorkSession(input.Session, input.ExpectedSessionVersion); err != nil {
+		return ActivateObjectiveResult{}, err
+	}
+	if err := checkExpectedVersion(input.Objective.Version(), input.ExpectedObjectiveVersion); err != nil {
+		return ActivateObjectiveResult{}, err
+	}
+	if input.Objective.WorkspaceID() != input.Session.Binding().WorkspaceID() {
+		return ActivateObjectiveResult{}, transitionConflict(ConflictReference, "objective belongs to another workspace")
+	}
+	if input.Objective.Status() != ObjectiveDraft {
+		return ActivateObjectiveResult{}, transitionConflict(ConflictState, "objective is not draft")
+	}
+	next, err := nextTransitionVersion(input.Objective.Version())
+	if err != nil {
+		return ActivateObjectiveResult{}, err
+	}
+	objective := input.Objective
+	objective.status, objective.version = ObjectiveActive, next
+	origin, _ := identityOrigin(objective.ID(), objective.Version())
+	return ActivateObjectiveResult{objective: objective, facts: []IdentityFact{
+		ObjectiveActivatedFact{origin: origin, objectiveID: objective.ID()},
+	}}, nil
+}
+
+func (result ActivateObjectiveResult) Objective() ObjectiveState { return result.objective }
+func (result ActivateObjectiveResult) Facts() []IdentityFact     { return cloneIdentityFacts(result.facts) }
+
+type RunParticipantPlan struct {
+	ParticipationID        RunParticipationID
+	Actor                  ActorState
+	ExpectedActorVersion   Version
+	Session                ActorSessionState
+	ExpectedSessionVersion Version
+	Role                   string
+}
+
+type RuntimeBindingPlan struct {
+	BindingID       RuntimeBindingID
+	ParticipationID RunParticipationID
+	SessionID       ActorSessionID
+	Endpoint        AggregateRef
+}
+
+type PlanRunWithBindingsInput struct {
+	OperatorSession                ActorSessionState
+	ExpectedOperatorSessionVersion Version
+	Run                            RunState
+	RunID                          RunID
+	Objective                      ObjectiveState
+	ExpectedObjectiveVersion       Version
+	WorkUnit                       WorkUnitState
+	ExpectedWorkUnitVersion        Version
+	Participants                   []RunParticipantPlan
+	Bindings                       []RuntimeBindingPlan
+}
+
+type PlanRunWithBindingsResult struct {
+	run            RunState
+	participations []RunParticipationState
+	bindings       []RuntimeBindingState
+	facts          []IdentityFact
+}
+
+func PlanRunWithBindings(input PlanRunWithBindingsInput) (PlanRunWithBindingsResult, error) {
+	if !input.Run.IsZero() || input.RunID.IsZero() || len(input.Participants) == 0 ||
+		len(input.Participants) > MaxRunParticipants || len(input.Bindings) == 0 || len(input.Bindings) > MaxRunBindings {
+		return PlanRunWithBindingsResult{}, transitionError(ErrorCodeInvalidArgument, "run plan exceeds its bounded shape")
+	}
+	if err := checkWorkSession(input.OperatorSession, input.ExpectedOperatorSessionVersion); err != nil {
+		return PlanRunWithBindingsResult{}, err
+	}
+	if err := checkExpectedVersion(input.Objective.Version(), input.ExpectedObjectiveVersion); err != nil {
+		return PlanRunWithBindingsResult{}, err
+	}
+	if err := checkExpectedVersion(input.WorkUnit.Version(), input.ExpectedWorkUnitVersion); err != nil {
+		return PlanRunWithBindingsResult{}, err
+	}
+	workspace := input.OperatorSession.Binding().WorkspaceID()
+	if input.Objective.Status() != ObjectiveActive || input.Objective.WorkspaceID() != workspace ||
+		input.WorkUnit.WorkspaceID() != workspace || input.WorkUnit.ObjectiveID() != input.Objective.ID() {
+		return PlanRunWithBindingsResult{}, transitionConflict(ConflictReference, "run objective and work references do not match")
+	}
+	participants := append([]RunParticipantPlan(nil), input.Participants...)
+	sort.Slice(participants, func(i, j int) bool {
+		return participants[i].ParticipationID.String() < participants[j].ParticipationID.String()
+	})
+	participations := make([]RunParticipationState, len(participants))
+	byID := make(map[RunParticipationID]RunParticipationState, len(participants))
+	seenActors := make(map[ActorID]struct{}, len(participants))
+	for index, plan := range participants {
+		if plan.ParticipationID.IsZero() || !validBoundedText(plan.Role, 128) || plan.Actor.IsZero() ||
+			plan.Actor.WorkspaceID() != workspace || plan.Actor.Status() != ActorActive ||
+			plan.Session.Binding().ActorID() != plan.Actor.ID() || plan.Session.Binding().WorkspaceID() != workspace {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictParticipant, "run participant plan is invalid")
+		}
+		if err := checkExpectedVersion(plan.Actor.Version(), plan.ExpectedActorVersion); err != nil {
+			return PlanRunWithBindingsResult{}, err
+		}
+		if err := checkWorkSession(plan.Session, plan.ExpectedSessionVersion); err != nil {
+			return PlanRunWithBindingsResult{}, err
+		}
+		if _, duplicate := seenActors[plan.Actor.ID()]; duplicate {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictParticipant, "actor is invited more than once")
+		}
+		seenActors[plan.Actor.ID()] = struct{}{}
+		state := RunParticipationState{id: plan.ParticipationID, runID: input.RunID, actorID: plan.Actor.ID(),
+			role: plan.Role, status: RunParticipationInvited, version: InitialVersion()}
+		participations[index], byID[state.ID()] = state, state
+	}
+	bindingPlans := append([]RuntimeBindingPlan(nil), input.Bindings...)
+	sort.Slice(bindingPlans, func(i, j int) bool { return bindingPlans[i].BindingID.String() < bindingPlans[j].BindingID.String() })
+	bindings := make([]RuntimeBindingState, len(bindingPlans))
+	seenBindings := make(map[RuntimeBindingID]struct{}, len(bindingPlans))
+	for index, plan := range bindingPlans {
+		participant, exists := byID[plan.ParticipationID]
+		if plan.BindingID.IsZero() || !exists || plan.SessionID.IsZero() || plan.Endpoint.Kind() != AggregateKindRuntimeEndpoint || plan.Endpoint.IsZero() {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictReference, "runtime binding plan is invalid")
+		}
+		if _, duplicate := seenBindings[plan.BindingID]; duplicate {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictReference, "runtime binding is duplicated")
+		}
+		seenBindings[plan.BindingID] = struct{}{}
+		matched := false
+		for _, declared := range participants {
+			matched = matched || declared.ParticipationID == participant.ID() && declared.Session.ID() == plan.SessionID
+		}
+		if !matched {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictParticipant, "binding session does not match participant")
+		}
+		endpoint, err := ParseRuntimeEndpointID(plan.Endpoint.ID())
+		if err != nil {
+			return PlanRunWithBindingsResult{}, transitionConflict(ConflictReference, "runtime endpoint identity is invalid")
+		}
+		bindings[index] = RuntimeBindingState{id: plan.BindingID, runID: input.RunID, participationID: participant.ID(),
+			sessionID: plan.SessionID, endpointID: endpoint, status: RuntimeBindingRequested, version: InitialVersion()}
+	}
+	run := RunState{id: input.RunID, workspaceID: workspace, objectiveID: input.Objective.ID(),
+		workUnitID: input.WorkUnit.ID(), operatorID: input.OperatorSession.Binding().ActorID(), status: RunPlanned, version: InitialVersion()}
+	runOrigin, _ := identityOrigin(run.ID(), run.Version())
+	facts := []IdentityFact{RunPlannedFact{origin: runOrigin, objectiveID: run.ObjectiveID(), workUnitID: run.WorkUnitID(), operatorID: run.OperatorID()}}
+	for _, state := range participations {
+		origin, _ := identityOrigin(state.ID(), state.Version())
+		facts = append(facts, RunParticipantInvitedFact{origin: origin, runID: state.RunID(), actorID: state.ActorID(), role: state.Role()})
+	}
+	for _, state := range bindings {
+		origin, _ := identityOrigin(state.ID(), state.Version())
+		facts = append(facts, RuntimeBindingRequestedFact{origin: origin, runID: state.RunID(), participationID: state.ParticipationID(), sessionID: state.ActorSessionID(), endpointID: state.RuntimeEndpointID()})
+	}
+	return PlanRunWithBindingsResult{run: run, participations: participations, bindings: bindings, facts: facts}, nil
+}
+
+func (result PlanRunWithBindingsResult) Run() RunState { return result.run }
+func (result PlanRunWithBindingsResult) Participations() []RunParticipationState {
+	return append([]RunParticipationState(nil), result.participations...)
+}
+func (result PlanRunWithBindingsResult) Bindings() []RuntimeBindingState {
+	return append([]RuntimeBindingState(nil), result.bindings...)
+}
+func (result PlanRunWithBindingsResult) Facts() []IdentityFact {
+	return cloneIdentityFacts(result.facts)
+}
+
+type JoinRunInput struct {
+	Session                      ActorSessionState
+	ExpectedSessionVersion       Version
+	Run                          RunState
+	ExpectedRunVersion           Version
+	Participation                RunParticipationState
+	ExpectedParticipationVersion Version
+}
+
+type JoinRunResult struct {
+	participation RunParticipationState
+	facts         []IdentityFact
+}
+
+func JoinRun(input JoinRunInput) (JoinRunResult, error) {
+	if err := checkWorkSession(input.Session, input.ExpectedSessionVersion); err != nil {
+		return JoinRunResult{}, err
+	}
+	if err := checkExpectedVersion(input.Run.Version(), input.ExpectedRunVersion); err != nil {
+		return JoinRunResult{}, err
+	}
+	if err := checkExpectedVersion(input.Participation.Version(), input.ExpectedParticipationVersion); err != nil {
+		return JoinRunResult{}, err
+	}
+	if input.Run.Status() != RunPlanned || input.Participation.Status() != RunParticipationInvited ||
+		input.Participation.RunID() != input.Run.ID() || input.Participation.ActorID() != input.Session.Binding().ActorID() ||
+		input.Run.WorkspaceID() != input.Session.Binding().WorkspaceID() {
+		return JoinRunResult{}, transitionConflict(ConflictParticipant, "actor session is not the invited run participant")
+	}
+	next, err := nextTransitionVersion(input.Participation.Version())
+	if err != nil {
+		return JoinRunResult{}, err
+	}
+	participation := input.Participation
+	participation.status, participation.sessionID, participation.version = RunParticipationActive, input.Session.ID(), next
+	origin, _ := identityOrigin(participation.ID(), participation.Version())
+	return JoinRunResult{participation: participation, facts: []IdentityFact{RunParticipantJoinedFact{
+		origin: origin, runID: participation.RunID(), actorID: participation.ActorID(), sessionID: participation.ActorSessionID(),
+	}}}, nil
+}
+
+func (result JoinRunResult) Participation() RunParticipationState { return result.participation }
+func (result JoinRunResult) Facts() []IdentityFact                { return cloneIdentityFacts(result.facts) }
+
+type StartRunInput struct {
+	OperatorSession                ActorSessionState
+	ExpectedOperatorSessionVersion Version
+	Run                            RunState
+	ExpectedRunVersion             Version
+	Participations                 []RunParticipationState
+}
+
+type StartRunResult struct {
+	run   RunState
+	facts []IdentityFact
+}
+
+func StartRun(input StartRunInput) (StartRunResult, error) {
+	if err := checkWorkSession(input.OperatorSession, input.ExpectedOperatorSessionVersion); err != nil {
+		return StartRunResult{}, err
+	}
+	if err := checkExpectedVersion(input.Run.Version(), input.ExpectedRunVersion); err != nil {
+		return StartRunResult{}, err
+	}
+	if input.Run.Status() != RunPlanned || input.Run.OperatorID() != input.OperatorSession.Binding().ActorID() || len(input.Participations) == 0 || len(input.Participations) > MaxRunParticipants {
+		return StartRunResult{}, transitionConflict(ConflictParticipant, "run start policy is not satisfied")
+	}
+	seen := make(map[RunParticipationID]struct{}, len(input.Participations))
+	for _, participant := range input.Participations {
+		if participant.RunID() != input.Run.ID() || participant.Status() != RunParticipationActive || participant.ActorSessionID().IsZero() {
+			return StartRunResult{}, transitionConflict(ConflictParticipant, "all declared participants must be joined")
+		}
+		if _, duplicate := seen[participant.ID()]; duplicate {
+			return StartRunResult{}, transitionConflict(ConflictParticipant, "participation is cited more than once")
+		}
+		seen[participant.ID()] = struct{}{}
+	}
+	next, err := nextTransitionVersion(input.Run.Version())
+	if err != nil {
+		return StartRunResult{}, err
+	}
+	run := input.Run
+	run.status, run.version = RunStarting, next
+	origin, _ := identityOrigin(run.ID(), run.Version())
+	return StartRunResult{run: run, facts: []IdentityFact{RunStartedFact{origin: origin, runID: run.ID()}}}, nil
+}
+
+func (result StartRunResult) Run() RunState         { return result.run }
+func (result StartRunResult) Facts() []IdentityFact { return cloneIdentityFacts(result.facts) }
+
+func checkWorkSession(session ActorSessionState, expected Version) error {
+	if session.IsZero() || session.Status() != ActorSessionActive {
+		return transitionConflict(ConflictSessionTerminal, "actor session is not active")
+	}
+	return checkExpectedVersion(session.Version(), expected)
+}
 
 type SessionStartAuthorityKind string
 

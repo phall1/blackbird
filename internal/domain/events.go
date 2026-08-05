@@ -178,6 +178,15 @@ const (
 	EventTypeActorDelegationProposed     EventType = "ActorDelegationProposed"
 	EventTypeActorDelegationActivated    EventType = "ActorDelegationActivated"
 	EventTypeActorSessionStarted         EventType = "ActorSessionStarted"
+	EventTypeWorkRefObserved             EventType = "WorkRefObserved"
+	EventTypeObjectiveCreated            EventType = "ObjectiveCreated"
+	EventTypeWorkUnitCreated             EventType = "WorkUnitCreated"
+	EventTypeObjectiveActivated          EventType = "ObjectiveActivated"
+	EventTypeRunPlanned                  EventType = "RunPlanned"
+	EventTypeRunParticipantInvited       EventType = "RunParticipantInvited"
+	EventTypeRuntimeBindingRequested     EventType = "RuntimeBindingRequested"
+	EventTypeRunParticipantJoined        EventType = "RunParticipantJoined"
+	EventTypeRunStarted                  EventType = "RunStarted"
 )
 
 func (eventType EventType) Valid() bool {
@@ -194,7 +203,16 @@ func (eventType EventType) Valid() bool {
 		EventTypeActorCreated,
 		EventTypeActorDelegationProposed,
 		EventTypeActorDelegationActivated,
-		EventTypeActorSessionStarted:
+		EventTypeActorSessionStarted,
+		EventTypeWorkRefObserved,
+		EventTypeObjectiveCreated,
+		EventTypeWorkUnitCreated,
+		EventTypeObjectiveActivated,
+		EventTypeRunPlanned,
+		EventTypeRunParticipantInvited,
+		EventTypeRuntimeBindingRequested,
+		EventTypeRunParticipantJoined,
+		EventTypeRunStarted:
 		return true
 	default:
 		return false

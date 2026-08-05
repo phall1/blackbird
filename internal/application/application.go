@@ -119,17 +119,22 @@ func (subject QuerySubject) ActorSessionID() domain.ActorSessionID { return subj
 type ContextGetQuery struct {
 	subject      QuerySubject
 	checkpointID CheckpointID
+	cursor       EventCursor
+	limit        uint16
 }
 
-func NewContextGetQuery(subject QuerySubject, checkpointID CheckpointID) (ContextGetQuery, error) {
-	if subject.principal.IsZero() || subject.session.IsZero() || checkpointID.IsZero() {
+func NewContextGetQuery(subject QuerySubject, checkpointID CheckpointID, cursor EventCursor, limit uint16) (ContextGetQuery, error) {
+	if subject.principal.IsZero() || subject.session.IsZero() || checkpointID.IsZero() ||
+		limit == 0 || limit > MaxQueryPageSize {
 		return ContextGetQuery{}, ErrInvalidQuery
 	}
-	return ContextGetQuery{subject: subject, checkpointID: checkpointID}, nil
+	return ContextGetQuery{subject: subject, checkpointID: checkpointID, cursor: cursor, limit: limit}, nil
 }
 
 func (query ContextGetQuery) Subject() QuerySubject      { return query.subject }
 func (query ContextGetQuery) CheckpointID() CheckpointID { return query.checkpointID }
+func (query ContextGetQuery) Cursor() EventCursor        { return query.cursor }
+func (query ContextGetQuery) Limit() uint16              { return query.limit }
 
 type EventsSyncQuery struct {
 	subject QuerySubject
@@ -248,17 +253,34 @@ func (record ContextRecord) CanonicalPayload() []byte {
 }
 
 type ContextCheckpoint struct {
-	id      CheckpointID
-	through EventCursor
-	session AuthorizedSessionView
-	records []ContextRecord
+	id                CheckpointID
+	authorityID       domain.AuthorityID
+	authorityEpoch    domain.AuthorityEpoch
+	through           EventCursor
+	projectionVersion uint32
+	serverTime        time.Time
+	session           AuthorizedSessionView
+	records           []ContextRecord
 }
 
-func NewContextCheckpoint(id CheckpointID, through EventCursor, session AuthorizedSessionView, records []ContextRecord) (ContextCheckpoint, error) {
-	if id.IsZero() || through.IsZero() || session.session.IsZero() || len(records) == 0 || len(records) > MaxContextCollaborators+6 {
+type ContextCheckpointParams struct {
+	CheckpointID      CheckpointID
+	AuthorityID       domain.AuthorityID
+	AuthorityEpoch    domain.AuthorityEpoch
+	ThroughCursor     EventCursor
+	ProjectionVersion uint32
+	ServerTime        time.Time
+	Session           AuthorizedSessionView
+	Records           []ContextRecord
+}
+
+func NewContextCheckpoint(params ContextCheckpointParams) (ContextCheckpoint, error) {
+	if params.CheckpointID.IsZero() || params.AuthorityID.IsZero() || params.AuthorityEpoch.IsZero() ||
+		params.ThroughCursor.IsZero() || params.ProjectionVersion == 0 || params.ServerTime.IsZero() ||
+		params.Session.session.IsZero() || len(params.Records) == 0 || len(params.Records) > MaxContextCollaborators+6 {
 		return ContextCheckpoint{}, ErrInvalidQuery
 	}
-	cloned := append([]ContextRecord(nil), records...)
+	cloned := append([]ContextRecord(nil), params.Records...)
 	for index, record := range cloned {
 		if !record.kind.Valid() || len(record.canonical) == 0 ||
 			(index > 0 && (cloned[index-1].kind > record.kind ||
@@ -267,11 +289,21 @@ func NewContextCheckpoint(id CheckpointID, through EventCursor, session Authoriz
 		}
 		cloned[index].canonical = append([]byte(nil), record.canonical...)
 	}
-	return ContextCheckpoint{id: id, through: through, session: session, records: cloned}, nil
+	return ContextCheckpoint{
+		id: params.CheckpointID, authorityID: params.AuthorityID, authorityEpoch: params.AuthorityEpoch,
+		through: params.ThroughCursor, projectionVersion: params.ProjectionVersion,
+		serverTime: params.ServerTime.UTC(), session: params.Session, records: cloned,
+	}, nil
 }
 
-func (checkpoint ContextCheckpoint) CheckpointID() CheckpointID     { return checkpoint.id }
+func (checkpoint ContextCheckpoint) CheckpointID() CheckpointID      { return checkpoint.id }
+func (checkpoint ContextCheckpoint) AuthorityID() domain.AuthorityID { return checkpoint.authorityID }
+func (checkpoint ContextCheckpoint) AuthorityEpoch() domain.AuthorityEpoch {
+	return checkpoint.authorityEpoch
+}
 func (checkpoint ContextCheckpoint) ThroughCursor() EventCursor     { return checkpoint.through }
+func (checkpoint ContextCheckpoint) ProjectionVersion() uint32      { return checkpoint.projectionVersion }
+func (checkpoint ContextCheckpoint) ServerTime() time.Time          { return checkpoint.serverTime }
 func (checkpoint ContextCheckpoint) Session() AuthorizedSessionView { return checkpoint.session }
 func (checkpoint ContextCheckpoint) Records() []ContextRecord {
 	result := append([]ContextRecord(nil), checkpoint.records...)
@@ -281,73 +313,205 @@ func (checkpoint ContextCheckpoint) Records() []ContextRecord {
 	return result
 }
 
-type SyncedEvent struct {
-	id               domain.EventID
-	sequence         uint64
-	eventType        domain.EventType
-	aggregateKind    domain.AggregateKind
-	aggregateID      string
-	aggregateVersion domain.Version
-	payload          []byte
-	recordedAt       time.Time
+type ContextDeltaType string
+
+const (
+	ContextDeltaUpsert     ContextDeltaType = "upsert"
+	ContextDeltaRemove     ContextDeltaType = "remove"
+	ContextDeltaInvalidate ContextDeltaType = "invalidate"
+)
+
+func (kind ContextDeltaType) Valid() bool {
+	return kind == ContextDeltaUpsert || kind == ContextDeltaRemove || kind == ContextDeltaInvalidate
 }
 
-func NewSyncedEvent(id domain.EventID, sequence uint64, eventType domain.EventType, aggregateKind domain.AggregateKind,
-	aggregateID string, aggregateVersion domain.Version, payload []byte, recordedAt time.Time) (SyncedEvent, error) {
-	if id.IsZero() || sequence == 0 || sequence > MaxCanonicalInteger || eventType == "" || aggregateKind == "" ||
-		!validOpaqueText(aggregateID, 256) || !aggregateVersion.Valid() || len(payload) == 0 ||
-		len(payload) > MaxQueryPayloadBytes || recordedAt.IsZero() {
+type ContextDelta struct {
+	eventID   domain.EventID
+	deltaType ContextDeltaType
+	resource  domain.AggregateTarget
+	version   domain.Version
+	value     []byte
+	after     EventCursor
+}
+
+func NewContextDelta(eventID domain.EventID, deltaType ContextDeltaType, resource domain.AggregateTarget,
+	version domain.Version, value []byte, after EventCursor) (ContextDelta, error) {
+	if eventID.IsZero() || !deltaType.Valid() || resource.IsZero() || !version.Valid() ||
+		len(value) == 0 || len(value) > MaxQueryPayloadBytes || after.IsZero() {
+		return ContextDelta{}, ErrInvalidQuery
+	}
+	return ContextDelta{eventID: eventID, deltaType: deltaType, resource: resource, version: version,
+		value: append([]byte(nil), value...), after: after}, nil
+}
+
+func (delta ContextDelta) EventID() domain.EventID          { return delta.eventID }
+func (delta ContextDelta) DeltaType() ContextDeltaType      { return delta.deltaType }
+func (delta ContextDelta) Resource() domain.AggregateTarget { return delta.resource }
+func (delta ContextDelta) Version() domain.Version          { return delta.version }
+func (delta ContextDelta) Value() []byte                    { return append([]byte(nil), delta.value...) }
+func (delta ContextDelta) AfterCursor() EventCursor         { return delta.after }
+
+type ContextPage struct {
+	checkpoint ContextCheckpoint
+	deltas     []ContextDelta
+	next       EventCursor
+	head       EventCursor
+	hasMore    bool
+}
+
+func NewContextCheckpointPage(checkpoint ContextCheckpoint, head EventCursor) (ContextPage, error) {
+	if checkpoint.id.IsZero() || checkpoint.through.IsZero() || head.IsZero() || checkpoint.through != head {
+		return ContextPage{}, ErrInvalidQuery
+	}
+	return ContextPage{checkpoint: checkpoint, deltas: []ContextDelta{}, next: head, head: head}, nil
+}
+
+func NewContextDeltaPage(deltas []ContextDelta, next, head EventCursor, hasMore bool) (ContextPage, error) {
+	if len(deltas) == 0 || len(deltas) > MaxQueryPageSize || next.IsZero() || head.IsZero() {
+		return ContextPage{}, ErrInvalidQuery
+	}
+	cloned := append([]ContextDelta(nil), deltas...)
+	for index := range cloned {
+		if cloned[index].eventID.IsZero() || cloned[index].after.IsZero() ||
+			(index > 0 && cloned[index-1].after == cloned[index].after) {
+			return ContextPage{}, ErrInvalidQuery
+		}
+		cloned[index].value = append([]byte(nil), cloned[index].value...)
+	}
+	if cloned[len(cloned)-1].after != next {
+		return ContextPage{}, ErrInvalidQuery
+	}
+	return ContextPage{deltas: cloned, next: next, head: head, hasMore: hasMore}, nil
+}
+
+func (page ContextPage) Checkpoint() (ContextCheckpoint, bool) {
+	return page.checkpoint, !page.checkpoint.id.IsZero()
+}
+func (page ContextPage) Deltas() []ContextDelta {
+	result := append([]ContextDelta(nil), page.deltas...)
+	for index := range result {
+		result[index].value = append([]byte(nil), result[index].value...)
+	}
+	return result
+}
+func (page ContextPage) NextCursor() EventCursor { return page.next }
+func (page ContextPage) HeadCursor() EventCursor { return page.head }
+func (page ContextPage) HasMore() bool           { return page.hasMore }
+
+type SyncedEventParams struct {
+	EventID        domain.EventID
+	EventType      domain.EventType
+	EventVersion   domain.EventSchemaVersion
+	AuthorityID    domain.AuthorityID
+	AuthorityEpoch domain.AuthorityEpoch
+	Scope          domain.AuthorityScope
+	OriginPosition domain.StreamPosition
+	Aggregate      domain.AggregateRef
+	PrincipalID    domain.PrincipalID
+	ActorID        *domain.ActorID
+	ActorSessionID *domain.ActorSessionID
+	CommandID      domain.CommandID
+	CausationID    *domain.EventID
+	CorrelationID  domain.CorrelationID
+	OccurredAt     time.Time
+	RecordedAt     time.Time
+	Payload        []byte
+}
+
+type SyncedEvent struct {
+	params SyncedEventParams
+}
+
+func NewSyncedEvent(params SyncedEventParams) (SyncedEvent, error) {
+	if params.EventID.IsZero() || params.EventType == "" || params.EventVersion.IsZero() ||
+		params.AuthorityID.IsZero() || params.AuthorityEpoch.IsZero() || params.Scope.IsZero() ||
+		!params.OriginPosition.Valid() || params.Aggregate.IsZero() || params.PrincipalID.IsZero() ||
+		params.CommandID.IsZero() || params.CorrelationID.IsZero() || params.OccurredAt.IsZero() ||
+		params.RecordedAt.IsZero() || params.RecordedAt.Before(params.OccurredAt) ||
+		len(params.Payload) == 0 || len(params.Payload) > MaxQueryPayloadBytes {
 		return SyncedEvent{}, ErrInvalidQuery
 	}
-	return SyncedEvent{id: id, sequence: sequence, eventType: eventType, aggregateKind: aggregateKind,
-		aggregateID: aggregateID, aggregateVersion: aggregateVersion, payload: append([]byte(nil), payload...), recordedAt: recordedAt.UTC()}, nil
+	if params.ActorID != nil && params.ActorID.IsZero() || params.ActorSessionID != nil && params.ActorSessionID.IsZero() ||
+		params.CausationID != nil && (params.CausationID.IsZero() || *params.CausationID == params.EventID) {
+		return SyncedEvent{}, ErrInvalidQuery
+	}
+	params.Payload = append([]byte(nil), params.Payload...)
+	params.OccurredAt, params.RecordedAt = params.OccurredAt.UTC(), params.RecordedAt.UTC()
+	return SyncedEvent{params: params}, nil
 }
 
-func (event SyncedEvent) EventID() domain.EventID             { return event.id }
-func (event SyncedEvent) Sequence() uint64                    { return event.sequence }
-func (event SyncedEvent) EventType() domain.EventType         { return event.eventType }
-func (event SyncedEvent) AggregateKind() domain.AggregateKind { return event.aggregateKind }
-func (event SyncedEvent) AggregateID() string                 { return event.aggregateID }
-func (event SyncedEvent) AggregateVersion() domain.Version    { return event.aggregateVersion }
-func (event SyncedEvent) Payload() []byte                     { return append([]byte(nil), event.payload...) }
-func (event SyncedEvent) RecordedAt() time.Time               { return event.recordedAt }
+func (event SyncedEvent) EventID() domain.EventID                 { return event.params.EventID }
+func (event SyncedEvent) EventType() domain.EventType             { return event.params.EventType }
+func (event SyncedEvent) EventVersion() domain.EventSchemaVersion { return event.params.EventVersion }
+func (event SyncedEvent) AuthorityID() domain.AuthorityID         { return event.params.AuthorityID }
+func (event SyncedEvent) AuthorityEpoch() domain.AuthorityEpoch   { return event.params.AuthorityEpoch }
+func (event SyncedEvent) Scope() domain.AuthorityScope            { return event.params.Scope }
+func (event SyncedEvent) OriginPosition() domain.StreamPosition   { return event.params.OriginPosition }
+func (event SyncedEvent) Sequence() uint64                        { return event.params.OriginPosition.Uint64() }
+func (event SyncedEvent) Aggregate() domain.AggregateRef          { return event.params.Aggregate }
+func (event SyncedEvent) AggregateKind() domain.AggregateKind     { return event.params.Aggregate.Kind() }
+func (event SyncedEvent) AggregateID() string                     { return event.params.Aggregate.ID() }
+func (event SyncedEvent) AggregateVersion() domain.Version        { return event.params.Aggregate.Version() }
+func (event SyncedEvent) PrincipalID() domain.PrincipalID         { return event.params.PrincipalID }
+func (event SyncedEvent) ActorID() *domain.ActorID                { return cloneOptional(event.params.ActorID) }
+func (event SyncedEvent) ActorSessionID() *domain.ActorSessionID {
+	return cloneOptional(event.params.ActorSessionID)
+}
+func (event SyncedEvent) CommandID() domain.CommandID { return event.params.CommandID }
+func (event SyncedEvent) CausationID() *domain.EventID {
+	return cloneOptional(event.params.CausationID)
+}
+func (event SyncedEvent) CorrelationID() domain.CorrelationID { return event.params.CorrelationID }
+func (event SyncedEvent) OccurredAt() time.Time               { return event.params.OccurredAt }
+func (event SyncedEvent) RecordedAt() time.Time               { return event.params.RecordedAt }
+func (event SyncedEvent) Payload() []byte                     { return append([]byte(nil), event.params.Payload...) }
+
+func cloneOptional[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
 
 type EventsPage struct {
 	session AuthorizedSessionView
 	after   EventCursor
 	next    EventCursor
+	head    EventCursor
 	events  []SyncedEvent
 	hasMore bool
 }
 
-func NewEventsPage(session AuthorizedSessionView, after, next EventCursor, events []SyncedEvent, hasMore bool) (EventsPage, error) {
-	if session.session.IsZero() || next.IsZero() || len(events) > MaxQueryPageSize || (!after.IsZero() && len(events) == 0 && after != next) {
+func NewEventsPage(session AuthorizedSessionView, after, next, head EventCursor, events []SyncedEvent, hasMore bool) (EventsPage, error) {
+	if session.session.IsZero() || next.IsZero() || head.IsZero() || len(events) > MaxQueryPageSize || (!after.IsZero() && len(events) == 0 && after != next) {
 		return EventsPage{}, ErrInvalidQuery
 	}
 	cloned := append([]SyncedEvent(nil), events...)
 	for index, event := range cloned {
-		if event.id.IsZero() || (index > 0 && cloned[index-1].sequence >= event.sequence) {
+		if event.params.EventID.IsZero() || (index > 0 && cloned[index-1].Sequence() >= event.Sequence()) {
 			return EventsPage{}, ErrInvalidQuery
 		}
-		cloned[index].payload = append([]byte(nil), event.payload...)
+		cloned[index].params.Payload = append([]byte(nil), event.params.Payload...)
 	}
-	return EventsPage{session: session, after: after, next: next, events: cloned, hasMore: hasMore}, nil
+	return EventsPage{session: session, after: after, next: next, head: head, events: cloned, hasMore: hasMore}, nil
 }
 
 func (page EventsPage) Session() AuthorizedSessionView { return page.session }
 func (page EventsPage) AfterCursor() EventCursor       { return page.after }
 func (page EventsPage) NextCursor() EventCursor        { return page.next }
+func (page EventsPage) HeadCursor() EventCursor        { return page.head }
 func (page EventsPage) Events() []SyncedEvent {
 	result := append([]SyncedEvent(nil), page.events...)
 	for index := range result {
-		result[index].payload = append([]byte(nil), result[index].payload...)
+		result[index].params.Payload = append([]byte(nil), result[index].params.Payload...)
 	}
 	return result
 }
 func (page EventsPage) HasMore() bool { return page.hasMore }
 
 type QueryStore interface {
-	GetContext(context.Context, ContextGetQuery) (ContextCheckpoint, error)
+	GetContext(context.Context, ContextGetQuery) (ContextPage, error)
 	SyncEvents(context.Context, EventsSyncQuery) (EventsPage, error)
 }
 
@@ -1329,7 +1493,16 @@ func identityEventType(eventType domain.EventType) bool {
 		domain.EventTypeActorCreated,
 		domain.EventTypeActorDelegationProposed,
 		domain.EventTypeActorDelegationActivated,
-		domain.EventTypeActorSessionStarted:
+		domain.EventTypeActorSessionStarted,
+		domain.EventTypeWorkRefObserved,
+		domain.EventTypeObjectiveCreated,
+		domain.EventTypeWorkUnitCreated,
+		domain.EventTypeObjectiveActivated,
+		domain.EventTypeRunPlanned,
+		domain.EventTypeRunParticipantInvited,
+		domain.EventTypeRuntimeBindingRequested,
+		domain.EventTypeRunParticipantJoined,
+		domain.EventTypeRunStarted:
 		return true
 	default:
 		return false
@@ -2080,6 +2253,12 @@ const (
 	StateActor                  StateKind = "actor"
 	StateActorDelegation        StateKind = "actor_delegation"
 	StateActorSession           StateKind = "actor_session"
+	StateWorkReference          StateKind = "work_reference"
+	StateObjective              StateKind = "objective"
+	StateWorkUnit               StateKind = "work_unit"
+	StateRun                    StateKind = "run"
+	StateRunParticipation       StateKind = "run_participation"
+	StateRuntimeBinding         StateKind = "runtime_binding"
 )
 
 // IdentityState is the closed W0 state union shared by application and storage.
@@ -2154,6 +2333,42 @@ func NewIdentityState(value any) (IdentityState, error) {
 		}
 		kind, version = StateActorSession, state.Version()
 		target, err = domain.NewAggregateTarget(state.ID())
+	case domain.WorkReferenceState:
+		if state.IsZero() {
+			return IdentityState{}, ErrInvalidApplicationContract
+		}
+		kind, version = StateWorkReference, state.Version()
+		target, err = domain.NewAggregateTarget(state.ID())
+	case domain.ObjectiveState:
+		if state.IsZero() {
+			return IdentityState{}, ErrInvalidApplicationContract
+		}
+		kind, version = StateObjective, state.Version()
+		target, err = domain.NewAggregateTarget(state.ID())
+	case domain.WorkUnitState:
+		if state.IsZero() {
+			return IdentityState{}, ErrInvalidApplicationContract
+		}
+		kind, version = StateWorkUnit, state.Version()
+		target, err = domain.NewAggregateTarget(state.ID())
+	case domain.RunState:
+		if state.IsZero() {
+			return IdentityState{}, ErrInvalidApplicationContract
+		}
+		kind, version = StateRun, state.Version()
+		target, err = domain.NewAggregateTarget(state.ID())
+	case domain.RunParticipationState:
+		if state.IsZero() {
+			return IdentityState{}, ErrInvalidApplicationContract
+		}
+		kind, version = StateRunParticipation, state.Version()
+		target, err = domain.NewAggregateTarget(state.ID())
+	case domain.RuntimeBindingState:
+		if state.IsZero() {
+			return IdentityState{}, ErrInvalidApplicationContract
+		}
+		kind, version = StateRuntimeBinding, state.Version()
+		target, err = domain.NewAggregateTarget(state.ID())
 	default:
 		return IdentityState{}, ErrInvalidApplicationContract
 	}
@@ -2197,6 +2412,9 @@ func (result ResultEnvelope) CanonicalBytes() []byte                 { return ap
 func (result ResultEnvelope) ResponseDigest() Digest                 { return result.responseDigest }
 func (result ResultEnvelope) Operation() CommandOperation            { return result.operation }
 func (result ResultEnvelope) ReceiptDocument() ReceiptResultDocument { return result.document }
+func (result ResultEnvelope) ResultView() (ReceiptResultView, bool) {
+	return result.document.ResultView()
+}
 func (result ResultEnvelope) RecoveryCapsulePlan() RecoveryCapsulePlan {
 	return cloneRecoveryCapsulePlan(result.capsulePlan)
 }
@@ -2887,6 +3105,7 @@ type ReceiptSnapshotParams struct {
 	AuthorityEpoch     domain.AuthorityEpoch
 	GuardDigest        domain.AuthorizationDigest
 	Events             EventRange
+	EventCursor        EventCursor
 	CapsuleRequirement RecoveryCapsuleRequirement
 	RecoveryCapsule    *RecoveryCapsuleDraft
 }
@@ -2901,6 +3120,7 @@ type ReceiptSnapshot struct {
 	authorityEpoch     domain.AuthorityEpoch
 	guardDigest        domain.AuthorizationDigest
 	events             EventRange
+	eventCursor        EventCursor
 	capsuleRequirement RecoveryCapsuleRequirement
 	recoveryCapsule    RecoveryCapsuleDraft
 	hasRecoveryCapsule bool
@@ -2911,6 +3131,7 @@ func NewReceiptSnapshot(params ReceiptSnapshotParams) (ReceiptSnapshot, error) {
 	if params.ReceiptID.IsZero() || params.CommandID.IsZero() || params.Identity.kind == "" ||
 		params.RequestFingerprint.IsZero() || params.Result.IsZero() || params.AuthorityID.IsZero() ||
 		params.AuthorityEpoch.IsZero() || params.GuardDigest.IsZero() || params.Events.count == 0 ||
+		params.EventCursor.IsZero() ||
 		!cataloged || params.Result.operation != contract.operation || params.CapsuleRequirement != contract.recovery ||
 		(params.CapsuleRequirement != RecoveryCapsuleRequired &&
 			params.CapsuleRequirement != RecoveryCapsuleNotApplicable) ||
@@ -2922,7 +3143,8 @@ func NewReceiptSnapshot(params ReceiptSnapshotParams) (ReceiptSnapshot, error) {
 		receiptID: params.ReceiptID, commandID: params.CommandID, identity: params.Identity,
 		requestFingerprint: params.RequestFingerprint, result: cloneResult(params.Result),
 		authorityID: params.AuthorityID, authorityEpoch: params.AuthorityEpoch,
-		guardDigest: params.GuardDigest, events: params.Events, capsuleRequirement: params.CapsuleRequirement,
+		guardDigest: params.GuardDigest, events: params.Events, eventCursor: params.EventCursor,
+		capsuleRequirement: params.CapsuleRequirement,
 	}
 	if params.RecoveryCapsule != nil {
 		if params.RecoveryCapsule.digest.IsZero() || params.RecoveryCapsule.resultDigest != params.Result.responseDigest {
@@ -2962,9 +3184,11 @@ func resultMatchesReceiptSnapshot(params ReceiptSnapshotParams) bool {
 }
 
 func cloneResult(result ResultEnvelope) ResultEnvelope {
+	document := result.document
+	document.view = cloneReceiptResultView(document.view)
 	return ResultEnvelope{
 		canonical: append([]byte(nil), result.canonical...), responseDigest: result.responseDigest,
-		operation: result.operation, document: result.document,
+		operation: result.operation, document: document,
 		capsulePlan: cloneRecoveryCapsulePlan(result.capsulePlan),
 	}
 }
@@ -2980,6 +3204,7 @@ func (receipt ReceiptSnapshot) AuthorityID() domain.AuthorityID         { return
 func (receipt ReceiptSnapshot) AuthorityEpoch() domain.AuthorityEpoch   { return receipt.authorityEpoch }
 func (receipt ReceiptSnapshot) GuardDigest() domain.AuthorizationDigest { return receipt.guardDigest }
 func (receipt ReceiptSnapshot) Events() EventRange                      { return receipt.events }
+func (receipt ReceiptSnapshot) EventCursor() EventCursor                { return receipt.eventCursor }
 func (receipt ReceiptSnapshot) CapsuleRequirement() RecoveryCapsuleRequirement {
 	return receipt.capsuleRequirement
 }
@@ -4744,6 +4969,17 @@ func (execution CommandExecution) Kind() CommandExecutionKind { return execution
 func (execution CommandExecution) Receipt() (ReceiptSnapshot, bool) {
 	return execution.receipt, execution.kind == CommandApplied || execution.kind == CommandCommittedCapsulePending ||
 		(execution.kind == CommandReplayed && execution.disclosure == ReplayDiscloseResult)
+}
+func (execution CommandExecution) ResultView() (ReceiptResultView, EventCursor, bool) {
+	receipt, ok := execution.Receipt()
+	if !ok {
+		return ReceiptResultView{}, EventCursor{}, false
+	}
+	view, ok := receipt.result.ResultView()
+	if !ok || receipt.eventCursor.IsZero() {
+		return ReceiptResultView{}, EventCursor{}, false
+	}
+	return view, receipt.eventCursor, true
 }
 
 // CommandRetryIdentity is the immutable receipt admission identity needed to

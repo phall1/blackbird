@@ -25,16 +25,23 @@ var (
 type AggregateKind string
 
 const (
-	AggregateKindInstallation    AggregateKind = "installation"
-	AggregateKindWorkspace       AggregateKind = "workspace"
-	AggregateKindPrincipal       AggregateKind = "principal"
-	AggregateKindDevice          AggregateKind = "device_registration"
-	AggregateKindMembership      AggregateKind = "workspace_membership"
-	AggregateKindActor           AggregateKind = "actor"
-	AggregateKindActorDelegation AggregateKind = "actor_delegation"
-	AggregateKindActorSession    AggregateKind = "actor_session"
-	AggregateKindGrant           AggregateKind = "grant"
-	AggregateKindInvitation      AggregateKind = "invitation"
+	AggregateKindInstallation     AggregateKind = "installation"
+	AggregateKindWorkspace        AggregateKind = "workspace"
+	AggregateKindPrincipal        AggregateKind = "principal"
+	AggregateKindDevice           AggregateKind = "device_registration"
+	AggregateKindMembership       AggregateKind = "workspace_membership"
+	AggregateKindActor            AggregateKind = "actor"
+	AggregateKindActorDelegation  AggregateKind = "actor_delegation"
+	AggregateKindActorSession     AggregateKind = "actor_session"
+	AggregateKindGrant            AggregateKind = "grant"
+	AggregateKindInvitation       AggregateKind = "invitation"
+	AggregateKindWorkReference    AggregateKind = "work_reference"
+	AggregateKindObjective        AggregateKind = "objective"
+	AggregateKindWorkUnit         AggregateKind = "work_unit"
+	AggregateKindRun              AggregateKind = "run"
+	AggregateKindRunParticipation AggregateKind = "run_participation"
+	AggregateKindRuntimeBinding   AggregateKind = "runtime_binding"
+	AggregateKindRuntimeEndpoint  AggregateKind = "runtime_endpoint_registration"
 )
 
 func (kind AggregateKind) Valid() bool {
@@ -48,7 +55,14 @@ func (kind AggregateKind) Valid() bool {
 		AggregateKindActorDelegation,
 		AggregateKindActorSession,
 		AggregateKindGrant,
-		AggregateKindInvitation:
+		AggregateKindInvitation,
+		AggregateKindWorkReference,
+		AggregateKindObjective,
+		AggregateKindWorkUnit,
+		AggregateKindRun,
+		AggregateKindRunParticipation,
+		AggregateKindRuntimeBinding,
+		AggregateKindRuntimeEndpoint:
 		return true
 	default:
 		return false
@@ -61,16 +75,23 @@ type aggregateIdentifier interface {
 	aggregateKind() AggregateKind
 }
 
-func (InstallationID) aggregateKind() AggregateKind    { return AggregateKindInstallation }
-func (WorkspaceID) aggregateKind() AggregateKind       { return AggregateKindWorkspace }
-func (PrincipalID) aggregateKind() AggregateKind       { return AggregateKindPrincipal }
-func (DeviceID) aggregateKind() AggregateKind          { return AggregateKindDevice }
-func (MembershipID) aggregateKind() AggregateKind      { return AggregateKindMembership }
-func (ActorID) aggregateKind() AggregateKind           { return AggregateKindActor }
-func (ActorDelegationID) aggregateKind() AggregateKind { return AggregateKindActorDelegation }
-func (ActorSessionID) aggregateKind() AggregateKind    { return AggregateKindActorSession }
-func (GrantID) aggregateKind() AggregateKind           { return AggregateKindGrant }
-func (InvitationID) aggregateKind() AggregateKind      { return AggregateKindInvitation }
+func (InstallationID) aggregateKind() AggregateKind     { return AggregateKindInstallation }
+func (WorkspaceID) aggregateKind() AggregateKind        { return AggregateKindWorkspace }
+func (PrincipalID) aggregateKind() AggregateKind        { return AggregateKindPrincipal }
+func (DeviceID) aggregateKind() AggregateKind           { return AggregateKindDevice }
+func (MembershipID) aggregateKind() AggregateKind       { return AggregateKindMembership }
+func (ActorID) aggregateKind() AggregateKind            { return AggregateKindActor }
+func (ActorDelegationID) aggregateKind() AggregateKind  { return AggregateKindActorDelegation }
+func (ActorSessionID) aggregateKind() AggregateKind     { return AggregateKindActorSession }
+func (GrantID) aggregateKind() AggregateKind            { return AggregateKindGrant }
+func (InvitationID) aggregateKind() AggregateKind       { return AggregateKindInvitation }
+func (WorkReferenceID) aggregateKind() AggregateKind    { return AggregateKindWorkReference }
+func (ObjectiveID) aggregateKind() AggregateKind        { return AggregateKindObjective }
+func (WorkUnitID) aggregateKind() AggregateKind         { return AggregateKindWorkUnit }
+func (RunID) aggregateKind() AggregateKind              { return AggregateKindRun }
+func (RunParticipationID) aggregateKind() AggregateKind { return AggregateKindRunParticipation }
+func (RuntimeBindingID) aggregateKind() AggregateKind   { return AggregateKindRuntimeBinding }
+func (RuntimeEndpointID) aggregateKind() AggregateKind  { return AggregateKindRuntimeEndpoint }
 
 // AggregateTarget is an immutable typed aggregate identity without a version.
 type AggregateTarget struct {

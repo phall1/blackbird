@@ -396,6 +396,7 @@ func bootstrapReceipt(t *testing.T, fixture bootstrapFixture) ReceiptSnapshot {
 		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
 		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleRequired,
 		RecoveryCapsule: mustCapsuleDraft(
 			t, fixture.resultRecord, fixture.command, fixture.spec.OperationMajor(),
@@ -904,8 +905,8 @@ func TestIJSONBoundsAndBoundedPayloads(t *testing.T) {
 			canonical: canonical, digest: DigestBytes(canonical),
 		}, operation: CommandBootstrapInstallation}
 		_, err := NewResultEnvelope(document)
-		if (err == nil) != (size <= MaxReceiptResultBytes) {
-			t.Errorf("result size %d error=%v", size, err)
+		if !errors.Is(err, ErrInvalidApplicationContract) {
+			t.Errorf("forged result size %d error=%v", size, err)
 		}
 	}
 	eventID, _ := domain.ParseEventID(applicationUUID(101))
@@ -915,6 +916,63 @@ func TestIJSONBoundsAndBoundedPayloads(t *testing.T) {
 		if (err == nil) != (size <= MaxEffectMetadataBytes) {
 			t.Errorf("effect size %d error=%v", size, err)
 		}
+	}
+}
+
+func TestQueryDTOViewsRetainCompleteDeterministicData(t *testing.T) {
+	t.Parallel()
+	_, authority, epoch, _, principal, _, _ := mustParseIDs(t)
+	workspace, _ := domain.ParseWorkspaceID(applicationUUID(140))
+	actor, _ := domain.ParseActorID(applicationUUID(141))
+	session, _ := domain.ParseActorSessionID(applicationUUID(142))
+	command, _ := domain.ParseCommandID(applicationUUID(143))
+	eventID, _ := domain.ParseEventID(applicationUUID(144))
+	causation, _ := domain.ParseEventID(applicationUUID(145))
+	correlation, _ := domain.ParseCorrelationID(applicationUUID(146))
+	subject, _ := NewQuerySubject(principal, session)
+	checkpointID, _ := NewCheckpointID("checkpoint:test")
+	cursor, _ := NewEventCursor("bbec1_after")
+	query, err := NewContextGetQuery(subject, checkpointID, cursor, MaxQueryPageSize)
+	if err != nil || query.Cursor() != cursor || query.Limit() != MaxQueryPageSize {
+		t.Fatalf("context query=%+v error=%v", query, err)
+	}
+	if _, err = NewContextGetQuery(subject, checkpointID, cursor, 0); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("zero context limit error=%v", err)
+	}
+
+	scope, _ := domain.WorkspaceScope(workspace)
+	position, _ := domain.NewStreamPosition(7)
+	aggregate, _ := domain.NewAggregateRef(workspace, domain.InitialVersion())
+	eventVersion, _ := domain.NewEventSchemaVersion(1)
+	occurred := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	payload := []byte(`{"workspace_id":"fixture"}`)
+	event, err := NewSyncedEvent(SyncedEventParams{
+		EventID: eventID, EventType: domain.EventTypeWorkspaceCreated, EventVersion: eventVersion,
+		AuthorityID: authority, AuthorityEpoch: epoch, Scope: scope, OriginPosition: position,
+		Aggregate: aggregate, PrincipalID: principal, ActorID: &actor, ActorSessionID: &session,
+		CommandID: command, CausationID: &causation, CorrelationID: correlation,
+		OccurredAt: occurred, RecordedAt: occurred.Add(time.Second), Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload[0] = 'x'
+	if event.AuthorityID() != authority || event.AuthorityEpoch() != epoch || event.Scope() != scope ||
+		event.OriginPosition() != position || event.EventVersion() != eventVersion ||
+		event.PrincipalID() != principal || event.CommandID() != command || event.CorrelationID() != correlation ||
+		!event.OccurredAt().Equal(occurred) || event.Payload()[0] != '{' ||
+		event.ActorID() == nil || *event.ActorID() != actor || event.ActorSessionID() == nil ||
+		*event.ActorSessionID() != session || event.CausationID() == nil || *event.CausationID() != causation {
+		t.Fatal("synced event omitted or aliased canonical envelope data")
+	}
+	head, _ := NewEventCursor("bbec1_head")
+	page, err := NewEventsPage(AuthorizedSessionView{session: session}, cursor, head, head, []SyncedEvent{event}, false)
+	if err != nil || page.HeadCursor() != head {
+		t.Fatalf("events page=%+v error=%v", page, err)
+	}
+	invalid := SyncedEventParams{EventID: eventID}
+	if _, err = NewSyncedEvent(invalid); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("incomplete event error=%v", err)
 	}
 }
 
@@ -1028,6 +1086,7 @@ func TestReceiptResolutionDistinguishesReplayAndConflicts(t *testing.T) {
 		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
 		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: eventRange,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleRequired,
 		RecoveryCapsule: mustCapsuleDraft(
 			t, fixture.resultRecord, fixture.command, fixture.spec.OperationMajor(),
@@ -1114,6 +1173,7 @@ func TestReceiptSnapshotRejectsMetadataOutsideSealedResult(t *testing.T) {
 		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
 		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleRequired, RecoveryCapsule: draft,
 	}
 	if _, err := NewReceiptSnapshot(valid); err != nil {
@@ -1461,6 +1521,7 @@ func TestReplayTimeIsStructurallyReadOnly(t *testing.T) {
 		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
 		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleRequired, RecoveryCapsule: draft,
 	})
 	replay, _ := ReplayReceipt(receipt)
@@ -1521,6 +1582,7 @@ func TestRecoveryCapsulePlanDraftSigningAndPendingOutcome(t *testing.T) {
 		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
 		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleRequired, RecoveryCapsule: draft,
 	})
 	pending, err := CommittedCapsulePendingCommandExecution(receipt)
@@ -1542,6 +1604,7 @@ func TestRecoveryCapsulePlanDraftSigningAndPendingOutcome(t *testing.T) {
 		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
 		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: RecoveryCapsuleNotApplicable, RecoveryCapsule: draft,
 	}); !errors.Is(err, ErrInvalidApplicationContract) {
 		t.Fatalf("not-applicable receipt accepted capsule: %v", err)
@@ -2341,6 +2404,7 @@ func TestAllW0OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
 			Identity: bootstrap.spec.ReceiptIdentity(), RequestFingerprint: bootstrap.spec.RequestFingerprint(),
 			Result: bootstrap.resultRecord, AuthorityID: bootstrap.authority, AuthorityEpoch: bootstrap.epoch,
 			GuardDigest: bootstrap.context.GuardEvidence().Digest(), Events: events,
+			EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 			CapsuleRequirement: RecoveryCapsuleRequired, RecoveryCapsule: draft,
 		})
 		if err != nil || receipt.Result().ResponseDigest() != bootstrap.resultRecord.ResponseDigest() {
@@ -2599,6 +2663,7 @@ func completeOperationPipeline(
 		ReceiptID: receiptID, CommandID: commandID, Identity: receiptIdentity,
 		RequestFingerprint: fingerprint, Result: result, AuthorityID: path.authority,
 		AuthorityEpoch: path.epoch, GuardDigest: appliedEvidence.Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_application_fixture"},
 		CapsuleRequirement: recovery.Requirement(), RecoveryCapsule: capsuleDraft,
 	})
 	if err != nil {

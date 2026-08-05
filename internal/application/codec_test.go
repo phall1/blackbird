@@ -1276,6 +1276,48 @@ func TestReceiptResultDigestIsAcyclicAndMutationComplete(t *testing.T) {
 	}
 }
 
+func TestReceiptResultReadViewIsTypedSealedAndImmutable(t *testing.T) {
+	t.Parallel()
+	fixture := newReceiptFixture(t)
+	params := fixture.paramsFor(
+		t, ReceiptOperationWorkspaceCreate,
+		[]domain.AggregateKind{domain.AggregateKindWorkspace, domain.AggregateKindMembership}, 3, "",
+	)
+	document, err := NewProductionCanonicalCodec().EncodeReceiptResult(mustReceiptResultView(t, params))
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, ok := document.ResultView()
+	if !ok || view.Operation() != params.Operation || view.AuthorityID() != params.AuthorityID ||
+		view.AuthorityEpoch() != params.AuthorityEpoch || view.Scope() != params.Scope ||
+		!view.AcceptedAt().Equal(params.AcceptedAt) || view.FirstEventPosition() != params.FirstEventPosition ||
+		view.LastEventPosition() != params.LastEventPosition || view.FinalStreamDigest() != params.FinalStreamDigest ||
+		len(view.Resources()) != len(params.Resources) || len(view.EventIDs()) != len(params.EventIDs) ||
+		!view.CapsuleRequired() {
+		t.Fatal("receipt result read view omitted canonical mapping data")
+	}
+	resources := view.Resources()
+	events := view.EventIDs()
+	resources[0] = domain.AggregateRef{}
+	events[0] = domain.EventID{}
+	second, ok := document.ResultView()
+	if !ok || second.Resources()[0].IsZero() || second.EventIDs()[0].IsZero() {
+		t.Fatal("receipt result read view exposed mutable internals")
+	}
+	if _, ok := (ReceiptResultDocument{}).ResultView(); ok {
+		t.Fatal("zero receipt document exposed a result view")
+	}
+}
+
+func mustReceiptResultView(t *testing.T, params W0ReceiptResultParams) W0ReceiptResultView {
+	t.Helper()
+	view, err := NewW0ReceiptResultView(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view
+}
+
 func TestReceiptResultCeremonyAndSessionFieldsAreHashed(t *testing.T) {
 	t.Parallel()
 

@@ -162,11 +162,86 @@ type ReceiptResultDocument struct {
 	document  canonicalDocument
 	operation CommandOperation
 	wire      receiptResultWire
+	view      ReceiptResultView
+}
+
+// ReceiptResultView is a sealed, immutable projection of the canonical W0
+// result. It retains domain values from construction so transport mapping never
+// needs to decode trusted canonical JSON back into mutable wire structs.
+type ReceiptResultView struct {
+	operation              CommandOperation
+	authorityID            domain.AuthorityID
+	authorityEpoch         domain.AuthorityEpoch
+	scope                  domain.AuthorityScope
+	acceptedAt             time.Time
+	resources              []domain.AggregateRef
+	issuedCeremonies       []domain.CeremonyChallenge
+	firstEventPosition     domain.StreamPosition
+	lastEventPosition      domain.StreamPosition
+	eventIDs               []domain.EventID
+	finalStreamDigest      domain.StreamDigest
+	capsuleRequired        bool
+	sessionBinding         domain.SessionBinding
+	sessionClient          domain.ClientInstanceID
+	presentationCredential domain.PresentationCredentialBinding
+	hasSession             bool
+}
+
+func newReceiptResultView(params W0ReceiptResultParams, capsuleRequired bool) ReceiptResultView {
+	result := ReceiptResultView{
+		operation: params.Operation, authorityID: params.AuthorityID, authorityEpoch: params.AuthorityEpoch,
+		scope: params.Scope, acceptedAt: params.AcceptedAt.UTC(),
+		resources:          append([]domain.AggregateRef(nil), params.Resources...),
+		issuedCeremonies:   append([]domain.CeremonyChallenge(nil), params.IssuedCeremonies...),
+		firstEventPosition: params.FirstEventPosition, lastEventPosition: params.LastEventPosition,
+		eventIDs: append([]domain.EventID(nil), params.EventIDs...), finalStreamDigest: params.FinalStreamDigest,
+		capsuleRequired: capsuleRequired, sessionClient: params.SessionClient,
+		presentationCredential: params.PresentationCredential, hasSession: params.SessionBinding != nil,
+	}
+	if params.SessionBinding != nil {
+		result.sessionBinding = *params.SessionBinding
+	}
+	return result
+}
+
+func cloneReceiptResultView(view ReceiptResultView) ReceiptResultView {
+	view.resources = append([]domain.AggregateRef(nil), view.resources...)
+	view.issuedCeremonies = append([]domain.CeremonyChallenge(nil), view.issuedCeremonies...)
+	view.eventIDs = append([]domain.EventID(nil), view.eventIDs...)
+	return view
+}
+
+func (view ReceiptResultView) Operation() CommandOperation           { return view.operation }
+func (view ReceiptResultView) AuthorityID() domain.AuthorityID       { return view.authorityID }
+func (view ReceiptResultView) AuthorityEpoch() domain.AuthorityEpoch { return view.authorityEpoch }
+func (view ReceiptResultView) Scope() domain.AuthorityScope          { return view.scope }
+func (view ReceiptResultView) AcceptedAt() time.Time                 { return view.acceptedAt }
+func (view ReceiptResultView) Resources() []domain.AggregateRef {
+	return append([]domain.AggregateRef(nil), view.resources...)
+}
+func (view ReceiptResultView) IssuedCeremonies() []domain.CeremonyChallenge {
+	return append([]domain.CeremonyChallenge(nil), view.issuedCeremonies...)
+}
+func (view ReceiptResultView) FirstEventPosition() domain.StreamPosition {
+	return view.firstEventPosition
+}
+func (view ReceiptResultView) LastEventPosition() domain.StreamPosition {
+	return view.lastEventPosition
+}
+func (view ReceiptResultView) EventIDs() []domain.EventID {
+	return append([]domain.EventID(nil), view.eventIDs...)
+}
+func (view ReceiptResultView) FinalStreamDigest() domain.StreamDigest { return view.finalStreamDigest }
+func (view ReceiptResultView) CapsuleRequired() bool                  { return view.capsuleRequired }
+func (view ReceiptResultView) Session() (domain.SessionBinding, domain.ClientInstanceID, domain.PresentationCredentialBinding, bool) {
+	return view.sessionBinding, view.sessionClient, view.presentationCredential, view.hasSession
 }
 
 func (document ReceiptResultDocument) IsZero() bool {
 	_, cataloged := receiptCatalog(document.operation)
-	return document.document.isZero() || !cataloged
+	return document.document.isZero() || !cataloged || document.view.operation != document.operation ||
+		document.view.authorityID.IsZero() || document.view.authorityEpoch.IsZero() ||
+		document.view.scope.IsZero() || document.view.acceptedAt.IsZero()
 }
 func (document ReceiptResultDocument) CanonicalBytes() []byte {
 	return document.document.canonicalBytes()
@@ -174,6 +249,12 @@ func (document ReceiptResultDocument) CanonicalBytes() []byte {
 func (document ReceiptResultDocument) Digest() Digest { return document.document.digest }
 func (document ReceiptResultDocument) Operation() CommandOperation {
 	return document.operation
+}
+func (document ReceiptResultDocument) ResultView() (ReceiptResultView, bool) {
+	if document.IsZero() || document.view.operation != document.operation {
+		return ReceiptResultView{}, false
+	}
+	return cloneReceiptResultView(document.view), true
 }
 
 func (codec ProductionCanonicalCodec) EncodeReceiptResult(
@@ -185,6 +266,7 @@ func (codec ProductionCanonicalCodec) EncodeReceiptResult(
 	}
 	return ReceiptResultDocument{
 		document: document, operation: view.Operation(), wire: cloneReceiptResultWire(view.wire),
+		view: cloneReceiptResultView(view.result),
 	}, nil
 }
 
@@ -487,6 +569,54 @@ type identityPayloadActorSessionStarted struct {
 	PresentationCredentialAudience  string              `json:"presentation_credential_audience"`
 	PresentationCredentialVersion   uint16              `json:"presentation_credential_version"`
 }
+type identityPayloadWorkRefObserved struct {
+	WorkspaceID        CanonicalIdentifier   `json:"workspace_id"`
+	ProviderNamespace  string                `json:"provider_namespace"`
+	ProviderObjectID   string                `json:"provider_object_id"`
+	ProviderLocator    string                `json:"provider_locator"`
+	ProviderVersion    string                `json:"provider_version"`
+	SelectedFields     canonicalEventPayload `json:"selected_fields"`
+	AdapterPrincipalID CanonicalIdentifier   `json:"adapter_principal_id"`
+	ObservedAt         CanonicalInstant      `json:"observed_at"`
+}
+type identityPayloadObjectiveCreated struct {
+	WorkspaceID        CanonicalIdentifier `json:"workspace_id"`
+	Title              string              `json:"title"`
+	AcceptanceCriteria string              `json:"acceptance_criteria"`
+}
+type identityPayloadWorkUnitCreated struct {
+	WorkspaceID     CanonicalIdentifier `json:"workspace_id"`
+	ObjectiveID     CanonicalIdentifier `json:"objective_id"`
+	WorkReferenceID CanonicalIdentifier `json:"work_reference_id"`
+	Title           string              `json:"title"`
+}
+type identityPayloadObjectiveActivated struct {
+	ObjectiveID CanonicalIdentifier `json:"objective_id"`
+}
+type identityPayloadRunPlanned struct {
+	ObjectiveID CanonicalIdentifier `json:"objective_id"`
+	WorkUnitID  CanonicalIdentifier `json:"work_unit_id"`
+	OperatorID  CanonicalIdentifier `json:"operator_actor_id"`
+}
+type identityPayloadRunParticipantInvited struct {
+	RunID   CanonicalIdentifier `json:"run_id"`
+	ActorID CanonicalIdentifier `json:"actor_id"`
+	Role    string              `json:"role"`
+}
+type identityPayloadRuntimeBindingRequested struct {
+	RunID             CanonicalIdentifier `json:"run_id"`
+	ParticipationID   CanonicalIdentifier `json:"participation_id"`
+	ActorSessionID    CanonicalIdentifier `json:"actor_session_id"`
+	RuntimeEndpointID CanonicalIdentifier `json:"runtime_endpoint_id"`
+}
+type identityPayloadRunParticipantJoined struct {
+	RunID          CanonicalIdentifier `json:"run_id"`
+	ActorID        CanonicalIdentifier `json:"actor_id"`
+	ActorSessionID CanonicalIdentifier `json:"actor_session_id"`
+}
+type identityPayloadRunStarted struct {
+	RunID CanonicalIdentifier `json:"run_id"`
+}
 
 func (identityPayloadInstallationBootstrapped) canonicalView()              {}
 func (identityPayloadInstallationBootstrapped) identityFactPayloadView()    {}
@@ -514,6 +644,24 @@ func (identityPayloadActorDelegationActivated) canonicalView()              {}
 func (identityPayloadActorDelegationActivated) identityFactPayloadView()    {}
 func (identityPayloadActorSessionStarted) canonicalView()                   {}
 func (identityPayloadActorSessionStarted) identityFactPayloadView()         {}
+func (identityPayloadWorkRefObserved) canonicalView()                       {}
+func (identityPayloadWorkRefObserved) identityFactPayloadView()             {}
+func (identityPayloadObjectiveCreated) canonicalView()                      {}
+func (identityPayloadObjectiveCreated) identityFactPayloadView()            {}
+func (identityPayloadWorkUnitCreated) canonicalView()                       {}
+func (identityPayloadWorkUnitCreated) identityFactPayloadView()             {}
+func (identityPayloadObjectiveActivated) canonicalView()                    {}
+func (identityPayloadObjectiveActivated) identityFactPayloadView()          {}
+func (identityPayloadRunPlanned) canonicalView()                            {}
+func (identityPayloadRunPlanned) identityFactPayloadView()                  {}
+func (identityPayloadRunParticipantInvited) canonicalView()                 {}
+func (identityPayloadRunParticipantInvited) identityFactPayloadView()       {}
+func (identityPayloadRuntimeBindingRequested) canonicalView()               {}
+func (identityPayloadRuntimeBindingRequested) identityFactPayloadView()     {}
+func (identityPayloadRunParticipantJoined) canonicalView()                  {}
+func (identityPayloadRunParticipantJoined) identityFactPayloadView()        {}
+func (identityPayloadRunStarted) canonicalView()                            {}
+func (identityPayloadRunStarted) identityFactPayloadView()                  {}
 
 func canonicalFactID(text string) (CanonicalIdentifier, error) {
 	identifier, err := NewCanonicalIdentifier(text)
@@ -691,6 +839,34 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 			PresentationCredentialAudience:  presentation.Audience().String(),
 			PresentationCredentialVersion:   presentation.Version(),
 		}, nil
+	case domain.WorkRefObservedFact:
+		observation := value.Observation()
+		observedAt, instantErr := NewCanonicalInstant(observation.ObservedAt())
+		fields, fieldsErr := canonicalizeStrict(observation.Fields().Bytes(), domain.MaxEventPayloadBytes, MaxCanonicalJSONDepth)
+		if instantErr != nil || fieldsErr != nil {
+			return nil, ErrCanonicalProfile
+		}
+		return identityPayloadWorkRefObserved{WorkspaceID: id(value.WorkspaceID().String()),
+			ProviderNamespace: observation.Namespace().String(), ProviderObjectID: observation.ObjectID().String(),
+			ProviderLocator: observation.Locator().String(), ProviderVersion: observation.ProviderVersion().String(),
+			SelectedFields: canonicalEventPayload{canonical: fields}, AdapterPrincipalID: id(observation.AdapterPrincipalID().String()),
+			ObservedAt: observedAt}, nil
+	case domain.ObjectiveCreatedFact:
+		return identityPayloadObjectiveCreated{WorkspaceID: id(value.WorkspaceID().String()), Title: value.Title(), AcceptanceCriteria: value.AcceptanceCriteria()}, nil
+	case domain.WorkUnitCreatedFact:
+		return identityPayloadWorkUnitCreated{WorkspaceID: id(value.WorkspaceID().String()), ObjectiveID: id(value.ObjectiveID().String()), WorkReferenceID: id(value.WorkReferenceID().String()), Title: value.Title()}, nil
+	case domain.ObjectiveActivatedFact:
+		return identityPayloadObjectiveActivated{ObjectiveID: id(value.ObjectiveID().String())}, nil
+	case domain.RunPlannedFact:
+		return identityPayloadRunPlanned{ObjectiveID: id(value.ObjectiveID().String()), WorkUnitID: id(value.WorkUnitID().String()), OperatorID: id(value.OperatorID().String())}, nil
+	case domain.RunParticipantInvitedFact:
+		return identityPayloadRunParticipantInvited{RunID: id(value.RunID().String()), ActorID: id(value.ActorID().String()), Role: value.Role()}, nil
+	case domain.RuntimeBindingRequestedFact:
+		return identityPayloadRuntimeBindingRequested{RunID: id(value.RunID().String()), ParticipationID: id(value.ParticipationID().String()), ActorSessionID: id(value.ActorSessionID().String()), RuntimeEndpointID: id(value.RuntimeEndpointID().String())}, nil
+	case domain.RunParticipantJoinedFact:
+		return identityPayloadRunParticipantJoined{RunID: id(value.RunID().String()), ActorID: id(value.ActorID().String()), ActorSessionID: id(value.ActorSessionID().String())}, nil
+	case domain.RunStartedFact:
+		return identityPayloadRunStarted{RunID: id(value.RunID().String())}, nil
 	default:
 		return nil, ErrCanonicalProfile
 	}
@@ -2267,6 +2443,7 @@ func (W0RecoveryCapsuleView) recoveryCapsuleHashView() {}
 type W0ReceiptResultView struct {
 	wire                 receiptResultWire
 	sessionBindingDigest CanonicalDigest
+	result               ReceiptResultView
 }
 
 func NewW0ReceiptResultView(params W0ReceiptResultParams) (W0ReceiptResultView, error) {
@@ -2324,7 +2501,7 @@ func NewW0ReceiptResultView(params W0ReceiptResultParams) (W0ReceiptResultView, 
 		AcceptedAt: acceptedAt, CommandFingerprint: commandDigest, AuthorizationDigest: authorizationDigest,
 		Resources: resources, IssuedCeremonies: ceremonies, Events: events,
 		CapsuleRequired: catalog.capsuleRequired, SessionBinding: session,
-	}, sessionBindingDigest: sessionDigest}, nil
+	}, sessionBindingDigest: sessionDigest, result: newReceiptResultView(params, catalog.capsuleRequired)}, nil
 }
 
 func receiptResources(

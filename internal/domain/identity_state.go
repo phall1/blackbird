@@ -16,6 +16,8 @@ const (
 	MaxDeviceCredentialOverlap  = 15 * time.Minute
 	MaxBootstrapFailedAttempts  = 5
 	BootstrapInvitationLifetime = 5 * time.Minute
+	MaxRunParticipants          = 32
+	MaxRunBindings              = 32
 )
 
 var (
@@ -26,7 +28,197 @@ var (
 	ErrInvalidIdentityState     = errors.New("invalid identity state")
 	ErrInvalidAuthorization     = errors.New("invalid identity authorization")
 	ErrInvalidIdentityMetadata  = errors.New("invalid identity metadata")
+	ErrInvalidWorkState         = errors.New("invalid work state")
 )
+
+type OpaqueProviderValue struct{ value string }
+
+func NewOpaqueProviderValue(value string) (OpaqueProviderValue, error) {
+	if !validBoundedText(value, 4096) {
+		return OpaqueProviderValue{}, ErrInvalidWorkState
+	}
+	return OpaqueProviderValue{value: value}, nil
+}
+
+func (value OpaqueProviderValue) String() string { return value.value }
+
+type ProviderObservation struct {
+	namespace       OpaqueProviderValue
+	objectID        OpaqueProviderValue
+	locator         OpaqueProviderValue
+	providerVersion OpaqueProviderValue
+	fields          EventPayload
+	adapter         PrincipalID
+	observedAt      time.Time
+}
+
+func NewProviderObservation(namespace, objectID, locator, providerVersion OpaqueProviderValue,
+	fields EventPayload, adapter PrincipalID, observedAt time.Time) (ProviderObservation, error) {
+	if namespace.String() == "" || objectID.String() == "" || locator.String() == "" ||
+		providerVersion.String() == "" || fields.IsZero() || adapter.IsZero() || observedAt.IsZero() {
+		return ProviderObservation{}, ErrInvalidWorkState
+	}
+	return ProviderObservation{namespace: namespace, objectID: objectID, locator: locator,
+		providerVersion: providerVersion, fields: EventPayload{object: fields.Bytes()}, adapter: adapter,
+		observedAt: observedAt.UTC()}, nil
+}
+
+func (observation ProviderObservation) Namespace() OpaqueProviderValue { return observation.namespace }
+func (observation ProviderObservation) ObjectID() OpaqueProviderValue  { return observation.objectID }
+func (observation ProviderObservation) Locator() OpaqueProviderValue   { return observation.locator }
+func (observation ProviderObservation) ProviderVersion() OpaqueProviderValue {
+	return observation.providerVersion
+}
+func (observation ProviderObservation) Fields() EventPayload {
+	return EventPayload{object: observation.fields.Bytes()}
+}
+func (observation ProviderObservation) AdapterPrincipalID() PrincipalID { return observation.adapter }
+func (observation ProviderObservation) ObservedAt() time.Time           { return observation.observedAt }
+
+type WorkReferenceState struct {
+	id          WorkReferenceID
+	workspaceID WorkspaceID
+	observation ProviderObservation
+	version     Version
+}
+
+func (state WorkReferenceState) IsZero() bool                     { return state.id.IsZero() }
+func (state WorkReferenceState) ID() WorkReferenceID              { return state.id }
+func (state WorkReferenceState) WorkspaceID() WorkspaceID         { return state.workspaceID }
+func (state WorkReferenceState) Observation() ProviderObservation { return state.observation }
+func (state WorkReferenceState) Version() Version                 { return state.version }
+
+type ObjectiveStatus string
+
+const (
+	ObjectiveDraft  ObjectiveStatus = "draft"
+	ObjectiveActive ObjectiveStatus = "active"
+)
+
+func (status ObjectiveStatus) Valid() bool {
+	return status == ObjectiveDraft || status == ObjectiveActive
+}
+
+type ObjectiveState struct {
+	id                 ObjectiveID
+	workspaceID        WorkspaceID
+	title              string
+	acceptanceCriteria string
+	status             ObjectiveStatus
+	version            Version
+}
+
+func (state ObjectiveState) IsZero() bool               { return state.id.IsZero() }
+func (state ObjectiveState) ID() ObjectiveID            { return state.id }
+func (state ObjectiveState) WorkspaceID() WorkspaceID   { return state.workspaceID }
+func (state ObjectiveState) Title() string              { return state.title }
+func (state ObjectiveState) AcceptanceCriteria() string { return state.acceptanceCriteria }
+func (state ObjectiveState) Status() ObjectiveStatus    { return state.status }
+func (state ObjectiveState) Version() Version           { return state.version }
+
+type WorkUnitStatus string
+
+const WorkUnitProposed WorkUnitStatus = "proposed"
+
+type WorkUnitState struct {
+	id              WorkUnitID
+	workspaceID     WorkspaceID
+	objectiveID     ObjectiveID
+	workReferenceID WorkReferenceID
+	title           string
+	status          WorkUnitStatus
+	version         Version
+}
+
+func (state WorkUnitState) IsZero() bool                     { return state.id.IsZero() }
+func (state WorkUnitState) ID() WorkUnitID                   { return state.id }
+func (state WorkUnitState) WorkspaceID() WorkspaceID         { return state.workspaceID }
+func (state WorkUnitState) ObjectiveID() ObjectiveID         { return state.objectiveID }
+func (state WorkUnitState) WorkReferenceID() WorkReferenceID { return state.workReferenceID }
+func (state WorkUnitState) Title() string                    { return state.title }
+func (state WorkUnitState) Status() WorkUnitStatus           { return state.status }
+func (state WorkUnitState) Version() Version                 { return state.version }
+
+type RunStatus string
+
+const (
+	RunPlanned  RunStatus = "planned"
+	RunStarting RunStatus = "starting"
+)
+
+func (status RunStatus) Valid() bool { return status == RunPlanned || status == RunStarting }
+
+type RunState struct {
+	id          RunID
+	workspaceID WorkspaceID
+	objectiveID ObjectiveID
+	workUnitID  WorkUnitID
+	operatorID  ActorID
+	status      RunStatus
+	version     Version
+}
+
+func (state RunState) IsZero() bool             { return state.id.IsZero() }
+func (state RunState) ID() RunID                { return state.id }
+func (state RunState) WorkspaceID() WorkspaceID { return state.workspaceID }
+func (state RunState) ObjectiveID() ObjectiveID { return state.objectiveID }
+func (state RunState) WorkUnitID() WorkUnitID   { return state.workUnitID }
+func (state RunState) OperatorID() ActorID      { return state.operatorID }
+func (state RunState) Status() RunStatus        { return state.status }
+func (state RunState) Version() Version         { return state.version }
+
+type RunParticipationStatus string
+
+const (
+	RunParticipationInvited RunParticipationStatus = "invited"
+	RunParticipationActive  RunParticipationStatus = "active"
+)
+
+func (status RunParticipationStatus) Valid() bool {
+	return status == RunParticipationInvited || status == RunParticipationActive
+}
+
+type RunParticipationState struct {
+	id        RunParticipationID
+	runID     RunID
+	actorID   ActorID
+	role      string
+	sessionID ActorSessionID
+	status    RunParticipationStatus
+	version   Version
+}
+
+func (state RunParticipationState) IsZero() bool                   { return state.id.IsZero() }
+func (state RunParticipationState) ID() RunParticipationID         { return state.id }
+func (state RunParticipationState) RunID() RunID                   { return state.runID }
+func (state RunParticipationState) ActorID() ActorID               { return state.actorID }
+func (state RunParticipationState) Role() string                   { return state.role }
+func (state RunParticipationState) ActorSessionID() ActorSessionID { return state.sessionID }
+func (state RunParticipationState) Status() RunParticipationStatus { return state.status }
+func (state RunParticipationState) Version() Version               { return state.version }
+
+type RuntimeBindingStatus string
+
+const RuntimeBindingRequested RuntimeBindingStatus = "requested"
+
+type RuntimeBindingState struct {
+	id              RuntimeBindingID
+	runID           RunID
+	participationID RunParticipationID
+	sessionID       ActorSessionID
+	endpointID      RuntimeEndpointID
+	status          RuntimeBindingStatus
+	version         Version
+}
+
+func (state RuntimeBindingState) IsZero() bool                         { return state.id.IsZero() }
+func (state RuntimeBindingState) ID() RuntimeBindingID                 { return state.id }
+func (state RuntimeBindingState) RunID() RunID                         { return state.runID }
+func (state RuntimeBindingState) ParticipationID() RunParticipationID  { return state.participationID }
+func (state RuntimeBindingState) ActorSessionID() ActorSessionID       { return state.sessionID }
+func (state RuntimeBindingState) RuntimeEndpointID() RuntimeEndpointID { return state.endpointID }
+func (state RuntimeBindingState) Status() RuntimeBindingStatus         { return state.status }
+func (state RuntimeBindingState) Version() Version                     { return state.version }
 
 func validBoundedText(value string, maximum int) bool {
 	if strings.TrimSpace(value) != value || value == "" || len(value) > maximum || !utf8.ValidString(value) {
@@ -1758,6 +1950,128 @@ func RehydrateActorSession(params ActorSessionRehydrationParams) (ActorSessionSt
 		status: params.Status, version: params.Version, binding: binding, capabilities: capabilities,
 		presentation: params.PresentationCredential,
 	}, nil
+}
+
+type WorkReferenceRehydrationParams struct {
+	ID          WorkReferenceID
+	WorkspaceID WorkspaceID
+	Observation ProviderObservation
+	Version     Version
+}
+
+func RehydrateWorkReference(params WorkReferenceRehydrationParams) (WorkReferenceState, error) {
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || !params.Version.Valid() ||
+		params.Observation.Namespace().String() == "" || params.Observation.ObjectID().String() == "" ||
+		params.Observation.Locator().String() == "" || params.Observation.ProviderVersion().String() == "" ||
+		params.Observation.Fields().IsZero() || params.Observation.AdapterPrincipalID().IsZero() ||
+		params.Observation.ObservedAt().IsZero() {
+		return WorkReferenceState{}, ErrInvalidWorkState
+	}
+	return WorkReferenceState{id: params.ID, workspaceID: params.WorkspaceID,
+		observation: params.Observation, version: params.Version}, nil
+}
+
+type ObjectiveRehydrationParams struct {
+	ID                 ObjectiveID
+	WorkspaceID        WorkspaceID
+	Title              string
+	AcceptanceCriteria string
+	Status             ObjectiveStatus
+	Version            Version
+}
+
+func RehydrateObjective(params ObjectiveRehydrationParams) (ObjectiveState, error) {
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || !validBoundedText(params.Title, 512) ||
+		!validBoundedText(params.AcceptanceCriteria, 8192) || !params.Status.Valid() || !params.Version.Valid() ||
+		(params.Status == ObjectiveDraft && params.Version != InitialVersion()) ||
+		(params.Status == ObjectiveActive && params.Version.Uint64() < 2) {
+		return ObjectiveState{}, ErrInvalidWorkState
+	}
+	return ObjectiveState{id: params.ID, workspaceID: params.WorkspaceID, title: params.Title,
+		acceptanceCriteria: params.AcceptanceCriteria, status: params.Status, version: params.Version}, nil
+}
+
+type WorkUnitRehydrationParams struct {
+	ID              WorkUnitID
+	WorkspaceID     WorkspaceID
+	ObjectiveID     ObjectiveID
+	WorkReferenceID WorkReferenceID
+	Title           string
+	Status          WorkUnitStatus
+	Version         Version
+}
+
+func RehydrateWorkUnit(params WorkUnitRehydrationParams) (WorkUnitState, error) {
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.ObjectiveID.IsZero() ||
+		params.WorkReferenceID.IsZero() || !validBoundedText(params.Title, 512) ||
+		params.Status != WorkUnitProposed || params.Version != InitialVersion() {
+		return WorkUnitState{}, ErrInvalidWorkState
+	}
+	return WorkUnitState{id: params.ID, workspaceID: params.WorkspaceID, objectiveID: params.ObjectiveID,
+		workReferenceID: params.WorkReferenceID, title: params.Title, status: params.Status, version: params.Version}, nil
+}
+
+type RunRehydrationParams struct {
+	ID          RunID
+	WorkspaceID WorkspaceID
+	ObjectiveID ObjectiveID
+	WorkUnitID  WorkUnitID
+	OperatorID  ActorID
+	Status      RunStatus
+	Version     Version
+}
+
+func RehydrateRun(params RunRehydrationParams) (RunState, error) {
+	if params.ID.IsZero() || params.WorkspaceID.IsZero() || params.ObjectiveID.IsZero() ||
+		params.WorkUnitID.IsZero() || params.OperatorID.IsZero() || !params.Status.Valid() || !params.Version.Valid() ||
+		(params.Status == RunPlanned && params.Version != InitialVersion()) ||
+		(params.Status == RunStarting && params.Version.Uint64() < 2) {
+		return RunState{}, ErrInvalidWorkState
+	}
+	return RunState{id: params.ID, workspaceID: params.WorkspaceID, objectiveID: params.ObjectiveID,
+		workUnitID: params.WorkUnitID, operatorID: params.OperatorID, status: params.Status, version: params.Version}, nil
+}
+
+type RunParticipationRehydrationParams struct {
+	ID             RunParticipationID
+	RunID          RunID
+	ActorID        ActorID
+	Role           string
+	ActorSessionID ActorSessionID
+	Status         RunParticipationStatus
+	Version        Version
+}
+
+func RehydrateRunParticipation(params RunParticipationRehydrationParams) (RunParticipationState, error) {
+	if params.ID.IsZero() || params.RunID.IsZero() || params.ActorID.IsZero() || !validBoundedText(params.Role, 128) ||
+		!params.Status.Valid() || !params.Version.Valid() ||
+		(params.Status == RunParticipationInvited && (!params.ActorSessionID.IsZero() || params.Version != InitialVersion())) ||
+		(params.Status == RunParticipationActive && (params.ActorSessionID.IsZero() || params.Version.Uint64() < 2)) {
+		return RunParticipationState{}, ErrInvalidWorkState
+	}
+	return RunParticipationState{id: params.ID, runID: params.RunID, actorID: params.ActorID,
+		role: params.Role, sessionID: params.ActorSessionID, status: params.Status, version: params.Version}, nil
+}
+
+type RuntimeBindingRehydrationParams struct {
+	ID                RuntimeBindingID
+	RunID             RunID
+	ParticipationID   RunParticipationID
+	ActorSessionID    ActorSessionID
+	RuntimeEndpointID RuntimeEndpointID
+	Status            RuntimeBindingStatus
+	Version           Version
+}
+
+func RehydrateRuntimeBinding(params RuntimeBindingRehydrationParams) (RuntimeBindingState, error) {
+	if params.ID.IsZero() || params.RunID.IsZero() || params.ParticipationID.IsZero() ||
+		params.ActorSessionID.IsZero() || params.RuntimeEndpointID.IsZero() ||
+		params.Status != RuntimeBindingRequested || params.Version != InitialVersion() {
+		return RuntimeBindingState{}, ErrInvalidWorkState
+	}
+	return RuntimeBindingState{id: params.ID, runID: params.RunID, participationID: params.ParticipationID,
+		sessionID: params.ActorSessionID, endpointID: params.RuntimeEndpointID, status: params.Status,
+		version: params.Version}, nil
 }
 
 func validDisplayNameValue(value DisplayName) bool {

@@ -346,17 +346,25 @@ func NewQueryService(store QueryStore, ids CheckpointIDSource) (*QueryService, e
 	return &QueryService{store: store, ids: ids}, nil
 }
 
-func (service *QueryService) GetContext(ctx context.Context, subject QuerySubject) (ContextCheckpoint, error) {
+func (service *QueryService) GetContext(
+	ctx context.Context,
+	subject QuerySubject,
+	cursor EventCursor,
+	limit uint16,
+) (ContextPage, error) {
 	if err := ctx.Err(); err != nil {
-		return ContextCheckpoint{}, err
+		return ContextPage{}, err
+	}
+	if limit == 0 || limit > MaxQueryPageSize {
+		return ContextPage{}, ErrInvalidQuery
 	}
 	id, err := service.ids.NewCheckpointID()
 	if err != nil {
-		return ContextCheckpoint{}, fmt.Errorf("%w: allocate context checkpoint: %w", ErrOrchestrationDependency, err)
+		return ContextPage{}, fmt.Errorf("%w: allocate context checkpoint: %w", ErrOrchestrationDependency, err)
 	}
-	query, err := NewContextGetQuery(subject, id)
+	query, err := NewContextGetQuery(subject, id, cursor, limit)
 	if err != nil {
-		return ContextCheckpoint{}, err
+		return ContextPage{}, err
 	}
 	return service.store.GetContext(ctx, query)
 }

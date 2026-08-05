@@ -445,6 +445,7 @@ func (unit *strictOrchestrationUOW) commitExecution(
 		ReceiptID: spec.ReceiptID(), CommandID: spec.CommandID(), Identity: spec.ReceiptIdentity(),
 		RequestFingerprint: spec.RequestFingerprint(), Result: result, AuthorityID: spec.AuthorityID(),
 		AuthorityEpoch: spec.RequestedEpoch(), GuardDigest: locked.GuardEvidence().Digest(), Events: events,
+		EventCursor:        EventCursor{value: "bbec1_orchestration_fixture"},
 		CapsuleRequirement: spec.RecoveryCapsule().Requirement(), RecoveryCapsule: draft,
 	})
 	if err != nil {
@@ -1663,9 +1664,9 @@ func assertExternalOrdering(t *testing.T, operation CommandOperation, order []st
 
 type queryServiceStore struct{ calls int }
 
-func (store *queryServiceStore) GetContext(context.Context, ContextGetQuery) (ContextCheckpoint, error) {
+func (store *queryServiceStore) GetContext(context.Context, ContextGetQuery) (ContextPage, error) {
 	store.calls++
-	return ContextCheckpoint{}, errors.New("query store sentinel")
+	return ContextPage{}, errors.New("query store sentinel")
 }
 
 func (store *queryServiceStore) SyncEvents(context.Context, EventsSyncQuery) (EventsPage, error) {
@@ -1695,7 +1696,7 @@ func TestQueryServiceValidatesBoundsAndCancellationBeforeDependencies(t *testing
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err = service.GetContext(cancelled, subject); !errors.Is(err, context.Canceled) {
+	if _, err = service.GetContext(cancelled, subject, EventCursor{}, 1); !errors.Is(err, context.Canceled) {
 		t.Fatalf("context cancellation error=%v", err)
 	}
 	if _, err = service.SyncEvents(cancelled, subject, EventCursor{}, 1); !errors.Is(err, context.Canceled) {
@@ -1709,6 +1710,12 @@ func TestQueryServiceValidatesBoundsAndCancellationBeforeDependencies(t *testing
 	}
 	if _, err = service.SyncEvents(context.Background(), subject, EventCursor{}, MaxQueryPageSize+1); !errors.Is(err, ErrInvalidQuery) {
 		t.Fatalf("oversized event bound error=%v", err)
+	}
+	if _, err = service.GetContext(context.Background(), subject, EventCursor{}, 0); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("zero context bound error=%v", err)
+	}
+	if _, err = service.GetContext(context.Background(), subject, EventCursor{}, MaxQueryPageSize+1); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("oversized context bound error=%v", err)
 	}
 	if store.calls != 0 {
 		t.Fatalf("invalid bounded query reached store %d times", store.calls)

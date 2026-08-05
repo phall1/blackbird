@@ -40,6 +40,13 @@ const (
 	IdentifierKindEvent               IdentifierKind = "event"
 	IdentifierKindCorrelation         IdentifierKind = "correlation"
 	IdentifierKindClientInstance      IdentifierKind = "client_instance"
+	IdentifierKindWorkReference       IdentifierKind = "work_reference"
+	IdentifierKindObjective           IdentifierKind = "objective"
+	IdentifierKindWorkUnit            IdentifierKind = "work_unit"
+	IdentifierKindRun                 IdentifierKind = "run"
+	IdentifierKindRunParticipation    IdentifierKind = "run_participation"
+	IdentifierKindRuntimeBinding      IdentifierKind = "runtime_binding"
+	IdentifierKindRuntimeEndpoint     IdentifierKind = "runtime_endpoint"
 )
 
 // IdentifierError reports a failed typed-ID boundary without weakening the
@@ -235,6 +242,13 @@ type receiptIDMarker struct{}
 type eventIDMarker struct{}
 type correlationIDMarker struct{}
 type clientInstanceIDMarker struct{}
+type workReferenceIDMarker struct{}
+type objectiveIDMarker struct{}
+type workUnitIDMarker struct{}
+type runIDMarker struct{}
+type runParticipationIDMarker struct{}
+type runtimeBindingIDMarker struct{}
+type runtimeEndpointIDMarker struct{}
 
 func (installationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindInstallation }
 func (authorityIDMarker) identifierKind() IdentifierKind       { return IdentifierKindAuthority }
@@ -256,6 +270,15 @@ func (receiptIDMarker) identifierKind() IdentifierKind        { return Identifie
 func (eventIDMarker) identifierKind() IdentifierKind          { return IdentifierKindEvent }
 func (correlationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindCorrelation }
 func (clientInstanceIDMarker) identifierKind() IdentifierKind { return IdentifierKindClientInstance }
+func (workReferenceIDMarker) identifierKind() IdentifierKind  { return IdentifierKindWorkReference }
+func (objectiveIDMarker) identifierKind() IdentifierKind      { return IdentifierKindObjective }
+func (workUnitIDMarker) identifierKind() IdentifierKind       { return IdentifierKindWorkUnit }
+func (runIDMarker) identifierKind() IdentifierKind            { return IdentifierKindRun }
+func (runParticipationIDMarker) identifierKind() IdentifierKind {
+	return IdentifierKindRunParticipation
+}
+func (runtimeBindingIDMarker) identifierKind() IdentifierKind  { return IdentifierKindRuntimeBinding }
+func (runtimeEndpointIDMarker) identifierKind() IdentifierKind { return IdentifierKindRuntimeEndpoint }
 
 // The unique marker embedded in every wrapper makes both implicit assignment
 // and explicit cross-kind conversion fail at compile time.
@@ -282,6 +305,19 @@ type EventID struct{ typedID[eventIDMarker] }
 type CorrelationID struct{ typedID[correlationIDMarker] }
 type ClientInstanceID struct {
 	typedID[clientInstanceIDMarker]
+}
+type WorkReferenceID struct{ typedID[workReferenceIDMarker] }
+type ObjectiveID struct{ typedID[objectiveIDMarker] }
+type WorkUnitID struct{ typedID[workUnitIDMarker] }
+type RunID struct{ typedID[runIDMarker] }
+type RunParticipationID struct {
+	typedID[runParticipationIDMarker]
+}
+type RuntimeBindingID struct {
+	typedID[runtimeBindingIDMarker]
+}
+type RuntimeEndpointID struct {
+	typedID[runtimeEndpointIDMarker]
 }
 
 func ParseInstallationID(text string) (InstallationID, error) {
@@ -356,6 +392,34 @@ func ParseClientInstanceID(text string) (ClientInstanceID, error) {
 	id, err := parseTypedID[clientInstanceIDMarker](text)
 	return ClientInstanceID{typedID: id}, err
 }
+func ParseWorkReferenceID(text string) (WorkReferenceID, error) {
+	id, err := parseTypedID[workReferenceIDMarker](text)
+	return WorkReferenceID{typedID: id}, err
+}
+func ParseObjectiveID(text string) (ObjectiveID, error) {
+	id, err := parseTypedID[objectiveIDMarker](text)
+	return ObjectiveID{typedID: id}, err
+}
+func ParseWorkUnitID(text string) (WorkUnitID, error) {
+	id, err := parseTypedID[workUnitIDMarker](text)
+	return WorkUnitID{typedID: id}, err
+}
+func ParseRunID(text string) (RunID, error) {
+	id, err := parseTypedID[runIDMarker](text)
+	return RunID{typedID: id}, err
+}
+func ParseRunParticipationID(text string) (RunParticipationID, error) {
+	id, err := parseTypedID[runParticipationIDMarker](text)
+	return RunParticipationID{typedID: id}, err
+}
+func ParseRuntimeBindingID(text string) (RuntimeBindingID, error) {
+	id, err := parseTypedID[runtimeBindingIDMarker](text)
+	return RuntimeBindingID{typedID: id}, err
+}
+func ParseRuntimeEndpointID(text string) (RuntimeEndpointID, error) {
+	id, err := parseTypedID[runtimeEndpointIDMarker](text)
+	return RuntimeEndpointID{typedID: id}, err
+}
 
 func NewInstallationID() (InstallationID, error) {
 	id, err := newTypedID[installationIDMarker]()
@@ -428,4 +492,32 @@ func NewCorrelationID() (CorrelationID, error) {
 func NewClientInstanceID() (ClientInstanceID, error) {
 	id, err := newTypedID[clientInstanceIDMarker]()
 	return ClientInstanceID{typedID: id}, err
+}
+func NewWorkReferenceID() (WorkReferenceID, error) {
+	id, err := newTypedID[workReferenceIDMarker]()
+	return WorkReferenceID{typedID: id}, err
+}
+func NewObjectiveID() (ObjectiveID, error) {
+	id, err := newTypedID[objectiveIDMarker]()
+	return ObjectiveID{typedID: id}, err
+}
+func NewWorkUnitID() (WorkUnitID, error) {
+	id, err := newTypedID[workUnitIDMarker]()
+	return WorkUnitID{typedID: id}, err
+}
+func NewRunID() (RunID, error) {
+	id, err := newTypedID[runIDMarker]()
+	return RunID{typedID: id}, err
+}
+func NewRunParticipationID() (RunParticipationID, error) {
+	id, err := newTypedID[runParticipationIDMarker]()
+	return RunParticipationID{typedID: id}, err
+}
+func NewRuntimeBindingID() (RuntimeBindingID, error) {
+	id, err := newTypedID[runtimeBindingIDMarker]()
+	return RuntimeBindingID{typedID: id}, err
+}
+func NewRuntimeEndpointID() (RuntimeEndpointID, error) {
+	id, err := newTypedID[runtimeEndpointIDMarker]()
+	return RuntimeEndpointID{typedID: id}, err
 }
