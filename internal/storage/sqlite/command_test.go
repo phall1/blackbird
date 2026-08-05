@@ -619,7 +619,7 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 		if _, err = tx.Exec(`DROP TRIGGER command_receipts_no_update`); err != nil {
 			t.Fatal(err)
 		}
