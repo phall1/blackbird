@@ -5,11 +5,83 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestOnlineBackupRemainsConsistentDuringActiveWALWrites(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	store, err := Open(ctx, Config{Path: filepath.Join(root, "active-source.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	writerDone := make(chan error, 1)
+	go func() {
+		for index := 1; index <= 250; index++ {
+			_, writeErr := store.db.ExecContext(ctx, `INSERT INTO backup_sessions(
+				backup_id, state, database_high_water_digest, manifest_digest, started_at_us, completed_at_us
+			) VALUES (?, 'retained', zeroblob(32), zeroblob(32), ?, ?)`,
+				backupTestUUID(0x700+index), index, index,
+			)
+			if writeErr != nil {
+				writerDone <- writeErr
+				return
+			}
+		}
+		writerDone <- nil
+	}()
+
+	lastRows := 0
+	for index := 0; index < 8; index++ {
+		path := filepath.Join(root, fmt.Sprintf("active-backup-%d.db", index))
+		manifest, backupErr := store.Backup(ctx, path)
+		if backupErr != nil {
+			t.Fatal(backupErr)
+		}
+		if _, verifyErr := VerifyBackup(ctx, path, manifest); verifyErr != nil {
+			t.Fatal(verifyErr)
+		}
+		backupDB, openErr := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		var rows int
+		queryErr := backupDB.QueryRowContext(ctx, "SELECT count(*) FROM backup_sessions").Scan(&rows)
+		closeErr := backupDB.Close()
+		if queryErr != nil || closeErr != nil {
+			t.Fatal(errors.Join(queryErr, closeErr))
+		}
+		if rows < lastRows || rows > 250 {
+			t.Fatalf("backup rows=%d after prior high-water=%d", rows, lastRows)
+		}
+		lastRows = rows
+	}
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO backup_sessions(
+		backup_id, state, database_high_water_digest, manifest_digest, started_at_us, completed_at_us
+	) VALUES (?, 'retained', zeroblob(32), zeroblob(32), 999, 999)`,
+		backupTestUUID(0x999)); err != nil {
+		t.Fatalf("source was not writable after active backups: %v", err)
+	}
+}
+
+func backupTestUUID(index int) string {
+	return fmt.Sprintf("01b8e094-9888-7000-8000-%012x", index)
+}
 
 func TestOnlineBackupManifestAndSealedRestore(t *testing.T) {
 	t.Parallel()
