@@ -466,6 +466,11 @@ func TestTransportAccessCredentialLifecycleAndLocalDenials(t *testing.T) {
 	if _, err := issuer.Rotate(material, forgedClaims, binding, 10*time.Minute); !errors.Is(err, ErrAccessDenied) {
 		t.Fatalf("cross-principal rotation error = %v", err)
 	}
+	forgedClaims = replacementClaims
+	forgedClaims.DeviceID = "device-2"
+	if _, err := issuer.Rotate(material, forgedClaims, binding, 10*time.Minute); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("cross-device rotation error = %v", err)
+	}
 	if _, err := issuer.VerifyLocalAccess(request, current); err != nil {
 		t.Fatalf("rejected rotation invalidated old credential: %v", err)
 	}
@@ -678,6 +683,67 @@ func TestVaultSignerCompositionAndNoSecretLeakEvidence(t *testing.T) {
 	}
 	if !strings.Contains(formatEvidence, "REDACTED") {
 		t.Fatal("credential formatting did not visibly redact the secret")
+	}
+}
+
+func TestVaultRecoveryCapsuleSignerLookupRejectsForgeryAndRedacts(t *testing.T) {
+	t.Parallel()
+
+	seed := sha256.Sum256([]byte("recovery capsule vault seed"))
+	store := newFakeSecretStore()
+	vault := NewCredentialVault(store, bytes.NewReader(seed[:]))
+	reference, err := InstallationCredentialReference("recovery-signing-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := vault.CreateCredential(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential.Destroy()
+
+	adapters, err := NewProductionOrchestrationAdapters(
+		vault, map[string]CredentialReference{"recovery-v1": reference},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := adapters.SignerLookup
+	if adapters.EffectPlanner == nil || adapters.DenialPolicy == nil {
+		t.Fatal("production adapter constructor omitted a supported dependency")
+	}
+	signer, err := lookup.PrepareRecoveryCapsuleSigner(t.Context(), "recovery-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := []byte("blackbird-recovery-capsule-signature/v1\x00bounded digest")
+	signature, err := signer.SignRecoveryCapsule(t.Context(), message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey := signer.Ed25519PublicKey()
+	if !ed25519.Verify(publicKey, message, signature) {
+		t.Fatal("vault-backed recovery signature did not verify")
+	}
+	forged := append([]byte(nil), signature...)
+	forged[0] ^= 1
+	if ed25519.Verify(publicKey, message, forged) || ed25519.Verify(publicKey, append(message, 0), signature) {
+		t.Fatal("forged or cross-message recovery signature verified")
+	}
+
+	formatted := fmt.Sprintf("%v %#v %+v", signer, signer, signer)
+	for _, forbidden := range []string{
+		string(seed[:]), hex.EncodeToString(seed[:]), base64.StdEncoding.EncodeToString(seed[:]),
+	} {
+		if strings.Contains(formatted, forbidden) {
+			t.Fatal("recovery signer formatting exposed seed material")
+		}
+	}
+	if !strings.Contains(formatted, "REDACTED") {
+		t.Fatal("recovery signer formatting was not visibly redacted")
+	}
+	if _, err := lookup.PrepareRecoveryCapsuleSigner(t.Context(), "unknown-key"); !errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("unknown signer error = %v", err)
 	}
 }
 

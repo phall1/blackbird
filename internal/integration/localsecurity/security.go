@@ -3,6 +3,7 @@
 package localsecurity
 
 import (
+	"context"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/hmac"
@@ -23,6 +24,8 @@ import (
 	"time"
 
 	"github.com/lexfrei/keychain"
+	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/domain"
 )
 
 const (
@@ -54,7 +57,228 @@ var (
 	ErrInvalidAccess       = errors.New("invalid transport access request")
 	ErrInvitationInvalid   = errors.New("pairing invitation invalid")
 	ErrInvitationSuspended = errors.New("pairing invitation requires explicit resume")
+	ErrSecurityDependency  = errors.New("local security dependency unavailable")
 )
+
+var (
+	_ application.RecoveryCapsuleSignerLookup = (*VaultRecoveryCapsuleSignerLookup)(nil)
+	_ application.EffectPlanner               = BoundedEffectPlanner{}
+	_ application.DenialSecurityPolicy        = StrictDenialSecurityPolicy{}
+)
+
+// ProductionOrchestrationAdapters is the securely composable subset of the
+// non-storage orchestration dependencies supported by the current application
+// contracts.
+type ProductionOrchestrationAdapters struct {
+	SignerLookup  application.RecoveryCapsuleSignerLookup
+	EffectPlanner application.EffectPlanner
+	DenialPolicy  application.DenialSecurityPolicy
+}
+
+func NewProductionOrchestrationAdapters(
+	vault *CredentialVault,
+	references map[string]CredentialReference,
+) (ProductionOrchestrationAdapters, error) {
+	signers, err := NewVaultRecoveryCapsuleSignerLookup(vault, references)
+	if err != nil {
+		return ProductionOrchestrationAdapters{}, err
+	}
+	return ProductionOrchestrationAdapters{
+		SignerLookup: signers, EffectPlanner: BoundedEffectPlanner{}, DenialPolicy: StrictDenialSecurityPolicy{},
+	}, nil
+}
+
+// VaultRecoveryCapsuleSignerLookup resolves public key identity during
+// preflight and loads private material from the protected vault only for the
+// duration of an individual signature operation.
+type VaultRecoveryCapsuleSignerLookup struct {
+	vault      *CredentialVault
+	references map[string]CredentialReference
+}
+
+func NewVaultRecoveryCapsuleSignerLookup(
+	vault *CredentialVault,
+	references map[string]CredentialReference,
+) (*VaultRecoveryCapsuleSignerLookup, error) {
+	if vault == nil || len(references) == 0 {
+		return nil, ErrSecurityDependency
+	}
+	cloned := make(map[string]CredentialReference, len(references))
+	for keyID, reference := range references {
+		if !validCredentialIdentifier(keyID) || validateCredentialReference(reference) != nil {
+			return nil, ErrInvalidCredential
+		}
+		cloned[keyID] = reference
+	}
+	return &VaultRecoveryCapsuleSignerLookup{vault: vault, references: cloned}, nil
+}
+
+func (lookup *VaultRecoveryCapsuleSignerLookup) PrepareRecoveryCapsuleSigner(
+	ctx context.Context,
+	keyID string,
+) (application.PreparedRecoveryCapsuleSigner, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if lookup == nil || lookup.vault == nil {
+		return nil, ErrSecurityDependency
+	}
+	reference, exists := lookup.references[keyID]
+	if !exists || !validCredentialIdentifier(keyID) {
+		return nil, ErrCredentialNotFound
+	}
+	credential, err := lookup.vault.LoadCredential(reference)
+	if err != nil {
+		return nil, err
+	}
+	publicKey, err := credential.PublicKey()
+	credential.Destroy()
+	if err != nil {
+		return nil, err
+	}
+	return &vaultRecoveryCapsuleSigner{
+		keyID: keyID, reference: reference, vault: lookup.vault,
+		publicKey: append(ed25519.PublicKey(nil), publicKey...),
+	}, nil
+}
+
+type vaultRecoveryCapsuleSigner struct {
+	keyID     string
+	reference CredentialReference
+	vault     *CredentialVault
+	publicKey ed25519.PublicKey
+}
+
+func (signer *vaultRecoveryCapsuleSigner) KeyID() string { return signer.keyID }
+
+func (signer *vaultRecoveryCapsuleSigner) Ed25519PublicKey() ed25519.PublicKey {
+	if signer == nil {
+		return nil
+	}
+	return append(ed25519.PublicKey(nil), signer.publicKey...)
+}
+
+func (signer *vaultRecoveryCapsuleSigner) SignRecoveryCapsule(
+	ctx context.Context,
+	message []byte,
+) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if signer == nil || signer.vault == nil || len(message) == 0 ||
+		len(message) > application.MaxRecoveryCapsuleBytes {
+		return nil, ErrSecurityDependency
+	}
+	credential, err := signer.vault.LoadCredential(signer.reference)
+	if err != nil {
+		return nil, err
+	}
+	defer credential.Destroy()
+	return credential.Sign(rand.Reader, message, crypto.Hash(0))
+}
+
+func (signer *vaultRecoveryCapsuleSigner) String() string {
+	return "[REDACTED recovery capsule signer]"
+}
+
+func (signer *vaultRecoveryCapsuleSigner) GoString() string { return signer.String() }
+
+// BoundedEffectPlanner emits one deterministic projection intent per committed
+// identity fact. Application constructors enforce bounds, metadata size, and
+// logical uniqueness.
+type BoundedEffectPlanner struct{}
+
+func (BoundedEffectPlanner) PlanEffects(input application.EffectPlanningInput) (application.EffectSet, error) {
+	facts := input.Facts()
+	if input.CommandID().IsZero() || len(facts) == 0 || len(facts) > application.MaxCommandEffects {
+		return application.EffectSet{}, application.ErrInvalidApplicationContract
+	}
+	major, err := application.NewOperationMajor(1)
+	if err != nil {
+		return application.EffectSet{}, err
+	}
+	intents := make([]application.EffectIntent, len(facts))
+	for index, fact := range facts {
+		if fact.Fact() == nil || fact.EventID().IsZero() || fact.Fact().Origin().IsZero() {
+			return application.EffectSet{}, application.ErrInvalidApplicationContract
+		}
+		metadata := []byte(fmt.Sprintf(
+			`{"event_type":%q,"origin":%q}`,
+			fact.Fact().Type(), fact.Fact().Origin().Target().String(),
+		))
+		intent, intentErr := application.NewEffectIntent(
+			fact.EventID(), "identity_projection", major,
+			fact.Fact().Origin().Target().String(), uint16(index), metadata,
+		)
+		if intentErr != nil {
+			return application.EffectSet{}, intentErr
+		}
+		intents[index] = intent
+	}
+	return application.NewEffectSet(intents...)
+}
+
+// StrictDenialSecurityPolicy records only safe, cataloged denial classes. It
+// derives authority and admission data from the locked command context rather
+// than from caller-controlled error text.
+type StrictDenialSecurityPolicy struct{}
+
+func (StrictDenialSecurityPolicy) DenialFollowUp(
+	locked application.CommandContext,
+	authentication application.AuthenticationEvidence,
+	policy application.PreparedPolicy,
+	rejection *domain.CommandError,
+) (application.SecuritySpec, error) {
+	if rejection == nil || authentication.PrincipalID().IsZero() ||
+		policy.Revision().String() == "" || policy.Digest().IsZero() {
+		return application.SecuritySpec{}, application.ErrInvalidSecuritySpec
+	}
+	spec := locked.Spec()
+	if locked.ReceiptResolution().Kind() != application.ReceiptAdmitted ||
+		spec.Authorship().PrincipalID() != authentication.PrincipalID() {
+		return application.SecuritySpec{}, application.ErrInvalidSecuritySpec
+	}
+	device, hasDevice := authentication.DeviceID()
+	var devicePointer *domain.DeviceID
+	if hasDevice {
+		devicePointer = &device
+	}
+	subject, err := application.AttributedDenialSubject(authentication.PrincipalID(), devicePointer)
+	if err != nil {
+		return application.SecuritySpec{}, err
+	}
+	class, reason, valid := safeDenialClassification(rejection)
+	if !valid {
+		return application.SecuritySpec{}, application.ErrInvalidSecuritySpec
+	}
+	draft, err := application.NewCommandDenialDraft(
+		spec.Operation(), spec.OperationMajor(), class, reason, spec.RequestFingerprint(),
+		subject, ptrPolicyRevision(policy.Revision()), spec.CorrelationID(),
+	)
+	if err != nil {
+		return application.SecuritySpec{}, err
+	}
+	return application.RecordCommandDenialSecurity(
+		spec.Scope(), spec.AuthorityID(), spec.RequestedEpoch(),
+		spec.Guards().AdmissionGeneration(), draft,
+	)
+}
+
+func safeDenialClassification(rejection *domain.CommandError) (application.CommandDenialClass, string, bool) {
+	if rejection == nil {
+		return "", "", false
+	}
+	switch rejection.Code() {
+	case domain.ErrorCodeUnauthenticated, domain.ErrorCodeSessionExpired:
+		return application.DenialAuthentication, "credential_rejected", true
+	case domain.ErrorCodeForbidden, domain.ErrorCodeCapabilityRequired:
+		return application.DenialAuthorization, "authorization_denied", true
+	default:
+		return "", "", false
+	}
+}
+
+func ptrPolicyRevision(revision domain.PolicyRevision) *domain.PolicyRevision { return &revision }
 
 // CredentialKind identifies a long-lived local Ed25519 credential class.
 type CredentialKind string
