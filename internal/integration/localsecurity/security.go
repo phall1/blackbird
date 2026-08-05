@@ -13,8 +13,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +40,9 @@ const (
 	maxTransportAccessTTL   = 15 * time.Minute
 	maxPairingInvitationTTL = 5 * time.Minute
 	maxPairingAttempts      = 5
+	proofEvidenceVersion    = 1
+	maxProofEvidenceBytes   = 16 * 1024
+	maxProofNonceBytes      = 64
 )
 
 var (
@@ -64,6 +69,9 @@ var (
 	_ application.RecoveryCapsuleSignerLookup = (*VaultRecoveryCapsuleSignerLookup)(nil)
 	_ application.EffectPlanner               = BoundedEffectPlanner{}
 	_ application.DenialSecurityPolicy        = StrictDenialSecurityPolicy{}
+	_ application.BootstrapProofVerifier      = (*CryptographicProofVerifier)(nil)
+	_ application.CeremonyProofVerifier       = (*CryptographicProofVerifier)(nil)
+	_ application.PairingRedemptionVerifier   = (*CryptographicProofVerifier)(nil)
 )
 
 // ProductionOrchestrationAdapters is the securely composable subset of the
@@ -979,6 +987,669 @@ func (registry *PairingInvitationRegistry) update(
 	}
 	delete(registry.records, identifier)
 	return nil
+}
+
+// ProofPublicKeyRegistry resolves stable domain key references without placing
+// private key material in proof state. Vault-backed references are loaded only
+// long enough to derive their public key.
+type ProofPublicKeyRegistry struct {
+	vault      *CredentialVault
+	references map[string]CredentialReference
+	publicKeys map[string]ed25519.PublicKey
+}
+
+func NewProofPublicKeyRegistry(
+	vault *CredentialVault,
+	references map[string]CredentialReference,
+	publicKeys map[string]ed25519.PublicKey,
+) (*ProofPublicKeyRegistry, error) {
+	if vault == nil && len(publicKeys) == 0 {
+		return nil, ErrSecurityDependency
+	}
+	registry := &ProofPublicKeyRegistry{
+		vault: vault, references: make(map[string]CredentialReference, len(references)),
+		publicKeys: make(map[string]ed25519.PublicKey, len(publicKeys)),
+	}
+	for keyReference, reference := range references {
+		if _, err := domain.NewPublicKeyReference(keyReference); err != nil || validateCredentialReference(reference) != nil {
+			return nil, ErrInvalidCredential
+		}
+		registry.references[keyReference] = reference
+	}
+	for keyReference, publicKey := range publicKeys {
+		if _, err := domain.NewPublicKeyReference(keyReference); err != nil || len(publicKey) != ed25519.PublicKeySize {
+			return nil, ErrInvalidCredential
+		}
+		registry.publicKeys[keyReference] = append(ed25519.PublicKey(nil), publicKey...)
+	}
+	return registry, nil
+}
+
+func (registry *ProofPublicKeyRegistry) resolve(reference domain.PublicKeyReference) (ed25519.PublicKey, error) {
+	if registry == nil || reference.String() == "" {
+		return nil, ErrSecurityDependency
+	}
+	if publicKey, exists := registry.publicKeys[reference.String()]; exists {
+		return append(ed25519.PublicKey(nil), publicKey...), nil
+	}
+	vaultReference, exists := registry.references[reference.String()]
+	if !exists || registry.vault == nil {
+		return nil, ErrCredentialNotFound
+	}
+	credential, err := registry.vault.LoadCredential(vaultReference)
+	if err != nil {
+		return nil, err
+	}
+	defer credential.Destroy()
+	return credential.PublicKey()
+}
+
+// BootstrapProofContext is verifier-owned state for one bootstrap invitation.
+// It contains no invitation secret and is removed after successful redemption.
+type BootstrapProofContext struct {
+	PairingInvitationID   PairingInvitationID
+	InvitationID          domain.InvitationID
+	InstallationID        domain.InstallationID
+	InstallationKey       domain.PublicKeyReference
+	Protocol              domain.PairingProtocol
+	Role                  domain.BootstrapRole
+	PrincipalID           domain.PrincipalID
+	PrincipalDisplayName  domain.DisplayName
+	DeviceID              domain.DeviceID
+	DeviceDisplayName     domain.DisplayName
+	DevicePublicKey       domain.PublicKeyReference
+	DeviceSPKIFingerprint domain.CredentialDigest
+	OwnerGrantID          domain.GrantID
+	OwnerCapabilities     domain.CapabilitySet
+	Binding               Binding
+}
+
+type ceremonyScope struct {
+	InstallationID string `json:"installation_id,omitempty"`
+	WorkspaceID    string `json:"workspace_id,omitempty"`
+	MembershipID   string `json:"membership_id,omitempty"`
+	ActorID        string `json:"actor_id,omitempty"`
+	DelegationID   string `json:"delegation_id,omitempty"`
+}
+
+// CeremonyProofContext is the complete verifier-owned expectation for one
+// challenge. PairingAuthorization is required only for device_pairing.
+type CeremonyProofContext struct {
+	ChallengeID          domain.CeremonyID
+	Purpose              domain.CeremonyPurpose
+	PrincipalID          domain.PrincipalID
+	DeviceID             domain.DeviceID
+	InstallationID       domain.InstallationID
+	WorkspaceID          domain.WorkspaceID
+	MembershipID         domain.MembershipID
+	ActorID              domain.ActorID
+	DelegationID         domain.ActorDelegationID
+	SignerKey            domain.PublicKeyReference
+	Binding              Binding
+	ExpiresAt            time.Time
+	PairingAuthorization *PairingAuthorizationContext
+}
+
+// PairingAuthorizationContext supplies policy output that must be bound into a
+// verified device-pairing transcript before a domain authorization is created.
+type PairingAuthorizationContext struct {
+	AuthorityID           domain.AuthorityID
+	AuthorityEpoch        domain.AuthorityEpoch
+	PolicyRevision        domain.PolicyRevision
+	AssuranceClass        domain.AssuranceClass
+	DeviceSPKIFingerprint domain.CredentialDigest
+}
+
+type proofChallengeRecord struct {
+	context  CeremonyProofContext
+	consumed bool
+}
+
+// ProofChallengeRegistry owns purpose, scope, expiry, and one-use state.
+type ProofChallengeRegistry struct {
+	mu         sync.Mutex
+	now        func() time.Time
+	bootstrap  map[domain.InvitationID]BootstrapProofContext
+	ceremonies map[domain.CeremonyID]proofChallengeRecord
+}
+
+func NewProofChallengeRegistry(now func() time.Time) *ProofChallengeRegistry {
+	return &ProofChallengeRegistry{
+		now: now, bootstrap: make(map[domain.InvitationID]BootstrapProofContext),
+		ceremonies: make(map[domain.CeremonyID]proofChallengeRecord),
+	}
+}
+
+func (registry *ProofChallengeRegistry) RegisterBootstrap(context BootstrapProofContext) error {
+	if registry == nil || registry.now == nil || !validBootstrapContext(context) {
+		return ErrInvalidProof
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, exists := registry.bootstrap[context.InvitationID]; exists {
+		return ErrInvalidProof
+	}
+	registry.bootstrap[context.InvitationID] = context
+	return nil
+}
+
+func (registry *ProofChallengeRegistry) RegisterCeremony(context CeremonyProofContext) error {
+	if registry == nil || registry.now == nil || !validCeremonyContext(context) ||
+		!registry.now().Before(context.ExpiresAt) {
+		return ErrInvalidProof
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, exists := registry.ceremonies[context.ChallengeID]; exists {
+		return ErrInvalidProof
+	}
+	registry.ceremonies[context.ChallengeID] = proofChallengeRecord{context: context}
+	return nil
+}
+
+// CryptographicProofVerifier verifies all proof ports that have sufficient
+// application context. It retains only verifier-owned metadata and digests.
+type CryptographicProofVerifier struct {
+	invitations *PairingInvitationRegistry
+	keys        *ProofPublicKeyRegistry
+	challenges  *ProofChallengeRegistry
+}
+
+func NewCryptographicProofVerifier(
+	invitations *PairingInvitationRegistry,
+	keys *ProofPublicKeyRegistry,
+	challenges *ProofChallengeRegistry,
+) (*CryptographicProofVerifier, error) {
+	if invitations == nil || keys == nil || challenges == nil || challenges.now == nil {
+		return nil, ErrSecurityDependency
+	}
+	return &CryptographicProofVerifier{invitations: invitations, keys: keys, challenges: challenges}, nil
+}
+
+type bootstrapProofEnvelopeV1 struct {
+	Version             int    `json:"version"`
+	Purpose             string `json:"purpose"`
+	InvitationID        string `json:"invitation_id"`
+	PairingInvitationID string `json:"pairing_invitation_id"`
+	Binding             string `json:"channel_binding"`
+	ClientNonce         string `json:"client_nonce"`
+	ServerNonce         string `json:"server_nonce"`
+	InvitationSecret    string `json:"invitation_secret"`
+	PairingProof        string `json:"pairing_proof"`
+	Signature           string `json:"signature"`
+}
+
+type bootstrapTranscriptV1 struct {
+	Domain               string   `json:"domain"`
+	Version              int      `json:"version"`
+	Purpose              string   `json:"purpose"`
+	InvitationID         string   `json:"invitation_id"`
+	PairingInvitationID  string   `json:"pairing_invitation_id"`
+	InstallationID       string   `json:"installation_id"`
+	InstallationKey      string   `json:"installation_key"`
+	Protocol             string   `json:"protocol"`
+	Role                 string   `json:"role"`
+	PrincipalID          string   `json:"principal_id"`
+	PrincipalDisplayName string   `json:"principal_display_name"`
+	DeviceID             string   `json:"device_id"`
+	DeviceDisplayName    string   `json:"device_display_name"`
+	DevicePublicKey      string   `json:"device_public_key"`
+	DeviceSPKI           string   `json:"device_spki_sha256"`
+	OwnerGrantID         string   `json:"owner_grant_id"`
+	OwnerCapabilities    []string `json:"owner_capabilities"`
+	Binding              string   `json:"channel_binding"`
+	ClientNonce          string   `json:"client_nonce"`
+	ServerNonce          string   `json:"server_nonce"`
+}
+
+// NewBootstrapProofEvidence creates the exact opaque envelope accepted by the
+// bootstrap verifier. The invitation secret copy is cleared before return.
+func NewBootstrapProofEvidence(
+	context BootstrapProofContext,
+	secret PairingInvitationSecret,
+	clientNonce []byte,
+	serverNonce []byte,
+	signer crypto.Signer,
+) (application.BootstrapProofEvidence, error) {
+	if !validBootstrapContext(context) || len(clientNonce) == 0 || len(clientNonce) > maxProofNonceBytes ||
+		len(serverNonce) == 0 || len(serverNonce) > maxProofNonceBytes {
+		return application.BootstrapProofEvidence{}, ErrInvalidProof
+	}
+	transcript, err := bootstrapTranscript(context, clientNonce, serverNonce)
+	if err != nil {
+		return application.BootstrapProofEvidence{}, err
+	}
+	signature, err := SignTranscript(signer, transcript)
+	if err != nil {
+		return application.BootstrapProofEvidence{}, ErrInvalidProof
+	}
+	secretBytes := secret.Bytes()
+	defer clear(secretBytes)
+	pairingProof, err := PairingProof(secretBytes, context.Binding, transcript)
+	if err != nil {
+		return application.BootstrapProofEvidence{}, err
+	}
+	envelope := bootstrapProofEnvelopeV1{
+		Version: proofEvidenceVersion, Purpose: "bootstrap", InvitationID: context.InvitationID.String(),
+		PairingInvitationID: context.PairingInvitationID.String(), Binding: encodeProofBytes(context.Binding[:]),
+		ClientNonce: encodeProofBytes(clientNonce), ServerNonce: encodeProofBytes(serverNonce),
+		InvitationSecret: encodeProofBytes(secretBytes), PairingProof: encodeProofBytes(pairingProof[:]),
+		Signature: encodeProofBytes(signature),
+	}
+	encoded, err := json.Marshal(envelope)
+	if err != nil || len(encoded) > maxProofEvidenceBytes {
+		return application.BootstrapProofEvidence{}, ErrInvalidProof
+	}
+	return application.NewBootstrapProofEvidence(encoded)
+}
+
+func (verifier *CryptographicProofVerifier) VerifyBootstrapProof(
+	ctx context.Context,
+	evidence application.BootstrapProofEvidence,
+) (application.BootstrapProofVerification, error) {
+	if err := ctx.Err(); err != nil {
+		return application.BootstrapProofVerification{}, err
+	}
+	var envelope bootstrapProofEnvelopeV1
+	if decodeProofEnvelope(evidence.Bytes(), &envelope) != nil || envelope.Version != proofEvidenceVersion ||
+		envelope.Purpose != "bootstrap" {
+		return application.BootstrapProofVerification{}, ErrInvalidProof
+	}
+	invitationID, err := domain.ParseInvitationID(envelope.InvitationID)
+	if err != nil {
+		return application.BootstrapProofVerification{}, ErrInvalidProof
+	}
+	verifier.challenges.mu.Lock()
+	defer verifier.challenges.mu.Unlock()
+	expected, exists := verifier.challenges.bootstrap[invitationID]
+	if !exists || expected.PairingInvitationID.String() != envelope.PairingInvitationID {
+		return verifier.rejectedBootstrap(invitationID, envelope), nil
+	}
+	clientNonce, clientOK := decodeProofBytes(envelope.ClientNonce, maxProofNonceBytes)
+	serverNonce, serverOK := decodeProofBytes(envelope.ServerNonce, maxProofNonceBytes)
+	binding, bindingOK := decodeProofArray32(envelope.Binding)
+	secretBytes, secretOK := decodeProofArray32(envelope.InvitationSecret)
+	presentedProof, proofOK := decodeProofArray32(envelope.PairingProof)
+	signature, signatureOK := decodeProofArray64(envelope.Signature)
+	defer clear(secretBytes[:])
+	transcript, transcriptErr := bootstrapTranscript(expected, clientNonce, serverNonce)
+	publicKey, keyErr := verifier.keys.resolve(expected.DevicePublicKey)
+	valid := clientOK && serverOK && bindingOK && secretOK && proofOK && signatureOK &&
+		binding == [bindingSize]byte(expected.Binding) && transcriptErr == nil && keyErr == nil &&
+		VerifyPairingProof(secretBytes[:], expected.Binding, transcript, presentedProof[:]) == nil &&
+		VerifyTranscript(publicKey, transcript, signature[:]) == nil
+	if !valid {
+		return verifier.rejectedBootstrap(invitationID, envelope), nil
+	}
+	var pairingID PairingInvitationID
+	decodedPairingID, decodeErr := hex.DecodeString(envelope.PairingInvitationID)
+	if decodeErr != nil || len(decodedPairingID) != len(pairingID) {
+		return verifier.rejectedBootstrap(invitationID, envelope), nil
+	}
+	copy(pairingID[:], decodedPairingID)
+	var secret PairingInvitationSecret
+	copy(secret.material[:], secretBytes[:])
+	if verifier.invitations.Redeem(pairingID, secret) != nil {
+		return verifier.rejectedBootstrap(invitationID, envelope), nil
+	}
+	delete(verifier.challenges.bootstrap, invitationID)
+	invitationDigest := domain.CommandFingerprint(sha256.Sum256(secretBytes[:]))
+	clientDigest := domain.CommandFingerprint(sha256.Sum256(clientNonce))
+	serverDigest := domain.CommandFingerprint(sha256.Sum256(serverNonce))
+	proof, err := domain.NewBootstrapProof(domain.BootstrapProofParams{
+		InvitationID: expected.InvitationID, InstallationID: expected.InstallationID,
+		InstallationKey: expected.InstallationKey, InvitationEvidence: invitationDigest,
+		TranscriptFingerprint: domain.CommandFingerprint(transcript), ClientNonceDigest: clientDigest,
+		ServerNonceDigest: serverDigest, Protocol: expected.Protocol, Role: expected.Role,
+		PrincipalID: expected.PrincipalID, PrincipalDisplayName: expected.PrincipalDisplayName,
+		DeviceID: expected.DeviceID, DeviceDisplayName: expected.DeviceDisplayName,
+		DevicePublicKey: expected.DevicePublicKey, DeviceSPKIFingerprint: expected.DeviceSPKIFingerprint,
+		OwnerGrantID: expected.OwnerGrantID, OwnerCapabilities: expected.OwnerCapabilities,
+	})
+	if err != nil {
+		return application.BootstrapProofVerification{}, ErrInvalidProof
+	}
+	return application.VerifiedBootstrapProof(proof), nil
+}
+
+func (verifier *CryptographicProofVerifier) rejectedBootstrap(
+	invitationID domain.InvitationID,
+	envelope bootstrapProofEnvelopeV1,
+) application.BootstrapProofVerification {
+	transcript := domain.CommandFingerprint(sha256.Sum256([]byte("blackbird-bootstrap-rejected/v1\x00" + envelope.InvitationID)))
+	client := domain.CommandFingerprint(sha256.Sum256([]byte(envelope.ClientNonce)))
+	server := domain.CommandFingerprint(sha256.Sum256([]byte(envelope.ServerNonce)))
+	binding := domain.CommandFingerprint(sha256.Sum256([]byte(envelope.Binding)))
+	presented := domain.CommandFingerprint(sha256.Sum256([]byte(envelope.PairingProof + envelope.Signature)))
+	attempt, err := application.NewBootstrapAttempt(invitationID, transcript, client, server, binding, presented)
+	if err != nil {
+		return application.BootstrapProofVerification{}
+	}
+	return application.RejectedBootstrapProof(attempt)
+}
+
+type ceremonyProofEnvelopeV1 struct {
+	Version     int           `json:"version"`
+	Purpose     string        `json:"purpose"`
+	ChallengeID string        `json:"challenge_id"`
+	PrincipalID string        `json:"principal_id"`
+	DeviceID    string        `json:"device_id,omitempty"`
+	Scope       ceremonyScope `json:"scope"`
+	Binding     string        `json:"channel_binding"`
+	Signature   string        `json:"signature"`
+}
+
+type ceremonyTranscriptV1 struct {
+	Domain      string        `json:"domain"`
+	Version     int           `json:"version"`
+	Purpose     string        `json:"purpose"`
+	ChallengeID string        `json:"challenge_id"`
+	PrincipalID string        `json:"principal_id"`
+	DeviceID    string        `json:"device_id,omitempty"`
+	Scope       ceremonyScope `json:"scope"`
+	SignerKey   string        `json:"signer_key"`
+	Binding     string        `json:"channel_binding"`
+}
+
+func NewCeremonyProofEvidence(
+	context CeremonyProofContext,
+	signer crypto.Signer,
+) (application.CeremonyProofEvidence, error) {
+	if !validCeremonyContext(context) {
+		return application.CeremonyProofEvidence{}, ErrInvalidProof
+	}
+	transcript, err := ceremonyTranscript(context)
+	if err != nil {
+		return application.CeremonyProofEvidence{}, err
+	}
+	signature, err := SignTranscript(signer, transcript)
+	if err != nil {
+		return application.CeremonyProofEvidence{}, ErrInvalidProof
+	}
+	envelope := ceremonyEnvelope(context)
+	envelope.Signature = encodeProofBytes(signature)
+	encoded, err := json.Marshal(envelope)
+	if err != nil || len(encoded) > maxProofEvidenceBytes {
+		return application.CeremonyProofEvidence{}, ErrInvalidProof
+	}
+	return application.NewCeremonyProofEvidence(encoded)
+}
+
+func (verifier *CryptographicProofVerifier) VerifyMembershipAcceptance(ctx context.Context, evidence application.CeremonyProofEvidence) (application.CeremonyProofVerification, error) {
+	return verifier.verifyCeremony(ctx, evidence, domain.CeremonyPurposeMembershipAcceptance)
+}
+
+func (verifier *CryptographicProofVerifier) VerifyDelegationActivation(ctx context.Context, evidence application.CeremonyProofEvidence) (application.CeremonyProofVerification, error) {
+	return verifier.verifyCeremony(ctx, evidence, domain.CeremonyPurposeDelegationActivation)
+}
+
+func (verifier *CryptographicProofVerifier) VerifyActorSessionHandoff(ctx context.Context, evidence application.CeremonyProofEvidence) (application.CeremonyProofVerification, error) {
+	return verifier.verifyCeremony(ctx, evidence, domain.CeremonyPurposeActorSessionStart)
+}
+
+func (verifier *CryptographicProofVerifier) verifyCeremony(
+	ctx context.Context,
+	evidence application.CeremonyProofEvidence,
+	purpose domain.CeremonyPurpose,
+) (application.CeremonyProofVerification, error) {
+	proof, subject, valid, err := verifier.verifyCeremonyProof(ctx, evidence, purpose, false)
+	if err != nil {
+		return application.CeremonyProofVerification{}, err
+	}
+	if valid {
+		return application.ValidCeremonyProof(proof)
+	}
+	return application.RejectedCeremonyProof(subject)
+}
+
+func (verifier *CryptographicProofVerifier) VerifyPairingRedemption(
+	ctx context.Context,
+	evidence application.CeremonyProofEvidence,
+) (application.PairingRedemptionDecision, error) {
+	proof, subject, valid, err := verifier.verifyCeremonyProof(ctx, evidence, domain.CeremonyPurposeDevicePairing, true)
+	if err != nil {
+		return application.PairingRedemptionDecision{}, err
+	}
+	if !valid {
+		return application.RejectedPairingRedemption(subject)
+	}
+	verifier.challenges.mu.Lock()
+	record := verifier.challenges.ceremonies[proof.ChallengeID()]
+	delete(verifier.challenges.ceremonies, proof.ChallengeID())
+	verifier.challenges.mu.Unlock()
+	context := record.context
+	authorizationContext := context.PairingAuthorization
+	credential, err := domain.NewDeviceCredentialBinding(
+		context.SignerKey, authorizationContext.DeviceSPKIFingerprint, proof.ProofDigest(),
+	)
+	if err != nil {
+		return application.PairingRedemptionDecision{}, ErrInvalidProof
+	}
+	authorization, err := domain.NewPairingRedemptionAuthorization(
+		authorizationContext.AuthorityID, authorizationContext.AuthorityEpoch, context.InstallationID,
+		context.PrincipalID, context.DeviceID, authorizationContext.PolicyRevision,
+		authorizationContext.AssuranceClass, verifier.challenges.now(), context.ChallengeID,
+		proof.ProofDigest(), credential,
+	)
+	if err != nil {
+		return application.PairingRedemptionDecision{}, ErrInvalidProof
+	}
+	verification, err := application.NewPairingRedemptionVerification(authorization, proof)
+	if err != nil {
+		return application.PairingRedemptionDecision{}, err
+	}
+	return application.ValidPairingRedemption(verification)
+}
+
+func (verifier *CryptographicProofVerifier) verifyCeremonyProof(
+	ctx context.Context,
+	evidence application.CeremonyProofEvidence,
+	purpose domain.CeremonyPurpose,
+	preserveRecord bool,
+) (domain.CeremonyProof, application.DenialSubject, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.CeremonyProof{}, application.DenialSubject{}, false, err
+	}
+	raw := evidence.Bytes()
+	var envelope ceremonyProofEnvelopeV1
+	if decodeProofEnvelope(raw, &envelope) != nil || envelope.Version != proofEvidenceVersion || envelope.Purpose != string(purpose) {
+		subject, _ := application.UnattributedDenialSource(application.DigestBytes(raw))
+		return domain.CeremonyProof{}, subject, false, nil
+	}
+	challengeID, err := domain.ParseCeremonyID(envelope.ChallengeID)
+	if err != nil {
+		subject, _ := application.UnattributedDenialSource(application.DigestBytes(raw))
+		return domain.CeremonyProof{}, subject, false, nil
+	}
+	verifier.challenges.mu.Lock()
+	defer verifier.challenges.mu.Unlock()
+	record, exists := verifier.challenges.ceremonies[challengeID]
+	subject := denialSubject(envelope, raw)
+	if !exists || record.consumed || !verifier.challenges.now().Before(record.context.ExpiresAt) ||
+		record.context.Purpose != purpose || ceremonyEnvelope(record.context).unsigned() != envelope.unsigned() {
+		return domain.CeremonyProof{}, subject, false, nil
+	}
+	transcript, transcriptErr := ceremonyTranscript(record.context)
+	publicKey, keyErr := verifier.keys.resolve(record.context.SignerKey)
+	signature, signatureOK := decodeProofArray64(envelope.Signature)
+	if transcriptErr != nil || keyErr != nil || !signatureOK || VerifyTranscript(publicKey, transcript, signature[:]) != nil {
+		return domain.CeremonyProof{}, subject, false, nil
+	}
+	record.consumed = true
+	if preserveRecord {
+		verifier.challenges.ceremonies[challengeID] = record
+	} else {
+		delete(verifier.challenges.ceremonies, challengeID)
+	}
+	proof, err := domain.NewCeremonyProof(
+		challengeID, purpose, domain.CommandFingerprint(transcript), record.context.PrincipalID, record.context.DeviceID,
+	)
+	if err != nil {
+		return domain.CeremonyProof{}, application.DenialSubject{}, false, ErrInvalidProof
+	}
+	return proof, application.DenialSubject{}, true, nil
+}
+
+type unsignedCeremonyEnvelope struct {
+	Version     int
+	Purpose     string
+	ChallengeID string
+	PrincipalID string
+	DeviceID    string
+	Scope       ceremonyScope
+	Binding     string
+}
+
+func (envelope ceremonyProofEnvelopeV1) unsigned() unsignedCeremonyEnvelope {
+	return unsignedCeremonyEnvelope{
+		envelope.Version, envelope.Purpose, envelope.ChallengeID, envelope.PrincipalID,
+		envelope.DeviceID, envelope.Scope, envelope.Binding,
+	}
+}
+
+func ceremonyEnvelope(context CeremonyProofContext) ceremonyProofEnvelopeV1 {
+	return ceremonyProofEnvelopeV1{
+		Version: proofEvidenceVersion, Purpose: string(context.Purpose), ChallengeID: context.ChallengeID.String(),
+		PrincipalID: context.PrincipalID.String(), DeviceID: context.DeviceID.String(),
+		Scope: ceremonyScope{
+			InstallationID: context.InstallationID.String(), WorkspaceID: context.WorkspaceID.String(),
+			MembershipID: context.MembershipID.String(), ActorID: context.ActorID.String(),
+			DelegationID: context.DelegationID.String(),
+		},
+		Binding: encodeProofBytes(context.Binding[:]),
+	}
+}
+
+func ceremonyTranscript(context CeremonyProofContext) (TranscriptHash, error) {
+	envelope := ceremonyEnvelope(context)
+	canonical, err := json.Marshal(ceremonyTranscriptV1{
+		Domain: "blackbird-ceremony-proof/v1", Version: envelope.Version, Purpose: envelope.Purpose,
+		ChallengeID: envelope.ChallengeID, PrincipalID: envelope.PrincipalID, DeviceID: envelope.DeviceID,
+		Scope: envelope.Scope, SignerKey: context.SignerKey.String(), Binding: envelope.Binding,
+	})
+	if err != nil {
+		return TranscriptHash{}, ErrInvalidTranscript
+	}
+	return HashTranscript(canonical)
+}
+
+func bootstrapTranscript(context BootstrapProofContext, clientNonce, serverNonce []byte) (TranscriptHash, error) {
+	capabilities := context.OwnerCapabilities.Values()
+	capabilityNames := make([]string, len(capabilities))
+	for index, capability := range capabilities {
+		capabilityNames[index] = capability.String()
+	}
+	spkiFingerprint := context.DeviceSPKIFingerprint.Bytes()
+	canonical, err := json.Marshal(bootstrapTranscriptV1{
+		Domain: "blackbird-bootstrap-proof/v1", Version: proofEvidenceVersion, Purpose: "bootstrap",
+		InvitationID: context.InvitationID.String(), PairingInvitationID: context.PairingInvitationID.String(),
+		InstallationID: context.InstallationID.String(), InstallationKey: context.InstallationKey.String(),
+		Protocol: string(context.Protocol), Role: string(context.Role), PrincipalID: context.PrincipalID.String(),
+		PrincipalDisplayName: context.PrincipalDisplayName.String(), DeviceID: context.DeviceID.String(),
+		DeviceDisplayName: context.DeviceDisplayName.String(), DevicePublicKey: context.DevicePublicKey.String(),
+		DeviceSPKI: hex.EncodeToString(spkiFingerprint[:]), OwnerGrantID: context.OwnerGrantID.String(),
+		OwnerCapabilities: capabilityNames, Binding: encodeProofBytes(context.Binding[:]),
+		ClientNonce: encodeProofBytes(clientNonce), ServerNonce: encodeProofBytes(serverNonce),
+	})
+	if err != nil {
+		return TranscriptHash{}, ErrInvalidTranscript
+	}
+	return HashTranscript(canonical)
+}
+
+func validBootstrapContext(context BootstrapProofContext) bool {
+	return context.PairingInvitationID != (PairingInvitationID{}) && !context.InvitationID.IsZero() &&
+		!context.InstallationID.IsZero() && context.InstallationKey.String() != "" && context.Protocol.Valid() &&
+		context.Role.Valid() && !context.PrincipalID.IsZero() && context.PrincipalDisplayName.String() != "" &&
+		!context.DeviceID.IsZero() && context.DeviceDisplayName.String() != "" && context.DevicePublicKey.String() != "" &&
+		!context.DeviceSPKIFingerprint.IsZero() && !context.OwnerGrantID.IsZero() &&
+		!context.OwnerCapabilities.IsZero() && context.Binding != (Binding{})
+}
+
+func validCeremonyContext(context CeremonyProofContext) bool {
+	if context.ChallengeID.IsZero() || !context.Purpose.Valid() || context.PrincipalID.IsZero() ||
+		context.SignerKey.String() == "" || context.Binding == (Binding{}) || context.ExpiresAt.IsZero() {
+		return false
+	}
+	switch context.Purpose {
+	case domain.CeremonyPurposeMembershipAcceptance:
+		return !context.WorkspaceID.IsZero() && !context.MembershipID.IsZero() && context.InstallationID.IsZero() &&
+			context.ActorID.IsZero() && context.DelegationID.IsZero() && context.DeviceID.IsZero() && context.PairingAuthorization == nil
+	case domain.CeremonyPurposeDelegationActivation, domain.CeremonyPurposeActorSessionStart:
+		return !context.WorkspaceID.IsZero() && !context.ActorID.IsZero() && !context.DelegationID.IsZero() &&
+			context.InstallationID.IsZero() && context.MembershipID.IsZero() && context.DeviceID.IsZero() && context.PairingAuthorization == nil
+	case domain.CeremonyPurposeDevicePairing:
+		authorization := context.PairingAuthorization
+		return !context.InstallationID.IsZero() && !context.DeviceID.IsZero() && context.WorkspaceID.IsZero() &&
+			context.MembershipID.IsZero() && context.ActorID.IsZero() && context.DelegationID.IsZero() && authorization != nil &&
+			!authorization.AuthorityID.IsZero() && !authorization.AuthorityEpoch.IsZero() &&
+			authorization.PolicyRevision.String() != "" && authorization.AssuranceClass.String() != "" &&
+			!authorization.DeviceSPKIFingerprint.IsZero()
+	default:
+		return false
+	}
+}
+
+func denialSubject(envelope ceremonyProofEnvelopeV1, raw []byte) application.DenialSubject {
+	principal, principalErr := domain.ParsePrincipalID(envelope.PrincipalID)
+	if principalErr == nil {
+		if envelope.DeviceID == "" {
+			subject, _ := application.AttributedDenialSubject(principal, nil)
+			return subject
+		}
+		device, deviceErr := domain.ParseDeviceID(envelope.DeviceID)
+		if deviceErr == nil {
+			subject, _ := application.AttributedDenialSubject(principal, &device)
+			return subject
+		}
+	}
+	subject, _ := application.UnattributedDenialSource(application.DigestBytes(raw))
+	return subject
+}
+
+func decodeProofEnvelope(encoded []byte, destination any) error {
+	if len(encoded) == 0 || len(encoded) > maxProofEvidenceBytes {
+		return ErrInvalidProof
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return ErrInvalidProof
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return ErrInvalidProof
+	}
+	return nil
+}
+
+func encodeProofBytes(value []byte) string { return base64.RawURLEncoding.EncodeToString(value) }
+
+func decodeProofBytes(encoded string, maximum int) ([]byte, bool) {
+	if encoded == "" || len(encoded) > base64.RawURLEncoding.EncodedLen(maximum) {
+		return nil, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	return decoded, err == nil && len(decoded) > 0 && len(decoded) <= maximum
+}
+
+func decodeProofArray32(encoded string) ([sha256.Size]byte, bool) {
+	var fixed [sha256.Size]byte
+	decoded, valid := decodeProofBytes(encoded, len(fixed))
+	if !valid || len(decoded) != len(fixed) {
+		return fixed, false
+	}
+	copy(fixed[:], decoded)
+	return fixed, true
+}
+
+func decodeProofArray64(encoded string) ([ed25519.SignatureSize]byte, bool) {
+	var fixed [ed25519.SignatureSize]byte
+	decoded, valid := decodeProofBytes(encoded, len(fixed))
+	if !valid || len(decoded) != len(fixed) {
+		return fixed, false
+	}
+	copy(fixed[:], decoded)
+	return fixed, true
 }
 
 // SPKIPin is SHA-256 over the canonical DER SubjectPublicKeyInfo encoding.

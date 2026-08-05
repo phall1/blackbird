@@ -2,8 +2,10 @@ package localsecurity
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,6 +21,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/domain"
 )
 
 func TestCredentialVaultLifecycle(t *testing.T) {
@@ -745,6 +750,339 @@ func TestVaultRecoveryCapsuleSignerLookupRejectsForgeryAndRedacts(t *testing.T) 
 	if _, err := lookup.PrepareRecoveryCapsuleSigner(t.Context(), "unknown-key"); !errors.Is(err, ErrCredentialNotFound) {
 		t.Fatalf("unknown signer error = %v", err)
 	}
+}
+
+func TestBootstrapProofVerifierBindsInvitationPrincipalDeviceAndChannel(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	invitationEntropy := append(bytes.Repeat([]byte{0x31}, 16), bytes.Repeat([]byte{0x32}, sha256.Size)...)
+	invitations := NewPairingInvitationRegistry(bytes.NewReader(invitationEntropy), func() time.Time { return now })
+	pairingID, secret, err := invitations.Issue(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceSeed := sha256.Sum256([]byte("bootstrap-device-key"))
+	deviceKey := ed25519.NewKeyFromSeed(deviceSeed[:])
+	keyReference, _ := domain.NewPublicKeyReference("keyref:bootstrap-device")
+	keys, err := NewProofPublicKeyRegistry(nil, nil, map[string]ed25519.PublicKey{
+		keyReference.String(): deviceKey.Public().(ed25519.PublicKey),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenges := NewProofChallengeRegistry(func() time.Time { return now })
+	context := testBootstrapProofContext(t, pairingID, keyReference, Binding{1, 2, 3})
+	if err := challenges.RegisterBootstrap(context); err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := NewCryptographicProofVerifier(invitations, keys, challenges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := NewBootstrapProofEvidence(context, secret, []byte("client nonce"), []byte("server nonce"), deviceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var envelope map[string]any
+	if err := json.Unmarshal(evidence.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"unknown field":   func(value map[string]any) { value["unexpected"] = true },
+		"unknown version": func(value map[string]any) { value["version"] = float64(2) },
+		"wrong purpose":   func(value map[string]any) { value["purpose"] = "device_pairing" },
+		"cross channel": func(value map[string]any) {
+			value["channel_binding"] = encodeProofBytes(bytes.Repeat([]byte{9}, bindingSize))
+		},
+		"forged signature": func(value map[string]any) {
+			value["signature"] = encodeProofBytes(bytes.Repeat([]byte{9}, ed25519.SignatureSize))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			copyEnvelope := cloneJSONMap(t, envelope)
+			mutate(copyEnvelope)
+			encoded, _ := json.Marshal(copyEnvelope)
+			forged, newErr := application.NewBootstrapProofEvidence(encoded)
+			if newErr != nil {
+				t.Fatal(newErr)
+			}
+			verification, verifyErr := verifier.VerifyBootstrapProof(t.Context(), forged)
+			if name == "unknown field" || name == "unknown version" || name == "wrong purpose" {
+				if !errors.Is(verifyErr, ErrInvalidProof) {
+					t.Fatalf("strict envelope error = %v", verifyErr)
+				}
+				return
+			}
+			if verifyErr != nil || verification.Decision() != application.ProofCryptographicallyRejected {
+				t.Fatalf("forged verification = (%v, %v)", verification.Decision(), verifyErr)
+			}
+		})
+	}
+
+	verification, err := verifier.VerifyBootstrapProof(t.Context(), evidence)
+	if err != nil || verification.Decision() != application.ProofValid {
+		t.Fatalf("valid bootstrap verification = (%v, %v)", verification.Decision(), err)
+	}
+	replayed, err := verifier.VerifyBootstrapProof(t.Context(), evidence)
+	if err != nil || replayed.Decision() != application.ProofCryptographicallyRejected {
+		t.Fatalf("replayed bootstrap verification = (%v, %v)", replayed.Decision(), err)
+	}
+	if err := invitations.Redeem(pairingID, secret); !errors.Is(err, ErrInvitationInvalid) {
+		t.Fatalf("verified bootstrap did not consume invitation: %v", err)
+	}
+}
+
+func TestCeremonyProofVerifierRejectsPurposeScopePrincipalChannelExpiryAndReplay(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	seed := sha256.Sum256([]byte("ceremony signing key"))
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	keyReference, _ := domain.NewPublicKeyReference("keyref:ceremony-device")
+	keys, _ := NewProofPublicKeyRegistry(nil, nil, map[string]ed25519.PublicKey{
+		keyReference.String(): privateKey.Public().(ed25519.PublicKey),
+	})
+	invitationRegistry := NewPairingInvitationRegistry(rand.Reader, func() time.Time { return now })
+	challenges := NewProofChallengeRegistry(func() time.Time { return now })
+	verifier, _ := NewCryptographicProofVerifier(invitationRegistry, keys, challenges)
+
+	contexts := []CeremonyProofContext{
+		testMembershipContext(t, keyReference, now),
+		testDelegationContext(t, keyReference, now, domain.CeremonyPurposeDelegationActivation),
+		testDelegationContext(t, keyReference, now, domain.CeremonyPurposeActorSessionStart),
+	}
+	verify := []func(context.Context, application.CeremonyProofEvidence) (application.CeremonyProofVerification, error){
+		verifier.VerifyMembershipAcceptance,
+		verifier.VerifyDelegationActivation,
+		verifier.VerifyActorSessionHandoff,
+	}
+	for index, proofContext := range contexts {
+		if err := challenges.RegisterCeremony(proofContext); err != nil {
+			t.Fatal(err)
+		}
+		evidence, err := NewCeremonyProofEvidence(proofContext, privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		verification, err := verify[index](t.Context(), evidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, valid := verification.Verified()
+		if !valid || proof.Purpose() != proofContext.Purpose || proof.ChallengeID() != proofContext.ChallengeID || proof.ProofDigest().IsZero() {
+			t.Fatal("valid ceremony did not return its genuine domain proof")
+		}
+		replayed, replayErr := verify[index](t.Context(), evidence)
+		if replayErr != nil {
+			t.Fatal(replayErr)
+		}
+		if _, valid := replayed.Verified(); valid {
+			t.Fatal("ceremony proof replay was accepted")
+		}
+	}
+
+	base := testMembershipContext(t, keyReference, now)
+	base.ChallengeID = mustCeremonyID(t, 90)
+	if err := challenges.RegisterCeremony(base); err != nil {
+		t.Fatal(err)
+	}
+	evidence, _ := NewCeremonyProofEvidence(base, privateKey)
+	var envelope map[string]any
+	_ = json.Unmarshal(evidence.Bytes(), &envelope)
+	attacks := map[string]func(map[string]any){
+		"cross principal": func(value map[string]any) { value["principal_id"] = proofUUID(91) },
+		"cross scope": func(value map[string]any) {
+			scope := value["scope"].(map[string]any)
+			scope["workspace_id"] = proofUUID(92)
+		},
+		"cross channel": func(value map[string]any) {
+			value["channel_binding"] = encodeProofBytes(bytes.Repeat([]byte{7}, bindingSize))
+		},
+		"cross purpose": func(value map[string]any) { value["purpose"] = string(domain.CeremonyPurposeDelegationActivation) },
+		"unknown field": func(value map[string]any) { value["extra"] = "rejected" },
+	}
+	for name, mutate := range attacks {
+		t.Run(name, func(t *testing.T) {
+			copyEnvelope := cloneJSONMap(t, envelope)
+			mutate(copyEnvelope)
+			encoded, _ := json.Marshal(copyEnvelope)
+			forged, _ := application.NewCeremonyProofEvidence(encoded)
+			verification, verifyErr := verifier.VerifyMembershipAcceptance(t.Context(), forged)
+			if verifyErr != nil {
+				t.Fatal(verifyErr)
+			}
+			if _, valid := verification.Verified(); valid {
+				t.Fatal("substituted ceremony proof was accepted")
+			}
+		})
+	}
+
+	expired := testMembershipContext(t, keyReference, now)
+	expired.ChallengeID = mustCeremonyID(t, 93)
+	expired.ExpiresAt = now.Add(time.Second)
+	if err := challenges.RegisterCeremony(expired); err != nil {
+		t.Fatal(err)
+	}
+	expiredEvidence, _ := NewCeremonyProofEvidence(expired, privateKey)
+	now = now.Add(time.Second)
+	verification, err := verifier.VerifyMembershipAcceptance(t.Context(), expiredEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, valid := verification.Verified(); valid {
+		t.Fatal("expired ceremony proof was accepted")
+	}
+}
+
+func TestPairingRedemptionVerifierConstructsBoundAuthorization(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	seed := sha256.Sum256([]byte("pairing redemption key"))
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	keyReference, _ := domain.NewPublicKeyReference("keyref:pairing-redemption")
+	keys, _ := NewProofPublicKeyRegistry(nil, nil, map[string]ed25519.PublicKey{
+		keyReference.String(): privateKey.Public().(ed25519.PublicKey),
+	})
+	challenges := NewProofChallengeRegistry(func() time.Time { return now })
+	verifier, _ := NewCryptographicProofVerifier(
+		NewPairingInvitationRegistry(rand.Reader, func() time.Time { return now }), keys, challenges,
+	)
+	principal, _ := domain.ParsePrincipalID(proofUUID(101))
+	device, _ := domain.ParseDeviceID(proofUUID(102))
+	installation, _ := domain.ParseInstallationID(proofUUID(103))
+	authority, _ := domain.ParseAuthorityID(proofUUID(104))
+	epoch, _ := domain.ParseAuthorityEpoch(proofUUID(105))
+	policy, _ := domain.NewPolicyRevision("pairing-policy:v1")
+	assurance, _ := domain.NewAssuranceClass("hardware_key")
+	spki, _ := PinPublicKey(privateKey.Public().(ed25519.PublicKey))
+	spkiDigest, _ := domain.NewCredentialDigest([sha256.Size]byte(spki))
+	proofContext := CeremonyProofContext{
+		ChallengeID: mustCeremonyID(t, 100), Purpose: domain.CeremonyPurposeDevicePairing,
+		PrincipalID: principal, DeviceID: device, InstallationID: installation,
+		SignerKey: keyReference, Binding: Binding{4, 5, 6}, ExpiresAt: now.Add(time.Minute),
+		PairingAuthorization: &PairingAuthorizationContext{
+			AuthorityID: authority, AuthorityEpoch: epoch, PolicyRevision: policy,
+			AssuranceClass: assurance, DeviceSPKIFingerprint: spkiDigest,
+		},
+	}
+	if err := challenges.RegisterCeremony(proofContext); err != nil {
+		t.Fatal(err)
+	}
+	evidence, _ := NewCeremonyProofEvidence(proofContext, privateKey)
+	decision, err := verifier.VerifyPairingRedemption(t.Context(), evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, valid := decision.Verified()
+	if !valid {
+		t.Fatal("valid pairing redemption was rejected")
+	}
+	authorization := verification.Authorization()
+	proof := verification.Proof()
+	if authorization.PrincipalID() != principal || authorization.DeviceID() != device ||
+		authorization.InstallationID() != installation || authorization.ChallengeID() != proof.ChallengeID() ||
+		authorization.TranscriptFingerprint() != proof.ProofDigest() ||
+		authorization.Credential().PublicKeyReference() != keyReference ||
+		authorization.Credential().SPKIFingerprint() != spkiDigest {
+		t.Fatal("pairing authorization was not bound to verified proof context")
+	}
+	replayed, err := verifier.VerifyPairingRedemption(t.Context(), evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, valid := replayed.Verified(); valid {
+		t.Fatal("pairing redemption replay was accepted")
+	}
+}
+
+func testBootstrapProofContext(
+	t *testing.T,
+	pairingID PairingInvitationID,
+	keyReference domain.PublicKeyReference,
+	binding Binding,
+) BootstrapProofContext {
+	t.Helper()
+	invitation, _ := domain.ParseInvitationID(proofUUID(1))
+	installation, _ := domain.ParseInstallationID(proofUUID(2))
+	installationKey, _ := domain.NewPublicKeyReference("keyref:installation")
+	principal, _ := domain.ParsePrincipalID(proofUUID(3))
+	principalName, _ := domain.NewDisplayName("Principal")
+	device, _ := domain.ParseDeviceID(proofUUID(4))
+	deviceName, _ := domain.NewDisplayName("Device")
+	spkiDigest, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("device spki")))
+	grant, _ := domain.ParseGrantID(proofUUID(5))
+	capabilities, _ := domain.NewCapabilitySet(domain.InstallationOwnerCapability())
+	return BootstrapProofContext{
+		PairingInvitationID: pairingID, InvitationID: invitation, InstallationID: installation,
+		InstallationKey: installationKey, Protocol: domain.PairingProtocolV1,
+		Role: domain.BootstrapRoleInstallationOwner, PrincipalID: principal,
+		PrincipalDisplayName: principalName, DeviceID: device, DeviceDisplayName: deviceName,
+		DevicePublicKey: keyReference, DeviceSPKIFingerprint: spkiDigest,
+		OwnerGrantID: grant, OwnerCapabilities: capabilities, Binding: binding,
+	}
+}
+
+func testMembershipContext(t *testing.T, key domain.PublicKeyReference, now time.Time) CeremonyProofContext {
+	t.Helper()
+	principal, _ := domain.ParsePrincipalID(proofUUID(20))
+	workspace, _ := domain.ParseWorkspaceID(proofUUID(21))
+	membership, _ := domain.ParseMembershipID(proofUUID(22))
+	return CeremonyProofContext{
+		ChallengeID: mustCeremonyID(t, 23), Purpose: domain.CeremonyPurposeMembershipAcceptance,
+		PrincipalID: principal, WorkspaceID: workspace, MembershipID: membership,
+		SignerKey: key, Binding: Binding{1, 3, 5}, ExpiresAt: now.Add(time.Minute),
+	}
+}
+
+func testDelegationContext(
+	t *testing.T,
+	key domain.PublicKeyReference,
+	now time.Time,
+	purpose domain.CeremonyPurpose,
+) CeremonyProofContext {
+	t.Helper()
+	offset := 30
+	if purpose == domain.CeremonyPurposeActorSessionStart {
+		offset = 40
+	}
+	principal, _ := domain.ParsePrincipalID(proofUUID(offset))
+	workspace, _ := domain.ParseWorkspaceID(proofUUID(offset + 1))
+	actor, _ := domain.ParseActorID(proofUUID(offset + 2))
+	delegation, _ := domain.ParseActorDelegationID(proofUUID(offset + 3))
+	return CeremonyProofContext{
+		ChallengeID: mustCeremonyID(t, offset+4), Purpose: purpose, PrincipalID: principal,
+		WorkspaceID: workspace, ActorID: actor, DelegationID: delegation,
+		SignerKey: key, Binding: Binding{2, 4, 6}, ExpiresAt: now.Add(time.Minute),
+	}
+}
+
+func mustCeremonyID(t *testing.T, index int) domain.CeremonyID {
+	t.Helper()
+	id, err := domain.ParseCeremonyID(proofUUID(index))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func proofUUID(index int) string {
+	return fmt.Sprintf("01b8e094-9888-7000-8000-%012x", index)
+}
+
+func cloneJSONMap(t *testing.T, source map[string]any) map[string]any {
+	t.Helper()
+	encoded, err := json.Marshal(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cloned map[string]any
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		t.Fatal(err)
+	}
+	return cloned
 }
 
 func testCertificate(t *testing.T, name string) (tls.Certificate, SPKIPin) {
