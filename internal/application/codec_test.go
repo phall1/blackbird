@@ -1889,6 +1889,19 @@ func TestProductionEventSemanticMaterializationAndVerification(t *testing.T) {
 	if trusted.EventDigest() != eventDigest || trusted.StreamDigest() != streamDigest {
 		t.Fatal("trusted event lost verified digests")
 	}
+	autoParams := params
+	autoParams.EventDigest = domain.EventDigest{}
+	autoParams.StreamDigest = domain.StreamDigest{}
+	automaticallyMaterialized, err := codec.MaterializeIdentityEvent(autoParams)
+	if err != nil {
+		t.Fatalf("production materialization failed: %v", err)
+	}
+	if automaticallyMaterialized.EventDigest() != eventDigest || automaticallyMaterialized.StreamDigest() != streamDigest {
+		t.Fatal("production materialization computed different digests")
+	}
+	if _, err := codec.MaterializeIdentityEvent(params); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("production materialization accepted caller-supplied digests: %v", err)
+	}
 	params.EventDigest = placeholderEvent
 	if _, err := codec.MaterializeEvent(params); !errors.Is(err, domain.ErrEventDigestVerification) {
 		t.Fatalf("semantic digest tamper got %v", err)

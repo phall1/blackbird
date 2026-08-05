@@ -882,6 +882,27 @@ func NotApplicableRecoveryCapsulePlan() RecoveryCapsulePlan {
 
 func (plan RecoveryCapsulePlan) Requirement() RecoveryCapsuleRequirement { return plan.requirement }
 func (plan RecoveryCapsulePlan) KeyID() string                           { return plan.keyID }
+func (plan RecoveryCapsulePlan) Ed25519PublicKey() ed25519.PublicKey {
+	return append(ed25519.PublicKey(nil), plan.publicKey...)
+}
+
+// RehydrateRecoveryCapsulePlan reconstructs immutable historical signing-key
+// identity for receipt verification. It never loads or accepts a private key.
+func RehydrateRecoveryCapsulePlan(
+	requirement RecoveryCapsuleRequirement,
+	keyID string,
+	publicKey ed25519.PublicKey,
+) (RecoveryCapsulePlan, error) {
+	plan := RecoveryCapsulePlan{
+		requirement: requirement,
+		keyID:       keyID,
+		publicKey:   append(ed25519.PublicKey(nil), publicKey...),
+	}
+	if !validRecoveryCapsulePlan(plan, requirement) {
+		return RecoveryCapsulePlan{}, ErrInvalidApplicationContract
+	}
+	return plan, nil
+}
 
 func cloneRecoveryCapsulePlan(plan RecoveryCapsulePlan) RecoveryCapsulePlan {
 	plan.publicKey = append(ed25519.PublicKey(nil), plan.publicKey...)
@@ -4280,6 +4301,46 @@ func (decision CommandDecision) DenialAudit() (SecuritySpec, bool) {
 	return decision.denialAudit, decision.hasDenialAudit
 }
 
+// ValidateCommandDecision proves that a callback decision was constructed
+// from this exact locked context without exposing private receipt or audit
+// bindings to a storage adapter.
+func ValidateCommandDecision(locked CommandContext, decision CommandDecision) error {
+	var (
+		expected CommandDecision
+		err      error
+	)
+	switch decision.kind {
+	case CommandDecisionApplied:
+		commit := OperationCommit{
+			operation:  locked.spec.commandOperation,
+			writes:     append([]IdentityState(nil), decision.writes...),
+			facts:      append([]FactIntent(nil), decision.facts...),
+			ceremonies: append([]CeremonyTransition(nil), decision.ceremonies...),
+		}
+		seed := AuditIntent{
+			operation: decision.audit.operation, outcome: decision.audit.outcome,
+			fingerprint: decision.audit.fingerprint, detail: decision.audit.detail,
+			subject: decision.audit.subject, provenance: decision.audit.provenance,
+			invocation: decision.audit.invocation, timing: decision.audit.timing,
+		}
+		expected, err = ApplyCommand(locked, commit, seed, decision.effects)
+	case CommandDecisionReplay:
+		expected, err = ReplayCommand(locked, decision.disclosure)
+	case CommandDecisionRollback:
+		if decision.hasDenialAudit {
+			expected, err = RollbackCommandWithSecurityAudit(locked, decision.rejection, decision.denialAudit)
+		} else {
+			expected, err = RollbackCommand(locked, decision.rejection)
+		}
+	default:
+		err = ErrInvalidCommandDecision
+	}
+	if err != nil || !reflect.DeepEqual(expected, decision) {
+		return ErrInvalidCommandDecision
+	}
+	return nil
+}
+
 type CommandExecutionKind string
 
 const (
@@ -4774,6 +4835,16 @@ func bindSecurityAuditContext(
 	}
 	spec.auditRequest, spec.provenance, spec.hasAuditContext = request, provenance, true
 	return spec, nil
+}
+
+// BindSecurityAuditContext attaches trusted transport audit evidence to a
+// denial specification before it enters a storage UnitOfWork.
+func BindSecurityAuditContext(
+	spec SecuritySpec,
+	request AuditRequestContext,
+	provenance AuditProvenanceEvidence,
+) (SecuritySpec, error) {
+	return bindSecurityAuditContext(spec, request, provenance)
 }
 
 // BootstrapAttempt is a secret-free, canonically fingerprinted rejected proof.

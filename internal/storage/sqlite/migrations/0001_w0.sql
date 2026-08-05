@@ -25,8 +25,9 @@ CREATE TABLE scope_guards (
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
     authority_id TEXT NOT NULL CHECK (length(authority_id) = 36),
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
+    bootstrap_generation_id TEXT CHECK (bootstrap_generation_id IS NULL OR length(bootstrap_generation_id) = 36),
     write_status TEXT NOT NULL,
-    guard_generation INTEGER NOT NULL CHECK (guard_generation > 0),
+    guard_generation INTEGER NOT NULL CHECK (guard_generation BETWEEN 1 AND 9007199254740991),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us > 0),
     PRIMARY KEY (scope_kind, scope_id)
 ) STRICT;
@@ -45,11 +46,11 @@ CREATE TABLE authority_streams (
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
     authority_id TEXT NOT NULL CHECK (length(authority_id) = 36),
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
-    next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
-    retained_from_sequence INTEGER NOT NULL CHECK (retained_from_sequence > 0),
+    next_sequence INTEGER NOT NULL CHECK (next_sequence BETWEEN 1 AND 9007199254740991),
+    retained_from_sequence INTEGER NOT NULL CHECK (retained_from_sequence BETWEEN 1 AND 9007199254740991),
     digest_algorithm TEXT NOT NULL CHECK (digest_algorithm = 'sha-256'),
     head_digest BLOB NOT NULL CHECK (length(head_digest) = 32),
-    next_audit_sequence INTEGER NOT NULL CHECK (next_audit_sequence > 0),
+    next_audit_sequence INTEGER NOT NULL CHECK (next_audit_sequence BETWEEN 1 AND 9007199254740991),
     audit_head_hash BLOB NOT NULL CHECK (length(audit_head_hash) = 32),
     authority_time_floor_us INTEGER NOT NULL CHECK (authority_time_floor_us > 0),
     predecessor_epoch TEXT CHECK (predecessor_epoch IS NULL OR length(predecessor_epoch) = 36),
@@ -69,24 +70,31 @@ CREATE TABLE installation_invitations (
     installation_id TEXT NOT NULL CHECK (length(installation_id) = 36),
     authority_id TEXT NOT NULL CHECK (length(authority_id) = 36),
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
+    installation_public_key_reference TEXT NOT NULL,
+    invitation_verifier BLOB NOT NULL CHECK (length(invitation_verifier) = 32),
     bootstrap_generation_id TEXT NOT NULL CHECK (length(bootstrap_generation_id) = 36),
-    status TEXT NOT NULL,
-    failed_attempts INTEGER NOT NULL CHECK (failed_attempts >= 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'consumed', 'exhausted')),
+    failed_attempts INTEGER NOT NULL CHECK (failed_attempts BETWEEN 0 AND 5),
     expires_at_us INTEGER NOT NULL CHECK (expires_at_us > 0),
-    version INTEGER NOT NULL CHECK (version > 0),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    CHECK (
+        (status = 'pending' AND failed_attempts < 5 AND version = failed_attempts + 1) OR
+        (status = 'consumed' AND failed_attempts < 5 AND version = failed_attempts + 2) OR
+        (status = 'exhausted' AND failed_attempts = 5 AND version = 6)
+    ),
     UNIQUE (installation_id, bootstrap_generation_id)
 ) STRICT;
 
 CREATE TABLE principals (
     principal_id TEXT PRIMARY KEY CHECK (length(principal_id) = 36),
     installation_id TEXT NOT NULL CHECK (length(installation_id) = 36),
-    kind TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('human', 'workload', 'service')),
     display_name TEXT NOT NULL,
     public_key_reference TEXT,
-    status TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'disabled')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     UNIQUE (installation_id, principal_id)
@@ -97,16 +105,21 @@ CREATE TABLE device_registrations (
     installation_id TEXT NOT NULL CHECK (length(installation_id) = 36),
     principal_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    credential_algorithm TEXT NOT NULL,
+    credential_algorithm TEXT,
     public_key_reference TEXT NOT NULL,
-    spki_fingerprint BLOB NOT NULL CHECK (length(spki_fingerprint) = 32),
-    transcript_fingerprint BLOB NOT NULL CHECK (length(transcript_fingerprint) = 32),
-    trust_revision INTEGER NOT NULL CHECK (trust_revision > 0),
-    status TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
+    spki_fingerprint BLOB CHECK (spki_fingerprint IS NULL OR length(spki_fingerprint) = 32),
+    transcript_fingerprint BLOB CHECK (transcript_fingerprint IS NULL OR length(transcript_fingerprint) = 32),
+    trust_revision INTEGER NOT NULL CHECK (trust_revision BETWEEN 1 AND 9007199254740991),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'trusted', 'suspended', 'revoked')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
-    FOREIGN KEY (installation_id, principal_id) REFERENCES principals(installation_id, principal_id)
+    FOREIGN KEY (installation_id, principal_id) REFERENCES principals(installation_id, principal_id),
+    CHECK (
+        (status = 'pending' AND credential_algorithm IS NULL AND spki_fingerprint IS NULL AND transcript_fingerprint IS NULL) OR
+        (status <> 'pending' AND credential_algorithm = 'ed25519-spki-sha256-v1' AND
+            spki_fingerprint IS NOT NULL AND transcript_fingerprint IS NOT NULL)
+    )
 ) STRICT;
 
 CREATE TABLE grants (
@@ -115,9 +128,9 @@ CREATE TABLE grants (
     workspace_id TEXT CHECK (workspace_id IS NULL OR length(workspace_id) = 36),
     principal_id TEXT NOT NULL,
     capabilities_json TEXT NOT NULL CHECK (json_valid(capabilities_json)),
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
     expires_at_us INTEGER,
-    version INTEGER NOT NULL CHECK (version > 0),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     FOREIGN KEY (installation_id, principal_id) REFERENCES principals(installation_id, principal_id)
@@ -125,12 +138,14 @@ CREATE TABLE grants (
 
 CREATE TABLE workspaces (
     workspace_id TEXT PRIMARY KEY CHECK (length(workspace_id) = 36),
+    installation_id TEXT NOT NULL CHECK (length(installation_id) = 36),
     home_authority_id TEXT NOT NULL CHECK (length(home_authority_id) = 36),
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
     alias TEXT NOT NULL UNIQUE,
     discovery_locator TEXT NOT NULL,
-    status TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
+    policy_revision TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'archived')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us)
 ) STRICT;
@@ -140,8 +155,8 @@ CREATE TABLE workspace_memberships (
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
     principal_id TEXT NOT NULL REFERENCES principals(principal_id),
     capabilities_json TEXT NOT NULL CHECK (json_valid(capabilities_json)),
-    status TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
+    status TEXT NOT NULL CHECK (status IN ('invited', 'active', 'suspended', 'revoked')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     UNIQUE (workspace_id, principal_id),
@@ -152,10 +167,10 @@ CREATE TABLE workspace_memberships (
 CREATE TABLE actors (
     actor_id TEXT PRIMARY KEY CHECK (length(actor_id) = 36),
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
-    kind TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('human', 'agent', 'automation', 'service')),
     display_name TEXT NOT NULL,
-    status TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'retired')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     UNIQUE (workspace_id, actor_id)
@@ -168,8 +183,8 @@ CREATE TABLE actor_delegations (
     actor_id TEXT NOT NULL,
     membership_id TEXT NOT NULL,
     capabilities_json TEXT NOT NULL CHECK (json_valid(capabilities_json)),
-    status TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version > 0),
+    status TEXT NOT NULL CHECK (status IN ('proposed', 'active', 'suspended', 'revoked')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     UNIQUE (workspace_id, principal_id, actor_id),
@@ -181,21 +196,50 @@ CREATE TABLE actor_delegations (
 
 CREATE TABLE actor_sessions (
     session_id TEXT PRIMARY KEY CHECK (length(session_id) = 36),
+    authority_id TEXT NOT NULL CHECK (length(authority_id) = 36),
+    authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
     principal_id TEXT NOT NULL,
     actor_id TEXT NOT NULL,
     delegation_id TEXT NOT NULL,
-    client_instance_id TEXT NOT NULL,
-    credential_digest BLOB NOT NULL CHECK (length(credential_digest) = 32),
-    status TEXT NOT NULL,
+    delegation_version INTEGER NOT NULL CHECK (delegation_version BETWEEN 1 AND 9007199254740991),
+    membership_id TEXT NOT NULL,
+    membership_version INTEGER NOT NULL CHECK (membership_version BETWEEN 1 AND 9007199254740991),
+    device_id TEXT,
+    device_version INTEGER,
+    device_trust_revision INTEGER,
+    client_instance_id TEXT NOT NULL CHECK (length(client_instance_id) = 36),
+    client_name TEXT NOT NULL,
+    client_version TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL CHECK (json_valid(capabilities_json)),
+    policy_revision TEXT NOT NULL,
+    assurance_class TEXT NOT NULL,
+    presentation_credential_reference TEXT NOT NULL,
+    presentation_credential_digest BLOB NOT NULL CHECK (length(presentation_credential_digest) = 32),
+    presentation_credential_audience TEXT NOT NULL,
+    presentation_credential_version INTEGER NOT NULL CHECK (presentation_credential_version > 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'ended', 'revoked', 'expired')),
     issued_at_us INTEGER NOT NULL CHECK (issued_at_us > 0),
     expires_at_us INTEGER NOT NULL CHECK (expires_at_us > issued_at_us),
-    version INTEGER NOT NULL CHECK (version > 0),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    CHECK (
+        (device_id IS NULL AND device_version IS NULL AND device_trust_revision IS NULL) OR
+        (length(device_id) = 36 AND device_version > 0 AND device_trust_revision > 0)
+    ),
     FOREIGN KEY (workspace_id, actor_id) REFERENCES actors(workspace_id, actor_id),
+    FOREIGN KEY (workspace_id, membership_id, principal_id)
+        REFERENCES workspace_memberships(workspace_id, membership_id, principal_id),
     FOREIGN KEY (workspace_id, delegation_id, principal_id, actor_id)
         REFERENCES actor_delegations(workspace_id, delegation_id, principal_id, actor_id)
+) STRICT;
+
+CREATE TABLE actor_session_grant_revisions (
+    session_id TEXT NOT NULL REFERENCES actor_sessions(session_id),
+    grant_id TEXT NOT NULL REFERENCES grants(grant_id),
+    grant_version INTEGER NOT NULL CHECK (grant_version BETWEEN 1 AND 9007199254740991),
+    PRIMARY KEY (session_id, grant_id)
 ) STRICT;
 
 CREATE TABLE ceremony_challenges (
@@ -203,12 +247,30 @@ CREATE TABLE ceremony_challenges (
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
     purpose TEXT NOT NULL,
-    challenge_digest BLOB NOT NULL CHECK (length(challenge_digest) = 32),
-    proof_fingerprint BLOB CHECK (proof_fingerprint IS NULL OR length(proof_fingerprint) = 32),
+    proof_fingerprint BLOB NOT NULL CHECK (length(proof_fingerprint) = 32),
+    installation_id TEXT CHECK (installation_id IS NULL OR length(installation_id) = 36),
+    workspace_id TEXT CHECK (workspace_id IS NULL OR length(workspace_id) = 36),
+    principal_id TEXT NOT NULL CHECK (length(principal_id) = 36),
+    membership_id TEXT CHECK (membership_id IS NULL OR length(membership_id) = 36),
+    actor_id TEXT CHECK (actor_id IS NULL OR length(actor_id) = 36),
+    delegation_id TEXT CHECK (delegation_id IS NULL OR length(delegation_id) = 36),
+    device_id TEXT CHECK (device_id IS NULL OR length(device_id) = 36),
     status TEXT NOT NULL,
     expires_at_us INTEGER NOT NULL CHECK (expires_at_us > 0),
     consumed_at_us INTEGER,
-    version INTEGER NOT NULL CHECK (version > 0)
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    CHECK (
+        (purpose = 'membership_acceptance' AND scope_kind = 'workspace' AND installation_id IS NULL AND
+            workspace_id = scope_id AND membership_id IS NOT NULL AND actor_id IS NULL AND delegation_id IS NULL AND device_id IS NULL) OR
+        (purpose IN ('delegation_activation', 'actor_session_start') AND scope_kind = 'workspace' AND installation_id IS NULL AND
+            workspace_id = scope_id AND membership_id IS NULL AND actor_id IS NOT NULL AND delegation_id IS NOT NULL AND device_id IS NULL) OR
+        (purpose = 'device_pairing' AND scope_kind = 'installation' AND installation_id = scope_id AND
+            workspace_id IS NULL AND membership_id IS NULL AND actor_id IS NULL AND delegation_id IS NULL AND device_id IS NOT NULL)
+    ),
+    CHECK (
+        (status = 'pending' AND consumed_at_us IS NULL) OR
+        (status = 'consumed' AND consumed_at_us IS NOT NULL)
+    )
 ) STRICT;
 
 CREATE TABLE command_receipts (
@@ -216,23 +278,29 @@ CREATE TABLE command_receipts (
     command_id TEXT NOT NULL UNIQUE CHECK (length(command_id) = 36),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
+    authority_id TEXT NOT NULL CHECK (length(authority_id) = 36),
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
     identity_kind TEXT NOT NULL CHECK (identity_kind IN ('ordinary_workspace', 'installation_provisioning', 'installation_admin')),
     workspace_id TEXT CHECK (workspace_id IS NULL OR length(workspace_id) = 36),
     installation_id TEXT CHECK (installation_id IS NULL OR length(installation_id) = 36),
     principal_id TEXT CHECK (principal_id IS NULL OR length(principal_id) = 36),
-    client_instance_id TEXT,
+    client_instance_id TEXT CHECK (client_instance_id IS NULL OR length(client_instance_id) = 36),
     transcript_fingerprint BLOB CHECK (transcript_fingerprint IS NULL OR length(transcript_fingerprint) = 32),
     operation TEXT NOT NULL,
+    operation_major INTEGER NOT NULL CHECK (operation_major BETWEEN 1 AND 65535),
     idempotency_key TEXT NOT NULL,
     request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
     result_digest BLOB NOT NULL CHECK (length(result_digest) = 32),
     result_canonical BLOB NOT NULL,
-    first_event_sequence INTEGER,
-    last_event_sequence INTEGER,
-    final_stream_digest BLOB CHECK (final_stream_digest IS NULL OR length(final_stream_digest) = 32),
+    first_event_sequence INTEGER NOT NULL CHECK (first_event_sequence BETWEEN 1 AND 9007199254740991),
+    last_event_sequence INTEGER NOT NULL CHECK (last_event_sequence >= first_event_sequence),
+    final_stream_digest BLOB NOT NULL CHECK (length(final_stream_digest) = 32),
     guard_digest BLOB NOT NULL CHECK (length(guard_digest) = 32),
+    capsule_required INTEGER NOT NULL CHECK (capsule_required IN (0, 1)),
+    recovery_capsule_canonical BLOB,
     recovery_capsule_digest BLOB CHECK (recovery_capsule_digest IS NULL OR length(recovery_capsule_digest) = 32),
+    recovery_capsule_key_id TEXT,
+    recovery_capsule_public_key BLOB CHECK (recovery_capsule_public_key IS NULL OR length(recovery_capsule_public_key) = 32),
     committed_at_us INTEGER NOT NULL CHECK (committed_at_us > 0),
     CHECK (
         (identity_kind = 'ordinary_workspace' AND workspace_id IS NOT NULL AND installation_id IS NULL AND
@@ -241,6 +309,16 @@ CREATE TABLE command_receipts (
             principal_id IS NULL AND client_instance_id IS NULL AND transcript_fingerprint IS NOT NULL) OR
         (identity_kind = 'installation_admin' AND workspace_id IS NULL AND installation_id IS NOT NULL AND
             principal_id IS NOT NULL AND client_instance_id IS NOT NULL AND transcript_fingerprint IS NULL)
+    ),
+    CHECK (
+        (capsule_required = 0 AND recovery_capsule_canonical IS NULL AND recovery_capsule_digest IS NULL AND
+            recovery_capsule_key_id IS NULL AND recovery_capsule_public_key IS NULL) OR
+        (capsule_required = 1 AND recovery_capsule_canonical IS NOT NULL AND recovery_capsule_digest IS NOT NULL AND
+            recovery_capsule_key_id IS NOT NULL AND recovery_capsule_public_key IS NOT NULL)
+    ),
+    CHECK (
+        (operation IN ('installation.bootstrap.v1', 'workspace.create.v1') AND last_event_sequence = first_event_sequence + 2) OR
+        (operation NOT IN ('installation.bootstrap.v1', 'workspace.create.v1') AND last_event_sequence = first_event_sequence)
     )
 ) STRICT;
 
@@ -254,6 +332,24 @@ CREATE UNIQUE INDEX command_receipts_installation_admin_identity
     ON command_receipts(installation_id, principal_id, client_instance_id, operation, idempotency_key)
     WHERE identity_kind = 'installation_admin';
 
+CREATE TABLE command_receipt_resources (
+    receipt_id TEXT NOT NULL REFERENCES command_receipts(receipt_id),
+    resource_ordinal INTEGER NOT NULL CHECK (resource_ordinal BETWEEN 0 AND 9007199254740991),
+    aggregate_kind TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL CHECK (length(aggregate_id) = 36),
+    aggregate_version INTEGER NOT NULL CHECK (aggregate_version BETWEEN 1 AND 9007199254740991),
+    PRIMARY KEY (receipt_id, resource_ordinal),
+    UNIQUE (receipt_id, aggregate_kind, aggregate_id)
+) STRICT;
+
+CREATE TABLE command_receipt_ceremonies (
+    receipt_id TEXT NOT NULL REFERENCES command_receipts(receipt_id),
+    ceremony_ordinal INTEGER NOT NULL CHECK (ceremony_ordinal BETWEEN 0 AND 9007199254740991),
+    ceremony_id TEXT NOT NULL REFERENCES ceremony_challenges(ceremony_id),
+    PRIMARY KEY (receipt_id, ceremony_ordinal),
+    UNIQUE (receipt_id, ceremony_id)
+) STRICT;
+
 CREATE TABLE domain_events (
     event_id TEXT PRIMARY KEY CHECK (length(event_id) = 36),
     command_id TEXT NOT NULL CHECK (length(command_id) = 36),
@@ -262,16 +358,16 @@ CREATE TABLE domain_events (
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
-    stream_sequence INTEGER NOT NULL CHECK (stream_sequence > 0),
+    stream_sequence INTEGER NOT NULL CHECK (stream_sequence BETWEEN 1 AND 9007199254740991),
     previous_stream_digest BLOB NOT NULL CHECK (length(previous_stream_digest) = 32),
     event_digest BLOB NOT NULL CHECK (length(event_digest) = 32),
     stream_digest BLOB NOT NULL CHECK (length(stream_digest) = 32),
     aggregate_kind TEXT NOT NULL,
     aggregate_id TEXT NOT NULL CHECK (length(aggregate_id) = 36),
-    aggregate_version INTEGER NOT NULL CHECK (aggregate_version > 0),
-    event_index INTEGER NOT NULL CHECK (event_index >= 0),
+    aggregate_version INTEGER NOT NULL CHECK (aggregate_version BETWEEN 1 AND 9007199254740991),
+    event_index INTEGER NOT NULL CHECK (event_index BETWEEN 0 AND 9007199254740991),
     event_type TEXT NOT NULL,
-    event_schema INTEGER NOT NULL CHECK (event_schema > 0),
+    event_schema INTEGER NOT NULL CHECK (event_schema BETWEEN 1 AND 65535),
     payload BLOB NOT NULL,
     principal_id TEXT NOT NULL CHECK (length(principal_id) = 36),
     actor_session_id TEXT CHECK (actor_session_id IS NULL OR length(actor_session_id) = 36),
@@ -287,7 +383,7 @@ CREATE TABLE domain_events (
 CREATE TABLE audit_entries (
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
-    audit_sequence INTEGER NOT NULL CHECK (audit_sequence > 0),
+    audit_sequence INTEGER NOT NULL CHECK (audit_sequence BETWEEN 1 AND 9007199254740991),
     previous_entry_hash BLOB NOT NULL CHECK (length(previous_entry_hash) = 32),
     entry_hash BLOB NOT NULL CHECK (length(entry_hash) = 32),
     canonical_entry BLOB NOT NULL,
@@ -297,31 +393,41 @@ CREATE TABLE audit_entries (
 ) STRICT;
 
 CREATE TABLE security_denials (
-    denial_fingerprint BLOB PRIMARY KEY CHECK (length(denial_fingerprint) = 32),
+    record_kind TEXT NOT NULL CHECK (record_kind IN ('bootstrap', 'command')),
+    denial_fingerprint BLOB NOT NULL CHECK (length(denial_fingerprint) = 32),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
     subject_kind TEXT NOT NULL,
     subject_id TEXT,
+    operation_major INTEGER,
     denial_class TEXT NOT NULL,
     reason TEXT NOT NULL,
     bucket INTEGER NOT NULL CHECK (bucket >= 0),
     occurrence_count INTEGER NOT NULL CHECK (occurrence_count > 0),
     first_recorded_at_us INTEGER NOT NULL CHECK (first_recorded_at_us > 0),
-    last_recorded_at_us INTEGER NOT NULL CHECK (last_recorded_at_us >= first_recorded_at_us)
+    last_recorded_at_us INTEGER NOT NULL CHECK (last_recorded_at_us >= first_recorded_at_us),
+    PRIMARY KEY (record_kind, denial_fingerprint, bucket),
+    CHECK (
+        (record_kind = 'bootstrap' AND subject_kind = 'invitation' AND subject_id IS NOT NULL AND
+            operation_major IS NULL AND bucket = 0) OR
+        (record_kind = 'command' AND operation_major IS NOT NULL AND operation_major > 0)
+    )
 ) STRICT;
 
 CREATE TABLE outbox_jobs (
     job_id TEXT PRIMARY KEY CHECK (length(job_id) = 36),
+    command_id TEXT NOT NULL CHECK (length(command_id) = 36),
     event_id TEXT NOT NULL REFERENCES domain_events(event_id),
     handler TEXT NOT NULL,
-    handler_contract_version INTEGER NOT NULL CHECK (handler_contract_version > 0),
+    handler_contract_version INTEGER NOT NULL CHECK (handler_contract_version BETWEEN 1 AND 65535),
     destination_key TEXT NOT NULL,
-    effect_ordinal INTEGER NOT NULL CHECK (effect_ordinal >= 0),
+    effect_ordinal INTEGER NOT NULL CHECK (effect_ordinal BETWEEN 0 AND 9007199254740991),
     effect_kind TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,
     payload BLOB NOT NULL,
+    metadata_digest BLOB NOT NULL CHECK (length(metadata_digest) = 32),
     status TEXT NOT NULL,
-    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count BETWEEN 0 AND 9007199254740991),
     available_at_us INTEGER NOT NULL CHECK (available_at_us > 0),
     claim_token TEXT,
     claim_deadline_us INTEGER,
@@ -331,16 +437,17 @@ CREATE TABLE outbox_jobs (
     parked_disposition TEXT,
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
-    UNIQUE (event_id, handler, handler_contract_version, destination_key, effect_ordinal)
+    UNIQUE (command_id, handler, handler_contract_version, destination_key, effect_ordinal),
+    UNIQUE (command_id, event_id, handler, handler_contract_version, destination_key, effect_ordinal)
 ) STRICT;
 
 CREATE TABLE projection_checkpoints (
     projection_name TEXT NOT NULL,
-    projection_schema INTEGER NOT NULL CHECK (projection_schema > 0),
+    projection_schema INTEGER NOT NULL CHECK (projection_schema BETWEEN 1 AND 65535),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
     authority_epoch TEXT NOT NULL CHECK (length(authority_epoch) = 36),
-    contiguous_sequence INTEGER NOT NULL CHECK (contiguous_sequence >= 0),
+    contiguous_sequence INTEGER NOT NULL CHECK (contiguous_sequence BETWEEN 0 AND 9007199254740991),
     stream_digest BLOB NOT NULL CHECK (length(stream_digest) = 32),
     health TEXT NOT NULL CHECK (health IN ('healthy', 'blocked', 'poisoned', 'rebuilding')),
     poison_event_id TEXT,

@@ -245,6 +245,35 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 
 func ptrTestTime(value time.Time) *time.Time { return &value }
 
+func TestValidateCommandDecisionRejectsCrossContextSubstitution(t *testing.T) {
+	t.Parallel()
+	fixture := buildBootstrapFixture(t)
+	if err := ValidateCommandDecision(fixture.context, fixture.decision); err != nil {
+		t.Fatalf("exact command decision rejected: %v", err)
+	}
+	evidence, err := NewAppliedGuardEvidence(fixture.spec.Guards(), fixture.spec.Guards().Evidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandTime, err := PersistedCommandAuthorityTime(fixture.now.Add(2 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invitation, err := NewIdentityState(fixture.invitation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	substituted, err := NewCommandContext(
+		fixture.spec, commandTime, []IdentityState{invitation}, AdmitReceipt(), evidence,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCommandDecision(substituted, fixture.decision); !errors.Is(err, ErrInvalidCommandDecision) {
+		t.Fatalf("cross-context command decision accepted: %v", err)
+	}
+}
+
 func testSecurityAuditContext(
 	t *testing.T,
 	spec SecuritySpec,

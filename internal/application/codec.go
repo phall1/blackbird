@@ -2913,6 +2913,116 @@ func (codec ProductionCanonicalCodec) MaterializeEvent(
 	return domain.NewEventEnvelope(params, codec)
 }
 
+// MaterializeIdentityEvent computes both digest fields from the allocated
+// envelope metadata, then constructs the event through the mandatory
+// production verifier. Callers cannot inject either digest or a verifier.
+func (codec ProductionCanonicalCodec) MaterializeIdentityEvent(
+	params domain.EventEnvelopeParams,
+) (domain.EventEnvelope, error) {
+	if !params.EventDigest.IsZero() || !params.StreamDigest.IsZero() {
+		return domain.EventEnvelope{}, ErrCanonicalProfile
+	}
+	view, err := eventSemanticViewFromParams(params)
+	if err != nil {
+		return domain.EventEnvelope{}, err
+	}
+	eventDigest, err := codec.HashEvent(view)
+	if err != nil {
+		return domain.EventEnvelope{}, err
+	}
+	streamDigest, err := codec.ChainStreamDigest(params.PreviousStreamDigest, params.StreamPosition, eventDigest)
+	if err != nil {
+		return domain.EventEnvelope{}, err
+	}
+	params.EventDigest = eventDigest
+	params.StreamDigest = streamDigest
+	return codec.MaterializeEvent(params)
+}
+
+func eventSemanticViewFromParams(params domain.EventEnvelopeParams) (eventSemanticViewV1, error) {
+	if params.EventID.IsZero() || params.CommandID.IsZero() || params.AuthorityID.IsZero() ||
+		params.AuthorityEpoch.IsZero() || params.Scope.IsZero() || !params.StreamPosition.Valid() ||
+		params.Aggregate.IsZero() || uint64(params.EventIndex) > MaxCanonicalInteger || !params.EventType.Valid() ||
+		params.SchemaVersion.Uint16() != 1 || params.Payload.IsZero() || params.PrincipalID.IsZero() ||
+		params.AuthorizationDigest.IsZero() || params.CommandReceiptID.IsZero() || params.CorrelationID.IsZero() ||
+		params.RecordedAt.IsZero() {
+		return eventSemanticViewV1{}, ErrCanonicalProfile
+	}
+	if _, err := decodeIdentityPayload(params.EventType, params.Payload.Bytes()); err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	id := func(text string) (CanonicalIdentifier, error) { return NewCanonicalIdentifier(text) }
+	eventID, err := id(params.EventID.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	commandID, err := id(params.CommandID.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	authorityID, err := id(params.AuthorityID.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	epoch, err := id(params.AuthorityEpoch.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	scopeID, err := id(params.Scope.ID())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	aggregateID, err := id(params.Aggregate.ID())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	principalID, err := id(params.PrincipalID.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	receiptID, err := id(params.CommandReceiptID.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	correlationID, err := id(params.CorrelationID.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	authorization, err := NewCanonicalDigest(params.AuthorizationDigest.String())
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	recordedAt, err := NewCanonicalInstant(params.RecordedAt)
+	if err != nil {
+		return eventSemanticViewV1{}, err
+	}
+	view := eventSemanticViewV1{
+		Schema: domain.EventEnvelopeSchema, EventID: eventID, CommandID: commandID,
+		AuthorityID: authorityID, AuthorityEpoch: epoch, ScopeKind: string(params.Scope.Kind()), ScopeID: scopeID,
+		StreamSequence: params.StreamPosition.Uint64(), AggregateKind: string(params.Aggregate.Kind()),
+		AggregateID: aggregateID, AggregateVersion: params.Aggregate.Version().Uint64(), EventIndex: params.EventIndex,
+		EventType: string(params.EventType), EventSchema: params.SchemaVersion.Uint16(),
+		Payload: canonicalEventPayload{canonical: params.Payload.Bytes()}, PrincipalID: principalID,
+		AuthorizationDigest: authorization, CommandReceiptID: receiptID, CorrelationID: correlationID,
+		RecordedAt: recordedAt,
+	}
+	if params.ActorSessionID != nil {
+		actor, actorErr := id(params.ActorSessionID.String())
+		if actorErr != nil {
+			return eventSemanticViewV1{}, actorErr
+		}
+		view.ActorSessionID = &actor
+	}
+	if params.CausationEventID != nil {
+		cause, causeErr := id(params.CausationEventID.String())
+		if causeErr != nil {
+			return eventSemanticViewV1{}, causeErr
+		}
+		view.CausationEventID = &cause
+	}
+	return view, nil
+}
+
 const auditEntrySchemaV1 = "blackbird.audit.entry/v1"
 
 type auditReceiptIdentityWire struct {
