@@ -9,6 +9,353 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 )
 
+const (
+	OperationContextGet = "context.get.v1"
+	OperationEventsSync = "events.sync.v1"
+
+	SchemaContextGetRequest = "blackbird.query.context_get/1"
+	SchemaEventsSyncRequest = "blackbird.query.events_sync/1"
+	SchemaContextPage       = "blackbird.context_page/1"
+	SchemaContextCheckpoint = "blackbird.context_checkpoint/1"
+	SchemaContextDelta      = "blackbird.context_delta/1"
+	SchemaEventPage         = "blackbird.event_page/1"
+)
+
+type ContextGetRequestDTO struct {
+	Schema         string                `json:"schema"`
+	RequestID      string                `json:"request_id"`
+	Operation      string                `json:"operation"`
+	ActorSessionID domain.ActorSessionID `json:"actor_session_id"`
+	Cursor         *string               `json:"cursor"`
+	Limit          uint16                `json:"limit"`
+}
+
+type EventsSyncRequestDTO struct {
+	Schema         string                `json:"schema"`
+	RequestID      string                `json:"request_id"`
+	Operation      string                `json:"operation"`
+	ActorSessionID domain.ActorSessionID `json:"actor_session_id"`
+	AfterCursor    string                `json:"after_cursor"`
+	Limit          uint16                `json:"limit"`
+}
+
+func DecodeContextGetRequest(data []byte) (ContextGetRequestDTO, error) {
+	var request ContextGetRequestDTO
+	if err := decodeStrict(data, MaxCommandJSONBytes, &request); err != nil {
+		return request, err
+	}
+	if err := requireTopLevelJSONMembers(data, "cursor", "limit"); err != nil {
+		return ContextGetRequestDTO{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return ContextGetRequestDTO{}, err
+	}
+	return request, nil
+}
+func (request ContextGetRequestDTO) Validate() error {
+	if err := validateLiteral("schema", request.Schema, SchemaContextGetRequest); err != nil {
+		return err
+	}
+	if err := validateToken("request_id", request.RequestID, maxRequestIDBytes); err != nil {
+		return err
+	}
+	if err := validateOperation(request.Operation, OperationContextGet); err != nil {
+		return err
+	}
+	if err := validateRequiredID("actor_session_id", request.ActorSessionID); err != nil {
+		return err
+	}
+	if request.Cursor != nil {
+		if err := validateCursor("cursor", *request.Cursor); err != nil {
+			return err
+		}
+	}
+	if request.Limit == 0 || request.Limit > maxContextDeltaCount {
+		return invalid("limit", fmt.Sprintf("must be within 1..%d", maxContextDeltaCount))
+	}
+	return nil
+}
+func DecodeEventsSyncRequest(data []byte) (EventsSyncRequestDTO, error) {
+	var request EventsSyncRequestDTO
+	if err := decodeStrict(data, MaxCommandJSONBytes, &request); err != nil {
+		return request, err
+	}
+	if err := request.Validate(); err != nil {
+		return EventsSyncRequestDTO{}, err
+	}
+	return request, nil
+}
+func (request EventsSyncRequestDTO) Validate() error {
+	if err := validateLiteral("schema", request.Schema, SchemaEventsSyncRequest); err != nil {
+		return err
+	}
+	if err := validateToken("request_id", request.RequestID, maxRequestIDBytes); err != nil {
+		return err
+	}
+	if err := validateOperation(request.Operation, OperationEventsSync); err != nil {
+		return err
+	}
+	if err := validateRequiredID("actor_session_id", request.ActorSessionID); err != nil {
+		return err
+	}
+	if err := validateCursor("after_cursor", request.AfterCursor); err != nil {
+		return err
+	}
+	if request.Limit == 0 || request.Limit > maxSyncPageCount {
+		return invalid("limit", fmt.Sprintf("must be within 1..%d", maxSyncPageCount))
+	}
+	return nil
+}
+
+type ContextCheckpointIDDTO string
+
+type ContextResourceDTO struct {
+	Type    domain.AggregateKind `json:"type"`
+	ID      string               `json:"id"`
+	Version domain.Version       `json:"version"`
+	State   string               `json:"state"`
+}
+
+type ContextCheckpointDTO struct {
+	Schema            string                 `json:"schema"`
+	CheckpointID      ContextCheckpointIDDTO `json:"checkpoint_id"`
+	AuthorityID       domain.AuthorityID     `json:"authority_id"`
+	AuthorityEpoch    domain.AuthorityEpoch  `json:"authority_epoch"`
+	WorkspaceID       domain.WorkspaceID     `json:"workspace_id"`
+	ActorSession      ContextResourceDTO     `json:"actor_session"`
+	Principal         ContextResourceDTO     `json:"principal"`
+	Membership        ContextResourceDTO     `json:"membership"`
+	Actor             ContextResourceDTO     `json:"actor"`
+	Delegation        ContextResourceDTO     `json:"delegation"`
+	Device            *ContextResourceDTO    `json:"device"`
+	Grants            []ContextResourceDTO   `json:"grants"`
+	ThroughCursor     string                 `json:"through_cursor"`
+	ProjectionVersion uint32                 `json:"projection_version"`
+	ServerTime        time.Time              `json:"server_time"`
+}
+
+func (checkpoint ContextCheckpointDTO) Validate() error {
+	if err := validateLiteral("checkpoint.schema", checkpoint.Schema, SchemaContextCheckpoint); err != nil {
+		return err
+	}
+	if err := validateCeremonyID("checkpoint.checkpoint_id", CeremonyIDDTO(checkpoint.CheckpointID)); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{"checkpoint.authority_id": checkpoint.AuthorityID, "checkpoint.authority_epoch": checkpoint.AuthorityEpoch, "checkpoint.workspace_id": checkpoint.WorkspaceID} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	resources := []struct {
+		field string
+		value ContextResourceDTO
+		kind  domain.AggregateKind
+	}{
+		{"checkpoint.actor_session", checkpoint.ActorSession, domain.AggregateKindActorSession},
+		{"checkpoint.principal", checkpoint.Principal, domain.AggregateKindPrincipal},
+		{"checkpoint.membership", checkpoint.Membership, domain.AggregateKindMembership},
+		{"checkpoint.actor", checkpoint.Actor, domain.AggregateKindActor},
+		{"checkpoint.delegation", checkpoint.Delegation, domain.AggregateKindActorDelegation},
+	}
+	if checkpoint.Device != nil {
+		resources = append(resources, struct {
+			field string
+			value ContextResourceDTO
+			kind  domain.AggregateKind
+		}{"checkpoint.device", *checkpoint.Device, domain.AggregateKindDevice})
+	}
+	if len(checkpoint.Grants) > maxGrantReferenceCount {
+		return invalid("checkpoint.grants", fmt.Sprintf("must contain at most %d entries", maxGrantReferenceCount))
+	}
+	for index, grant := range checkpoint.Grants {
+		resources = append(resources, struct {
+			field string
+			value ContextResourceDTO
+			kind  domain.AggregateKind
+		}{fmt.Sprintf("checkpoint.grants[%d]", index), grant, domain.AggregateKindGrant})
+	}
+	seen := make(map[string]struct{}, len(resources))
+	for _, resource := range resources {
+		if resource.value.Type != resource.kind {
+			return invalid(resource.field+".type", fmt.Sprintf("must equal %q", resource.kind))
+		}
+		if err := validateAggregateID(resource.kind, resource.value.ID); err != nil {
+			return invalid(resource.field+".id", err.Error())
+		}
+		if err := validateVersion(resource.field+".version", resource.value.Version); err != nil {
+			return err
+		}
+		if err := validateToken(resource.field+".state", resource.value.State, 64); err != nil {
+			return err
+		}
+		key := string(resource.kind) + "\x00" + resource.value.ID
+		if _, duplicate := seen[key]; duplicate {
+			return invalid("checkpoint", "must not contain duplicate resources")
+		}
+		seen[key] = struct{}{}
+	}
+	if err := validateCursor("checkpoint.through_cursor", checkpoint.ThroughCursor); err != nil {
+		return err
+	}
+	if checkpoint.ProjectionVersion == 0 {
+		return invalid("checkpoint.projection_version", "must be positive")
+	}
+	return validateUTCInstant("checkpoint.server_time", checkpoint.ServerTime)
+}
+
+type ContextDeltaDTO struct {
+	Schema      string           `json:"schema"`
+	EventID     domain.EventID   `json:"event_id"`
+	DeltaType   string           `json:"delta_type"`
+	Resource    ResourceScopeDTO `json:"resource"`
+	Version     domain.Version   `json:"version"`
+	Value       json.RawMessage  `json:"value"`
+	AfterCursor string           `json:"after_cursor"`
+}
+
+func (delta ContextDeltaDTO) Validate() error {
+	if err := validateLiteral("delta.schema", delta.Schema, SchemaContextDelta); err != nil {
+		return err
+	}
+	if err := validateRequiredID("delta.event_id", delta.EventID); err != nil {
+		return err
+	}
+	if delta.DeltaType != "upsert" && delta.DeltaType != "remove" && delta.DeltaType != "invalidate" {
+		return invalid("delta.delta_type", "is not a stable context delta type")
+	}
+	if err := delta.Resource.validate("delta.resource"); err != nil {
+		return err
+	}
+	if err := validateVersion("delta.version", delta.Version); err != nil {
+		return err
+	}
+	if !rawJSONObject(delta.Value) {
+		return invalid("delta.value", "must be a JSON object")
+	}
+	return validateCursor("delta.after_cursor", delta.AfterCursor)
+}
+
+type ContextPageDTO struct {
+	Schema     string                `json:"schema"`
+	RequestID  string                `json:"request_id"`
+	Operation  string                `json:"operation"`
+	Checkpoint *ContextCheckpointDTO `json:"checkpoint"`
+	Deltas     []ContextDeltaDTO     `json:"deltas"`
+	NextCursor string                `json:"next_cursor"`
+	HeadCursor string                `json:"head_cursor"`
+	HasMore    bool                  `json:"has_more"`
+}
+
+func DecodeContextPage(data []byte) (ContextPageDTO, error) {
+	var page ContextPageDTO
+	if err := decodeOutput(data, MaxOutcomeJSONBytes, &page); err != nil {
+		return page, err
+	}
+	if err := requireTopLevelJSONMembers(data, "checkpoint", "deltas", "has_more"); err != nil {
+		return ContextPageDTO{}, err
+	}
+	if err := page.Validate(); err != nil {
+		return ContextPageDTO{}, err
+	}
+	return page, nil
+}
+func (page ContextPageDTO) Validate() error {
+	if err := validateLiteral("schema", page.Schema, SchemaContextPage); err != nil {
+		return err
+	}
+	if err := validateToken("request_id", page.RequestID, maxRequestIDBytes); err != nil {
+		return err
+	}
+	if err := validateOperation(page.Operation, OperationContextGet); err != nil {
+		return err
+	}
+	if page.Deltas == nil || len(page.Deltas) > maxContextDeltaCount {
+		return invalid("deltas", fmt.Sprintf("must be a present list with at most %d entries", maxContextDeltaCount))
+	}
+	if page.Checkpoint != nil && len(page.Deltas) != 0 {
+		return invalid("checkpoint", "cannot be combined with deltas")
+	}
+	if page.Checkpoint == nil && len(page.Deltas) == 0 {
+		return invalid("deltas", "must be non-empty when checkpoint is null")
+	}
+	if page.Checkpoint != nil {
+		if err := page.Checkpoint.Validate(); err != nil {
+			return err
+		}
+	}
+	seen := make(map[domain.EventID]struct{}, len(page.Deltas))
+	for index, delta := range page.Deltas {
+		if err := delta.Validate(); err != nil {
+			return invalid(fmt.Sprintf("deltas[%d]", index), err.Error())
+		}
+		if _, ok := seen[delta.EventID]; ok {
+			return invalid("deltas", "must not contain duplicate event IDs")
+		}
+		seen[delta.EventID] = struct{}{}
+	}
+	if err := validateCursor("next_cursor", page.NextCursor); err != nil {
+		return err
+	}
+	return validateCursor("head_cursor", page.HeadCursor)
+}
+
+type EventPageDTO struct {
+	Schema     string                `json:"schema"`
+	RequestID  string                `json:"request_id"`
+	Operation  string                `json:"operation"`
+	Events     []RawEventEnvelopeDTO `json:"events"`
+	NextCursor string                `json:"next_cursor"`
+	HeadCursor string                `json:"head_cursor"`
+	HasMore    bool                  `json:"has_more"`
+}
+
+func DecodeEventPage(data []byte) (EventPageDTO, error) {
+	var page EventPageDTO
+	if err := decodeOutput(data, MaxOutcomeJSONBytes, &page); err != nil {
+		return page, err
+	}
+	if err := requireTopLevelJSONMembers(data, "events", "has_more"); err != nil {
+		return EventPageDTO{}, err
+	}
+	if err := page.Validate(); err != nil {
+		return EventPageDTO{}, err
+	}
+	return page, nil
+}
+func (page EventPageDTO) Validate() error {
+	if err := validateLiteral("schema", page.Schema, SchemaEventPage); err != nil {
+		return err
+	}
+	if err := validateToken("request_id", page.RequestID, maxRequestIDBytes); err != nil {
+		return err
+	}
+	if err := validateOperation(page.Operation, OperationEventsSync); err != nil {
+		return err
+	}
+	if page.Events == nil || len(page.Events) > maxSyncPageCount {
+		return invalid("events", fmt.Sprintf("must be a present list with at most %d entries", maxSyncPageCount))
+	}
+	seen := make(map[domain.EventID]struct{}, len(page.Events))
+	for index, event := range page.Events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return invalid(fmt.Sprintf("events[%d]", index), err.Error())
+		}
+		validated, err := DecodeEventEnvelope(encoded)
+		if err != nil {
+			return invalid(fmt.Sprintf("events[%d]", index), err.Error())
+		}
+		if _, duplicate := seen[validated.EventID]; duplicate {
+			return invalid("events", "must not contain duplicate event IDs")
+		}
+		seen[validated.EventID] = struct{}{}
+	}
+	if err := validateCursor("next_cursor", page.NextCursor); err != nil {
+		return err
+	}
+	return validateCursor("head_cursor", page.HeadCursor)
+}
+
 type EventEnvelopeDTO[Payload any] struct {
 	Schema         string                 `json:"schema"`
 	EventID        domain.EventID         `json:"event_id"`

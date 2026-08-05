@@ -229,6 +229,251 @@ func (result WorkspaceCreateResultDTO) Validate() error {
 	return nil
 }
 
+type PrincipalRegisterResultDTO struct {
+	CommandResultMetadataDTO
+	Resource PrincipalRegisterResourceDTO `json:"resource"`
+}
+type PrincipalRegisterResourceDTO struct {
+	InstallationID  domain.InstallationID `json:"installation_id"`
+	PrincipalID     domain.PrincipalID    `json:"principal_id"`
+	PrincipalState  string                `json:"principal_state"`
+	ResourceVersion domain.Version        `json:"resource_version"`
+}
+
+type DevicePairingBeginResultDTO struct {
+	CommandResultMetadataDTO
+	Resource DevicePairingBeginResourceDTO `json:"resource"`
+}
+type DevicePairingBeginResourceDTO struct {
+	InstallationID  domain.InstallationID `json:"installation_id"`
+	DeviceID        domain.DeviceID       `json:"device_id"`
+	DeviceState     string                `json:"device_state"`
+	ResourceVersion domain.Version        `json:"resource_version"`
+	Challenge       IssuedCeremonyDTO     `json:"challenge"`
+}
+
+type DevicePairResultDTO struct {
+	CommandResultMetadataDTO
+	Resource DevicePairResourceDTO `json:"resource"`
+}
+type DevicePairResourceDTO struct {
+	InstallationID  domain.InstallationID `json:"installation_id"`
+	DeviceID        domain.DeviceID       `json:"device_id"`
+	DeviceState     string                `json:"device_state"`
+	ResourceVersion domain.Version        `json:"resource_version"`
+	TrustRevision   domain.Version        `json:"trust_revision"`
+}
+
+type WorkspaceMemberInviteResultDTO struct {
+	CommandResultMetadataDTO
+	Resource WorkspaceMemberInviteResourceDTO `json:"resource"`
+}
+type WorkspaceMemberInviteResourceDTO struct {
+	WorkspaceID     domain.WorkspaceID  `json:"workspace_id"`
+	MembershipID    domain.MembershipID `json:"membership_id"`
+	MembershipState string              `json:"membership_state"`
+	ResourceVersion domain.Version      `json:"resource_version"`
+	Challenge       IssuedCeremonyDTO   `json:"challenge"`
+}
+type WorkspaceMembershipAcceptResultDTO struct {
+	CommandResultMetadataDTO
+	Resource WorkspaceMembershipAcceptResourceDTO `json:"resource"`
+}
+type WorkspaceMembershipAcceptResourceDTO struct {
+	WorkspaceID     domain.WorkspaceID  `json:"workspace_id"`
+	MembershipID    domain.MembershipID `json:"membership_id"`
+	MembershipState string              `json:"membership_state"`
+	ResourceVersion domain.Version      `json:"resource_version"`
+}
+
+type ActorCreateResultDTO struct {
+	CommandResultMetadataDTO
+	Resource ActorCreateResourceDTO `json:"resource"`
+}
+type ActorCreateResourceDTO struct {
+	WorkspaceID     domain.WorkspaceID `json:"workspace_id"`
+	ActorID         domain.ActorID     `json:"actor_id"`
+	ActorState      string             `json:"actor_state"`
+	ResourceVersion domain.Version     `json:"resource_version"`
+}
+type ActorDelegationProposeResultDTO struct {
+	CommandResultMetadataDTO
+	Resource ActorDelegationProposeResourceDTO `json:"resource"`
+}
+type ActorDelegationProposeResourceDTO struct {
+	WorkspaceID     domain.WorkspaceID       `json:"workspace_id"`
+	DelegationID    domain.ActorDelegationID `json:"delegation_id"`
+	DelegationState string                   `json:"delegation_state"`
+	ResourceVersion domain.Version           `json:"resource_version"`
+	Challenge       IssuedCeremonyDTO        `json:"challenge"`
+}
+type ActorDelegationActivateResultDTO struct {
+	CommandResultMetadataDTO
+	Resource ActorDelegationActivateResourceDTO `json:"resource"`
+}
+type ActorDelegationActivateResourceDTO struct {
+	WorkspaceID           domain.WorkspaceID       `json:"workspace_id"`
+	DelegationID          domain.ActorDelegationID `json:"delegation_id"`
+	DelegationState       string                   `json:"delegation_state"`
+	ResourceVersion       domain.Version           `json:"resource_version"`
+	SessionStartChallenge IssuedCeremonyDTO        `json:"session_start_challenge"`
+}
+type SessionStartResultDTO struct {
+	CommandResultMetadataDTO
+	Resource SessionStartResourceDTO `json:"resource"`
+}
+type SessionStartResourceDTO struct {
+	WorkspaceID     domain.WorkspaceID    `json:"workspace_id"`
+	ActorSessionID  domain.ActorSessionID `json:"actor_session_id"`
+	SessionState    string                `json:"session_state"`
+	ResourceVersion domain.Version        `json:"resource_version"`
+	AbsoluteExpiry  time.Time             `json:"absolute_expiry"`
+}
+
+type IssuedCeremonyDTO struct {
+	CeremonyID domain.CeremonyID `json:"ceremony_id"`
+	Purpose    string            `json:"purpose"`
+	ExpiresAt  time.Time         `json:"expires_at"`
+}
+
+func (ceremony IssuedCeremonyDTO) validate(field string) error {
+	if err := validateRequiredID(field+".ceremony_id", ceremony.CeremonyID); err != nil {
+		return err
+	}
+	if !domain.CeremonyPurpose(ceremony.Purpose).Valid() {
+		return invalid(field+".purpose", "is not a stable ceremony purpose")
+	}
+	return validateUTCInstant(field+".expires_at", ceremony.ExpiresAt)
+}
+
+func validateSingleResult(metadata CommandResultMetadataDTO, operation string, ids map[string]interface{ IsZero() bool }, stateField, state, expectedState string, version domain.Version) error {
+	if err := metadata.validate(operation, 1); err != nil {
+		return err
+	}
+	for field, id := range ids {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	if err := validateLiteral(stateField, state, expectedState); err != nil {
+		return err
+	}
+	return validateVersion("resource.resource_version", version)
+}
+
+func (result PrincipalRegisterResultDTO) Validate() error {
+	return validateSingleResult(result.CommandResultMetadataDTO, OperationPrincipalRegister, map[string]interface{ IsZero() bool }{"resource.installation_id": result.Resource.InstallationID, "resource.principal_id": result.Resource.PrincipalID}, "resource.principal_state", result.Resource.PrincipalState, string(domain.PrincipalActive), result.Resource.ResourceVersion)
+}
+func (result DevicePairingBeginResultDTO) Validate() error {
+	if err := validateSingleResult(result.CommandResultMetadataDTO, OperationDevicePairingBegin, map[string]interface{ IsZero() bool }{"resource.installation_id": result.Resource.InstallationID, "resource.device_id": result.Resource.DeviceID}, "resource.device_state", result.Resource.DeviceState, string(domain.DevicePending), result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	if err := result.Resource.Challenge.validate("resource.challenge"); err != nil {
+		return err
+	}
+	return validateLiteral("resource.challenge.purpose", result.Resource.Challenge.Purpose, string(domain.CeremonyPurposeDevicePairing))
+}
+func (result DevicePairResultDTO) Validate() error {
+	if err := validateSingleResult(result.CommandResultMetadataDTO, OperationDevicePair, map[string]interface{ IsZero() bool }{"resource.installation_id": result.Resource.InstallationID, "resource.device_id": result.Resource.DeviceID}, "resource.device_state", result.Resource.DeviceState, string(domain.DeviceTrusted), result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	return validateVersion("resource.trust_revision", result.Resource.TrustRevision)
+}
+func (result WorkspaceMemberInviteResultDTO) Validate() error {
+	if err := validateSingleResult(result.CommandResultMetadataDTO, OperationWorkspaceMemberInvite, map[string]interface{ IsZero() bool }{"resource.workspace_id": result.Resource.WorkspaceID, "resource.membership_id": result.Resource.MembershipID}, "resource.membership_state", result.Resource.MembershipState, string(domain.MembershipInvited), result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	if err := result.Resource.Challenge.validate("resource.challenge"); err != nil {
+		return err
+	}
+	return validateLiteral("resource.challenge.purpose", result.Resource.Challenge.Purpose, string(domain.CeremonyPurposeMembershipAcceptance))
+}
+func (result WorkspaceMembershipAcceptResultDTO) Validate() error {
+	return validateSingleResult(result.CommandResultMetadataDTO, OperationWorkspaceMembershipAccept, map[string]interface{ IsZero() bool }{"resource.workspace_id": result.Resource.WorkspaceID, "resource.membership_id": result.Resource.MembershipID}, "resource.membership_state", result.Resource.MembershipState, string(domain.MembershipActive), result.Resource.ResourceVersion)
+}
+func (result ActorCreateResultDTO) Validate() error {
+	return validateSingleResult(result.CommandResultMetadataDTO, OperationActorCreate, map[string]interface{ IsZero() bool }{"resource.workspace_id": result.Resource.WorkspaceID, "resource.actor_id": result.Resource.ActorID}, "resource.actor_state", result.Resource.ActorState, string(domain.ActorActive), result.Resource.ResourceVersion)
+}
+func (result ActorDelegationProposeResultDTO) Validate() error {
+	if err := validateSingleResult(result.CommandResultMetadataDTO, OperationActorDelegationPropose, map[string]interface{ IsZero() bool }{"resource.workspace_id": result.Resource.WorkspaceID, "resource.delegation_id": result.Resource.DelegationID}, "resource.delegation_state", result.Resource.DelegationState, string(domain.DelegationProposed), result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	if err := result.Resource.Challenge.validate("resource.challenge"); err != nil {
+		return err
+	}
+	return validateLiteral("resource.challenge.purpose", result.Resource.Challenge.Purpose, string(domain.CeremonyPurposeDelegationActivation))
+}
+func (result ActorDelegationActivateResultDTO) Validate() error {
+	if err := validateSingleResult(result.CommandResultMetadataDTO, OperationActorDelegationActivate, map[string]interface{ IsZero() bool }{"resource.workspace_id": result.Resource.WorkspaceID, "resource.delegation_id": result.Resource.DelegationID}, "resource.delegation_state", result.Resource.DelegationState, string(domain.DelegationActive), result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	if err := result.Resource.SessionStartChallenge.validate("resource.session_start_challenge"); err != nil {
+		return err
+	}
+	return validateLiteral("resource.session_start_challenge.purpose", result.Resource.SessionStartChallenge.Purpose, string(domain.CeremonyPurposeActorSessionStart))
+}
+func (result SessionStartResultDTO) Validate() error {
+	if err := validateSingleResult(result.CommandResultMetadataDTO, OperationSessionStart, map[string]interface{ IsZero() bool }{"resource.workspace_id": result.Resource.WorkspaceID, "resource.actor_session_id": result.Resource.ActorSessionID}, "resource.session_state", result.Resource.SessionState, string(domain.ActorSessionActive), result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	return validateUTCInstant("resource.absolute_expiry", result.Resource.AbsoluteExpiry)
+}
+
+func decodeCommandResult[T any](data []byte, result *T, validate func() error) error {
+	if err := decodeOutput(data, MaxOutcomeJSONBytes, result); err != nil {
+		return err
+	}
+	if err := requireTopLevelJSONMembers(data, "idempotent_replay"); err != nil {
+		return err
+	}
+	return validate()
+}
+func DecodePrincipalRegisterResult(data []byte) (PrincipalRegisterResultDTO, error) {
+	var value PrincipalRegisterResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeDevicePairingBeginResult(data []byte) (DevicePairingBeginResultDTO, error) {
+	var value DevicePairingBeginResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeDevicePairResult(data []byte) (DevicePairResultDTO, error) {
+	var value DevicePairResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeWorkspaceMemberInviteResult(data []byte) (WorkspaceMemberInviteResultDTO, error) {
+	var value WorkspaceMemberInviteResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeWorkspaceMembershipAcceptResult(data []byte) (WorkspaceMembershipAcceptResultDTO, error) {
+	var value WorkspaceMembershipAcceptResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeActorCreateResult(data []byte) (ActorCreateResultDTO, error) {
+	var value ActorCreateResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeActorDelegationProposeResult(data []byte) (ActorDelegationProposeResultDTO, error) {
+	var value ActorDelegationProposeResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeActorDelegationActivateResult(data []byte) (ActorDelegationActivateResultDTO, error) {
+	var value ActorDelegationActivateResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+func DecodeSessionStartResult(data []byte) (SessionStartResultDTO, error) {
+	var value SessionStartResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
 func validateUTCInstant(field string, instant time.Time) error {
 	if instant.IsZero() {
 		return invalid(field, "is required")

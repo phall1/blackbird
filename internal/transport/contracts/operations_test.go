@@ -220,11 +220,68 @@ func TestWireIdentifierFieldsRetainConcreteDomainTypes(t *testing.T) {
 	}
 }
 
+func TestW0OperationInventoryIsClosedAndStable(t *testing.T) {
+	t.Parallel()
+
+	want := []string{
+		"installation.bootstrap.v1",
+		"principal.register.v1",
+		"pairing.challenge.issue.v1",
+		"pairing.challenge.redeem.v1",
+		"workspace.create.v1",
+		"workspace_member.invite.v1",
+		"workspace_membership.accept.v1",
+		"actor.create.v1",
+		"actor_delegation.propose.v1",
+		"actor_delegation.activate.v1",
+		"session.start.v1",
+	}
+	got := W0OperationInventory()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("W0OperationInventory() = %#v, want %#v", got, want)
+	}
+	got[0] = "mutated"
+	if W0OperationInventory()[0] != want[0] {
+		t.Fatal("W0OperationInventory() returned mutable catalog storage")
+	}
+}
+
+func TestPrincipalRegisterRequestStrictBoundaryAndGolden(t *testing.T) {
+	t.Parallel()
+
+	request := PrincipalRegisterRequestDTO{
+		CommandMetadataDTO: fixtureMetadata(t, SchemaPrincipalRegisterCommand, OperationPrincipalRegister, "req-principal-1", "principal-key-1"),
+		ClientInstanceID:   mustParseClientInstanceID(t, idClient),
+		ExpectedVersions:   PrincipalRegisterExpectedVersionsDTO{Registrar: domain.InitialVersion()},
+		Body: PrincipalRegisterBodyDTO{
+			InstallationID: mustParseInstallationID(t, idInstallation), RegistrarID: mustParsePrincipalID(t, idPrincipal),
+			PrincipalID: mustParsePrincipalID(t, idActor), Kind: PrincipalKindWorkload,
+			DisplayName: "Build Agent", PublicKeyReference: "thumbprint:build-agent-1",
+		},
+	}
+	encoded := mustMarshal(t, request)
+	if _, err := DecodePrincipalRegisterRequest(encoded); err != nil {
+		t.Fatalf("DecodePrincipalRegisterRequest() error = %v", err)
+	}
+	want := `{"schema":"blackbird.command.principal_register/1","request_id":"req-principal-1","command_id":"` + idCommand + `","operation":"principal.register.v1","idempotency_key":"principal-key-1","authority_id":"` + idAuthority + `","authority_epoch":"` + idEpoch + `","deadline":"2026-08-04T12:01:00Z","causation_id":null,"correlation_id":"` + idCorrelation + `","client_instance_id":"` + idClient + `","expected_versions":{"registrar":1},"body":{"installation_id":"` + idInstallation + `","registrar_id":"` + idPrincipal + `","principal_id":"` + idActor + `","kind":"workload","display_name":"Build Agent","public_key_reference":"thumbprint:build-agent-1"}}`
+	if string(encoded) != want {
+		t.Fatalf("JSON changed\n got: %s\nwant: %s", encoded, want)
+	}
+	duplicate := addTopLevelJSONField(encoded, `"operation":"principal.register.v1"`)
+	if _, err := DecodePrincipalRegisterRequest(duplicate); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("duplicate error = %v, want ErrInvalidJSON", err)
+	}
+	additive := addTopLevelJSONField(encoded, `"future":true`)
+	if _, err := DecodePrincipalRegisterRequest(additive); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("additive request error = %v, want ErrInvalidJSON", err)
+	}
+}
+
 func TestInstallationBootstrapRequestJSONFieldStability(t *testing.T) {
 	t.Parallel()
 
 	encoded := string(mustMarshal(t, fixtureInstallationBootstrapRequest(t)))
-	want := `{"schema":"blackbird.command.installation_bootstrap/1","request_id":"req-bootstrap-1","command_id":"` + idCommand + `","operation":"installation.bootstrap.v1","idempotency_key":"bootstrap-key-1","authority_id":"` + idAuthority + `","authority_epoch":"` + idEpoch + `","deadline":"2026-08-04T12:01:00Z","correlation_id":"` + idCorrelation + `","expected_versions":{"invitation":1},"body":{"installation_id":"` + idInstallation + `","invitation_id":"` + idInvitation + `","principal":{"principal_id":"` + idPrincipal + `","kind":"human","display_name":"Alice"},"device":{"device_id":"` + idDevice + `","display_name":"Alice Cockpit","public_key_spki":"ZWQyNTUxOS1zcGtp"},"installation_owner_grant_id":"` + idGrant + `","pairing":{"protocol":"blackbird.pair/v1","transcript_hash":"` + strings.Repeat("a", 64) + `"}}}`
+	want := `{"schema":"blackbird.command.installation_bootstrap/1","request_id":"req-bootstrap-1","command_id":"` + idCommand + `","operation":"installation.bootstrap.v1","idempotency_key":"bootstrap-key-1","authority_id":"` + idAuthority + `","authority_epoch":"` + idEpoch + `","deadline":"2026-08-04T12:01:00Z","causation_id":null,"correlation_id":"` + idCorrelation + `","expected_versions":{"invitation":1},"body":{"installation_id":"` + idInstallation + `","invitation_id":"` + idInvitation + `","bootstrap_generation_id":"` + idEventThree + `","principal":{"principal_id":"` + idPrincipal + `","kind":"human","display_name":"Alice"},"device":{"device_id":"` + idDevice + `","display_name":"Alice Cockpit","public_key_spki":"ZWQyNTUxOS1zcGtp"},"installation_owner_grant_id":"` + idGrant + `","owner_capabilities":["workspace:admin"],"pairing":{"protocol":"blackbird.pair/v1","transcript_hash":"` + strings.Repeat("a", 64) + `"}}}`
 	if encoded != want {
 		t.Fatalf("JSON changed\n got: %s\nwant: %s", encoded, want)
 	}
@@ -236,8 +293,9 @@ func fixtureInstallationBootstrapRequest(t *testing.T) InstallationBootstrapRequ
 		CommandMetadataDTO: fixtureMetadata(t, SchemaInstallationBootstrapCommand, OperationInstallationBootstrap, "req-bootstrap-1", "bootstrap-key-1"),
 		ExpectedVersions:   InstallationBootstrapExpectedVersionsDTO{Invitation: domain.InitialVersion()},
 		Body: InstallationBootstrapBodyDTO{
-			InstallationID: mustParseInstallationID(t, idInstallation),
-			InvitationID:   mustParseInvitationID(t, idInvitation),
+			InstallationID:        mustParseInstallationID(t, idInstallation),
+			InvitationID:          mustParseInvitationID(t, idInvitation),
+			BootstrapGenerationID: mustParseBootstrapGenerationID(t, idEventThree),
 			Principal: BootstrapPrincipalDTO{
 				PrincipalID: mustParsePrincipalID(t, idPrincipal),
 				Kind:        PrincipalKindHuman,
@@ -249,6 +307,7 @@ func fixtureInstallationBootstrapRequest(t *testing.T) InstallationBootstrapRequ
 				PublicKeySPKI: "ZWQyNTUxOS1zcGtp",
 			},
 			InstallationOwnerGrantID: mustParseGrantID(t, idGrant),
+			OwnerCapabilities:        []string{"workspace:admin"},
 			Pairing:                  ApprovedPairingTranscriptRefDTO{Protocol: PairingProtocolV1, TranscriptHash: strings.Repeat("a", 64)},
 		},
 	}
@@ -259,15 +318,19 @@ func fixtureWorkspaceCreateRequest(t *testing.T) WorkspaceCreateRequestDTO {
 	return WorkspaceCreateRequestDTO{
 		CommandMetadataDTO: fixtureMetadata(t, SchemaWorkspaceCreateCommand, OperationWorkspaceCreate, "req-workspace-1", "workspace-key-1"),
 		ClientInstanceID:   mustParseClientInstanceID(t, idClient),
-		ExpectedVersions:   WorkspaceCreateExpectedVersionsDTO{OwnerPrincipal: domain.InitialVersion()},
+		ExpectedVersions: WorkspaceCreateExpectedVersionsDTO{
+			OwnerPrincipal: domain.InitialVersion(), InstallationGrant: domain.InitialVersion(),
+		},
 		Body: WorkspaceCreateBodyDTO{
-			InstallationID:    mustParseInstallationID(t, idInstallation),
-			WorkspaceID:       mustParseWorkspaceID(t, idWorkspace),
-			OwnerPrincipalID:  mustParsePrincipalID(t, idPrincipal),
-			OwnerMembershipID: mustParseMembershipID(t, idMembership),
-			Alias:             "Proof Workspace",
-			DiscoveryLocator:  "/proof/workspace",
-			PolicyRevision:    "policy-w0.2",
+			InstallationID:      mustParseInstallationID(t, idInstallation),
+			WorkspaceID:         mustParseWorkspaceID(t, idWorkspace),
+			OwnerPrincipalID:    mustParsePrincipalID(t, idPrincipal),
+			InstallationGrantID: mustParseGrantID(t, idGrant),
+			OwnerMembershipID:   mustParseMembershipID(t, idMembership),
+			Alias:               "Proof Workspace",
+			DiscoveryLocator:    "/proof/workspace",
+			PolicyRevision:      "policy-w0.2",
+			OwnerCapabilities:   []string{"workspace:admin"},
 		},
 	}
 }
@@ -279,18 +342,25 @@ func fixtureSessionStartRequest(t *testing.T) SessionStartRequestDTO {
 	return SessionStartRequestDTO{
 		CommandMetadataDTO: fixtureMetadata(t, SchemaSessionStartCommand, OperationSessionStart, "req-session-1", "session-key-1"),
 		ExpectedVersions: SessionStartExpectedVersionsDTO{
-			Membership: domain.InitialVersion(),
-			Delegation: domain.InitialVersion(),
-			Device:     &deviceVersion,
-			Grants:     []GrantRevisionDTO{{GrantID: mustParseGrantID(t, idGrant), Version: domain.InitialVersion()}},
+			Workspace:   domain.InitialVersion(),
+			Principal:   domain.InitialVersion(),
+			Membership:  domain.InitialVersion(),
+			Actor:       domain.InitialVersion(),
+			Delegation:  domain.InitialVersion(),
+			Device:      &deviceVersion,
+			DeviceTrust: &deviceVersion,
+			Grants:      []GrantRevisionDTO{{GrantID: mustParseGrantID(t, idGrant), Version: domain.InitialVersion()}},
 		},
 		Body: SessionStartBodyDTO{
-			WorkspaceID:    mustParseWorkspaceID(t, idWorkspace),
-			ActorSessionID: mustParseActorSessionID(t, idSession),
-			ActorID:        mustParseActorID(t, idActor),
-			MembershipID:   mustParseMembershipID(t, idMembership),
-			DelegationID:   mustParseActorDelegationID(t, idDelegation),
-			DeviceID:       &device,
+			WorkspaceID:        mustParseWorkspaceID(t, idWorkspace),
+			PrincipalID:        mustParsePrincipalID(t, idPrincipal),
+			ActorSessionID:     mustParseActorSessionID(t, idSession),
+			ActorID:            mustParseActorID(t, idActor),
+			MembershipID:       mustParseMembershipID(t, idMembership),
+			DelegationID:       mustParseActorDelegationID(t, idDelegation),
+			DeviceID:           &device,
+			StartAuthorityKind: "trusted_device",
+			AbsoluteExpiry:     fixtureTime.Add(time.Hour),
 			Client: SessionClientDTO{
 				InstanceID:   mustParseClientInstanceID(t, idClient),
 				Name:         "phux-runner",
@@ -460,6 +530,14 @@ func mustParseClientInstanceID(t *testing.T, value string) domain.ClientInstance
 func mustParseEventID(t *testing.T, value string) domain.EventID {
 	t.Helper()
 	id, err := domain.ParseEventID(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+func mustParseBootstrapGenerationID(t *testing.T, value string) domain.BootstrapGenerationID {
+	t.Helper()
+	id, err := domain.ParseBootstrapGenerationID(value)
 	if err != nil {
 		t.Fatal(err)
 	}

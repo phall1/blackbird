@@ -74,6 +74,109 @@ func TestCommandResultsStrictBoundary(t *testing.T) {
 	}
 }
 
+func TestPrincipalRegisterResultForwardCompatibilityAndPresence(t *testing.T) {
+	t.Parallel()
+
+	result := PrincipalRegisterResultDTO{
+		CommandResultMetadataDTO: fixtureResultMetadata(t, OperationPrincipalRegister, idEventOne),
+		Resource: PrincipalRegisterResourceDTO{
+			InstallationID: mustParseInstallationID(t, idInstallation),
+			PrincipalID:    mustParsePrincipalID(t, idPrincipal), PrincipalState: StateActive,
+			ResourceVersion: domain.InitialVersion(),
+		},
+	}
+	encoded := mustMarshal(t, result)
+	if _, err := DecodePrincipalRegisterResult(encoded); err != nil {
+		t.Fatalf("DecodePrincipalRegisterResult() error = %v", err)
+	}
+	additive := addTopLevelJSONField(encoded, `"future":true`)
+	if _, err := DecodePrincipalRegisterResult(additive); err != nil {
+		t.Fatalf("additive result error = %v", err)
+	}
+	missingReplay := removeJSONField(encoded, `"idempotent_replay":false,`)
+	if _, err := DecodePrincipalRegisterResult(missingReplay); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("missing idempotent_replay error = %v, want ErrInvalidContract", err)
+	}
+}
+
+func TestContextAndEventQueryGoldensStrictInputsAndAdditiveOutputs(t *testing.T) {
+	t.Parallel()
+
+	contextRequest := ContextGetRequestDTO{
+		Schema: SchemaContextGetRequest, RequestID: "req-context-1", Operation: OperationContextGet,
+		ActorSessionID: mustParseActorSessionID(t, idSession), Cursor: nil, Limit: 64,
+	}
+	contextJSON := mustMarshal(t, contextRequest)
+	wantContext := `{"schema":"blackbird.query.context_get/1","request_id":"req-context-1","operation":"context.get.v1","actor_session_id":"` + idSession + `","cursor":null,"limit":64}`
+	if string(contextJSON) != wantContext {
+		t.Fatalf("context request JSON changed\n got: %s\nwant: %s", contextJSON, wantContext)
+	}
+	if _, err := DecodeContextGetRequest(contextJSON); err != nil {
+		t.Fatalf("DecodeContextGetRequest() error = %v", err)
+	}
+	if _, err := DecodeContextGetRequest(addTopLevelJSONField(contextJSON, `"future":true`)); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("additive context request error = %v, want ErrInvalidJSON", err)
+	}
+	missingCursor := removeJSONField(contextJSON, `"cursor":null,`)
+	if _, err := DecodeContextGetRequest(missingCursor); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("missing cursor error = %v, want ErrInvalidContract", err)
+	}
+
+	eventsRequest := EventsSyncRequestDTO{
+		Schema: SchemaEventsSyncRequest, RequestID: "req-events-1", Operation: OperationEventsSync,
+		ActorSessionID: mustParseActorSessionID(t, idSession), AfterCursor: "bbec1_fixture", Limit: 128,
+	}
+	eventsJSON := mustMarshal(t, eventsRequest)
+	wantEvents := `{"schema":"blackbird.query.events_sync/1","request_id":"req-events-1","operation":"events.sync.v1","actor_session_id":"` + idSession + `","after_cursor":"bbec1_fixture","limit":128}`
+	if string(eventsJSON) != wantEvents {
+		t.Fatalf("events request JSON changed\n got: %s\nwant: %s", eventsJSON, wantEvents)
+	}
+	if _, err := DecodeEventsSyncRequest(eventsJSON); err != nil {
+		t.Fatalf("DecodeEventsSyncRequest() error = %v", err)
+	}
+
+	page := fixtureContextCheckpointPage(t)
+	pageJSON := mustMarshal(t, page)
+	if _, err := DecodeContextPage(addTopLevelJSONField(pageJSON, `"future_optional":{"safe":true}`)); err != nil {
+		t.Fatalf("additive context page error = %v", err)
+	}
+	duplicate := bytes.Replace(pageJSON, []byte(`"grants":[]`), []byte(`"grants":[],"grants":[]`), 1)
+	if _, err := DecodeContextPage(duplicate); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("duplicate checkpoint field error = %v, want ErrInvalidJSON", err)
+	}
+
+	eventPage := EventPageDTO{
+		Schema: SchemaEventPage, RequestID: "req-events-1", Operation: OperationEventsSync,
+		Events: []RawEventEnvelopeDTO{}, NextCursor: "bbec1_fixture", HeadCursor: "bbec1_head", HasMore: false,
+	}
+	if _, err := DecodeEventPage(mustMarshal(t, eventPage)); err != nil {
+		t.Fatalf("DecodeEventPage() error = %v", err)
+	}
+}
+
+func fixtureContextCheckpointPage(t *testing.T) ContextPageDTO {
+	t.Helper()
+	resource := func(kind domain.AggregateKind, id string) ContextResourceDTO {
+		return ContextResourceDTO{Type: kind, ID: id, Version: domain.InitialVersion(), State: StateActive}
+	}
+	return ContextPageDTO{
+		Schema: SchemaContextPage, RequestID: "req-context-1", Operation: OperationContextGet,
+		Checkpoint: &ContextCheckpointDTO{
+			Schema: SchemaContextCheckpoint, CheckpointID: ContextCheckpointIDDTO(idEventThree),
+			AuthorityID: mustParseAuthorityID(t, idAuthority), AuthorityEpoch: mustParseAuthorityEpoch(t, idEpoch),
+			WorkspaceID:  mustParseWorkspaceID(t, idWorkspace),
+			ActorSession: resource(domain.AggregateKindActorSession, idSession),
+			Principal:    resource(domain.AggregateKindPrincipal, idPrincipal),
+			Membership:   resource(domain.AggregateKindMembership, idMembership),
+			Actor:        resource(domain.AggregateKindActor, idActor),
+			Delegation:   resource(domain.AggregateKindActorDelegation, idDelegation),
+			Device:       nil, Grants: []ContextResourceDTO{}, ThroughCursor: "bbcc1_fixture",
+			ProjectionVersion: 1, ServerTime: fixtureTime,
+		},
+		Deltas: []ContextDeltaDTO{}, NextCursor: "bbcc1_fixture", HeadCursor: "bbcc1_head", HasMore: false,
+	}
+}
+
 func TestTypedErrorStrictBoundaryAndJSONStability(t *testing.T) {
 	t.Parallel()
 

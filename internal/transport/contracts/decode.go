@@ -40,6 +40,8 @@ const (
 	maxGrantReferenceCount   = 64
 	maxEventIDCount          = 16
 	maxFieldViolationCount   = 64
+	maxSyncPageCount         = 256
+	maxContextDeltaCount     = 256
 	maxJSONNestingDepth      = 64
 )
 
@@ -70,6 +72,13 @@ func invalid(field, problem string) error {
 
 func decodeStrict(data []byte, limit int, target any) error {
 	return decodeBounded(data, limit, target, true)
+}
+
+func decodeCommandInput(data []byte, target any) error {
+	if err := decodeStrict(data, MaxCommandJSONBytes, target); err != nil {
+		return err
+	}
+	return requireTopLevelJSONMembers(data, "causation_id")
 }
 
 func decodeOutput(data []byte, limit int, target any) error {
@@ -294,6 +303,27 @@ func requireTopLevelJSONMembers(data []byte, required ...string) error {
 	for _, member := range required {
 		if !found[member] {
 			return invalid(member, "is a required JSON member")
+		}
+	}
+	return nil
+}
+
+func requireNestedJSONMembers(data []byte, object string, required ...string) error {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	}
+	raw, present := envelope[object]
+	if !present {
+		return invalid(object, "is a required JSON member")
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		return invalid(object, "must be a JSON object")
+	}
+	for _, member := range required {
+		if _, present := members[member]; !present {
+			return invalid(object+"."+member, "is a required JSON member")
 		}
 	}
 	return nil
