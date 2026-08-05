@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,12 +26,15 @@ import (
 )
 
 const (
-	pairingExporterLabel = "EXPORTER-Blackbird-Pair-v1"
-	sessionExporterLabel = "EXPORTER-Blackbird-Session-v1"
-	transcriptDomain     = "blackbird-pairing-transcript/v1"
-	bindingSize          = 32
-	credentialService    = "com.phall1.blackbird.credentials.v1"
-	credentialIDMaxBytes = 128
+	pairingExporterLabel    = "EXPORTER-Blackbird-Pair-v1"
+	sessionExporterLabel    = "EXPORTER-Blackbird-Session-v1"
+	transcriptDomain        = "blackbird-pairing-transcript/v1"
+	bindingSize             = 32
+	credentialService       = "com.phall1.blackbird.credentials.v1"
+	credentialIDMaxBytes    = 128
+	maxTransportAccessTTL   = 15 * time.Minute
+	maxPairingInvitationTTL = 5 * time.Minute
+	maxPairingAttempts      = 5
 )
 
 var (
@@ -46,6 +50,10 @@ var (
 	ErrCredentialNotFound  = errors.New("credential not found")
 	ErrVaultUnavailable    = errors.New("OS credential vault unavailable")
 	ErrCredentialDestroyed = errors.New("credential key material destroyed")
+	ErrAccessDenied        = errors.New("local transport access denied")
+	ErrInvalidAccess       = errors.New("invalid transport access request")
+	ErrInvitationInvalid   = errors.New("pairing invitation invalid")
+	ErrInvitationSuspended = errors.New("pairing invitation requires explicit resume")
 )
 
 // CredentialKind identifies a long-lived local Ed25519 credential class.
@@ -205,6 +213,12 @@ func (credential *Ed25519Credential) NewCertificate(validity CertificateValidity
 	return newCertificate(publicKey, credential, validity)
 }
 
+// SignTranscript signs a pairing transcript without exporting vault key
+// material into the pairing layer.
+func (credential *Ed25519Credential) SignTranscript(transcript TranscriptHash) ([]byte, error) {
+	return SignTranscript(credential, transcript)
+}
+
 func (credential *Ed25519Credential) Destroy() {
 	if credential == nil {
 		return
@@ -339,6 +353,408 @@ func validCredentialIdentifier(identifier string) bool {
 		return false
 	}
 	return true
+}
+
+// TransportAccessCredential is a short-lived opaque secret. It is useful only
+// with the mTLS connection whose exporter binding was supplied at issuance.
+type TransportAccessCredential struct {
+	mu        sync.RWMutex
+	material  [sha256.Size]byte
+	destroyed bool
+}
+
+func (credential *TransportAccessCredential) String() string {
+	return "[REDACTED transport access credential]"
+}
+
+func (credential *TransportAccessCredential) GoString() string { return credential.String() }
+
+// Bytes returns a disposable copy for transport encoding. Callers should clear
+// it immediately after writing it to the authenticated connection.
+func (credential *TransportAccessCredential) Bytes() ([]byte, error) {
+	if credential == nil {
+		return nil, ErrAccessDenied
+	}
+	credential.mu.RLock()
+	defer credential.mu.RUnlock()
+	if credential.destroyed {
+		return nil, ErrAccessDenied
+	}
+	return append([]byte(nil), credential.material[:]...), nil
+}
+
+func (credential *TransportAccessCredential) Destroy() {
+	if credential == nil {
+		return
+	}
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	clear(credential.material[:])
+	credential.destroyed = true
+}
+
+// TransportAccessClaims are authenticated identity and authorization revisions
+// attached to one paired connection. Identifier fields are metadata, not
+// caller-overridable request values.
+type TransportAccessClaims struct {
+	PrincipalID       string
+	DeviceID          string
+	AuthorityEpoch    string
+	GrantsRevision    uint64
+	CredentialVersion uint64
+	RevocationVersion uint64
+}
+
+// TransportAccessCurrent is authoritative state checked on every acceptance.
+// Exact epoch equality is intentional; epochs have no ordering semantics.
+type TransportAccessCurrent struct {
+	AuthorityEpoch    string
+	GrantsRevision    uint64
+	CredentialVersion uint64
+	RevocationVersion uint64
+}
+
+// LocalAccessRequest contains evidence available at the local transport edge.
+// Origin-bearing browser requests are rejected even if they reach loopback.
+type LocalAccessRequest struct {
+	Credential    []byte
+	Binding       Binding
+	BrowserOrigin string
+}
+
+type transportAccessRecord struct {
+	claims            TransportAccessClaims
+	bindingDigest     [sha256.Size]byte
+	serverIncarnation [sha256.Size]byte
+	expiresAt         time.Time
+}
+
+// TransportAccessIssuer issues and verifies sender-constrained access for a
+// single daemon incarnation. Restart invalidates all issued credentials.
+type TransportAccessIssuer struct {
+	mu                sync.Mutex
+	random            io.Reader
+	now               func() time.Time
+	serverIncarnation [sha256.Size]byte
+	records           map[[sha256.Size]byte]transportAccessRecord
+	healthy           bool
+}
+
+func NewTransportAccessIssuer(random io.Reader, now func() time.Time) (*TransportAccessIssuer, error) {
+	if random == nil || now == nil {
+		return nil, ErrInvalidAccess
+	}
+	issuer := &TransportAccessIssuer{random: random, now: now, records: make(map[[sha256.Size]byte]transportAccessRecord)}
+	if err := issuer.rotateIncarnation(); err != nil {
+		return nil, err
+	}
+	issuer.healthy = true
+	return issuer, nil
+}
+
+func (issuer *TransportAccessIssuer) Issue(
+	claims TransportAccessClaims,
+	binding Binding,
+	ttl time.Duration,
+) (*TransportAccessCredential, error) {
+	if issuer == nil || !validTransportClaims(claims) || binding == (Binding{}) || ttl <= 0 || ttl > maxTransportAccessTTL {
+		return nil, ErrInvalidAccess
+	}
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	if !issuer.healthy {
+		return nil, ErrAccessDenied
+	}
+	return issuer.issueLocked(claims, binding, ttl)
+}
+
+func (issuer *TransportAccessIssuer) issueLocked(
+	claims TransportAccessClaims,
+	binding Binding,
+	ttl time.Duration,
+) (*TransportAccessCredential, error) {
+	var material [sha256.Size]byte
+	var digest [sha256.Size]byte
+	generated := false
+	for range 4 {
+		if _, err := io.ReadFull(issuer.random, material[:]); err != nil {
+			clear(material[:])
+			return nil, fmt.Errorf("%w: access credential entropy unavailable", ErrInvalidAccess)
+		}
+		digest = sha256.Sum256(material[:])
+		if _, exists := issuer.records[digest]; !exists {
+			generated = true
+			break
+		}
+		clear(material[:])
+	}
+	if !generated {
+		return nil, fmt.Errorf("%w: access credential collision", ErrInvalidAccess)
+	}
+	record := transportAccessRecord{
+		claims: claims, bindingDigest: sha256.Sum256(binding[:]),
+		serverIncarnation: issuer.serverIncarnation, expiresAt: issuer.now().Add(ttl),
+	}
+	issuer.records[digest] = record
+	return &TransportAccessCredential{material: material}, nil
+}
+
+// Rotate replaces an accepted credential. The old credential remains valid if
+// generation of its replacement fails.
+func (issuer *TransportAccessIssuer) Rotate(
+	oldCredential []byte,
+	claims TransportAccessClaims,
+	binding Binding,
+	ttl time.Duration,
+) (*TransportAccessCredential, error) {
+	if issuer == nil || len(oldCredential) != sha256.Size || !validTransportClaims(claims) ||
+		binding == (Binding{}) || ttl <= 0 || ttl > maxTransportAccessTTL {
+		return nil, ErrInvalidAccess
+	}
+	oldDigest := sha256.Sum256(oldCredential)
+	bindingDigest := sha256.Sum256(binding[:])
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	if !issuer.healthy {
+		return nil, ErrAccessDenied
+	}
+	oldRecord, ok := issuer.records[oldDigest]
+	if !ok || !issuer.now().Before(oldRecord.expiresAt) ||
+		subtle.ConstantTimeCompare(oldRecord.bindingDigest[:], bindingDigest[:]) != 1 ||
+		claims.PrincipalID != oldRecord.claims.PrincipalID || claims.DeviceID != oldRecord.claims.DeviceID ||
+		claims.AuthorityEpoch != oldRecord.claims.AuthorityEpoch ||
+		claims.GrantsRevision != oldRecord.claims.GrantsRevision ||
+		claims.RevocationVersion != oldRecord.claims.RevocationVersion ||
+		oldRecord.claims.CredentialVersion == ^uint64(0) ||
+		claims.CredentialVersion != oldRecord.claims.CredentialVersion+1 {
+		return nil, ErrAccessDenied
+	}
+	replacement, err := issuer.issueLocked(claims, binding, ttl)
+	if err != nil {
+		return nil, err
+	}
+	delete(issuer.records, oldDigest)
+	return replacement, nil
+}
+
+// VerifyLocalAccess denies browser-originated and unpaired callers before
+// returning server-established identity claims.
+func (issuer *TransportAccessIssuer) VerifyLocalAccess(
+	request LocalAccessRequest,
+	current TransportAccessCurrent,
+) (TransportAccessClaims, error) {
+	if issuer == nil || request.BrowserOrigin != "" || len(request.Credential) != sha256.Size ||
+		request.Binding == (Binding{}) || !validTransportCurrent(current) {
+		return TransportAccessClaims{}, ErrAccessDenied
+	}
+	credentialDigest := sha256.Sum256(request.Credential)
+	bindingDigest := sha256.Sum256(request.Binding[:])
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	record, ok := issuer.records[credentialDigest]
+	if issuer.healthy && ok && subtle.ConstantTimeCompare(record.bindingDigest[:], bindingDigest[:]) == 1 &&
+		record.serverIncarnation == issuer.serverIncarnation && issuer.now().Before(record.expiresAt) &&
+		record.claims.AuthorityEpoch == current.AuthorityEpoch &&
+		record.claims.GrantsRevision == current.GrantsRevision &&
+		record.claims.CredentialVersion == current.CredentialVersion &&
+		record.claims.RevocationVersion == current.RevocationVersion {
+		return record.claims, nil
+	}
+	return TransportAccessClaims{}, ErrAccessDenied
+}
+
+func (issuer *TransportAccessIssuer) Revoke(credential []byte) error {
+	if issuer == nil || len(credential) != sha256.Size {
+		return ErrAccessDenied
+	}
+	digest := sha256.Sum256(credential)
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	if !issuer.healthy {
+		return ErrAccessDenied
+	}
+	if _, ok := issuer.records[digest]; !ok {
+		return ErrAccessDenied
+	}
+	delete(issuer.records, digest)
+	return nil
+}
+
+// Restart rotates the opaque server incarnation and invalidates every live
+// assertion. Durable actor sessions are deliberately not represented here;
+// callers must issue fresh access and explicitly resume them elsewhere.
+func (issuer *TransportAccessIssuer) Restart() error {
+	if issuer == nil {
+		return ErrInvalidAccess
+	}
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	issuer.healthy = false
+	if err := issuer.rotateIncarnationLocked(); err != nil {
+		return err
+	}
+	clear(issuer.records)
+	issuer.healthy = true
+	return nil
+}
+
+func (issuer *TransportAccessIssuer) rotateIncarnation() error {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	return issuer.rotateIncarnationLocked()
+}
+
+func (issuer *TransportAccessIssuer) rotateIncarnationLocked() error {
+	if _, err := io.ReadFull(issuer.random, issuer.serverIncarnation[:]); err != nil {
+		clear(issuer.serverIncarnation[:])
+		return fmt.Errorf("%w: server incarnation entropy unavailable", ErrInvalidAccess)
+	}
+	return nil
+}
+
+func validTransportClaims(claims TransportAccessClaims) bool {
+	return validAccessIdentifier(claims.PrincipalID) && validAccessIdentifier(claims.DeviceID) &&
+		validAccessIdentifier(claims.AuthorityEpoch) && claims.GrantsRevision > 0 &&
+		claims.CredentialVersion > 0 && claims.RevocationVersion > 0
+}
+
+func validTransportCurrent(current TransportAccessCurrent) bool {
+	return validAccessIdentifier(current.AuthorityEpoch) && current.GrantsRevision > 0 &&
+		current.CredentialVersion > 0 && current.RevocationVersion > 0
+}
+
+func validAccessIdentifier(identifier string) bool {
+	return identifier != "" && len(identifier) <= credentialIDMaxBytes && strings.TrimSpace(identifier) == identifier
+}
+
+// PairingInvitationID is a non-secret lookup identifier.
+type PairingInvitationID [16]byte
+
+func (identifier PairingInvitationID) String() string { return hex.EncodeToString(identifier[:]) }
+
+// PairingInvitationSecret is a one-time secret with no serializable fields.
+// Bytes returns the deliberate handoff representation.
+type PairingInvitationSecret struct {
+	material [sha256.Size]byte
+}
+
+func (secret PairingInvitationSecret) String() string   { return "[REDACTED pairing invitation]" }
+func (secret PairingInvitationSecret) GoString() string { return secret.String() }
+
+func (secret PairingInvitationSecret) Bytes() []byte {
+	return append([]byte(nil), secret.material[:]...)
+}
+
+type pairingInvitationRecord struct {
+	digest    [sha256.Size]byte
+	expiresAt time.Time
+	attempts  int
+	suspended bool
+}
+
+// PairingInvitationRegistry enforces one-time use, attempt limits, expiry, and
+// explicit proof-of-secret resume after a daemon restart.
+type PairingInvitationRegistry struct {
+	mu      sync.Mutex
+	random  io.Reader
+	now     func() time.Time
+	records map[PairingInvitationID]pairingInvitationRecord
+}
+
+func NewPairingInvitationRegistry(random io.Reader, now func() time.Time) *PairingInvitationRegistry {
+	return &PairingInvitationRegistry{random: random, now: now, records: make(map[PairingInvitationID]pairingInvitationRecord)}
+}
+
+func (registry *PairingInvitationRegistry) Issue(ttl time.Duration) (PairingInvitationID, PairingInvitationSecret, error) {
+	if registry == nil || registry.random == nil || registry.now == nil || ttl <= 0 || ttl > maxPairingInvitationTTL {
+		return PairingInvitationID{}, PairingInvitationSecret{}, ErrInvitationInvalid
+	}
+	var identifier PairingInvitationID
+	var secret PairingInvitationSecret
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	generated := false
+	for range 4 {
+		if _, err := io.ReadFull(registry.random, identifier[:]); err != nil {
+			return PairingInvitationID{}, PairingInvitationSecret{}, ErrInvitationInvalid
+		}
+		if _, exists := registry.records[identifier]; !exists {
+			generated = true
+			break
+		}
+	}
+	if !generated {
+		return PairingInvitationID{}, PairingInvitationSecret{}, ErrInvitationInvalid
+	}
+	if _, err := io.ReadFull(registry.random, secret.material[:]); err != nil {
+		clear(secret.material[:])
+		return PairingInvitationID{}, PairingInvitationSecret{}, ErrInvitationInvalid
+	}
+	registry.records[identifier] = pairingInvitationRecord{
+		digest: sha256.Sum256(secret.material[:]), expiresAt: registry.now().Add(ttl),
+	}
+	return identifier, secret, nil
+}
+
+func (registry *PairingInvitationRegistry) Restart() {
+	if registry == nil {
+		return
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for identifier, record := range registry.records {
+		record.suspended = true
+		registry.records[identifier] = record
+	}
+}
+
+func (registry *PairingInvitationRegistry) Resume(identifier PairingInvitationID, secret PairingInvitationSecret) error {
+	return registry.update(identifier, secret, true)
+}
+
+func (registry *PairingInvitationRegistry) Redeem(identifier PairingInvitationID, secret PairingInvitationSecret) error {
+	return registry.update(identifier, secret, false)
+}
+
+func (registry *PairingInvitationRegistry) update(
+	identifier PairingInvitationID,
+	secret PairingInvitationSecret,
+	resume bool,
+) error {
+	if registry == nil || registry.now == nil || identifier == (PairingInvitationID{}) ||
+		secret.material == ([sha256.Size]byte{}) {
+		return ErrInvitationInvalid
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	record, ok := registry.records[identifier]
+	if !ok || !registry.now().Before(record.expiresAt) || record.attempts >= maxPairingAttempts {
+		delete(registry.records, identifier)
+		return ErrInvitationInvalid
+	}
+	presented := sha256.Sum256(secret.material[:])
+	if subtle.ConstantTimeCompare(record.digest[:], presented[:]) != 1 {
+		record.attempts++
+		if record.attempts >= maxPairingAttempts {
+			delete(registry.records, identifier)
+		} else {
+			registry.records[identifier] = record
+		}
+		return ErrInvitationInvalid
+	}
+	if resume {
+		if !record.suspended {
+			return ErrInvitationInvalid
+		}
+		record.suspended = false
+		registry.records[identifier] = record
+		return nil
+	}
+	if record.suspended {
+		return ErrInvitationSuspended
+	}
+	delete(registry.records, identifier)
+	return nil
 }
 
 // SPKIPin is SHA-256 over the canonical DER SubjectPublicKeyInfo encoding.
@@ -514,12 +930,21 @@ func HashTranscript(canonicalJCS []byte) (TranscriptHash, error) {
 	return sha256.Sum256(canonicalJCS), nil
 }
 
-// SignTranscript signs the transcript digest under the reviewed domain.
-func SignTranscript(privateKey ed25519.PrivateKey, transcript TranscriptHash) ([]byte, error) {
-	if !validPrivateKey(privateKey) || transcript == (TranscriptHash{}) {
+// SignTranscript signs the transcript digest under the reviewed domain through
+// an Ed25519 signer, including a vault-backed Ed25519Credential.
+func SignTranscript(signer crypto.Signer, transcript TranscriptHash) ([]byte, error) {
+	if signer == nil || transcript == (TranscriptHash{}) {
 		return nil, ErrInvalidTranscript
 	}
-	return ed25519.Sign(privateKey, transcriptMessage(transcript)), nil
+	publicKey, ok := signer.Public().(ed25519.PublicKey)
+	if !ok || len(publicKey) != ed25519.PublicKeySize {
+		return nil, ErrInvalidTranscript
+	}
+	signature, err := signer.Sign(rand.Reader, transcriptMessage(transcript), crypto.Hash(0))
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return nil, ErrInvalidTranscript
+	}
+	return signature, nil
 }
 
 // VerifyTranscript verifies a transcript signature and its domain binding.

@@ -7,9 +7,14 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -395,6 +400,284 @@ func TestSecurityPrimitivesRejectMissingInputs(t *testing.T) {
 	}
 	if _, err := PairingBinding(tls.ConnectionState{}); !errors.Is(err, ErrExporter) {
 		t.Fatalf("pre-handshake exporter error = %v", err)
+	}
+}
+
+func TestTransportAccessCredentialLifecycleAndLocalDenials(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	entropy := append(bytes.Repeat([]byte{0x51}, sha256.Size), bytes.Repeat([]byte{0x52}, sha256.Size)...)
+	entropy = append(entropy, bytes.Repeat([]byte{0x53}, sha256.Size)...)
+	issuer, err := NewTransportAccessIssuer(bytes.NewReader(entropy), func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewTransportAccessIssuer: %v", err)
+	}
+	claims := TransportAccessClaims{
+		PrincipalID: "principal-1", DeviceID: "device-1", AuthorityEpoch: "epoch-opaque-a",
+		GrantsRevision: 4, CredentialVersion: 2, RevocationVersion: 7,
+	}
+	current := TransportAccessCurrent{
+		AuthorityEpoch: claims.AuthorityEpoch, GrantsRevision: claims.GrantsRevision,
+		CredentialVersion: claims.CredentialVersion, RevocationVersion: claims.RevocationVersion,
+	}
+	binding := Binding{1, 2, 3}
+	credential, err := issuer.Issue(claims, binding, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	defer credential.Destroy()
+	material, err := credential.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	defer clear(material)
+	request := LocalAccessRequest{Credential: material, Binding: binding}
+	got, err := issuer.VerifyLocalAccess(request, current)
+	if err != nil || got != claims {
+		t.Fatalf("VerifyLocalAccess = (%+v, %v), want issued claims", got, err)
+	}
+
+	denials := []struct {
+		name    string
+		request LocalAccessRequest
+		current TransportAccessCurrent
+	}{
+		{"unpaired local process", LocalAccessRequest{Binding: binding}, current},
+		{"browser origin", LocalAccessRequest{Credential: material, Binding: binding, BrowserOrigin: "https://evil.example"}, current},
+		{"connection change", LocalAccessRequest{Credential: material, Binding: Binding{9}}, current},
+		{"epoch change", request, TransportAccessCurrent{"epoch-opaque-b", 4, 2, 7}},
+		{"grant change", request, TransportAccessCurrent{claims.AuthorityEpoch, 5, 2, 7}},
+		{"credential rotation", request, TransportAccessCurrent{claims.AuthorityEpoch, 4, 3, 7}},
+		{"revocation change", request, TransportAccessCurrent{claims.AuthorityEpoch, 4, 2, 8}},
+	}
+	for _, test := range denials {
+		t.Run(test.name, func(t *testing.T) {
+			if _, verifyErr := issuer.VerifyLocalAccess(test.request, test.current); !errors.Is(verifyErr, ErrAccessDenied) {
+				t.Fatalf("VerifyLocalAccess error = %v", verifyErr)
+			}
+		})
+	}
+
+	replacementClaims := claims
+	replacementClaims.CredentialVersion++
+	forgedClaims := replacementClaims
+	forgedClaims.PrincipalID = "principal-2"
+	if _, err := issuer.Rotate(material, forgedClaims, binding, 10*time.Minute); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("cross-principal rotation error = %v", err)
+	}
+	if _, err := issuer.VerifyLocalAccess(request, current); err != nil {
+		t.Fatalf("rejected rotation invalidated old credential: %v", err)
+	}
+	replacement, err := issuer.Rotate(material, replacementClaims, binding, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	defer replacement.Destroy()
+	if _, err := issuer.VerifyLocalAccess(request, current); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("rotated credential remained valid: %v", err)
+	}
+	replacementMaterial, _ := replacement.Bytes()
+	defer clear(replacementMaterial)
+	replacementCurrent := current
+	replacementCurrent.CredentialVersion++
+	if _, err := issuer.VerifyLocalAccess(
+		LocalAccessRequest{Credential: replacementMaterial, Binding: binding}, replacementCurrent,
+	); err != nil {
+		t.Fatalf("replacement credential rejected: %v", err)
+	}
+	if err := issuer.Revoke(replacementMaterial); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if _, err := issuer.VerifyLocalAccess(
+		LocalAccessRequest{Credential: replacementMaterial, Binding: binding}, replacementCurrent,
+	); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("revoked credential error = %v", err)
+	}
+}
+
+func TestTransportAccessExpiryAndRestartInvalidation(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	entropy := append(bytes.Repeat([]byte{0x63}, sha256.Size), bytes.Repeat([]byte{0x64}, sha256.Size)...)
+	entropy = append(entropy, bytes.Repeat([]byte{0x65}, sha256.Size)...)
+	entropy = append(entropy, bytes.Repeat([]byte{0x66}, sha256.Size)...)
+	issuer, err := NewTransportAccessIssuer(
+		bytes.NewReader(entropy), func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := TransportAccessClaims{"principal", "device", "epoch", 1, 1, 1}
+	current := TransportAccessCurrent{"epoch", 1, 1, 1}
+	binding := Binding{1}
+	credential, err := issuer.Issue(claims, binding, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer credential.Destroy()
+	material, _ := credential.Bytes()
+	defer clear(material)
+	request := LocalAccessRequest{Credential: material, Binding: binding}
+	now = now.Add(time.Minute)
+	if _, err := issuer.VerifyLocalAccess(request, current); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("expired credential error = %v", err)
+	}
+
+	now = now.Add(-time.Minute)
+	fresh, err := issuer.Issue(claims, binding, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Destroy()
+	freshMaterial, _ := fresh.Bytes()
+	defer clear(freshMaterial)
+	if err := issuer.Restart(); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if _, err := issuer.VerifyLocalAccess(
+		LocalAccessRequest{Credential: freshMaterial, Binding: binding}, current,
+	); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("pre-restart credential error = %v", err)
+	}
+}
+
+func TestPairingInvitationRestartResumeAttemptAndExpiryControls(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	registry := NewPairingInvitationRegistry(
+		bytes.NewReader(bytes.Repeat([]byte{0x42}, 16+sha256.Size)), func() time.Time { return now },
+	)
+	identifier, secret, err := registry.Issue(5 * time.Minute)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	registry.Restart()
+	if err := registry.Redeem(identifier, secret); !errors.Is(err, ErrInvitationSuspended) {
+		t.Fatalf("post-restart redemption error = %v", err)
+	}
+	if err := registry.Resume(identifier, secret); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if err := registry.Redeem(identifier, secret); err != nil {
+		t.Fatalf("Redeem after resume: %v", err)
+	}
+	if err := registry.Redeem(identifier, secret); !errors.Is(err, ErrInvitationInvalid) {
+		t.Fatalf("reused invitation error = %v", err)
+	}
+
+	expiryRegistry := NewPairingInvitationRegistry(
+		bytes.NewReader(bytes.Repeat([]byte{0x43}, 16+sha256.Size)), func() time.Time { return now },
+	)
+	expiringID, expiringSecret, _ := expiryRegistry.Issue(time.Minute)
+	now = now.Add(time.Minute)
+	if err := expiryRegistry.Redeem(expiringID, expiringSecret); !errors.Is(err, ErrInvitationInvalid) {
+		t.Fatalf("expired invitation error = %v", err)
+	}
+
+	attemptRegistry := NewPairingInvitationRegistry(
+		bytes.NewReader(bytes.Repeat([]byte{0x44}, 16+sha256.Size)), func() time.Time { return now },
+	)
+	attemptID, attemptSecret, _ := attemptRegistry.Issue(time.Minute)
+	wrongSecret := PairingInvitationSecret{material: [sha256.Size]byte{1}}
+	for range maxPairingAttempts {
+		if err := attemptRegistry.Redeem(attemptID, wrongSecret); !errors.Is(err, ErrInvitationInvalid) {
+			t.Fatalf("failed attempt error = %v", err)
+		}
+	}
+	if err := attemptRegistry.Redeem(attemptID, attemptSecret); !errors.Is(err, ErrInvitationInvalid) {
+		t.Fatalf("attempt-exhausted invitation error = %v", err)
+	}
+}
+
+func TestVaultSignerCompositionAndNoSecretLeakEvidence(t *testing.T) {
+	t.Parallel()
+
+	seed := sha256.Sum256([]byte("seeded vault signer secret"))
+	store := newFakeSecretStore()
+	reference, _ := DeviceCredentialReference("leak-test-device")
+	vault := NewCredentialVault(store, bytes.NewReader(seed[:]))
+	credential, err := vault.CreateCredential(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer credential.Destroy()
+	transcript, _ := HashTranscript([]byte(`{"protocol":"blackbird.pair/v1"}`))
+	signature, err := credential.SignTranscript(transcript)
+	if err != nil {
+		t.Fatalf("vault SignTranscript: %v", err)
+	}
+	publicKey, _ := credential.PublicKey()
+	if err := VerifyTranscript(publicKey, transcript, signature); err != nil {
+		t.Fatalf("VerifyTranscript: %v", err)
+	}
+	certificate, _, err := credential.NewCertificate(testValidity())
+	if err != nil || certificate.PrivateKey != credential {
+		t.Fatalf("vault signer was not retained by certificate: key=%T error=%v", certificate.PrivateKey, err)
+	}
+	invitationBytes := bytes.Repeat([]byte{0x71}, sha256.Size)
+	invitationRegistry := NewPairingInvitationRegistry(
+		bytes.NewReader(append(bytes.Repeat([]byte{0x70}, 16), invitationBytes...)), time.Now,
+	)
+	invitationID, invitation, err := invitationRegistry.Issue(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accessBytes := bytes.Repeat([]byte{0x73}, sha256.Size)
+	accessEntropy := append(bytes.Repeat([]byte{0x72}, sha256.Size), accessBytes...)
+	accessIssuer, err := NewTransportAccessIssuer(bytes.NewReader(accessEntropy), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, err := accessIssuer.Issue(
+		TransportAccessClaims{"principal", "device", "epoch", 1, 1, 1}, Binding{1}, time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer access.Destroy()
+
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	logger.Printf(
+		"credential=%v invitation=%v access=%v reference=%v error=%v",
+		credential, invitation, access, reference, ErrAccessDenied,
+	)
+	databaseEvidence, err := json.Marshal(struct {
+		CredentialReference string                     `json:"credential_reference"`
+		PublicKey           []byte                     `json:"public_key"`
+		InvitationID        string                     `json:"invitation_id"`
+		Invitation          PairingInvitationSecret    `json:"invitation"`
+		Access              *TransportAccessCredential `json:"access"`
+	}{reference.String(), publicKey, invitationID.String(), invitation, access})
+	if err != nil {
+		t.Fatal(err)
+	}
+	environmentEvidence := []string{"BLACKBIRD_CREDENTIAL_REFERENCE=" + reference.String()}
+	argumentEvidence := []string{"blackbird", "--credential-reference", reference.String()}
+	errorEvidence := fmt.Errorf("transport authentication: %w", ErrAccessDenied).Error()
+	formatEvidence := fmt.Sprintf(
+		"%v %#v %+v %x %q %v %#v %+v %x %q %v %#v %+v %x %q",
+		credential, credential, credential, credential, credential,
+		invitation, invitation, invitation, invitation, invitation,
+		access, access, access, access, access,
+	)
+	allEvidence := strings.Join(environmentEvidence, "\n") + strings.Join(argumentEvidence, "\n") +
+		strings.Join(os.Environ(), "\n") + strings.Join(os.Args, "\n") + logs.String() +
+		string(databaseEvidence) + errorEvidence + formatEvidence
+	for _, forbidden := range []string{
+		string(seed[:]), hex.EncodeToString(seed[:]), base64.StdEncoding.EncodeToString(seed[:]),
+		string(invitationBytes), hex.EncodeToString(invitationBytes), base64.StdEncoding.EncodeToString(invitationBytes),
+		string(accessBytes), hex.EncodeToString(accessBytes), base64.StdEncoding.EncodeToString(accessBytes),
+	} {
+		if strings.Contains(allEvidence, forbidden) {
+			t.Fatalf("environment/argv/log/error/format/database evidence leaked seeded key material")
+		}
+	}
+	if !strings.Contains(formatEvidence, "REDACTED") {
+		t.Fatal("credential formatting did not visibly redact the secret")
 	}
 }
 
