@@ -373,6 +373,7 @@ func (authorization *LockedAuthorization) authorize(
 		deviceID, deviceTrust = expectedID, expectedTrust
 	}
 	capabilitySets := make([]domain.CapabilitySet, 0, 4)
+	grantCapabilities := make(map[domain.Capability]struct{})
 	for _, revision := range request.GrantRevisions() {
 		grant, exists := grants[revision.Target()]
 		if !exists || grant.Status() != domain.GrantActive || grant.Version() != revision.Version() ||
@@ -380,7 +381,20 @@ func (authorization *LockedAuthorization) authorize(
 			(!grant.WorkspaceID().IsZero() && grant.WorkspaceID().String() != request.Scope().ID()) {
 			return domain.IdentityAuthorization{}, ErrAccessDenied
 		}
-		capabilitySets = append(capabilitySets, grant.Capabilities())
+		for _, capability := range grant.Capabilities().Values() {
+			grantCapabilities[capability] = struct{}{}
+		}
+	}
+	if len(grantCapabilities) > 0 {
+		values := make([]domain.Capability, 0, len(grantCapabilities))
+		for capability := range grantCapabilities {
+			values = append(values, capability)
+		}
+		combined, err := domain.NewCapabilitySet(values...)
+		if err != nil {
+			return domain.IdentityAuthorization{}, ErrAccessDenied
+		}
+		capabilitySets = append(capabilitySets, combined)
 	}
 	assurance := authorization.assurance
 	if request.Scope().Kind() == domain.ScopeKindWorkspace {
@@ -533,16 +547,19 @@ func (preparer *GeneratedPresentationCredentialPreparer) PreparePresentationCred
 		return domain.PresentationCredentialBinding{}, ErrInvalidAccess
 	}
 	preparer.mu.Lock()
-	defer preparer.mu.Unlock()
 	if _, exists := preparer.used[request.DeliveryReference()]; exists {
+		preparer.mu.Unlock()
 		return domain.PresentationCredentialBinding{}, ErrAccessDenied
 	}
 	preparer.used[request.DeliveryReference()] = struct{}{}
 	secret := make([]byte, sha256.Size)
 	if _, err := io.ReadFull(preparer.random, secret); err != nil {
+		delete(preparer.used, request.DeliveryReference())
+		preparer.mu.Unlock()
 		clear(secret)
 		return domain.PresentationCredentialBinding{}, ErrSecurityDependency
 	}
+	preparer.mu.Unlock()
 	defer clear(secret)
 	device, hasDevice := request.DeviceID()
 	bound := hmac.New(sha256.New, secret)

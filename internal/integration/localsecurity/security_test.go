@@ -756,6 +756,174 @@ func TestVaultRecoveryCapsuleSignerLookupRejectsForgeryAndRedacts(t *testing.T) 
 	}
 }
 
+func TestAuthenticationAndPolicyPreparersRejectForgedAndStaleEvidence(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	principal, _ := domain.ParsePrincipalID(proofUUID(120))
+	device, _ := domain.ParseDeviceID(proofUUID(121))
+	installation, _ := domain.ParseInstallationID(proofUUID(122))
+	scope, _ := domain.InstallationScope(installation)
+	authority, _ := domain.ParseAuthorityID(proofUUID(123))
+	provenance, _ := application.NewAuditProvenanceEvidence(authority, nil)
+	audience, _ := domain.NewCredentialAudience("blackbird:local")
+	fingerprint, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("authenticated credential")))
+	params := application.AuthenticationRequestParams{
+		Operation: application.CommandRegisterPrincipal, Scope: scope, PrincipalID: principal,
+		PrincipalRevision: domain.InitialVersion(), DeviceID: &device,
+		DeviceRevision: domain.InitialVersion(), DeviceTrustRevision: domain.InitialVersion(),
+		DeviceRevokeRevision: domain.InitialVersion(), CredentialFingerprint: fingerprint,
+		ChannelBinding: application.DigestBytes([]byte("authenticated channel")), Audience: audience,
+		AuditProvenance: provenance, VerifiedAt: now,
+	}
+	request, err := application.NewAuthenticationRequest(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := NewAuthenticationRegistry()
+	if err := registry.Register(request); err != nil {
+		t.Fatal(err)
+	}
+	preparer, _ := NewAuthenticationPreparer(registry)
+	decision, err := preparer.PrepareAuthentication(t.Context(), request)
+	if err != nil || decision.Kind() != application.AuthenticationValid {
+		t.Fatalf("registered authentication = (%s, %v)", decision.Kind(), err)
+	}
+
+	attacks := map[string]func(*application.AuthenticationRequestParams){
+		"forged principal": func(value *application.AuthenticationRequestParams) {
+			value.PrincipalID, _ = domain.ParsePrincipalID(proofUUID(124))
+		},
+		"stale principal": func(value *application.AuthenticationRequestParams) {
+			value.PrincipalRevision, _ = domain.NewVersion(2)
+		},
+		"stale credential": func(value *application.AuthenticationRequestParams) {
+			value.DeviceTrustRevision, _ = domain.NewVersion(2)
+		},
+		"revoked device revision": func(value *application.AuthenticationRequestParams) {
+			value.DeviceRevokeRevision, _ = domain.NewVersion(2)
+		},
+		"cross audience": func(value *application.AuthenticationRequestParams) {
+			value.Audience, _ = domain.NewCredentialAudience("blackbird:other")
+		},
+		"cross channel": func(value *application.AuthenticationRequestParams) {
+			value.ChannelBinding = application.DigestBytes([]byte("other channel"))
+		},
+	}
+	for name, mutate := range attacks {
+		t.Run(name, func(t *testing.T) {
+			forgedParams := params
+			mutate(&forgedParams)
+			forged, newErr := application.NewAuthenticationRequest(forgedParams)
+			if newErr != nil {
+				t.Fatal(newErr)
+			}
+			if _, prepareErr := preparer.PrepareAuthentication(t.Context(), forged); !errors.Is(prepareErr, ErrAccessDenied) {
+				t.Fatalf("forged authentication error = %v", prepareErr)
+			}
+		})
+	}
+
+	policyRevision, _ := domain.NewPolicyRevision("local-policy:v1")
+	policyDigest := application.DigestBytes([]byte("local policy"))
+	policies := NewPolicyRegistry()
+	if err := policies.Register(scope, policyRevision, policyDigest); err != nil {
+		t.Fatal(err)
+	}
+	policyPreparer, _ := NewPolicyPreparer(policies)
+	policyRequest, _ := application.NewPolicyPreparationRequest(request, policyRevision, policyDigest)
+	if _, err := policyPreparer.PreparePolicy(t.Context(), policyRequest); err != nil {
+		t.Fatal(err)
+	}
+	staleRevision, _ := domain.NewPolicyRevision("local-policy:v0")
+	stalePolicy, _ := application.NewPolicyPreparationRequest(request, staleRevision, policyDigest)
+	if _, err := policyPreparer.PreparePolicy(t.Context(), stalePolicy); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("stale policy revision error = %v", err)
+	}
+	staleDigest, _ := application.NewPolicyPreparationRequest(request, policyRevision, application.DigestBytes([]byte("forged policy")))
+	if _, err := policyPreparer.PreparePolicy(t.Context(), staleDigest); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("stale policy digest error = %v", err)
+	}
+	if err := registry.Revoke(request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := preparer.PrepareAuthentication(t.Context(), request); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("replay after revocation error = %v", err)
+	}
+}
+
+func TestGeneratedPresentationCredentialIsBoundAndDeliveredOnce(t *testing.T) {
+	t.Parallel()
+	principal, _ := domain.ParsePrincipalID(proofUUID(130))
+	device, _ := domain.ParseDeviceID(proofUUID(131))
+	session, _ := domain.ParseActorSessionID(proofUUID(132))
+	audience, _ := domain.NewCredentialAudience("blackbird:session")
+	delivery := &recordingPresentationDelivery{}
+	request, err := application.NewPresentationCredentialRequest(
+		application.CommandStartActorSession, principal, &device, session, audience,
+		application.DigestBytes([]byte("session channel")), "delivery-132", delivery,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := bytes.Repeat([]byte{0x91}, sha256.Size)
+	preparer, _ := NewGeneratedPresentationCredentialPreparer(bytes.NewReader(secret))
+	binding, err := preparer.PreparePresentationCredential(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.IsZero() || binding.Audience() != audience || delivery.calls != 1 ||
+		delivery.reference != "delivery-132" || !bytes.Equal(delivery.credential, secret) {
+		t.Fatal("generated credential was not bound and delivered exactly once")
+	}
+	if bytes.Contains([]byte(fmt.Sprintf("%v %#v", binding, binding)), secret) {
+		t.Fatal("presentation binding exposed plaintext credential")
+	}
+	if _, err := preparer.PreparePresentationCredential(t.Context(), request); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("reused delivery error = %v", err)
+	}
+}
+
+func TestGeneratedPresentationCredentialConsumesFailedDeliveryReference(t *testing.T) {
+	t.Parallel()
+	principal, _ := domain.ParsePrincipalID(proofUUID(133))
+	session, _ := domain.ParseActorSessionID(proofUUID(134))
+	audience, _ := domain.NewCredentialAudience("blackbird:session")
+	delivery := &recordingPresentationDelivery{err: errors.New("delivery unavailable")}
+	request, err := application.NewPresentationCredentialRequest(
+		application.CommandStartActorSession, principal, nil, session, audience,
+		application.DigestBytes([]byte("retry channel")), "delivery-134", delivery,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparer, _ := NewGeneratedPresentationCredentialPreparer(bytes.NewReader(bytes.Repeat([]byte{0x92}, 2*sha256.Size)))
+	if _, err := preparer.PreparePresentationCredential(t.Context(), request); !errors.Is(err, ErrSecurityDependency) {
+		t.Fatalf("failed delivery error = %v", err)
+	}
+	delivery.err = nil
+	if _, err := preparer.PreparePresentationCredential(t.Context(), request); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("failed delivery reference was reusable: %v", err)
+	}
+}
+
+type recordingPresentationDelivery struct {
+	calls      int
+	reference  string
+	credential []byte
+	err        error
+}
+
+func (delivery *recordingPresentationDelivery) DeliverPresentationCredential(
+	_ context.Context,
+	reference string,
+	credential []byte,
+) error {
+	delivery.calls++
+	delivery.reference = reference
+	delivery.credential = append([]byte(nil), credential...)
+	return delivery.err
+}
+
 func TestBootstrapProofVerifierBindsInvitationPrincipalDeviceAndChannel(t *testing.T) {
 	t.Parallel()
 
