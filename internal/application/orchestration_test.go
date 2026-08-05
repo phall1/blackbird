@@ -158,8 +158,9 @@ func (verifier orchestrationBootstrapVerifier) VerifyBootstrapProof(
 }
 
 type orchestrationAuthorizer struct {
-	calls     int
-	rejection *domain.CommandError
+	calls             int
+	rejection         *domain.CommandError
+	principalOverride domain.PrincipalID
 }
 
 func (authorizer *orchestrationAuthorizer) AuthorizeLocked(
@@ -172,6 +173,9 @@ func (authorizer *orchestrationAuthorizer) AuthorizeLocked(
 		return domain.IdentityAuthorization{}, authorizer.rejection
 	}
 	principal, _ := domain.ParsePrincipalID(applicationUUID(5))
+	if !authorizer.principalOverride.IsZero() {
+		principal = authorizer.principalOverride
+	}
 	installation, _ := domain.ParseInstallationID(locked.Spec().Scope().ID())
 	capabilities, _ := domain.NewCapabilitySet(domain.InstallationOwnerCapability())
 	policy, _ := domain.NewPolicyRevision("policy-1")
@@ -540,6 +544,45 @@ func TestOrchestrationFullReplayUsesHistoricalReceiptSigner(t *testing.T) {
 	if unit.writes != 0 || signers.signs != 1 || len(signers.requested) != 2 ||
 		signers.requested[0] != currentSigner.KeyID() || signers.requested[1] != historicalSigner.KeyID() {
 		t.Fatalf("writes=%d signs=%d requested=%v", unit.writes, signers.signs, signers.requested)
+	}
+}
+
+func TestOrchestrationRejectsReceiptSubstitutedAfterReplayCallback(t *testing.T) {
+	service, request, unit, _, _, _ := orchestrationFixture(t, orchestrationReplayOnly)
+	fixture := buildBootstrapFixture(t)
+	receipt := bootstrapReceipt(t, fixture)
+	receipt.requestFingerprint = request.Spec.RequestFingerprint()
+	replay, _ := ReplayReceipt(receipt)
+	disclosureTime, _ := ReadOnlyDisclosureTime(fixture.now, fixture.now)
+	invitationState, _ := NewIdentityState(fixture.invitation)
+	locked, err := NewCommandContext(
+		request.Spec, disclosureTime, []IdentityState{invitationState}, replay, fixture.context.GuardEvidence(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit.contexts = []CommandContext{locked}
+	unit.replayReceipt = receipt
+	unit.replayReceipt.receiptID, _ = domain.ParseReceiptID(applicationUUID(99))
+
+	if _, err = service.BootstrapInstallation(context.Background(), request); !errors.Is(err, ErrInvalidCommandExecution) {
+		t.Fatalf("substituted replay receipt error=%v", err)
+	}
+}
+
+func TestOrchestrationRejectsAuthorizationForDifferentPrincipal(t *testing.T) {
+	service, request, unit, authorizer, _, _ := orchestrationFixture(t, orchestrationIndeterminate)
+	authorizer.principalOverride, _ = domain.ParsePrincipalID(applicationUUID(99))
+	called := false
+	_, err := service.executeCommand(
+		context.Background(), request.CommandRequest, CommandBootstrapInstallation,
+		func(CommandContext, domain.IdentityAuthorization, AuthenticationEvidence, PreparedPolicy) (OperationCommit, error) {
+			called = true
+			return OperationCommit{}, nil
+		},
+	)
+	if !errors.Is(err, ErrInvalidApplicationContract) || called || unit.writes != 0 {
+		t.Fatalf("error=%v called=%t writes=%d", err, called, unit.writes)
 	}
 }
 

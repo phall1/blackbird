@@ -2091,7 +2091,9 @@ func finalizeCommandAudit(
 		receiptIdentityDigest: receiptDigest, correlationID: &trace,
 	}
 	seed.timing = AuditTiming{persistedAuthorityTime: commandContext.timeEvidence.value.UTC()}
-	seed.subject = commandAuditSubject(commandContext)
+	if seed.subject.kind == "" {
+		seed.subject = commandAuditSubject(commandContext)
+	}
 	seed.provenance = AuditProvenance{sourceAuthority: spec.authorityID}
 	seed.authorization = commandAuditAuthorization(commandContext)
 	seed.resources = auditResources(spec.guards.mutations)

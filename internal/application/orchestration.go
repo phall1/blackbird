@@ -1,6 +1,7 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -430,8 +431,14 @@ func (service *OrchestrationService) executePreparedCommand(
 	transition transitionDecision,
 ) (CommandExecution, error) {
 	signer, signerErr := service.prepareSigner(ctx, request.Spec)
+	var expectedDecision CommandDecision
 
-	transaction, transactionErr := service.uow.ExecuteCommand(ctx, request.Spec, func(locked CommandContext) (CommandDecision, error) {
+	transaction, transactionErr := service.uow.ExecuteCommand(ctx, request.Spec, func(locked CommandContext) (decision CommandDecision, decisionErr error) {
+		defer func() {
+			if decisionErr == nil {
+				expectedDecision = decision
+			}
+		}()
 		switch locked.ReceiptResolution().Kind() {
 		case ReceiptExactReplay:
 			disclosure, disclosureErr := service.replayDisclosure.AuthorizeReplay(locked, authentication, policy)
@@ -459,6 +466,9 @@ func (service *OrchestrationService) executePreparedCommand(
 		if authorizationErr != nil {
 			return service.rollbackDecision(locked, authentication, policy, authorizationErr)
 		}
+		if !authorizationMatchesCommand(authorization, authentication, policy, request.Spec, locked) {
+			return CommandDecision{}, ErrInvalidApplicationContract
+		}
 		commit, transitionErr := transition(locked, authorization, authentication, policy)
 		if transitionErr != nil {
 			return service.rollbackDecision(locked, authentication, policy, transitionErr)
@@ -469,6 +479,7 @@ func (service *OrchestrationService) executePreparedCommand(
 		if auditErr != nil {
 			return CommandDecision{}, auditErr
 		}
+		audit.subject = authenticatedAuditSubject(authentication, request.Spec)
 		planningInput, planningErr := NewEffectPlanningInput(request.Spec.CommandID(), commit.facts)
 		if planningErr != nil {
 			return CommandDecision{}, planningErr
@@ -485,7 +496,131 @@ func (service *OrchestrationService) executePreparedCommand(
 	if transactionErr != nil {
 		return CommandExecution{}, transactionErr
 	}
+	if !transactionMatchesDecision(request.Spec, transaction, expectedDecision) {
+		return CommandExecution{}, ErrInvalidCommandExecution
+	}
 	return service.finishCommand(ctx, transaction, signer)
+}
+
+func authorizationMatchesCommand(
+	authorization domain.IdentityAuthorization,
+	authentication AuthenticationEvidence,
+	policy PreparedPolicy,
+	spec CommandSpec,
+	locked CommandContext,
+) bool {
+	if authorization.PrincipalID() != authentication.principal ||
+		authorization.AuthorityID() != spec.authorityID || authorization.AuthorityEpoch() != spec.requestedEpoch ||
+		authorization.PolicyRevision() != policy.revision || !authorshipGuardsMatch(spec) {
+		return false
+	}
+	authorityTime, present := locked.AuthorityTime()
+	if !present || !authorization.EvaluatedAt().Equal(authorityTime) {
+		return false
+	}
+	switch spec.scope.Kind() {
+	case domain.ScopeKindInstallation:
+		if authorization.InstallationID().String() != spec.scope.ID() || !authorization.WorkspaceID().IsZero() {
+			return false
+		}
+	case domain.ScopeKindWorkspace:
+		if authorization.WorkspaceID().String() != spec.scope.ID() || authorization.InstallationID().IsZero() {
+			return false
+		}
+	default:
+		return false
+	}
+	device, _, hasDevice := authorization.AuthenticatedDevice()
+	return hasDevice == authentication.hasDevice && (!hasDevice || device == authentication.device)
+}
+
+func authorshipGuardsMatch(spec CommandSpec) bool {
+	if !spec.authorship.hasActor {
+		return true
+	}
+	var actor, session bool
+	for _, guard := range spec.guards.evidence {
+		if guard.kind != EvidenceLifecycleStatus {
+			continue
+		}
+		actor = actor || guard.targetKind == string(domain.AggregateKindActor) &&
+			guard.targetID == spec.authorship.actor.String()
+		session = session || guard.targetKind == string(domain.AggregateKindActorSession) &&
+			guard.targetID == spec.authorship.actorSession.String()
+	}
+	return actor && session
+}
+
+func authenticatedAuditSubject(authentication AuthenticationEvidence, spec CommandSpec) AuditSubject {
+	subject := AuditSubject{kind: AuditSubjectAttributed, principal: authentication.principal}
+	if authentication.hasDevice {
+		subject.device, subject.hasDevice = authentication.device, true
+	}
+	if spec.authorship.hasActor {
+		subject.actor, subject.actorSession, subject.hasActor =
+			spec.authorship.actor, spec.authorship.actorSession, true
+	}
+	return subject
+}
+
+func transactionMatchesDecision(
+	spec CommandSpec,
+	execution CommandTransactionExecution,
+	decision CommandDecision,
+) bool {
+	switch execution.kind {
+	case CommandTransactionCommitted:
+		return decision.kind == CommandDecisionApplied && receiptMatchesCommittedSpec(execution.receipt, spec)
+	case CommandTransactionReplayed:
+		if decision.kind != CommandDecisionReplay || execution.disclosure != decision.disclosure {
+			return false
+		}
+		if execution.disclosure == ReplayDiscloseAppliedOnly {
+			return execution.appliedOnly == decision.appliedOnly
+		}
+		return sameReceiptSnapshot(execution.receipt, decision.replay)
+	case CommandTransactionRejected:
+		return decision.kind == CommandDecisionRollback && execution.rejection == decision.rejection &&
+			sameCommandDenialSpec(execution.denialAudit, decision.denialAudit)
+	case CommandTransactionIndeterminate:
+		return decision.kind == CommandDecisionApplied
+	default:
+		return false
+	}
+}
+
+func receiptMatchesCommittedSpec(receipt ReceiptSnapshot, spec CommandSpec) bool {
+	return receipt.receiptID == spec.receiptID && receipt.commandID == spec.commandID &&
+		receipt.identity == spec.receiptIdentity && receipt.requestFingerprint == spec.requestFingerprint &&
+		receipt.capsuleRequirement == spec.recoveryCapsule.requirement
+}
+
+func sameReceiptSnapshot(left, right ReceiptSnapshot) bool {
+	return left.receiptID == right.receiptID && left.commandID == right.commandID && left.identity == right.identity &&
+		left.requestFingerprint == right.requestFingerprint && left.result.responseDigest == right.result.responseDigest &&
+		left.authorityID == right.authorityID && left.authorityEpoch == right.authorityEpoch &&
+		left.guardDigest == right.guardDigest && left.events == right.events &&
+		left.capsuleRequirement == right.capsuleRequirement && left.hasRecoveryCapsule == right.hasRecoveryCapsule &&
+		(!left.hasRecoveryCapsule || (left.recoveryCapsule.digest == right.recoveryCapsule.digest &&
+			left.recoveryCapsule.resultDigest == right.recoveryCapsule.resultDigest &&
+			left.recoveryCapsule.keyID == right.recoveryCapsule.keyID &&
+			bytes.Equal(left.recoveryCapsule.canonical, right.recoveryCapsule.canonical)))
+}
+
+func sameCommandDenialSpec(left, right SecuritySpec) bool {
+	if left.operation == "" && right.operation == "" {
+		return true
+	}
+	return left.operation == SecurityRecordCommandDenial && right.operation == SecurityRecordCommandDenial &&
+		left.scope == right.scope && left.authorityID == right.authorityID && left.epoch == right.epoch &&
+		left.admission == right.admission && left.commandDenial.operation == right.commandDenial.operation &&
+		left.commandDenial.operationMajor == right.commandDenial.operationMajor &&
+		left.commandDenial.class == right.commandDenial.class && left.commandDenial.reason == right.commandDenial.reason &&
+		left.commandDenial.requestFingerprint == right.commandDenial.requestFingerprint &&
+		left.commandDenial.denialFingerprint == right.commandDenial.denialFingerprint &&
+		left.commandDenial.subject == right.commandDenial.subject && left.commandDenial.policy == right.commandDenial.policy &&
+		left.commandDenial.hasPolicy == right.commandDenial.hasPolicy &&
+		left.commandDenial.correlation == right.commandDenial.correlation
 }
 
 func (service *OrchestrationService) executeBootstrapCommand(
@@ -499,7 +634,13 @@ func (service *OrchestrationService) executeBootstrapCommand(
 		return CommandExecution{}, fmt.Errorf("%w: policy preparation: %w", ErrOrchestrationDependency, err)
 	}
 	signer, signerErr := service.prepareSigner(ctx, request.Spec)
-	transaction, transactionErr := service.uow.ExecuteCommand(ctx, request.Spec, func(locked CommandContext) (CommandDecision, error) {
+	var expectedDecision CommandDecision
+	transaction, transactionErr := service.uow.ExecuteCommand(ctx, request.Spec, func(locked CommandContext) (decision CommandDecision, decisionErr error) {
+		defer func() {
+			if decisionErr == nil {
+				expectedDecision = decision
+			}
+		}()
 		switch locked.ReceiptResolution().Kind() {
 		case ReceiptExactReplay:
 			disclosure, disclosureErr := service.replayDisclosure.AuthorizeReplay(locked, authentication, policy)
@@ -532,6 +673,7 @@ func (service *OrchestrationService) executeBootstrapCommand(
 		if auditErr != nil {
 			return CommandDecision{}, auditErr
 		}
+		audit.subject = authenticatedAuditSubject(authentication, request.Spec)
 		planningInput, planningErr := NewEffectPlanningInput(request.Spec.CommandID(), commit.facts)
 		if planningErr != nil {
 			return CommandDecision{}, planningErr
@@ -547,6 +689,9 @@ func (service *OrchestrationService) executeBootstrapCommand(
 	}
 	if transactionErr != nil {
 		return CommandExecution{}, transactionErr
+	}
+	if !transactionMatchesDecision(request.Spec, transaction, expectedDecision) {
+		return CommandExecution{}, ErrInvalidCommandExecution
 	}
 	return service.finishCommand(ctx, transaction, signer)
 }
