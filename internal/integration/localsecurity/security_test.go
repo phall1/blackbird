@@ -765,9 +765,16 @@ func TestBootstrapProofVerifierBindsInvitationPrincipalDeviceAndChannel(t *testi
 	deviceSeed := sha256.Sum256([]byte("bootstrap-device-key"))
 	deviceKey := ed25519.NewKeyFromSeed(deviceSeed[:])
 	keyReference, _ := domain.NewPublicKeyReference("keyref:bootstrap-device")
-	keys, err := NewProofPublicKeyRegistry(nil, nil, map[string]ed25519.PublicKey{
-		keyReference.String(): deviceKey.Public().(ed25519.PublicKey),
-	})
+	vaultReference, _ := DeviceCredentialReference("bootstrap-device")
+	vault := NewCredentialVault(newFakeSecretStore(), bytes.NewReader(deviceSeed[:]))
+	vaultCredential, err := vault.CreateCredential(vaultReference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultCredential.Destroy()
+	keys, err := NewProofPublicKeyRegistry(vault, map[string]CredentialReference{
+		keyReference.String(): vaultReference,
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,17 +815,22 @@ func TestBootstrapProofVerifierBindsInvitationPrincipalDeviceAndChannel(t *testi
 			if newErr != nil {
 				t.Fatal(newErr)
 			}
-			verification, verifyErr := verifier.VerifyBootstrapProof(t.Context(), forged)
-			if name == "unknown field" || name == "unknown version" || name == "wrong purpose" {
-				if !errors.Is(verifyErr, ErrInvalidProof) {
-					t.Fatalf("strict envelope error = %v", verifyErr)
-				}
-				return
-			}
-			if verifyErr != nil || verification.Decision() != application.ProofCryptographicallyRejected {
-				t.Fatalf("forged verification = (%v, %v)", verification.Decision(), verifyErr)
+			_, verifyErr := verifier.VerifyBootstrapProof(t.Context(), forged)
+			if !errors.Is(verifyErr, ErrInvalidProof) {
+				t.Fatalf("noncanonical or invalid envelope error = %v", verifyErr)
 			}
 		})
+	}
+	var canonicalForgery bootstrapProofEnvelopeV1
+	if err := json.Unmarshal(evidence.Bytes(), &canonicalForgery); err != nil {
+		t.Fatal(err)
+	}
+	canonicalForgery.Signature = encodeProofBytes(bytes.Repeat([]byte{9}, ed25519.SignatureSize))
+	forgedBytes, _ := json.Marshal(canonicalForgery)
+	forgedEvidence, _ := application.NewBootstrapProofEvidence(forgedBytes)
+	forgedVerification, err := verifier.VerifyBootstrapProof(t.Context(), forgedEvidence)
+	if err != nil || forgedVerification.Decision() != application.ProofCryptographicallyRejected {
+		t.Fatalf("canonical signature forgery = (%v, %v)", forgedVerification.Decision(), err)
 	}
 
 	verification, err := verifier.VerifyBootstrapProof(t.Context(), evidence)
@@ -972,6 +984,20 @@ func TestPairingRedemptionVerifierConstructsBoundAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	evidence, _ := NewCeremonyProofEvidence(proofContext, privateKey)
+	var crossDeviceEnvelope ceremonyProofEnvelopeV1
+	if err := json.Unmarshal(evidence.Bytes(), &crossDeviceEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	crossDeviceEnvelope.DeviceID = proofUUID(106)
+	crossDeviceBytes, _ := json.Marshal(crossDeviceEnvelope)
+	crossDeviceEvidence, _ := application.NewCeremonyProofEvidence(crossDeviceBytes)
+	crossDeviceDecision, err := verifier.VerifyPairingRedemption(t.Context(), crossDeviceEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, valid := crossDeviceDecision.Verified(); valid {
+		t.Fatal("cross-device pairing proof was accepted")
+	}
 	decision, err := verifier.VerifyPairingRedemption(t.Context(), evidence)
 	if err != nil {
 		t.Fatal(err)
