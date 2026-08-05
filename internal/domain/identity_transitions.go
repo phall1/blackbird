@@ -76,14 +76,16 @@ func (fact DevicePairingBeganFact) DisplayName() DisplayName               { ret
 func (fact DevicePairingBeganFact) PublicKeyReference() PublicKeyReference { return fact.publicKey }
 
 type DevicePairedFact struct {
-	origin         AggregateRef
-	installationID InstallationID
-	deviceID       DeviceID
-	principalID    PrincipalID
-	displayName    DisplayName
-	transcript     CommandFingerprint
-	trustRevision  Version
-	credential     DeviceCredentialBinding
+	origin             AggregateRef
+	installationID     InstallationID
+	deviceID           DeviceID
+	principalID        PrincipalID
+	displayName        DisplayName
+	transcript         CommandFingerprint
+	trustRevision      Version
+	revocationRevision Version
+	credential         DeviceCredentialBinding
+	activatedAt        time.Time
 }
 
 func (DevicePairedFact) Type() EventType                                 { return EventTypeDevicePaired }
@@ -95,7 +97,63 @@ func (fact DevicePairedFact) PrincipalID() PrincipalID                   { retur
 func (fact DevicePairedFact) DisplayName() DisplayName                   { return fact.displayName }
 func (fact DevicePairedFact) TranscriptFingerprint() CommandFingerprint  { return fact.transcript }
 func (fact DevicePairedFact) TrustRevision() Version                     { return fact.trustRevision }
+func (fact DevicePairedFact) RevocationRevision() Version                { return fact.revocationRevision }
 func (fact DevicePairedFact) CredentialBinding() DeviceCredentialBinding { return fact.credential }
+func (fact DevicePairedFact) CredentialActivatedAt() time.Time           { return fact.activatedAt }
+
+type DeviceCredentialRotatedFact struct {
+	origin             AggregateRef
+	deviceID           DeviceID
+	previousCredential DeviceCredentialBinding
+	activeCredential   DeviceCredentialBinding
+	trustRevision      Version
+	revocationRevision Version
+	transcript         CommandFingerprint
+	rotatedAt          time.Time
+	retiringExpiresAt  time.Time
+}
+
+func (DeviceCredentialRotatedFact) Type() EventType           { return EventTypeDeviceCredentialRotated }
+func (DeviceCredentialRotatedFact) identityFact()             {}
+func (fact DeviceCredentialRotatedFact) Origin() AggregateRef { return fact.origin }
+func (fact DeviceCredentialRotatedFact) DeviceID() DeviceID   { return fact.deviceID }
+func (fact DeviceCredentialRotatedFact) PreviousCredential() DeviceCredentialBinding {
+	return fact.previousCredential
+}
+func (fact DeviceCredentialRotatedFact) ActiveCredential() DeviceCredentialBinding {
+	return fact.activeCredential
+}
+func (fact DeviceCredentialRotatedFact) TrustRevision() Version      { return fact.trustRevision }
+func (fact DeviceCredentialRotatedFact) RevocationRevision() Version { return fact.revocationRevision }
+func (fact DeviceCredentialRotatedFact) TranscriptFingerprint() CommandFingerprint {
+	return fact.transcript
+}
+func (fact DeviceCredentialRotatedFact) RotatedAt() time.Time { return fact.rotatedAt }
+func (fact DeviceCredentialRotatedFact) RetiringCredentialExpiresAt() time.Time {
+	return fact.retiringExpiresAt
+}
+
+type DeviceRevokedFact struct {
+	origin                AggregateRef
+	deviceID              DeviceID
+	credential            DeviceCredentialBinding
+	trustRevision         Version
+	revocationRevision    Version
+	revocationFingerprint CommandFingerprint
+	revokedAt             time.Time
+}
+
+func (DeviceRevokedFact) Type() EventType                                 { return EventTypeDeviceRevoked }
+func (DeviceRevokedFact) identityFact()                                   {}
+func (fact DeviceRevokedFact) Origin() AggregateRef                       { return fact.origin }
+func (fact DeviceRevokedFact) DeviceID() DeviceID                         { return fact.deviceID }
+func (fact DeviceRevokedFact) CredentialBinding() DeviceCredentialBinding { return fact.credential }
+func (fact DeviceRevokedFact) TrustRevision() Version                     { return fact.trustRevision }
+func (fact DeviceRevokedFact) RevocationRevision() Version                { return fact.revocationRevision }
+func (fact DeviceRevokedFact) RevocationFingerprint() CommandFingerprint {
+	return fact.revocationFingerprint
+}
+func (fact DeviceRevokedFact) RevokedAt() time.Time { return fact.revokedAt }
 
 type WorkspaceCreatedFact struct {
 	origin      AggregateRef
@@ -454,14 +512,15 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 		version:        InitialVersion(),
 	}
 	device := DeviceState{
-		id:             input.DeviceID,
-		installationID: input.Invitation.InstallationID(),
-		principalID:    input.PrincipalID,
-		displayName:    input.DeviceDisplayName,
-		publicKey:      input.DevicePublicKey,
-		status:         DeviceTrusted,
-		version:        InitialVersion(),
-		trustRevision:  InitialVersion(),
+		id:                 input.DeviceID,
+		installationID:     input.Invitation.InstallationID(),
+		principalID:        input.PrincipalID,
+		displayName:        input.DeviceDisplayName,
+		publicKey:          input.DevicePublicKey,
+		status:             DeviceTrusted,
+		version:            InitialVersion(),
+		trustRevision:      InitialVersion(),
+		revocationRevision: InitialVersion(),
 	}
 	credential, err := NewDeviceCredentialBinding(
 		input.Proof.DevicePublicKey(), input.Proof.DeviceSPKIFingerprint(), input.Proof.TranscriptFingerprint(),
@@ -470,6 +529,7 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 		return BootstrapInstallationResult{}, transitionError(ErrorCodeInvalidArgument, "bootstrap credential binding is invalid")
 	}
 	device.credential = credential
+	device.credentialActivatedAt = input.EvaluatedAt.UTC()
 	grant := GrantState{
 		id:             input.OwnerGrantID,
 		installationID: input.Invitation.InstallationID(),
@@ -505,14 +565,16 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 			kind: PrincipalKindHuman, displayName: principal.DisplayName(), publicKey: principal.PublicKeyReference(),
 		},
 		DevicePairedFact{
-			origin:         deviceOrigin,
-			installationID: input.Invitation.InstallationID(),
-			deviceID:       input.DeviceID,
-			principalID:    input.PrincipalID,
-			displayName:    device.DisplayName(),
-			transcript:     input.Proof.TranscriptFingerprint(),
-			trustRevision:  device.TrustRevision(),
-			credential:     device.CredentialBinding(),
+			origin:             deviceOrigin,
+			installationID:     input.Invitation.InstallationID(),
+			deviceID:           input.DeviceID,
+			principalID:        input.PrincipalID,
+			displayName:        device.DisplayName(),
+			transcript:         input.Proof.TranscriptFingerprint(),
+			trustRevision:      device.TrustRevision(),
+			revocationRevision: device.RevocationRevision(),
+			credential:         device.CredentialBinding(),
+			activatedAt:        device.CredentialActivatedAt(),
 		},
 	}
 	return BootstrapInstallationResult{
@@ -1216,15 +1278,16 @@ func BeginDevicePairing(input BeginDevicePairingInput) (BeginDevicePairingResult
 		return BeginDevicePairingResult{}, transitionConflict(ConflictReference, "device challenge binding does not match")
 	}
 	device := DeviceState{
-		id:             input.DeviceID,
-		installationID: input.Authorization.InstallationID(),
-		principalID:    input.Principal.ID(),
-		displayName:    input.DisplayName,
-		publicKey:      input.PublicKeyReference,
-		status:         DevicePending,
-		version:        InitialVersion(),
-		trustRevision:  InitialVersion(),
-		pairing:        input.Challenge,
+		id:                 input.DeviceID,
+		installationID:     input.Authorization.InstallationID(),
+		principalID:        input.Principal.ID(),
+		displayName:        input.DisplayName,
+		publicKey:          input.PublicKeyReference,
+		status:             DevicePending,
+		version:            InitialVersion(),
+		trustRevision:      InitialVersion(),
+		revocationRevision: InitialVersion(),
+		pairing:            input.Challenge,
 	}
 	origin, err := identityOrigin(device.ID(), device.Version())
 	if err != nil {
@@ -1318,6 +1381,7 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 	device.trustRevision = nextTrustRevision
 	device.pairing = device.pairing.consume()
 	device.credential = input.Authorization.Credential()
+	device.credentialActivatedAt = input.AuthorityTime.UTC()
 	origin, err := identityOrigin(device.ID(), device.Version())
 	if err != nil {
 		return PairDeviceResult{}, err
@@ -1325,15 +1389,229 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 	fact := DevicePairedFact{
 		origin: origin, installationID: device.InstallationID(),
 		deviceID: device.ID(), principalID: device.PrincipalID(), displayName: device.DisplayName(),
-		transcript:    input.Proof.ProofDigest(),
-		trustRevision: device.TrustRevision(),
-		credential:    device.CredentialBinding(),
+		transcript:         input.Proof.ProofDigest(),
+		trustRevision:      device.TrustRevision(),
+		revocationRevision: device.RevocationRevision(),
+		credential:         device.CredentialBinding(),
+		activatedAt:        device.CredentialActivatedAt(),
 	}
 	return PairDeviceResult{device: device, facts: []IdentityFact{fact}}, nil
 }
 
 func (result PairDeviceResult) Device() DeviceState   { return result.device }
 func (result PairDeviceResult) Facts() []IdentityFact { return cloneIdentityFacts(result.facts) }
+
+// VerifiedDeviceCredentialPossession is verifier output for one side of a
+// rotation. It carries only public binding metadata; signature bytes and key
+// material remain at the authentication boundary.
+type VerifiedDeviceCredentialPossession struct {
+	deviceID   DeviceID
+	credential CredentialDigest
+	transcript CommandFingerprint
+	verifiedAt time.Time
+}
+
+func NewVerifiedDeviceCredentialPossession(
+	deviceID DeviceID,
+	credential CredentialDigest,
+	transcript CommandFingerprint,
+	verifiedAt time.Time,
+) (VerifiedDeviceCredentialPossession, error) {
+	if deviceID.IsZero() || credential.IsZero() || transcript.IsZero() || verifiedAt.IsZero() {
+		return VerifiedDeviceCredentialPossession{}, ErrInvalidAuthorization
+	}
+	return VerifiedDeviceCredentialPossession{
+		deviceID: deviceID, credential: credential, transcript: transcript, verifiedAt: verifiedAt.UTC(),
+	}, nil
+}
+
+type DeviceCredentialRotationCommand struct {
+	device                DeviceState
+	expectedVersion       Version
+	expectedTrustRevision Version
+	newCredential         DeviceCredentialBinding
+	oldPossession         VerifiedDeviceCredentialPossession
+	newPossession         VerifiedDeviceCredentialPossession
+	overlap               time.Duration
+	rotatedAt             time.Time
+}
+
+func NewDeviceCredentialRotationCommand(
+	device DeviceState,
+	expectedVersion Version,
+	expectedTrustRevision Version,
+	newCredential DeviceCredentialBinding,
+	oldPossession VerifiedDeviceCredentialPossession,
+	newPossession VerifiedDeviceCredentialPossession,
+	overlap time.Duration,
+	rotatedAt time.Time,
+) (DeviceCredentialRotationCommand, error) {
+	active := device.CredentialBinding()
+	if device.IsZero() || device.Status() != DeviceTrusted || !expectedVersion.Valid() ||
+		!expectedTrustRevision.Valid() || !validDeviceCredentialBinding(active) ||
+		!validDeviceCredentialBinding(newCredential) ||
+		newCredential.SPKIFingerprint() == active.SPKIFingerprint() ||
+		newCredential.PublicKeyReference() == active.PublicKeyReference() ||
+		overlap <= 0 || overlap > MaxDeviceCredentialOverlap || rotatedAt.IsZero() ||
+		oldPossession.deviceID != device.ID() || newPossession.deviceID != device.ID() ||
+		oldPossession.credential != active.SPKIFingerprint() ||
+		newPossession.credential != newCredential.SPKIFingerprint() ||
+		oldPossession.transcript.IsZero() || oldPossession.transcript != newPossession.transcript ||
+		newCredential.TranscriptFingerprint() != oldPossession.transcript ||
+		oldPossession.verifiedAt.IsZero() || !oldPossession.verifiedAt.Equal(rotatedAt) ||
+		newPossession.verifiedAt.IsZero() || !newPossession.verifiedAt.Equal(rotatedAt) {
+		return DeviceCredentialRotationCommand{}, ErrInvalidAuthorization
+	}
+	return DeviceCredentialRotationCommand{
+		device: device, expectedVersion: expectedVersion, expectedTrustRevision: expectedTrustRevision,
+		newCredential: newCredential, oldPossession: oldPossession, newPossession: newPossession,
+		overlap: overlap, rotatedAt: rotatedAt.UTC(),
+	}, nil
+}
+
+type DeviceCredentialRotationResult struct {
+	device DeviceState
+	facts  []IdentityFact
+}
+
+func RotateDeviceCredential(command DeviceCredentialRotationCommand) (DeviceCredentialRotationResult, error) {
+	if command.device.IsZero() || command.oldPossession.deviceID.IsZero() || command.newPossession.deviceID.IsZero() {
+		return DeviceCredentialRotationResult{}, transitionError(ErrorCodeInvalidArgument, "credential rotation command is invalid")
+	}
+	if err := checkExpectedVersion(command.device.Version(), command.expectedVersion); err != nil {
+		return DeviceCredentialRotationResult{}, err
+	}
+	if err := checkExpectedVersion(command.device.TrustRevision(), command.expectedTrustRevision); err != nil {
+		return DeviceCredentialRotationResult{}, err
+	}
+	if command.device.Status() != DeviceTrusted {
+		return DeviceCredentialRotationResult{}, transitionConflict(ConflictState, "device is not trusted")
+	}
+	nextVersion, err := nextTransitionVersion(command.device.Version())
+	if err != nil {
+		return DeviceCredentialRotationResult{}, err
+	}
+	nextTrustRevision, err := nextTransitionVersion(command.device.TrustRevision())
+	if err != nil {
+		return DeviceCredentialRotationResult{}, err
+	}
+	device := command.device
+	previous := device.credential
+	device.publicKey = command.newCredential.PublicKeyReference()
+	device.credential = command.newCredential
+	device.credentialActivatedAt = command.rotatedAt
+	device.retiringCredential = previous
+	device.retiringCredentialExpiresAt = command.rotatedAt.Add(command.overlap)
+	device.lastRotationTranscript = command.newCredential.TranscriptFingerprint()
+	device.rotatedAt = command.rotatedAt
+	device.version = nextVersion
+	device.trustRevision = nextTrustRevision
+	if device.revocationRevision.IsZero() {
+		device.revocationRevision = InitialVersion()
+	}
+	origin, err := identityOrigin(device.ID(), device.Version())
+	if err != nil {
+		return DeviceCredentialRotationResult{}, err
+	}
+	fact := DeviceCredentialRotatedFact{
+		origin: origin, deviceID: device.ID(), previousCredential: previous,
+		activeCredential: device.CredentialBinding(), trustRevision: device.TrustRevision(),
+		revocationRevision: device.RevocationRevision(), transcript: device.RotationTranscriptFingerprint(),
+		rotatedAt: device.RotatedAt(), retiringExpiresAt: device.retiringCredentialExpiresAt,
+	}
+	return DeviceCredentialRotationResult{device: device, facts: []IdentityFact{fact}}, nil
+}
+
+func (result DeviceCredentialRotationResult) Device() DeviceState { return result.device }
+func (result DeviceCredentialRotationResult) Facts() []IdentityFact {
+	return cloneIdentityFacts(result.facts)
+}
+
+type DeviceRevocationCommand struct {
+	device                     DeviceState
+	expectedVersion            Version
+	expectedTrustRevision      Version
+	expectedRevocationRevision Version
+	revocationFingerprint      CommandFingerprint
+	revokedAt                  time.Time
+}
+
+func NewDeviceRevocationCommand(
+	device DeviceState,
+	expectedVersion Version,
+	expectedTrustRevision Version,
+	expectedRevocationRevision Version,
+	revocationFingerprint CommandFingerprint,
+	revokedAt time.Time,
+) (DeviceRevocationCommand, error) {
+	if device.IsZero() || !expectedVersion.Valid() || !expectedTrustRevision.Valid() ||
+		!expectedRevocationRevision.Valid() || revocationFingerprint.IsZero() || revokedAt.IsZero() ||
+		device.Status() == DevicePending || device.Status() == DeviceRevoked ||
+		!validDeviceCredentialBinding(device.CredentialBinding()) {
+		return DeviceRevocationCommand{}, ErrInvalidAuthorization
+	}
+	return DeviceRevocationCommand{
+		device: device, expectedVersion: expectedVersion, expectedTrustRevision: expectedTrustRevision,
+		expectedRevocationRevision: expectedRevocationRevision,
+		revocationFingerprint:      revocationFingerprint, revokedAt: revokedAt.UTC(),
+	}, nil
+}
+
+type DeviceRevocationResult struct {
+	device DeviceState
+	facts  []IdentityFact
+}
+
+func RevokeDevice(command DeviceRevocationCommand) (DeviceRevocationResult, error) {
+	if command.device.IsZero() || command.revocationFingerprint.IsZero() {
+		return DeviceRevocationResult{}, transitionError(ErrorCodeInvalidArgument, "device revocation command is invalid")
+	}
+	if err := checkExpectedVersion(command.device.Version(), command.expectedVersion); err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	if err := checkExpectedVersion(command.device.TrustRevision(), command.expectedTrustRevision); err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	if err := checkExpectedVersion(command.device.RevocationRevision(), command.expectedRevocationRevision); err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	if command.device.Status() == DeviceRevoked {
+		return DeviceRevocationResult{}, transitionConflict(ConflictState, "device revocation is terminal")
+	}
+	nextVersion, err := nextTransitionVersion(command.device.Version())
+	if err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	nextTrustRevision, err := nextTransitionVersion(command.device.TrustRevision())
+	if err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	nextRevocationRevision, err := nextTransitionVersion(command.device.RevocationRevision())
+	if err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	device := command.device
+	device.status = DeviceRevoked
+	device.version = nextVersion
+	device.trustRevision = nextTrustRevision
+	device.revocationRevision = nextRevocationRevision
+	device.retiringCredential = DeviceCredentialBinding{}
+	device.retiringCredentialExpiresAt = time.Time{}
+	device.revokedAt = command.revokedAt
+	origin, err := identityOrigin(device.ID(), device.Version())
+	if err != nil {
+		return DeviceRevocationResult{}, err
+	}
+	fact := DeviceRevokedFact{
+		origin: origin, deviceID: device.ID(), credential: device.CredentialBinding(),
+		trustRevision: device.TrustRevision(), revocationRevision: device.RevocationRevision(),
+		revocationFingerprint: command.revocationFingerprint, revokedAt: device.RevokedAt(),
+	}
+	return DeviceRevocationResult{device: device, facts: []IdentityFact{fact}}, nil
+}
+
+func (result DeviceRevocationResult) Device() DeviceState   { return result.device }
+func (result DeviceRevocationResult) Facts() []IdentityFact { return cloneIdentityFacts(result.facts) }
 
 type SessionStartAuthorityKind string
 
@@ -1357,7 +1635,7 @@ func TrustedDeviceSessionStart(
 	expectedTrustRevision Version,
 ) (SessionStartAuthority, error) {
 	if device.IsZero() || !expectedVersion.Valid() || !expectedTrustRevision.Valid() ||
-		!validDeviceCredentialBinding(device.CredentialBinding()) {
+		device.Status() != DeviceTrusted || !validDeviceCredentialBinding(device.CredentialBinding()) {
 		return SessionStartAuthority{}, ErrInvalidAuthorization
 	}
 	return SessionStartAuthority{

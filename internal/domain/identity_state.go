@@ -13,6 +13,7 @@ const (
 	MaxIdentityCapabilities     = 64
 	MaxSessionGrantRevisions    = 64
 	MaxActorSessionLifetime     = 24 * time.Hour
+	MaxDeviceCredentialOverlap  = 15 * time.Minute
 	MaxBootstrapFailedAttempts  = 5
 	BootstrapInvitationLifetime = 5 * time.Minute
 )
@@ -1178,16 +1179,23 @@ func (status DeviceStatus) Valid() bool {
 }
 
 type DeviceState struct {
-	id             DeviceID
-	installationID InstallationID
-	principalID    PrincipalID
-	displayName    DisplayName
-	publicKey      PublicKeyReference
-	status         DeviceStatus
-	version        Version
-	trustRevision  Version
-	pairing        CeremonyChallenge
-	credential     DeviceCredentialBinding
+	id                          DeviceID
+	installationID              InstallationID
+	principalID                 PrincipalID
+	displayName                 DisplayName
+	publicKey                   PublicKeyReference
+	status                      DeviceStatus
+	version                     Version
+	trustRevision               Version
+	revocationRevision          Version
+	pairing                     CeremonyChallenge
+	credential                  DeviceCredentialBinding
+	credentialActivatedAt       time.Time
+	retiringCredential          DeviceCredentialBinding
+	retiringCredentialExpiresAt time.Time
+	lastRotationTranscript      CommandFingerprint
+	rotatedAt                   time.Time
+	revokedAt                   time.Time
 }
 
 func (state DeviceState) IsZero() bool                               { return state.id.IsZero() }
@@ -1199,8 +1207,31 @@ func (state DeviceState) PublicKeyReference() PublicKeyReference     { return st
 func (state DeviceState) Status() DeviceStatus                       { return state.status }
 func (state DeviceState) Version() Version                           { return state.version }
 func (state DeviceState) TrustRevision() Version                     { return state.trustRevision }
+func (state DeviceState) RevocationRevision() Version                { return state.revocationRevision }
 func (state DeviceState) PairingChallenge() CeremonyChallenge        { return state.pairing }
 func (state DeviceState) CredentialBinding() DeviceCredentialBinding { return state.credential }
+func (state DeviceState) ActiveCredential() DeviceCredentialBinding  { return state.credential }
+func (state DeviceState) CredentialActivatedAt() time.Time           { return state.credentialActivatedAt }
+func (state DeviceState) RotationTranscriptFingerprint() CommandFingerprint {
+	return state.lastRotationTranscript
+}
+func (state DeviceState) RotatedAt() time.Time { return state.rotatedAt }
+func (state DeviceState) RevokedAt() time.Time { return state.revokedAt }
+func (state DeviceState) RetiringCredential() (DeviceCredentialBinding, time.Time, bool) {
+	return state.retiringCredential, state.retiringCredentialExpiresAt, !state.retiringCredential.IsZero()
+}
+
+func (state DeviceState) AcceptsCredential(fingerprint CredentialDigest, evaluatedAt time.Time) bool {
+	if state.status != DeviceTrusted || fingerprint.IsZero() || evaluatedAt.IsZero() {
+		return false
+	}
+	if state.credential.SPKIFingerprint() == fingerprint {
+		return true
+	}
+	return !state.retiringCredential.IsZero() &&
+		state.retiringCredential.SPKIFingerprint() == fingerprint &&
+		evaluatedAt.Before(state.retiringCredentialExpiresAt)
+}
 
 type GrantStatus string
 
@@ -1450,39 +1481,72 @@ func RehydratePrincipal(params PrincipalRehydrationParams) (PrincipalState, erro
 }
 
 type DeviceRehydrationParams struct {
-	ID                 DeviceID
-	InstallationID     InstallationID
-	PrincipalID        PrincipalID
-	DisplayName        DisplayName
-	PublicKeyReference PublicKeyReference
-	Status             DeviceStatus
-	Version            Version
-	TrustRevision      Version
-	PairingChallenge   CeremonyChallenge
-	CredentialBinding  DeviceCredentialBinding
+	ID                            DeviceID
+	InstallationID                InstallationID
+	PrincipalID                   PrincipalID
+	DisplayName                   DisplayName
+	PublicKeyReference            PublicKeyReference
+	Status                        DeviceStatus
+	Version                       Version
+	TrustRevision                 Version
+	RevocationRevision            Version
+	PairingChallenge              CeremonyChallenge
+	CredentialBinding             DeviceCredentialBinding
+	CredentialActivatedAt         time.Time
+	RetiringCredential            DeviceCredentialBinding
+	RetiringCredentialExpiresAt   time.Time
+	RotationTranscriptFingerprint CommandFingerprint
+	RotatedAt                     time.Time
+	RevokedAt                     time.Time
 }
 
 func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
 	if params.ID.IsZero() || params.InstallationID.IsZero() || params.PrincipalID.IsZero() ||
 		!validDisplayNameValue(params.DisplayName) || !validPublicKeyReferenceValue(params.PublicKeyReference) ||
-		!params.Status.Valid() || !params.Version.Valid() || !params.TrustRevision.Valid() ||
-		params.TrustRevision.Uint64() > params.Version.Uint64() {
+		!params.Status.Valid() || !params.Version.Valid() || !params.TrustRevision.Valid() || !params.RevocationRevision.Valid() ||
+		params.TrustRevision.Uint64() > params.Version.Uint64() ||
+		params.RevocationRevision.Uint64() > params.Version.Uint64() {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
 	hasPairing := !params.PairingChallenge.IsZero()
 	hasCredential := !params.CredentialBinding.IsZero()
+	hasRetiringCredential := !params.RetiringCredential.IsZero()
 	if hasCredential && !validDeviceCredentialBinding(params.CredentialBinding) {
+		return DeviceState{}, ErrInvalidIdentityState
+	}
+	if hasRetiringCredential {
+		if params.Status != DeviceTrusted || !hasCredential ||
+			!validDeviceCredentialBinding(params.RetiringCredential) ||
+			params.RetiringCredential.SPKIFingerprint() == params.CredentialBinding.SPKIFingerprint() ||
+			params.RetiringCredentialExpiresAt.IsZero() || params.RotatedAt.IsZero() ||
+			params.CredentialActivatedAt.IsZero() || params.RotationTranscriptFingerprint.IsZero() ||
+			params.CredentialBinding.TranscriptFingerprint() != params.RotationTranscriptFingerprint ||
+			!params.RetiringCredentialExpiresAt.After(params.RotatedAt) ||
+			params.RetiringCredentialExpiresAt.After(params.RotatedAt.Add(MaxDeviceCredentialOverlap)) ||
+			!params.CredentialActivatedAt.Equal(params.RotatedAt) {
+			return DeviceState{}, ErrInvalidIdentityState
+		}
+	} else if !params.RetiringCredentialExpiresAt.IsZero() {
+		return DeviceState{}, ErrInvalidIdentityState
+	}
+	if params.Status == DeviceRevoked {
+		if params.RevokedAt.IsZero() || hasRetiringCredential || params.RevocationRevision.Uint64() <= InitialVersion().Uint64() {
+			return DeviceState{}, ErrInvalidIdentityState
+		}
+	} else if !params.RevokedAt.IsZero() {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
 	if (params.Status == DeviceSuspended || params.Status == DeviceRevoked) && !versionRecordsMutation(params.Version) {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
 	if params.Status == DevicePending {
-		if !hasPairing || params.PairingChallenge.Status() != CeremonyPending || hasCredential {
+		if !hasPairing || params.PairingChallenge.Status() != CeremonyPending || hasCredential ||
+			!params.CredentialActivatedAt.IsZero() {
 			return DeviceState{}, ErrInvalidIdentityState
 		}
 	} else {
-		if !hasCredential || params.CredentialBinding.PublicKeyReference() != params.PublicKeyReference {
+		if !hasCredential || params.CredentialActivatedAt.IsZero() ||
+			params.CredentialBinding.PublicKeyReference() != params.PublicKeyReference {
 			return DeviceState{}, ErrInvalidIdentityState
 		}
 	}
@@ -1503,8 +1567,12 @@ func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
 	return DeviceState{
 		id: params.ID, installationID: params.InstallationID, principalID: params.PrincipalID,
 		displayName: params.DisplayName, publicKey: params.PublicKeyReference, status: params.Status,
-		version: params.Version, trustRevision: params.TrustRevision, pairing: params.PairingChallenge,
-		credential: params.CredentialBinding,
+		version: params.Version, trustRevision: params.TrustRevision, revocationRevision: params.RevocationRevision,
+		pairing: params.PairingChallenge, credential: params.CredentialBinding,
+		credentialActivatedAt: params.CredentialActivatedAt.UTC(), retiringCredential: params.RetiringCredential,
+		retiringCredentialExpiresAt: params.RetiringCredentialExpiresAt.UTC(),
+		lastRotationTranscript:      params.RotationTranscriptFingerprint, rotatedAt: params.RotatedAt.UTC(),
+		revokedAt: params.RevokedAt.UTC(),
 	}, nil
 }
 

@@ -406,10 +406,33 @@ type identityPayloadDevicePaired struct {
 	DisplayName                     string              `json:"display_name"`
 	TranscriptFingerprint           CanonicalDigest     `json:"transcript_fingerprint"`
 	TrustRevision                   uint64              `json:"trust_revision"`
+	RevocationRevision              uint64              `json:"revocation_revision"`
+	CredentialActivatedAt           CanonicalInstant    `json:"credential_activated_at"`
 	CredentialAlgorithm             string              `json:"credential_algorithm"`
 	PublicKeyReference              string              `json:"public_key_reference"`
 	SPKIFingerprint                 CanonicalDigest     `json:"spki_fingerprint"`
 	CredentialTranscriptFingerprint CanonicalDigest     `json:"credential_transcript_fingerprint"`
+}
+type identityPayloadDeviceCredentialRotated struct {
+	DeviceID                    CanonicalIdentifier `json:"device_id"`
+	PreviousPublicKeyReference  string              `json:"previous_public_key_reference"`
+	PreviousSPKIFingerprint     CanonicalDigest     `json:"previous_spki_fingerprint"`
+	ActivePublicKeyReference    string              `json:"active_public_key_reference"`
+	ActiveSPKIFingerprint       CanonicalDigest     `json:"active_spki_fingerprint"`
+	TrustRevision               uint64              `json:"trust_revision"`
+	RevocationRevision          uint64              `json:"revocation_revision"`
+	TranscriptFingerprint       CanonicalDigest     `json:"transcript_fingerprint"`
+	RotatedAt                   CanonicalInstant    `json:"rotated_at"`
+	RetiringCredentialExpiresAt CanonicalInstant    `json:"retiring_credential_expires_at"`
+}
+type identityPayloadDeviceRevoked struct {
+	DeviceID              CanonicalIdentifier `json:"device_id"`
+	PublicKeyReference    string              `json:"public_key_reference"`
+	SPKIFingerprint       CanonicalDigest     `json:"spki_fingerprint"`
+	TrustRevision         uint64              `json:"trust_revision"`
+	RevocationRevision    uint64              `json:"revocation_revision"`
+	RevocationFingerprint CanonicalDigest     `json:"revocation_fingerprint"`
+	RevokedAt             CanonicalInstant    `json:"revoked_at"`
 }
 type identityPayloadWorkspaceCreated struct {
 	WorkspaceID      CanonicalIdentifier `json:"workspace_id"`
@@ -473,6 +496,10 @@ func (identityPayloadDevicePairingBegan) canonicalView()                    {}
 func (identityPayloadDevicePairingBegan) identityFactPayloadView()          {}
 func (identityPayloadDevicePaired) canonicalView()                          {}
 func (identityPayloadDevicePaired) identityFactPayloadView()                {}
+func (identityPayloadDeviceCredentialRotated) canonicalView()               {}
+func (identityPayloadDeviceCredentialRotated) identityFactPayloadView()     {}
+func (identityPayloadDeviceRevoked) canonicalView()                         {}
+func (identityPayloadDeviceRevoked) identityFactPayloadView()               {}
 func (identityPayloadWorkspaceCreated) canonicalView()                      {}
 func (identityPayloadWorkspaceCreated) identityFactPayloadView()            {}
 func (identityPayloadWorkspaceMemberInvited) canonicalView()                {}
@@ -568,14 +595,47 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 		}, nil
 	case domain.DevicePairedFact:
 		credential := value.CredentialBinding()
+		activatedAt, err := NewCanonicalInstant(value.CredentialActivatedAt())
+		if err != nil {
+			return nil, ErrCanonicalProfile
+		}
 		return identityPayloadDevicePaired{
 			InstallationID: id(value.InstallationID().String()), DeviceID: id(value.DeviceID().String()),
 			PrincipalID: id(value.PrincipalID().String()),
 			DisplayName: value.DisplayName().String(), TranscriptFingerprint: digest([sha256.Size]byte(value.TranscriptFingerprint())),
-			TrustRevision: value.TrustRevision().Uint64(), CredentialAlgorithm: credential.Algorithm(),
+			TrustRevision: value.TrustRevision().Uint64(), RevocationRevision: value.RevocationRevision().Uint64(),
+			CredentialActivatedAt: activatedAt, CredentialAlgorithm: credential.Algorithm(),
 			PublicKeyReference:              credential.PublicKeyReference().String(),
 			SPKIFingerprint:                 digest(credential.SPKIFingerprint().Bytes()),
 			CredentialTranscriptFingerprint: digest([sha256.Size]byte(credential.TranscriptFingerprint())),
+		}, nil
+	case domain.DeviceCredentialRotatedFact:
+		previous, active := value.PreviousCredential(), value.ActiveCredential()
+		rotatedAt, rotatedErr := NewCanonicalInstant(value.RotatedAt())
+		expiresAt, expiresErr := NewCanonicalInstant(value.RetiringCredentialExpiresAt())
+		if rotatedErr != nil || expiresErr != nil {
+			return nil, ErrCanonicalProfile
+		}
+		return identityPayloadDeviceCredentialRotated{
+			DeviceID: id(value.DeviceID().String()), PreviousPublicKeyReference: previous.PublicKeyReference().String(),
+			PreviousSPKIFingerprint:  digest(previous.SPKIFingerprint().Bytes()),
+			ActivePublicKeyReference: active.PublicKeyReference().String(),
+			ActiveSPKIFingerprint:    digest(active.SPKIFingerprint().Bytes()), TrustRevision: value.TrustRevision().Uint64(),
+			RevocationRevision:    value.RevocationRevision().Uint64(),
+			TranscriptFingerprint: digest([sha256.Size]byte(value.TranscriptFingerprint())),
+			RotatedAt:             rotatedAt, RetiringCredentialExpiresAt: expiresAt,
+		}, nil
+	case domain.DeviceRevokedFact:
+		credential := value.CredentialBinding()
+		revokedAt, err := NewCanonicalInstant(value.RevokedAt())
+		if err != nil {
+			return nil, ErrCanonicalProfile
+		}
+		return identityPayloadDeviceRevoked{
+			DeviceID: id(value.DeviceID().String()), PublicKeyReference: credential.PublicKeyReference().String(),
+			SPKIFingerprint: digest(credential.SPKIFingerprint().Bytes()), TrustRevision: value.TrustRevision().Uint64(),
+			RevocationRevision:    value.RevocationRevision().Uint64(),
+			RevocationFingerprint: digest([sha256.Size]byte(value.RevocationFingerprint())), RevokedAt: revokedAt,
 		}, nil
 	case domain.WorkspaceCreatedFact:
 		return identityPayloadWorkspaceCreated{

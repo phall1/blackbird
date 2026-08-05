@@ -110,16 +110,35 @@ CREATE TABLE device_registrations (
     spki_fingerprint BLOB CHECK (spki_fingerprint IS NULL OR length(spki_fingerprint) = 32),
     transcript_fingerprint BLOB CHECK (transcript_fingerprint IS NULL OR length(transcript_fingerprint) = 32),
     trust_revision INTEGER NOT NULL CHECK (trust_revision BETWEEN 1 AND 9007199254740991),
+    revocation_revision INTEGER NOT NULL CHECK (revocation_revision BETWEEN 1 AND 9007199254740991),
+    credential_activated_at_us INTEGER,
+    retiring_credential_algorithm TEXT,
+    retiring_public_key_reference TEXT,
+    retiring_spki_fingerprint BLOB CHECK (retiring_spki_fingerprint IS NULL OR length(retiring_spki_fingerprint) = 32),
+    retiring_transcript_fingerprint BLOB CHECK (retiring_transcript_fingerprint IS NULL OR length(retiring_transcript_fingerprint) = 32),
+    retiring_credential_expires_at_us INTEGER,
+    rotation_transcript_fingerprint BLOB CHECK (rotation_transcript_fingerprint IS NULL OR length(rotation_transcript_fingerprint) = 32),
+    rotated_at_us INTEGER,
+    revoked_at_us INTEGER,
     status TEXT NOT NULL CHECK (status IN ('pending', 'trusted', 'suspended', 'revoked')),
     version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
     created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
     FOREIGN KEY (installation_id, principal_id) REFERENCES principals(installation_id, principal_id),
     CHECK (
-        (status = 'pending' AND credential_algorithm IS NULL AND spki_fingerprint IS NULL AND transcript_fingerprint IS NULL) OR
+        (status = 'pending' AND credential_algorithm IS NULL AND spki_fingerprint IS NULL AND transcript_fingerprint IS NULL AND
+            credential_activated_at_us IS NULL AND revoked_at_us IS NULL) OR
         (status <> 'pending' AND credential_algorithm = 'ed25519-spki-sha256-v1' AND
-            spki_fingerprint IS NOT NULL AND transcript_fingerprint IS NOT NULL)
-    )
+            spki_fingerprint IS NOT NULL AND transcript_fingerprint IS NOT NULL AND credential_activated_at_us IS NOT NULL)
+    ),
+    CHECK ((retiring_credential_algorithm IS NULL AND retiring_public_key_reference IS NULL AND
+        retiring_spki_fingerprint IS NULL AND retiring_transcript_fingerprint IS NULL AND
+        retiring_credential_expires_at_us IS NULL) OR
+        (status = 'trusted' AND retiring_credential_algorithm = 'ed25519-spki-sha256-v1' AND
+        retiring_public_key_reference IS NOT NULL AND retiring_spki_fingerprint IS NOT NULL AND
+        retiring_transcript_fingerprint IS NOT NULL AND retiring_credential_expires_at_us IS NOT NULL AND
+        rotated_at_us IS NOT NULL AND rotation_transcript_fingerprint IS NOT NULL)),
+    CHECK ((status = 'revoked' AND revoked_at_us IS NOT NULL) OR (status <> 'revoked' AND revoked_at_us IS NULL))
 ) STRICT;
 
 CREATE TABLE grants (

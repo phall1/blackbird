@@ -761,23 +761,53 @@ func writeIdentityState(ctx context.Context, tx *sql.Tx, state application.Ident
 			public_key_reference, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			value.ID().String(), value.InstallationID().String(), string(value.Kind()), value.DisplayName().String(), public, string(value.Status()), current, timestamp, timestamp)
 	case domain.DeviceState:
-		var algorithm, spki, transcript any
+		var algorithm, spki, transcript, activatedAt any
 		if credential := value.CredentialBinding(); !credential.IsZero() {
 			algorithm = credential.Algorithm()
 			spkiValue := credential.SPKIFingerprint().Bytes()
 			transcriptValue := credential.TranscriptFingerprint()
 			spki, transcript = spkiValue[:], transcriptValue[:]
+			activatedAt = timeMicros(value.CredentialActivatedAt())
+		}
+		var retiringAlgorithm, retiringKey, retiringSPKI, retiringTranscript, retiringExpires any
+		if retiring, expires, present := value.RetiringCredential(); present {
+			retiringAlgorithm, retiringKey = retiring.Algorithm(), retiring.PublicKeyReference().String()
+			retiringSPKIValue := retiring.SPKIFingerprint().Bytes()
+			retiringTranscriptValue := retiring.TranscriptFingerprint()
+			retiringSPKI, retiringTranscript, retiringExpires = retiringSPKIValue[:], retiringTranscriptValue[:], timeMicros(expires)
+		}
+		var rotationTranscript, rotatedAt, revokedAt any
+		if fingerprint := value.RotationTranscriptFingerprint(); !fingerprint.IsZero() {
+			rotationTranscript = fingerprint[:]
+		}
+		if !value.RotatedAt().IsZero() {
+			rotatedAt = timeMicros(value.RotatedAt())
+		}
+		if !value.RevokedAt().IsZero() {
+			revokedAt = timeMicros(value.RevokedAt())
 		}
 		if current == 1 {
 			result, err = tx.ExecContext(ctx, `INSERT INTO device_registrations(device_id, installation_id, principal_id,
 				display_name, credential_algorithm, public_key_reference, spki_fingerprint, transcript_fingerprint,
-				trust_revision, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				trust_revision, revocation_revision, credential_activated_at_us, retiring_credential_algorithm,
+				retiring_public_key_reference, retiring_spki_fingerprint, retiring_transcript_fingerprint,
+				retiring_credential_expires_at_us, rotation_transcript_fingerprint, rotated_at_us, revoked_at_us,
+				status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				value.ID().String(), value.InstallationID().String(), value.PrincipalID().String(), value.DisplayName().String(), algorithm,
-				value.PublicKeyReference().String(), spki, transcript, value.TrustRevision().Uint64(), string(value.Status()), current, timestamp, timestamp)
+				value.PublicKeyReference().String(), spki, transcript, value.TrustRevision().Uint64(), value.RevocationRevision().Uint64(),
+				activatedAt, retiringAlgorithm, retiringKey, retiringSPKI, retiringTranscript, retiringExpires,
+				rotationTranscript, rotatedAt, revokedAt, string(value.Status()), current, timestamp, timestamp)
 		} else {
-			result, err = tx.ExecContext(ctx, `UPDATE device_registrations SET credential_algorithm = ?, spki_fingerprint = ?,
-				transcript_fingerprint = ?, trust_revision = ?, status = ?, version = ?, updated_at_us = ? WHERE device_id = ? AND version = ?`,
-				algorithm, spki, transcript, value.TrustRevision().Uint64(), string(value.Status()), current, timestamp, value.ID().String(), prior)
+			result, err = tx.ExecContext(ctx, `UPDATE device_registrations SET credential_algorithm = ?, public_key_reference = ?,
+				spki_fingerprint = ?, transcript_fingerprint = ?, trust_revision = ?, revocation_revision = ?,
+				credential_activated_at_us = ?, retiring_credential_algorithm = ?, retiring_public_key_reference = ?,
+				retiring_spki_fingerprint = ?, retiring_transcript_fingerprint = ?, retiring_credential_expires_at_us = ?,
+				rotation_transcript_fingerprint = ?, rotated_at_us = ?, revoked_at_us = ?, status = ?, version = ?, updated_at_us = ?
+				WHERE device_id = ? AND version = ?`,
+				algorithm, value.PublicKeyReference().String(), spki, transcript, value.TrustRevision().Uint64(),
+				value.RevocationRevision().Uint64(), activatedAt, retiringAlgorithm, retiringKey, retiringSPKI,
+				retiringTranscript, retiringExpires, rotationTranscript, rotatedAt, revokedAt, string(value.Status()),
+				current, timestamp, value.ID().String(), prior)
 		}
 	case domain.GrantState:
 		capabilities, encodeErr := capabilitiesJSON(value.Capabilities())
@@ -1376,13 +1406,18 @@ func loadPrincipalState(ctx context.Context, tx *sql.Tx, id string) (domain.Prin
 
 func loadDeviceState(ctx context.Context, tx *sql.Tx, id string) (domain.DeviceState, error) {
 	var deviceID, installationID, principalID, display, key, status string
-	var algorithm sql.NullString
-	var spki, transcript []byte
-	var trust, version uint64
+	var algorithm, retiringAlgorithm, retiringKey sql.NullString
+	var spki, transcript, retiringSPKI, retiringTranscript, rotationTranscript []byte
+	var activatedAt, retiringExpires, rotatedAt, revokedAt sql.NullInt64
+	var trust, revocation, version uint64
 	err := tx.QueryRowContext(ctx, `SELECT device_id, installation_id, principal_id, display_name, credential_algorithm,
-		public_key_reference, spki_fingerprint, transcript_fingerprint, trust_revision, status, version
+		public_key_reference, spki_fingerprint, transcript_fingerprint, trust_revision, revocation_revision,
+		credential_activated_at_us, retiring_credential_algorithm, retiring_public_key_reference,
+		retiring_spki_fingerprint, retiring_transcript_fingerprint, retiring_credential_expires_at_us,
+		rotation_transcript_fingerprint, rotated_at_us, revoked_at_us, status, version
 		FROM device_registrations WHERE device_id = ?`, id).Scan(&deviceID, &installationID, &principalID, &display,
-		&algorithm, &key, &spki, &transcript, &trust, &status, &version)
+		&algorithm, &key, &spki, &transcript, &trust, &revocation, &activatedAt, &retiringAlgorithm, &retiringKey,
+		&retiringSPKI, &retiringTranscript, &retiringExpires, &rotationTranscript, &rotatedAt, &revokedAt, &status, &version)
 	if err != nil {
 		return domain.DeviceState{}, err
 	}
@@ -1410,26 +1445,64 @@ func loadDeviceState(ctx context.Context, tx *sql.Tx, id string) (domain.DeviceS
 	if ceremonyErr != nil {
 		return domain.DeviceState{}, ceremonyErr
 	}
-	var credential domain.DeviceCredentialBinding
-	if algorithm.Valid {
-		if algorithm.String != domain.DeviceCredentialAlgorithm || len(spki) != sha256.Size || len(transcript) != sha256.Size {
+	credential, err := decodeDeviceCredential(algorithm, key, spki, transcript)
+	if err != nil {
+		return domain.DeviceState{}, err
+	}
+	retiring, err := decodeDeviceCredential(retiringAlgorithm, retiringKey.String, retiringSPKI, retiringTranscript)
+	if err != nil {
+		return domain.DeviceState{}, err
+	}
+	var rotationFingerprint domain.CommandFingerprint
+	if len(rotationTranscript) != 0 {
+		if len(rotationTranscript) != sha256.Size {
 			return domain.DeviceState{}, application.ErrInvalidCommandContext
 		}
-		var spkiArray [sha256.Size]byte
-		copy(spkiArray[:], spki)
-		digest, e := domain.NewCredentialDigest(spkiArray)
-		if e != nil {
-			return domain.DeviceState{}, e
-		}
-		var fingerprint domain.CommandFingerprint
-		copy(fingerprint[:], transcript)
-		credential, err = domain.NewDeviceCredentialBinding(public, digest, fingerprint)
-		if err != nil {
-			return domain.DeviceState{}, err
-		}
+		copy(rotationFingerprint[:], rotationTranscript)
 	}
 	return domain.RehydrateDevice(domain.DeviceRehydrationParams{ID: did, InstallationID: iid, PrincipalID: pid, DisplayName: name,
-		PublicKeyReference: public, Status: domain.DeviceStatus(status), Version: mustVersion(version), TrustRevision: mustVersion(trust), PairingChallenge: ceremony, CredentialBinding: credential})
+		PublicKeyReference: public, Status: domain.DeviceStatus(status), Version: mustVersion(version),
+		TrustRevision: mustVersion(trust), RevocationRevision: mustVersion(revocation), PairingChallenge: ceremony,
+		CredentialBinding: credential, CredentialActivatedAt: nullableMicrosTime(activatedAt), RetiringCredential: retiring,
+		RetiringCredentialExpiresAt: nullableMicrosTime(retiringExpires), RotationTranscriptFingerprint: rotationFingerprint,
+		RotatedAt: nullableMicrosTime(rotatedAt), RevokedAt: nullableMicrosTime(revokedAt)})
+}
+
+func decodeDeviceCredential(
+	algorithm sql.NullString,
+	key string,
+	spki []byte,
+	transcript []byte,
+) (domain.DeviceCredentialBinding, error) {
+	if !algorithm.Valid {
+		if len(spki) != 0 || len(transcript) != 0 {
+			return domain.DeviceCredentialBinding{}, application.ErrInvalidCommandContext
+		}
+		return domain.DeviceCredentialBinding{}, nil
+	}
+	if algorithm.String != domain.DeviceCredentialAlgorithm || len(spki) != sha256.Size || len(transcript) != sha256.Size {
+		return domain.DeviceCredentialBinding{}, application.ErrInvalidCommandContext
+	}
+	public, err := domain.NewPublicKeyReference(key)
+	if err != nil {
+		return domain.DeviceCredentialBinding{}, err
+	}
+	var spkiArray [sha256.Size]byte
+	copy(spkiArray[:], spki)
+	digest, err := domain.NewCredentialDigest(spkiArray)
+	if err != nil {
+		return domain.DeviceCredentialBinding{}, err
+	}
+	var fingerprint domain.CommandFingerprint
+	copy(fingerprint[:], transcript)
+	return domain.NewDeviceCredentialBinding(public, digest, fingerprint)
+}
+
+func nullableMicrosTime(value sql.NullInt64) time.Time {
+	if !value.Valid {
+		return time.Time{}
+	}
+	return microsTime(value.Int64)
 }
 
 func decodeCapabilities(raw string) (domain.CapabilitySet, error) {

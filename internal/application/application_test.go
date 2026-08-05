@@ -2421,7 +2421,8 @@ func TestVersionedCommitRejectsResultComputedFromAlternateLockedState(t *testing
 	alternate, err := domain.RehydrateDevice(domain.DeviceRehydrationParams{
 		ID: locked.ID(), InstallationID: locked.InstallationID(), PrincipalID: locked.PrincipalID(),
 		DisplayName: alternateName, PublicKeyReference: alternateKey, Status: locked.Status(),
-		Version: locked.Version(), TrustRevision: locked.TrustRevision(), PairingChallenge: locked.PairingChallenge(),
+		Version: locked.Version(), TrustRevision: locked.TrustRevision(), RevocationRevision: locked.RevocationRevision(),
+		PairingChallenge: locked.PairingChallenge(),
 	})
 	if err != nil {
 		t.Fatal(err)

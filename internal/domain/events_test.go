@@ -75,6 +75,8 @@ func TestW0EventVocabularyIsClosed(t *testing.T) {
 		EventTypePrincipalRegistered,
 		EventTypeDevicePairingBegan,
 		EventTypeDevicePaired,
+		EventTypeDeviceCredentialRotated,
+		EventTypeDeviceRevoked,
 		EventTypeWorkspaceCreated,
 		EventTypeWorkspaceMemberInvited,
 		EventTypeWorkspaceMembershipAccepted,

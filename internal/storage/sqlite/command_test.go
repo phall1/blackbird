@@ -78,6 +78,15 @@ func TestExecuteCommandPersistsBootstrapAtomicallyAndReplaysExactly(t *testing.T
 	if outboxCommand != spec.CommandID().String() || len(outboxMetadataDigest) != sha256.Size {
 		t.Fatalf("invalid outbox identity command=%q metadata_digest=%d", outboxCommand, len(outboxMetadataDigest))
 	}
+	var revocationRevision uint64
+	var credentialActivatedAt int64
+	if err := store.db.QueryRow(`SELECT revocation_revision, credential_activated_at_us
+		FROM device_registrations`).Scan(&revocationRevision, &credentialActivatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if revocationRevision != 1 || credentialActivatedAt <= 0 {
+		t.Fatalf("device credential metadata revision=%d activated_at=%d", revocationRevision, credentialActivatedAt)
+	}
 	var nextSequence, nextAudit int
 	if err := store.db.QueryRow(`SELECT next_sequence, next_audit_sequence FROM authority_streams
 		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`,

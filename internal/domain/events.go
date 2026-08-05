@@ -169,6 +169,8 @@ const (
 	EventTypePrincipalRegistered         EventType = "PrincipalRegistered"
 	EventTypeDevicePairingBegan          EventType = "DevicePairingBegan"
 	EventTypeDevicePaired                EventType = "DevicePaired"
+	EventTypeDeviceCredentialRotated     EventType = "DeviceCredentialRotated"
+	EventTypeDeviceRevoked               EventType = "DeviceRevoked"
 	EventTypeWorkspaceCreated            EventType = "WorkspaceCreated"
 	EventTypeWorkspaceMemberInvited      EventType = "WorkspaceMemberInvited"
 	EventTypeWorkspaceMembershipAccepted EventType = "WorkspaceMembershipAccepted"
@@ -184,6 +186,8 @@ func (eventType EventType) Valid() bool {
 		EventTypePrincipalRegistered,
 		EventTypeDevicePairingBegan,
 		EventTypeDevicePaired,
+		EventTypeDeviceCredentialRotated,
+		EventTypeDeviceRevoked,
 		EventTypeWorkspaceCreated,
 		EventTypeWorkspaceMemberInvited,
 		EventTypeWorkspaceMembershipAccepted,
