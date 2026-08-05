@@ -2682,7 +2682,11 @@ func completeOperationPipeline(
 	key, _ := domain.NewIdempotencyKey(fmt.Sprintf("matrix-%02d", index))
 	var receiptIdentity ReceiptIdentity
 	var err error
-	switch operationContracts[testCase.operation].receipt {
+	contract, cataloged := commandContract(testCase.operation)
+	if !cataloged {
+		t.Fatalf("uncataloged operation %s", testCase.operation)
+	}
+	switch contract.receipt {
 	case ReceiptIdentityOrdinary:
 		workspaceID, parseErr := domain.ParseWorkspaceID(testCase.scope.ID())
 		if parseErr != nil {
@@ -2738,7 +2742,7 @@ func completeOperationPipeline(
 		}
 	}
 	recovery := NotApplicableRecoveryCapsulePlan()
-	if operationContracts[testCase.operation].recovery == RecoveryCapsuleRequired {
+	if contract.recovery == RecoveryCapsuleRequired {
 		recovery, err = PrepareRecoveryCapsulePlan(newTestCapsuleSigner("ed25519:matrix:" + string(testCase.operation)))
 		if err != nil {
 			t.Fatal(err)
@@ -2749,7 +2753,7 @@ func completeOperationPipeline(
 		Scope: testCase.scope, AuthorityID: path.authority, RequestedEpoch: path.epoch,
 		CommandID: commandID, ReceiptID: receiptID, Operation: operation, OperationMajor: major,
 		ReceiptIdentity: receiptIdentity, RequestFingerprint: fingerprint, Authorship: testCase.authorship,
-		CorrelationID: correlationID, AuthorityTimeClass: operationContracts[testCase.operation].timeClass,
+		CorrelationID: correlationID, AuthorityTimeClass: contract.timeClass,
 		RecoveryCapsule: recovery, Guards: guardPlan, ExpectedFacts: factExpectations,
 	}
 	spec, err := NewCommandSpec(specParams)
@@ -2786,7 +2790,18 @@ func completeOperationPipeline(
 	effects, _ := NewEffectSet()
 	decision, err := ApplyCommand(commandContext, commit, audit, effects)
 	if err != nil {
-		t.Fatalf("apply: %v", err)
+		t.Fatalf("apply: %v (resolution=%v operation=%v audit_outcome=%v audit_operation=%v audit_fingerprint=%v writes=%v facts=%v ceremonies=%v effects=%v)",
+			err,
+			commandContext.resolution.kind == ReceiptAdmitted,
+			commit.operation == commandContext.spec.commandOperation,
+			audit.outcome == AuditCommandApplied,
+			audit.operation == commandContext.spec.operation,
+			audit.fingerprint == commandContext.spec.requestFingerprint,
+			writesMatchPlan(commit.writes, commandContext.spec.guards.mutations),
+			factsMatchPlan(commit.facts, commandContext.spec.expectedFacts),
+			ceremonyTransitionsMatchPlan(commit.ceremonies, commandContext.spec.guards.ceremonies),
+			effectsReferToFacts(effects, commit.facts),
+		)
 	}
 	if err := ValidateCommandDecision(commandContext, decision); err != nil {
 		t.Fatalf("validate decision: %v", err)

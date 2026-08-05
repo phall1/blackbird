@@ -461,6 +461,13 @@ func (payload canonicalEventPayload) MarshalJSON() ([]byte, error) {
 	}
 	return append([]byte(nil), payload.canonical...), nil
 }
+func (payload *canonicalEventPayload) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || !json.Valid(data) {
+		return ErrCanonicalProfile
+	}
+	payload.canonical = append(payload.canonical[:0], data...)
+	return nil
+}
 
 type identityPayloadInstallationBootstrapped struct {
 	InstallationID        CanonicalIdentifier `json:"installation_id"`
@@ -574,6 +581,7 @@ type identityPayloadActorSessionStarted struct {
 	PresentationCredentialVersion   uint16              `json:"presentation_credential_version"`
 }
 type identityPayloadWorkRefObserved struct {
+	WorkReferenceID    CanonicalIdentifier   `json:"work_reference_id"`
 	WorkspaceID        CanonicalIdentifier   `json:"workspace_id"`
 	ProviderNamespace  string                `json:"provider_namespace"`
 	ProviderObjectID   string                `json:"provider_object_id"`
@@ -584,11 +592,13 @@ type identityPayloadWorkRefObserved struct {
 	ObservedAt         CanonicalInstant      `json:"observed_at"`
 }
 type identityPayloadObjectiveCreated struct {
+	ObjectiveID        CanonicalIdentifier `json:"objective_id"`
 	WorkspaceID        CanonicalIdentifier `json:"workspace_id"`
 	Title              string              `json:"title"`
 	AcceptanceCriteria string              `json:"acceptance_criteria"`
 }
 type identityPayloadWorkUnitCreated struct {
+	WorkUnitID      CanonicalIdentifier `json:"work_unit_id"`
 	WorkspaceID     CanonicalIdentifier `json:"workspace_id"`
 	ObjectiveID     CanonicalIdentifier `json:"objective_id"`
 	WorkReferenceID CanonicalIdentifier `json:"work_reference_id"`
@@ -598,25 +608,29 @@ type identityPayloadObjectiveActivated struct {
 	ObjectiveID CanonicalIdentifier `json:"objective_id"`
 }
 type identityPayloadRunPlanned struct {
+	RunID       CanonicalIdentifier `json:"run_id"`
 	ObjectiveID CanonicalIdentifier `json:"objective_id"`
 	WorkUnitID  CanonicalIdentifier `json:"work_unit_id"`
 	OperatorID  CanonicalIdentifier `json:"operator_actor_id"`
 }
 type identityPayloadRunParticipantInvited struct {
-	RunID   CanonicalIdentifier `json:"run_id"`
-	ActorID CanonicalIdentifier `json:"actor_id"`
-	Role    string              `json:"role"`
+	ParticipationID CanonicalIdentifier `json:"participation_id"`
+	RunID           CanonicalIdentifier `json:"run_id"`
+	ActorID         CanonicalIdentifier `json:"actor_id"`
+	Role            string              `json:"role"`
 }
 type identityPayloadRuntimeBindingRequested struct {
+	BindingID         CanonicalIdentifier `json:"binding_id"`
 	RunID             CanonicalIdentifier `json:"run_id"`
 	ParticipationID   CanonicalIdentifier `json:"participation_id"`
 	ActorSessionID    CanonicalIdentifier `json:"actor_session_id"`
 	RuntimeEndpointID CanonicalIdentifier `json:"runtime_endpoint_id"`
 }
 type identityPayloadRunParticipantJoined struct {
-	RunID          CanonicalIdentifier `json:"run_id"`
-	ActorID        CanonicalIdentifier `json:"actor_id"`
-	ActorSessionID CanonicalIdentifier `json:"actor_session_id"`
+	ParticipationID CanonicalIdentifier `json:"participation_id"`
+	RunID           CanonicalIdentifier `json:"run_id"`
+	ActorID         CanonicalIdentifier `json:"actor_id"`
+	ActorSessionID  CanonicalIdentifier `json:"actor_session_id"`
 }
 type identityPayloadRunStarted struct {
 	RunID CanonicalIdentifier `json:"run_id"`
@@ -850,25 +864,25 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 		if instantErr != nil || fieldsErr != nil {
 			return nil, ErrCanonicalProfile
 		}
-		return identityPayloadWorkRefObserved{WorkspaceID: id(value.WorkspaceID().String()),
+		return identityPayloadWorkRefObserved{WorkReferenceID: id(fact.Origin().ID()), WorkspaceID: id(value.WorkspaceID().String()),
 			ProviderNamespace: observation.Namespace().String(), ProviderObjectID: observation.ObjectID().String(),
 			ProviderLocator: observation.Locator().String(), ProviderVersion: observation.ProviderVersion().String(),
 			SelectedFields: canonicalEventPayload{canonical: fields}, AdapterPrincipalID: id(observation.AdapterPrincipalID().String()),
 			ObservedAt: observedAt}, nil
 	case domain.ObjectiveCreatedFact:
-		return identityPayloadObjectiveCreated{WorkspaceID: id(value.WorkspaceID().String()), Title: value.Title(), AcceptanceCriteria: value.AcceptanceCriteria()}, nil
+		return identityPayloadObjectiveCreated{ObjectiveID: id(fact.Origin().ID()), WorkspaceID: id(value.WorkspaceID().String()), Title: value.Title(), AcceptanceCriteria: value.AcceptanceCriteria()}, nil
 	case domain.WorkUnitCreatedFact:
-		return identityPayloadWorkUnitCreated{WorkspaceID: id(value.WorkspaceID().String()), ObjectiveID: id(value.ObjectiveID().String()), WorkReferenceID: id(value.WorkReferenceID().String()), Title: value.Title()}, nil
+		return identityPayloadWorkUnitCreated{WorkUnitID: id(fact.Origin().ID()), WorkspaceID: id(value.WorkspaceID().String()), ObjectiveID: id(value.ObjectiveID().String()), WorkReferenceID: id(value.WorkReferenceID().String()), Title: value.Title()}, nil
 	case domain.ObjectiveActivatedFact:
 		return identityPayloadObjectiveActivated{ObjectiveID: id(value.ObjectiveID().String())}, nil
 	case domain.RunPlannedFact:
-		return identityPayloadRunPlanned{ObjectiveID: id(value.ObjectiveID().String()), WorkUnitID: id(value.WorkUnitID().String()), OperatorID: id(value.OperatorID().String())}, nil
+		return identityPayloadRunPlanned{RunID: id(fact.Origin().ID()), ObjectiveID: id(value.ObjectiveID().String()), WorkUnitID: id(value.WorkUnitID().String()), OperatorID: id(value.OperatorID().String())}, nil
 	case domain.RunParticipantInvitedFact:
-		return identityPayloadRunParticipantInvited{RunID: id(value.RunID().String()), ActorID: id(value.ActorID().String()), Role: value.Role()}, nil
+		return identityPayloadRunParticipantInvited{ParticipationID: id(fact.Origin().ID()), RunID: id(value.RunID().String()), ActorID: id(value.ActorID().String()), Role: value.Role()}, nil
 	case domain.RuntimeBindingRequestedFact:
-		return identityPayloadRuntimeBindingRequested{RunID: id(value.RunID().String()), ParticipationID: id(value.ParticipationID().String()), ActorSessionID: id(value.ActorSessionID().String()), RuntimeEndpointID: id(value.RuntimeEndpointID().String())}, nil
+		return identityPayloadRuntimeBindingRequested{BindingID: id(fact.Origin().ID()), RunID: id(value.RunID().String()), ParticipationID: id(value.ParticipationID().String()), ActorSessionID: id(value.ActorSessionID().String()), RuntimeEndpointID: id(value.RuntimeEndpointID().String())}, nil
 	case domain.RunParticipantJoinedFact:
-		return identityPayloadRunParticipantJoined{RunID: id(value.RunID().String()), ActorID: id(value.ActorID().String()), ActorSessionID: id(value.ActorSessionID().String())}, nil
+		return identityPayloadRunParticipantJoined{ParticipationID: id(fact.Origin().ID()), RunID: id(value.RunID().String()), ActorID: id(value.ActorID().String()), ActorSessionID: id(value.ActorSessionID().String())}, nil
 	case domain.RunStartedFact:
 		return identityPayloadRunStarted{RunID: id(value.RunID().String())}, nil
 	default:
@@ -2308,6 +2322,88 @@ func NewStartActorSessionCommandHashView(context W0CommandHashContextParams, par
 func (startActorSessionCommandHashView) canonicalView()   {}
 func (startActorSessionCommandHashView) commandHashView() {}
 
+type ObserveWorkRefCommandHashParams struct {
+	Adapter                      CommandExpectedResource
+	Workspace                    CommandExpectedResource
+	WorkReferenceID              CanonicalIdentifier
+	ExpectedWorkReferenceVersion *uint64
+	ProviderNamespace            string
+	ProviderObjectID             string
+	ProviderLocator              string
+	ProviderVersion              string
+	SelectedFields               domain.EventPayload
+	AdapterPrincipalID           CanonicalIdentifier
+	ObservedAt                   time.Time
+	PreviousProviderVersion      string
+}
+
+type observeWorkRefCommandBody struct {
+	Adapter                      CommandExpectedResource `json:"adapter"`
+	Workspace                    CommandExpectedResource `json:"workspace"`
+	WorkReferenceID              CanonicalIdentifier     `json:"work_reference_id"`
+	ExpectedWorkReferenceVersion *uint64                 `json:"expected_work_reference_version"`
+	ProviderNamespace            string                  `json:"provider_namespace"`
+	ProviderObjectID             string                  `json:"provider_object_id"`
+	ProviderLocator              string                  `json:"provider_locator"`
+	ProviderVersion              string                  `json:"provider_version"`
+	SelectedFields               canonicalEventPayload   `json:"selected_fields"`
+	AdapterPrincipalID           CanonicalIdentifier     `json:"adapter_principal_id"`
+	ObservedAt                   CanonicalInstant        `json:"observed_at"`
+	PreviousProviderVersion      *string                 `json:"previous_provider_version"`
+}
+
+type observeWorkRefCommandHashView struct {
+	Command commandHashContextWire    `json:"command"`
+	Body    observeWorkRefCommandBody `json:"body"`
+}
+
+func NewObserveWorkRefCommandHashView(
+	context W0CommandHashContextParams,
+	params ObserveWorkRefCommandHashParams,
+) (CommandHashView, error) {
+	command, commandErr := commandHashContext(CommandObserveWorkRef, context)
+	selectedFields, fieldsErr := canonicalizeStrict(
+		params.SelectedFields.Bytes(), domain.MaxEventPayloadBytes, MaxCanonicalJSONDepth,
+	)
+	observedAt, observedErr := NewCanonicalInstant(params.ObservedAt)
+	_, namespaceErr := domain.NewOpaqueProviderValue(params.ProviderNamespace)
+	_, objectErr := domain.NewOpaqueProviderValue(params.ProviderObjectID)
+	_, locatorErr := domain.NewOpaqueProviderValue(params.ProviderLocator)
+	_, versionErr := domain.NewOpaqueProviderValue(params.ProviderVersion)
+	create := params.ExpectedWorkReferenceVersion == nil && params.PreviousProviderVersion == ""
+	update := params.ExpectedWorkReferenceVersion != nil && *params.ExpectedWorkReferenceVersion > 0 &&
+		*params.ExpectedWorkReferenceVersion <= MaxCanonicalInteger && params.PreviousProviderVersion != ""
+	if params.PreviousProviderVersion != "" {
+		_, predecessorErr := domain.NewOpaqueProviderValue(params.PreviousProviderVersion)
+		if predecessorErr != nil {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	if commandErr != nil || fieldsErr != nil || observedErr != nil || namespaceErr != nil || objectErr != nil ||
+		locatorErr != nil || versionErr != nil || !validCommandResource(params.Adapter) ||
+		!validCommandResource(params.Workspace) || params.WorkReferenceID.String() == "" ||
+		params.AdapterPrincipalID.String() == "" || params.Adapter.ID != params.AdapterPrincipalID || (!create && !update) {
+		return nil, ErrCanonicalProfile
+	}
+	body := observeWorkRefCommandBody{
+		Adapter: params.Adapter, Workspace: params.Workspace, WorkReferenceID: params.WorkReferenceID,
+		ProviderNamespace: params.ProviderNamespace, ProviderObjectID: params.ProviderObjectID,
+		ProviderLocator: params.ProviderLocator, ProviderVersion: params.ProviderVersion,
+		SelectedFields: canonicalEventPayload{canonical: selectedFields}, AdapterPrincipalID: params.AdapterPrincipalID,
+		ObservedAt: observedAt,
+	}
+	if update {
+		expected := *params.ExpectedWorkReferenceVersion
+		predecessor := params.PreviousProviderVersion
+		body.ExpectedWorkReferenceVersion = &expected
+		body.PreviousProviderVersion = &predecessor
+	}
+	return observeWorkRefCommandHashView{Command: command, Body: body}, nil
+}
+
+func (observeWorkRefCommandHashView) canonicalView()   {}
+func (observeWorkRefCommandHashView) commandHashView() {}
+
 // BootstrapAttemptViewV1 is the retained, secret-free invalid-proof identity.
 type BootstrapAttemptViewV1 struct {
 	InvitationID         CanonicalIdentifier `json:"invitation_id"`
@@ -3402,6 +3498,24 @@ func decodeIdentityPayload(eventType domain.EventType, canonical []byte) (any, e
 		target = &identityPayloadActorDelegationActivated{}
 	case domain.EventTypeActorSessionStarted:
 		target = &identityPayloadActorSessionStarted{}
+	case domain.EventTypeWorkRefObserved:
+		target = &identityPayloadWorkRefObserved{}
+	case domain.EventTypeObjectiveCreated:
+		target = &identityPayloadObjectiveCreated{}
+	case domain.EventTypeWorkUnitCreated:
+		target = &identityPayloadWorkUnitCreated{}
+	case domain.EventTypeObjectiveActivated:
+		target = &identityPayloadObjectiveActivated{}
+	case domain.EventTypeRunPlanned:
+		target = &identityPayloadRunPlanned{}
+	case domain.EventTypeRunParticipantInvited:
+		target = &identityPayloadRunParticipantInvited{}
+	case domain.EventTypeRuntimeBindingRequested:
+		target = &identityPayloadRuntimeBindingRequested{}
+	case domain.EventTypeRunParticipantJoined:
+		target = &identityPayloadRunParticipantJoined{}
+	case domain.EventTypeRunStarted:
+		target = &identityPayloadRunStarted{}
 	default:
 		return nil, ErrCanonicalProfile
 	}
@@ -3453,6 +3567,24 @@ func identityPayloadMatchesEnvelope(event domain.EventEnvelope, payload any) boo
 		return matchesAggregate(value.DelegationID) && matchesScope(value.WorkspaceID)
 	case *identityPayloadActorSessionStarted:
 		return matchesAggregate(value.SessionID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadWorkRefObserved:
+		return matchesAggregate(value.WorkReferenceID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadObjectiveCreated:
+		return matchesAggregate(value.ObjectiveID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadWorkUnitCreated:
+		return matchesAggregate(value.WorkUnitID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadObjectiveActivated:
+		return matchesAggregate(value.ObjectiveID)
+	case *identityPayloadRunPlanned:
+		return matchesAggregate(value.RunID)
+	case *identityPayloadRunParticipantInvited:
+		return matchesAggregate(value.ParticipationID)
+	case *identityPayloadRuntimeBindingRequested:
+		return matchesAggregate(value.BindingID)
+	case *identityPayloadRunParticipantJoined:
+		return matchesAggregate(value.ParticipationID)
+	case *identityPayloadRunStarted:
+		return matchesAggregate(value.RunID)
 	default:
 		return false
 	}
@@ -3466,7 +3598,10 @@ func expectedEventScopeKind(eventType domain.EventType) domain.ScopeKind {
 	case domain.EventTypeWorkspaceCreated, domain.EventTypeWorkspaceMemberInvited,
 		domain.EventTypeWorkspaceMembershipAccepted, domain.EventTypeActorCreated,
 		domain.EventTypeActorDelegationProposed, domain.EventTypeActorDelegationActivated,
-		domain.EventTypeActorSessionStarted:
+		domain.EventTypeActorSessionStarted, domain.EventTypeWorkRefObserved, domain.EventTypeObjectiveCreated,
+		domain.EventTypeWorkUnitCreated, domain.EventTypeObjectiveActivated, domain.EventTypeRunPlanned,
+		domain.EventTypeRunParticipantInvited, domain.EventTypeRuntimeBindingRequested,
+		domain.EventTypeRunParticipantJoined, domain.EventTypeRunStarted:
 		return domain.ScopeKindWorkspace
 	default:
 		return ""
@@ -3491,6 +3626,18 @@ func expectedEventAggregateKind(eventType domain.EventType) domain.AggregateKind
 		return domain.AggregateKindActorDelegation
 	case domain.EventTypeActorSessionStarted:
 		return domain.AggregateKindActorSession
+	case domain.EventTypeWorkRefObserved:
+		return domain.AggregateKindWorkReference
+	case domain.EventTypeObjectiveCreated, domain.EventTypeObjectiveActivated:
+		return domain.AggregateKindObjective
+	case domain.EventTypeWorkUnitCreated:
+		return domain.AggregateKindWorkUnit
+	case domain.EventTypeRunPlanned, domain.EventTypeRunStarted:
+		return domain.AggregateKindRun
+	case domain.EventTypeRunParticipantInvited, domain.EventTypeRunParticipantJoined:
+		return domain.AggregateKindRunParticipation
+	case domain.EventTypeRuntimeBindingRequested:
+		return domain.AggregateKindRuntimeBinding
 	default:
 		return ""
 	}
@@ -3563,6 +3710,29 @@ func validIdentityPayload(payload any) bool {
 			validCapabilities(value.Capabilities) && validOpaqueText(value.PresentationCredentialReference, 256) &&
 			value.PresentationCredentialDigest.String() != "" && validOpaqueText(value.PresentationCredentialAudience, 256) &&
 			value.PresentationCredentialVersion == domain.PresentationCredentialVersion
+	case *identityPayloadWorkRefObserved:
+		return validIDs(value.WorkReferenceID, value.WorkspaceID, value.AdapterPrincipalID) &&
+			validOpaqueText(value.ProviderNamespace, 4096) && validOpaqueText(value.ProviderObjectID, 4096) &&
+			validOpaqueText(value.ProviderLocator, 4096) && validOpaqueText(value.ProviderVersion, 4096) &&
+			len(value.SelectedFields.canonical) > 0
+	case *identityPayloadObjectiveCreated:
+		return validIDs(value.ObjectiveID, value.WorkspaceID) && validOpaqueText(value.Title, 256) &&
+			validOpaqueText(value.AcceptanceCriteria, 4096)
+	case *identityPayloadWorkUnitCreated:
+		return validIDs(value.WorkUnitID, value.WorkspaceID, value.ObjectiveID, value.WorkReferenceID) &&
+			validOpaqueText(value.Title, 256)
+	case *identityPayloadObjectiveActivated:
+		return validIDs(value.ObjectiveID)
+	case *identityPayloadRunPlanned:
+		return validIDs(value.RunID, value.ObjectiveID, value.WorkUnitID, value.OperatorID)
+	case *identityPayloadRunParticipantInvited:
+		return validIDs(value.ParticipationID, value.RunID, value.ActorID) && validOpaqueText(value.Role, 128)
+	case *identityPayloadRuntimeBindingRequested:
+		return validIDs(value.BindingID, value.RunID, value.ParticipationID, value.ActorSessionID, value.RuntimeEndpointID)
+	case *identityPayloadRunParticipantJoined:
+		return validIDs(value.ParticipationID, value.RunID, value.ActorID, value.ActorSessionID)
+	case *identityPayloadRunStarted:
+		return validIDs(value.RunID)
 	default:
 		return false
 	}

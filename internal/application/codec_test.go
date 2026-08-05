@@ -543,6 +543,68 @@ func mustCommandHashView(view CommandHashView, err error) CommandHashView {
 	return view
 }
 
+func TestObserveWorkRefCommandHashProfile(t *testing.T) {
+	t.Parallel()
+
+	id := func(index int) CanonicalIdentifier { return mustCanonicalID(t, codecUUID(index)) }
+	resource := func(index int) CommandExpectedResource {
+		return CommandExpectedResource{ID: id(index), ExpectedVersion: uint64(index)}
+	}
+	fields, err := domain.NewEventPayload([]byte(`{"status":"open","priority":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	context := W0CommandHashContextParams{
+		ScopeKind: StreamScopeWorkspace, ScopeID: id(1), PrincipalID: id(2), ClientInstanceID: id(3),
+		CorrelationID: id(4), ProtocolCapabilities: []string{"receipts-v1"},
+	}
+	base := ObserveWorkRefCommandHashParams{
+		Adapter: resource(2), Workspace: resource(1), WorkReferenceID: id(30), ProviderNamespace: "beads",
+		ProviderObjectID: "bd-fam.2.2", ProviderLocator: "beads://blackmail/bd-fam.2.2", ProviderVersion: "beads-v7",
+		SelectedFields: fields, AdapterPrincipalID: id(2), ObservedAt: time.Date(2026, 8, 5, 12, 30, 0, 123_000_000, time.UTC),
+	}
+	create := mustCommandHashView(NewObserveWorkRefCommandHashView(context, base))
+	createFingerprint, err := NewProductionCanonicalCodec().HashCommand(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hex.EncodeToString(createFingerprint[:]), "45f6c8e5a178ad943c39991468675bf8b26fd8ad7d0748e48cbb2d005c43cdb1"; got != want {
+		t.Fatalf("observe create golden changed: got %s, want %s", got, want)
+	}
+
+	expected := uint64(1)
+	update := base
+	update.ExpectedWorkReferenceVersion = &expected
+	update.ProviderVersion = "beads-v8"
+	update.PreviousProviderVersion = "beads-v7"
+	updateFingerprint, err := NewProductionCanonicalCodec().HashCommand(
+		mustCommandHashView(NewObserveWorkRefCommandHashView(context, update)),
+	)
+	if err != nil || updateFingerprint == createFingerprint {
+		t.Fatalf("update fingerprint=%x error=%v", updateFingerprint, err)
+	}
+
+	reordered, _ := domain.NewEventPayload([]byte(`{"priority":1,"status":"open"}`))
+	canonicalEquivalent := base
+	canonicalEquivalent.SelectedFields = reordered
+	equivalentFingerprint, err := NewProductionCanonicalCodec().HashCommand(
+		mustCommandHashView(NewObserveWorkRefCommandHashView(context, canonicalEquivalent)),
+	)
+	if err != nil || equivalentFingerprint != createFingerprint {
+		t.Fatalf("selected field canonicalization changed fingerprint: %x, %v", equivalentFingerprint, err)
+	}
+
+	invalid := []ObserveWorkRefCommandHashParams{base, base, base}
+	invalid[0].ExpectedWorkReferenceVersion = &expected
+	invalid[1].PreviousProviderVersion = "beads-v6"
+	invalid[2].AdapterPrincipalID = id(5)
+	for index, candidate := range invalid {
+		if _, err := NewObserveWorkRefCommandHashView(context, candidate); !errors.Is(err, ErrCanonicalProfile) {
+			t.Fatalf("invalid case %d error=%v", index, err)
+		}
+	}
+}
+
 func TestW0CommandHashViewsHashEveryStructuralField(t *testing.T) {
 	t.Parallel()
 

@@ -1326,6 +1326,116 @@ func TestAllElevenOrchestrationHandlersCommitExactRecordedShape(t *testing.T) {
 	}
 }
 
+func TestObserveWorkRefOrchestrationCommitsExactRecordedShape(t *testing.T) {
+	t.Parallel()
+
+	path := buildOperationDomainPath(t)
+	adapterID, _ := domain.ParsePrincipalID(applicationUUID(719))
+	adapterName, _ := domain.NewDisplayName("Beads adapter")
+	adapterKey, _ := domain.NewPublicKeyReference("keyref:beads-adapter")
+	ownerAuthorization, err := domain.NewIdentityAuthorization(
+		path.authority, path.epoch, path.installation, path.bootstrap.Principal().ID(), path.ownerCaps,
+		path.policy, path.assurance, path.now, domain.MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registeredAdapter, err := domain.RegisterPrincipal(domain.RegisterPrincipalInput{
+		Authorization: ownerAuthorization, Registrar: path.bootstrap.Principal(),
+		ExpectedRegistrarVersion: path.bootstrap.Principal().Version(), PrincipalID: adapterID,
+		Kind: domain.PrincipalKindService, DisplayName: adapterName, PublicKeyReference: adapterKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := registeredAdapter.Principal()
+	workspace := path.createdWorkspace.Workspace()
+	workspaceScope, _ := domain.WorkspaceScope(workspace.ID())
+	workReferenceID, _ := domain.ParseWorkReferenceID(applicationUUID(720))
+	namespace, _ := domain.NewOpaqueProviderValue("beads")
+	objectID, _ := domain.NewOpaqueProviderValue("bd-fam.2.2")
+	locator, _ := domain.NewOpaqueProviderValue("beads://blackmail/bd-fam.2.2")
+	providerVersion, _ := domain.NewOpaqueProviderValue("beads-v7")
+	fields, _ := domain.NewEventPayload([]byte(`{"priority":1,"status":"in_progress"}`))
+	observation, err := domain.NewProviderObservation(
+		namespace, objectID, locator, providerVersion, fields, adapter.ID(), path.now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization, err := domain.NewWorkspaceIdentityAuthorization(
+		path.authority, path.epoch, path.installation, workspace.ID(), adapter.ID(), path.memberCaps,
+		path.policy, path.assurance, path.now, domain.MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := domain.ObserveWorkRef(domain.ObserveWorkRefInput{
+		Authorization: authorization, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(),
+		Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(), WorkReferenceID: workReferenceID,
+		Observation: observation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorship, _ := AuthorityAuthorship(adapter.ID())
+	authorityGuard, _ := CurrentAuthorityEpochGuard(workspaceScope, path.authority, path.epoch)
+	policyGuard, _ := PolicyRevisionGuard(workspaceScope, path.policy)
+	workReferenceAbsent, _ := domain.ExpectAggregateAbsent(workReferenceID)
+	testCase := operationPipelineCase{
+		operation: CommandObserveWorkRef, scope: workspaceScope, admission: workspaceScope,
+		principal: adapter.ID(), authorship: authorship,
+		authorization: []IdentityState{mustIdentityState(t, adapter), mustIdentityState(t, workspace)},
+		disclosure:    []domain.AggregateTarget{mustTarget(t, adapter), mustTarget(t, workspace)},
+		mutations:     []domain.AggregateExpectation{workReferenceAbsent},
+		evidence:      []EvidenceGuard{authorityGuard, policyGuard}, facts: observed.Facts(),
+		commit: func(context CommandContext) (OperationCommit, error) {
+			return ObserveWorkRefCommit(context, observed)
+		},
+	}
+	pipeline := completeOperationPipeline(t, path, testCase, 42)
+	view, err := NewObserveWorkRefCommandHashView(orchestrationCommandContext(t, pipeline), ObserveWorkRefCommandHashParams{
+		Adapter: orchestrationResource(t, adapter), Workspace: orchestrationResource(t, workspace),
+		WorkReferenceID: mustCanonical(t, workReferenceID.String()), ProviderNamespace: namespace.String(),
+		ProviderObjectID: objectID.String(), ProviderLocator: locator.String(), ProviderVersion: providerVersion.String(),
+		SelectedFields: fields, AdapterPrincipalID: mustCanonical(t, adapter.ID().String()), ObservedAt: path.now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
+	authentication, policy := orchestrationPreparationRequests(
+		t, CommandObserveWorkRef, workspaceScope, adapter.ID(), adapter.Version(), path.authority,
+	)
+	request := ObserveWorkRefRequest{
+		CommandRequest: CommandRequest{Spec: pipeline.spec, HashView: view, Authentication: authentication,
+			Policy: policy, Audit: orchestrationAuditContext(t)},
+		AdapterID: adapter.ID(), WorkspaceID: workspace.ID(), WorkReferenceID: workReferenceID,
+		Observation: observation,
+	}
+	trap := &orchestrationTrap{}
+	unit := &strictOrchestrationUOW{
+		t: t, trap: trap, mode: orchestrationCommitted, contexts: []CommandContext{pipeline.context},
+	}
+	handlerCase := orchestrationHandlerCase{
+		name: CommandObserveWorkRef, pipeline: pipeline,
+		invoke: func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
+			return service.ObserveWorkRef(ctx, request)
+		},
+	}
+	execution, err := handlerCase.invoke(
+		context.Background(), orchestrationMatrixService(t, path, handlerCase, unit, ReplayDiscloseResult),
+	)
+	if err != nil || execution.Kind() != CommandApplied || len(unit.decisions) != 1 ||
+		len(unit.decisions[0].Writes()) != 1 || len(unit.decisions[0].Facts()) != 1 {
+		t.Fatalf("execution=%s error=%v decisions=%d", execution.Kind(), err, len(unit.decisions))
+	}
+	state, ok := unit.decisions[0].Writes()[0].Value().(domain.WorkReferenceState)
+	if !ok || state.ID() != workReferenceID || state.Observation().ProviderVersion() != providerVersion {
+		t.Fatalf("work reference write=%#v", unit.decisions[0].Writes())
+	}
+}
+
 func TestOrchestrationCarriesFederatedAuthenticationProvenanceIntoAudit(t *testing.T) {
 	path := buildOperationDomainPath(t)
 	testCase := buildOrchestrationHandlerCases(t, path)[0]

@@ -4764,6 +4764,18 @@ func identityStateRef(state IdentityState) (domain.AggregateRef, error) {
 		return domain.NewAggregateRef(value.ID(), value.Version())
 	case domain.ActorSessionState:
 		return domain.NewAggregateRef(value.ID(), value.Version())
+	case domain.WorkReferenceState:
+		return domain.NewAggregateRef(value.ID(), value.Version())
+	case domain.ObjectiveState:
+		return domain.NewAggregateRef(value.ID(), value.Version())
+	case domain.WorkUnitState:
+		return domain.NewAggregateRef(value.ID(), value.Version())
+	case domain.RunState:
+		return domain.NewAggregateRef(value.ID(), value.Version())
+	case domain.RunParticipationState:
+		return domain.NewAggregateRef(value.ID(), value.Version())
+	case domain.RuntimeBindingState:
+		return domain.NewAggregateRef(value.ID(), value.Version())
 	default:
 		return domain.AggregateRef{}, ErrInvalidCommandDecision
 	}

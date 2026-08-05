@@ -1145,6 +1145,8 @@ func commandHashContextOf(view CommandHashView) (commandHashContextWire, bool) {
 		return value.Command, true
 	case startActorSessionCommandHashView:
 		return value.Command, true
+	case observeWorkRefCommandHashView:
+		return value.Command, true
 	default:
 		return commandHashContextWire{}, false
 	}
@@ -1433,6 +1435,9 @@ func commandHashViewMatches(operation CommandOperation, view CommandHashView) bo
 	case CommandStartActorSession:
 		_, ok := view.(startActorSessionCommandHashView)
 		return ok
+	case CommandObserveWorkRef:
+		_, ok := view.(observeWorkRefCommandHashView)
+		return ok
 	default:
 		return false
 	}
@@ -1458,6 +1463,105 @@ func lockedState[T any](locked CommandContext, id interface{ String() string }) 
 		}
 	}
 	return zero, ErrInvalidCommandContext
+}
+
+type ObserveWorkRefRequest struct {
+	CommandRequest
+	AdapterID                    domain.PrincipalID
+	WorkspaceID                  domain.WorkspaceID
+	WorkReferenceID              domain.WorkReferenceID
+	ExpectedWorkReferenceVersion domain.Version
+	Observation                  domain.ProviderObservation
+	PreviousProviderVersion      domain.OpaqueProviderValue
+}
+
+func (service *OrchestrationService) ObserveWorkRef(
+	ctx context.Context,
+	request ObserveWorkRefRequest,
+) (CommandExecution, error) {
+	view, ok := request.HashView.(observeWorkRefCommandHashView)
+	if err := validateCommandRequest(request.CommandRequest, CommandObserveWorkRef); err != nil || !ok ||
+		!expectedResourceMatches(request.Spec, view.Body.Adapter, domain.AggregateKindPrincipal, resourceAuthorization) ||
+		!expectedResourceMatches(request.Spec, view.Body.Workspace, domain.AggregateKindWorkspace, resourceAuthorization) ||
+		view.Body.Adapter.ID.String() != request.AdapterID.String() ||
+		view.Body.Workspace.ID.String() != request.WorkspaceID.String() ||
+		view.Body.WorkReferenceID.String() != request.WorkReferenceID.String() ||
+		!observeWorkRefMutationMatches(request.Spec, request.WorkReferenceID, request.ExpectedWorkReferenceVersion,
+			view.Body.ExpectedWorkReferenceVersion) ||
+		!providerObservationMatches(view.Body, request.Observation, request.PreviousProviderVersion) {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	return service.executeCommand(ctx, request.CommandRequest, CommandObserveWorkRef,
+		func(locked CommandContext, authorization domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {
+			adapter, err := lockedState[domain.PrincipalState](locked, request.AdapterID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			workspace, err := lockedState[domain.WorkspaceState](locked, request.WorkspaceID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			var workReference domain.WorkReferenceState
+			if !request.ExpectedWorkReferenceVersion.IsZero() {
+				workReference, err = lockedState[domain.WorkReferenceState](locked, request.WorkReferenceID)
+				if err != nil {
+					return OperationCommit{}, err
+				}
+			}
+			result, err := domain.ObserveWorkRef(domain.ObserveWorkRefInput{
+				Authorization: authorization, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(),
+				Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(), WorkReference: workReference,
+				ExpectedWorkReferenceVersion: request.ExpectedWorkReferenceVersion, WorkReferenceID: request.WorkReferenceID,
+				Observation: request.Observation, PreviousProviderVersion: request.PreviousProviderVersion,
+			})
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			return ObserveWorkRefCommit(locked, result)
+		})
+}
+
+func observeWorkRefMutationMatches(
+	spec CommandSpec,
+	id domain.WorkReferenceID,
+	expected domain.Version,
+	wire *uint64,
+) bool {
+	if expected.IsZero() {
+		return wire == nil && mutationTargetMatches(
+			spec, id.String(), domain.AggregateKindWorkReference, domain.ExpectationMustNotExist,
+		)
+	}
+	if wire == nil || *wire != expected.Uint64() {
+		return false
+	}
+	for _, mutation := range spec.Guards().Mutations() {
+		version, present := mutation.Version()
+		if present && mutation.Target().Kind() == domain.AggregateKindWorkReference &&
+			mutation.Target().ID() == id.String() && version == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func providerObservationMatches(
+	body observeWorkRefCommandBody,
+	observation domain.ProviderObservation,
+	previous domain.OpaqueProviderValue,
+) bool {
+	fields, err := canonicalizeStrict(observation.Fields().Bytes(), domain.MaxEventPayloadBytes, MaxCanonicalJSONDepth)
+	if err != nil || body.ProviderNamespace != observation.Namespace().String() ||
+		body.ProviderObjectID != observation.ObjectID().String() || body.ProviderLocator != observation.Locator().String() ||
+		body.ProviderVersion != observation.ProviderVersion().String() ||
+		body.AdapterPrincipalID.String() != observation.AdapterPrincipalID().String() ||
+		!body.ObservedAt.Time().Equal(observation.ObservedAt()) || !bytes.Equal(body.SelectedFields.canonical, fields) {
+		return false
+	}
+	if body.ExpectedWorkReferenceVersion == nil || body.PreviousProviderVersion == nil {
+		return body.ExpectedWorkReferenceVersion == nil && body.PreviousProviderVersion == nil && previous.String() == ""
+	}
+	return *body.PreviousProviderVersion == previous.String()
 }
 
 type BootstrapInstallationRequest struct {
