@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-const productOpenAPIGoldenSHA256 = "07cc5d6b9983cd55c94e826125a9a811e21de2a4569a9b620b606858b40384f6"
+const productOpenAPIGoldenSHA256 = "9462dfdca70a65be856f83f38e150c5acb3455bc255432a5f8adc4822f7bdd12"
 
 func TestProductOpenAPI31IsDeterministicAndComplete(t *testing.T) {
 	t.Parallel()

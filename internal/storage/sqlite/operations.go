@@ -486,42 +486,55 @@ func authorizeSessionQuery(ctx context.Context, tx *sql.Tx, subject application.
 }
 
 func loadContextRecords(ctx context.Context, tx *sql.Tx, state authorizedQueryState) ([]application.ContextRecord, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT kind, id, version, payload FROM (
-		SELECT 'workspace' AS kind, workspace_id AS id, version,
+	rows, err := tx.QueryContext(ctx, `SELECT kind, id, version, lifecycle_state, payload FROM (
+		SELECT 'workspace' AS kind, workspace_id AS id, version, status AS lifecycle_state,
 			json_object('alias', alias, 'policy_revision', policy_revision, 'status', status) AS payload
 			FROM workspaces WHERE workspace_id = ?
-		UNION ALL SELECT 'principal', principal_id, version,
+		UNION ALL SELECT 'principal', principal_id, version, status,
 			json_object('display_name', display_name, 'kind', kind, 'status', status)
 			FROM principals WHERE principal_id = ?
-		UNION ALL SELECT 'actor', actor_id, version,
+		UNION ALL SELECT 'actor', actor_id, version, status,
 			json_object('display_name', display_name, 'kind', kind, 'status', status)
 			FROM actors WHERE workspace_id = ? AND actor_id = ?
-		UNION ALL SELECT 'membership', membership_id, version,
+		UNION ALL SELECT 'membership', membership_id, version, status,
 			json_object('capabilities', json(capabilities_json), 'principal_id', principal_id, 'status', status)
 			FROM workspace_memberships WHERE workspace_id = ? AND principal_id = ?
-		UNION ALL SELECT 'actor_delegation', delegation_id, version,
+		UNION ALL SELECT 'actor_delegation', delegation_id, version, status,
 			json_object('actor_id', actor_id, 'capabilities', json(capabilities_json), 'principal_id', principal_id, 'status', status)
 			FROM actor_delegations WHERE workspace_id = ? AND principal_id = ? AND actor_id = ?
-		UNION ALL SELECT 'actor_session', session_id, version,
+		UNION ALL SELECT 'actor_session', session_id, version, status,
 			json_object('actor_id', actor_id, 'capabilities', json(capabilities_json), 'expires_at_us', expires_at_us,
 			'principal_id', principal_id, 'status', status)
 			FROM actor_sessions WHERE workspace_id = ? AND session_id = ?
+		UNION ALL SELECT 'device', device.device_id, device.version, device.status,
+			json_object('display_name', device.display_name, 'principal_id', device.principal_id, 'status', device.status)
+			FROM device_registrations AS device JOIN actor_sessions AS session ON session.device_id = device.device_id
+			WHERE session.session_id = ?
+		UNION ALL SELECT 'grant', grant_state.grant_id, grant_state.version, grant_state.status,
+			json_object('capabilities', json(grant_state.capabilities_json), 'principal_id', grant_state.principal_id,
+			'status', grant_state.status)
+			FROM grants AS grant_state JOIN actor_session_grant_revisions AS revision
+			ON revision.grant_id = grant_state.grant_id WHERE revision.session_id = ?
 	) ORDER BY kind, id`, state.workspace.String(), state.view.PrincipalID().String(), state.workspace.String(),
 		state.view.ActorID().String(), state.workspace.String(), state.view.PrincipalID().String(), state.workspace.String(),
-		state.view.PrincipalID().String(), state.view.ActorID().String(), state.workspace.String(), state.view.ActorSessionID().String())
+		state.view.PrincipalID().String(), state.view.ActorID().String(), state.workspace.String(), state.view.ActorSessionID().String(),
+		state.view.ActorSessionID().String(), state.view.ActorSessionID().String())
 	if err != nil {
 		return nil, fmt.Errorf("read SQLite context identity: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	records := make([]application.ContextRecord, 0, 6)
+	records := make([]application.ContextRecord, 0, 7+application.MaxContextGrantRevisions)
 	for rows.Next() {
-		var kind, id, payload string
+		var kind, id, lifecycleState, payload string
 		var version uint64
-		if err := rows.Scan(&kind, &id, &version, &payload); err != nil {
+		if err := rows.Scan(&kind, &id, &version, &lifecycleState, &payload); err != nil {
 			return nil, err
 		}
 		domainVersion, versionErr := domain.NewVersion(version)
-		record, recordErr := application.NewContextRecord(application.ContextRecordKind(kind), id, domainVersion, []byte(payload))
+		record, recordErr := application.NewTypedContextRecord(application.ContextRecordParams{
+			Kind: application.ContextRecordKind(kind), ID: id, Version: domainVersion,
+			LifecycleState: application.ContextLifecycleState(lifecycleState), CanonicalPayload: []byte(payload),
+		})
 		if versionErr != nil || recordErr != nil {
 			return nil, application.ErrInvalidQuery
 		}
@@ -530,10 +543,10 @@ func loadContextRecords(ctx context.Context, tx *sql.Tx, state authorizedQuerySt
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(records) != 6 {
+	if len(records) < 6 {
 		return nil, application.ErrInvalidQuery
 	}
-	collaborators, err := tx.QueryContext(ctx, `SELECT actor_id, version,
+	collaborators, err := tx.QueryContext(ctx, `SELECT actor_id, version, status,
 		json_object('display_name', display_name, 'kind', kind, 'status', status) FROM actors
 		WHERE workspace_id = ? AND actor_id <> ? ORDER BY actor_id LIMIT ?`, state.workspace.String(),
 		state.view.ActorID().String(), application.MaxContextCollaborators+1)
@@ -543,9 +556,9 @@ func loadContextRecords(ctx context.Context, tx *sql.Tx, state authorizedQuerySt
 	defer func() { _ = collaborators.Close() }()
 	count := 0
 	for collaborators.Next() {
-		var id, payload string
+		var id, lifecycleState, payload string
 		var version uint64
-		if err := collaborators.Scan(&id, &version, &payload); err != nil {
+		if err := collaborators.Scan(&id, &version, &lifecycleState, &payload); err != nil {
 			return nil, err
 		}
 		count++
@@ -553,7 +566,10 @@ func loadContextRecords(ctx context.Context, tx *sql.Tx, state authorizedQuerySt
 			return nil, queryError(domain.ErrorCodeBackpressure, "context collaborator set exceeds query bound")
 		}
 		domainVersion, versionErr := domain.NewVersion(version)
-		record, recordErr := application.NewContextRecord(application.ContextRecordCollaborator, id, domainVersion, []byte(payload))
+		record, recordErr := application.NewTypedContextRecord(application.ContextRecordParams{
+			Kind: application.ContextRecordCollaborator, ID: id, Version: domainVersion,
+			LifecycleState: application.ContextLifecycleState(lifecycleState), CanonicalPayload: []byte(payload),
+		})
 		if versionErr != nil || recordErr != nil {
 			return nil, application.ErrInvalidQuery
 		}

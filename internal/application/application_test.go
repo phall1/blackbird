@@ -939,11 +939,29 @@ func TestQueryDTOViewsRetainCompleteDeterministicData(t *testing.T) {
 	if _, err = NewContextGetQuery(subject, checkpointID, cursor, 0); !errors.Is(err, ErrInvalidQuery) {
 		t.Fatalf("zero context limit error=%v", err)
 	}
-	record, _ := NewContextRecord(ContextRecordWorkspace, workspace.String(), domain.InitialVersion(), []byte(`{"state":"active"}`))
+	recordKinds := []ContextRecordKind{
+		ContextRecordActor, ContextRecordDelegation, ContextRecordMembership, ContextRecordPrincipal,
+		ContextRecordSession, ContextRecordWorkspace,
+	}
+	records := make([]ContextRecord, 0, len(recordKinds))
+	for index, kind := range recordKinds {
+		id := applicationUUID(150 + index)
+		if kind == ContextRecordWorkspace {
+			id = workspace.String()
+		}
+		record, recordErr := NewTypedContextRecord(ContextRecordParams{
+			Kind: kind, ID: id, Version: domain.InitialVersion(), LifecycleState: ContextStateActive,
+			CanonicalPayload: []byte(`{"status":"active"}`),
+		})
+		if recordErr != nil {
+			t.Fatalf("new %s context record: %v", kind, recordErr)
+		}
+		records = append(records, record)
+	}
 	checkpoint, err := NewContextCheckpoint(ContextCheckpointParams{
 		CheckpointID: checkpointID, AuthorityID: authority, AuthorityEpoch: epoch, ThroughCursor: cursor,
 		ProjectionVersion: 1, ServerTime: time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC),
-		Session: AuthorizedSessionView{session: session}, Records: []ContextRecord{record},
+		Session: AuthorizedSessionView{session: session}, Records: records,
 	})
 	if err != nil || checkpoint.AuthorityID() != authority || checkpoint.AuthorityEpoch() != epoch ||
 		checkpoint.ProjectionVersion() != 1 || checkpoint.ServerTime().IsZero() {
@@ -991,6 +1009,106 @@ func TestQueryDTOViewsRetainCompleteDeterministicData(t *testing.T) {
 	target, _ := domain.NewAggregateTarget(workspace)
 	if _, err = NewContextDelta(eventID, ContextDeltaUpsert, target, domain.InitialVersion(), []byte(`[]`), head); !errors.Is(err, ErrInvalidQuery) {
 		t.Fatalf("non-object context delta error=%v", err)
+	}
+}
+
+func TestContextRecordTypedProjectionIsClosedImmutableAndComplete(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		kind  ContextRecordKind
+		state ContextLifecycleState
+	}{
+		{ContextRecordWorkspace, ContextStateArchived},
+		{ContextRecordPrincipal, ContextStateDisabled},
+		{ContextRecordActor, ContextStateRetired},
+		{ContextRecordMembership, ContextStateInvited},
+		{ContextRecordDelegation, ContextStateProposed},
+		{ContextRecordSession, ContextStateExpired},
+		{ContextRecordDevice, ContextStateTrusted},
+		{ContextRecordGrant, ContextStateRevoked},
+		{ContextRecordCollaborator, ContextStateSuspended},
+	}
+	for index, test := range tests {
+		payload := []byte(`{"status":"` + string(test.state) + `","value":"canonical"}`)
+		record, err := NewTypedContextRecord(ContextRecordParams{
+			Kind: test.kind, ID: applicationUUID(180 + index), Version: domain.InitialVersion(),
+			LifecycleState: test.state, CanonicalPayload: payload,
+		})
+		if err != nil {
+			t.Fatalf("NewTypedContextRecord(%s, %s): %v", test.kind, test.state, err)
+		}
+		payload[0] = 'x'
+		first := record.CanonicalPayload()
+		first[0] = 'x'
+		if record.Kind() != test.kind || record.ID() == "" || record.Version() != domain.InitialVersion() ||
+			record.LifecycleState() != test.state || record.CanonicalPayload()[0] != '{' {
+			t.Fatalf("record %s omitted or aliased projection data", test.kind)
+		}
+	}
+
+	for _, test := range []struct {
+		kind  ContextRecordKind
+		state ContextLifecycleState
+	}{
+		{ContextRecordWorkspace, ContextStateRevoked},
+		{ContextRecordPrincipal, ContextStateArchived},
+		{ContextRecordActor, ContextStateExpired},
+		{ContextRecordMembership, ContextStateRetired},
+		{ContextRecordDelegation, ContextStateEnded},
+		{ContextRecordSession, ContextStateInvited},
+		{ContextRecordDevice, ContextStateEnded},
+		{ContextRecordGrant, ContextStateTrusted},
+	} {
+		_, err := NewTypedContextRecord(ContextRecordParams{
+			Kind: test.kind, ID: applicationUUID(200), Version: domain.InitialVersion(),
+			LifecycleState: test.state, CanonicalPayload: []byte(`{"status":"active"}`),
+		})
+		if !errors.Is(err, ErrInvalidQuery) {
+			t.Errorf("NewTypedContextRecord(%s, %s) error = %v", test.kind, test.state, err)
+		}
+	}
+}
+
+func TestContextCheckpointNormalizesCompleteRecordOrdering(t *testing.T) {
+	t.Parallel()
+	_, authority, epoch, _, _, _, _ := mustParseIDs(t)
+	session, _ := domain.ParseActorSessionID(applicationUUID(229))
+	checkpointID, _ := NewCheckpointID("checkpoint:ordering")
+	cursor, _ := NewEventCursor("bbcc1_ordering")
+	kinds := []ContextRecordKind{
+		ContextRecordWorkspace, ContextRecordSession, ContextRecordPrincipal, ContextRecordMembership,
+		ContextRecordDelegation, ContextRecordCollaborator, ContextRecordActor, ContextRecordCollaborator,
+	}
+	records := make([]ContextRecord, 0, len(kinds))
+	for index, kind := range kinds {
+		record, err := NewTypedContextRecord(ContextRecordParams{
+			Kind: kind, ID: applicationUUID(230 - index), Version: domain.InitialVersion(),
+			LifecycleState: ContextStateActive, CanonicalPayload: []byte(`{"status":"active"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+	checkpoint, err := NewContextCheckpoint(ContextCheckpointParams{
+		CheckpointID: checkpointID, AuthorityID: authority, AuthorityEpoch: epoch, ThroughCursor: cursor,
+		ProjectionVersion: 1, ServerTime: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC),
+		Session: AuthorizedSessionView{session: session}, Records: records,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered := checkpoint.Records()
+	for index := 1; index < len(ordered); index++ {
+		if ordered[index-1].Kind() > ordered[index].Kind() ||
+			ordered[index-1].Kind() == ordered[index].Kind() && ordered[index-1].ID() >= ordered[index].ID() {
+			t.Fatalf("records are not deterministically ordered: %+v", ordered)
+		}
+	}
+	records[0].canonical[0] = 'x'
+	ordered[0].canonical[0] = 'x'
+	if checkpoint.Records()[0].CanonicalPayload()[0] != '{' {
+		t.Fatal("checkpoint records alias constructor or accessor storage")
 	}
 }
 

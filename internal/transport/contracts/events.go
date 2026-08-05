@@ -19,6 +19,8 @@ const (
 	SchemaContextCheckpoint = "blackbird.context_checkpoint/1"
 	SchemaContextDelta      = "blackbird.context_delta/1"
 	SchemaEventPage         = "blackbird.event_page/1"
+
+	maxContextCollaboratorCount = 256
 )
 
 type ContextGetRequestDTO struct {
@@ -122,6 +124,7 @@ type ContextCheckpointDTO struct {
 	AuthorityID       domain.AuthorityID     `json:"authority_id"`
 	AuthorityEpoch    domain.AuthorityEpoch  `json:"authority_epoch"`
 	WorkspaceID       domain.WorkspaceID     `json:"workspace_id"`
+	Workspace         ContextResourceDTO     `json:"workspace"`
 	ActorSession      ContextResourceDTO     `json:"actor_session"`
 	Principal         ContextResourceDTO     `json:"principal"`
 	Membership        ContextResourceDTO     `json:"membership"`
@@ -129,6 +132,7 @@ type ContextCheckpointDTO struct {
 	Delegation        ContextResourceDTO     `json:"delegation"`
 	Device            *ContextResourceDTO    `json:"device"`
 	Grants            []ContextResourceDTO   `json:"grants"`
+	Collaborators     []ContextResourceDTO   `json:"collaborators"`
 	ThroughCursor     string                 `json:"through_cursor"`
 	ProjectionVersion uint32                 `json:"projection_version"`
 	ServerTime        time.Time              `json:"server_time"`
@@ -151,11 +155,15 @@ func (checkpoint ContextCheckpointDTO) Validate() error {
 		value ContextResourceDTO
 		kind  domain.AggregateKind
 	}{
+		{"checkpoint.workspace", checkpoint.Workspace, domain.AggregateKindWorkspace},
 		{"checkpoint.actor_session", checkpoint.ActorSession, domain.AggregateKindActorSession},
 		{"checkpoint.principal", checkpoint.Principal, domain.AggregateKindPrincipal},
 		{"checkpoint.membership", checkpoint.Membership, domain.AggregateKindMembership},
 		{"checkpoint.actor", checkpoint.Actor, domain.AggregateKindActor},
 		{"checkpoint.delegation", checkpoint.Delegation, domain.AggregateKindActorDelegation},
+	}
+	if checkpoint.Workspace.ID != checkpoint.WorkspaceID.String() {
+		return invalid("checkpoint.workspace.id", "must equal checkpoint.workspace_id")
 	}
 	if checkpoint.Device != nil {
 		resources = append(resources, struct {
@@ -173,6 +181,16 @@ func (checkpoint ContextCheckpointDTO) Validate() error {
 			value ContextResourceDTO
 			kind  domain.AggregateKind
 		}{fmt.Sprintf("checkpoint.grants[%d]", index), grant, domain.AggregateKindGrant})
+	}
+	if checkpoint.Collaborators == nil || len(checkpoint.Collaborators) > maxContextCollaboratorCount {
+		return invalid("checkpoint.collaborators", fmt.Sprintf("must be a present list with at most %d entries", maxContextCollaboratorCount))
+	}
+	for index, collaborator := range checkpoint.Collaborators {
+		resources = append(resources, struct {
+			field string
+			value ContextResourceDTO
+			kind  domain.AggregateKind
+		}{fmt.Sprintf("checkpoint.collaborators[%d]", index), collaborator, domain.AggregateKindActor})
 	}
 	seen := make(map[string]struct{}, len(resources))
 	for _, resource := range resources {

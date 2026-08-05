@@ -218,13 +218,16 @@ const (
 	ContextRecordMembership   ContextRecordKind = "membership"
 	ContextRecordDelegation   ContextRecordKind = "actor_delegation"
 	ContextRecordSession      ContextRecordKind = "actor_session"
+	ContextRecordDevice       ContextRecordKind = "device"
+	ContextRecordGrant        ContextRecordKind = "grant"
 	ContextRecordCollaborator ContextRecordKind = "collaborator"
 )
 
 func (kind ContextRecordKind) Valid() bool {
 	switch kind {
 	case ContextRecordWorkspace, ContextRecordPrincipal, ContextRecordActor, ContextRecordMembership,
-		ContextRecordDelegation, ContextRecordSession, ContextRecordCollaborator:
+		ContextRecordDelegation, ContextRecordSession, ContextRecordDevice, ContextRecordGrant,
+		ContextRecordCollaborator:
 		return true
 	default:
 		return false
@@ -235,19 +238,75 @@ type ContextRecord struct {
 	kind      ContextRecordKind
 	id        string
 	version   domain.Version
+	state     ContextLifecycleState
 	canonical []byte
 }
 
-func NewContextRecord(kind ContextRecordKind, id string, version domain.Version, canonical []byte) (ContextRecord, error) {
-	if !kind.Valid() || !validOpaqueText(id, 256) || !version.Valid() || len(canonical) == 0 || len(canonical) > MaxQueryPayloadBytes {
+type ContextLifecycleState string
+
+const (
+	ContextStateActive    ContextLifecycleState = "active"
+	ContextStateArchived  ContextLifecycleState = "archived"
+	ContextStateDisabled  ContextLifecycleState = "disabled"
+	ContextStateEnded     ContextLifecycleState = "ended"
+	ContextStateExpired   ContextLifecycleState = "expired"
+	ContextStateInvited   ContextLifecycleState = "invited"
+	ContextStatePending   ContextLifecycleState = "pending"
+	ContextStateProposed  ContextLifecycleState = "proposed"
+	ContextStateRetired   ContextLifecycleState = "retired"
+	ContextStateRevoked   ContextLifecycleState = "revoked"
+	ContextStateSuspended ContextLifecycleState = "suspended"
+	ContextStateTrusted   ContextLifecycleState = "trusted"
+)
+
+func (state ContextLifecycleState) ValidFor(kind ContextRecordKind) bool {
+	switch kind {
+	case ContextRecordWorkspace:
+		return state == ContextStateActive || state == ContextStateSuspended || state == ContextStateArchived
+	case ContextRecordPrincipal:
+		return state == ContextStateActive || state == ContextStateSuspended || state == ContextStateDisabled
+	case ContextRecordActor, ContextRecordCollaborator:
+		return state == ContextStateActive || state == ContextStateSuspended || state == ContextStateRetired
+	case ContextRecordMembership:
+		return state == ContextStateInvited || state == ContextStateActive || state == ContextStateSuspended || state == ContextStateRevoked
+	case ContextRecordDelegation:
+		return state == ContextStateProposed || state == ContextStateActive || state == ContextStateSuspended || state == ContextStateRevoked
+	case ContextRecordSession:
+		return state == ContextStateActive || state == ContextStateEnded || state == ContextStateRevoked || state == ContextStateExpired
+	case ContextRecordDevice:
+		return state == ContextStatePending || state == ContextStateTrusted || state == ContextStateSuspended || state == ContextStateRevoked
+	case ContextRecordGrant:
+		return state == ContextStateActive || state == ContextStateRevoked
+	default:
+		return false
+	}
+}
+
+type ContextRecordParams struct {
+	Kind             ContextRecordKind
+	ID               string
+	Version          domain.Version
+	LifecycleState   ContextLifecycleState
+	CanonicalPayload []byte
+}
+
+func NewTypedContextRecord(params ContextRecordParams) (ContextRecord, error) {
+	if !params.Kind.Valid() || !validOpaqueText(params.ID, 256) || !params.Version.Valid() ||
+		!params.LifecycleState.ValidFor(params.Kind) || !validQueryJSONObject(params.CanonicalPayload) {
 		return ContextRecord{}, ErrInvalidQuery
 	}
-	return ContextRecord{kind: kind, id: id, version: version, canonical: append([]byte(nil), canonical...)}, nil
+	return ContextRecord{
+		kind: params.Kind, id: params.ID, version: params.Version, state: params.LifecycleState,
+		canonical: append([]byte(nil), params.CanonicalPayload...),
+	}, nil
 }
 
 func (record ContextRecord) Kind() ContextRecordKind { return record.kind }
 func (record ContextRecord) ID() string              { return record.id }
 func (record ContextRecord) Version() domain.Version { return record.version }
+func (record ContextRecord) LifecycleState() ContextLifecycleState {
+	return record.state
+}
 func (record ContextRecord) CanonicalPayload() []byte {
 	return append([]byte(nil), record.canonical...)
 }
@@ -277,17 +336,49 @@ type ContextCheckpointParams struct {
 func NewContextCheckpoint(params ContextCheckpointParams) (ContextCheckpoint, error) {
 	if params.CheckpointID.IsZero() || params.AuthorityID.IsZero() || params.AuthorityEpoch.IsZero() ||
 		params.ThroughCursor.IsZero() || params.ProjectionVersion == 0 || params.ServerTime.IsZero() ||
-		params.Session.session.IsZero() || len(params.Records) == 0 || len(params.Records) > MaxContextCollaborators+6 {
+		params.Session.session.IsZero() || len(params.Records) == 0 ||
+		len(params.Records) > MaxContextCollaborators+MaxContextGrantRevisions+7 {
 		return ContextCheckpoint{}, ErrInvalidQuery
 	}
 	cloned := append([]ContextRecord(nil), params.Records...)
+	sort.Slice(cloned, func(left, right int) bool {
+		if cloned[left].kind != cloned[right].kind {
+			return cloned[left].kind < cloned[right].kind
+		}
+		return cloned[left].id < cloned[right].id
+	})
+	required := map[ContextRecordKind]bool{
+		ContextRecordWorkspace: false, ContextRecordPrincipal: false, ContextRecordActor: false,
+		ContextRecordMembership: false, ContextRecordDelegation: false, ContextRecordSession: false,
+	}
+	collaborators := 0
+	devices := 0
+	grants := 0
 	for index, record := range cloned {
-		if !record.kind.Valid() || len(record.canonical) == 0 ||
-			(index > 0 && (cloned[index-1].kind > record.kind ||
-				(cloned[index-1].kind == record.kind && cloned[index-1].id >= record.id))) {
+		if !record.kind.Valid() || !record.state.ValidFor(record.kind) || !validQueryJSONObject(record.canonical) ||
+			(index > 0 && cloned[index-1].kind == record.kind && cloned[index-1].id == record.id) {
 			return ContextCheckpoint{}, ErrInvalidQuery
 		}
+		if record.kind == ContextRecordCollaborator {
+			collaborators++
+		} else if record.kind == ContextRecordDevice {
+			devices++
+		} else if record.kind == ContextRecordGrant {
+			grants++
+		} else if present, requiredKind := required[record.kind]; !requiredKind || present {
+			return ContextCheckpoint{}, ErrInvalidQuery
+		} else {
+			required[record.kind] = true
+		}
 		cloned[index].canonical = append([]byte(nil), record.canonical...)
+	}
+	if collaborators > MaxContextCollaborators || devices > 1 || grants > MaxContextGrantRevisions {
+		return ContextCheckpoint{}, ErrInvalidQuery
+	}
+	for _, present := range required {
+		if !present {
+			return ContextCheckpoint{}, ErrInvalidQuery
+		}
 	}
 	return ContextCheckpoint{
 		id: params.CheckpointID, authorityID: params.AuthorityID, authorityEpoch: params.AuthorityEpoch,
