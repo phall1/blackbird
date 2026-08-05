@@ -2577,6 +2577,9 @@ func completeOperationPipeline(
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
+	if err := ValidateCommandDecision(commandContext, decision); err != nil {
+		t.Fatalf("validate decision: %v", err)
+	}
 	first, _ := domain.NewStreamPosition(1)
 	last, _ := domain.NewStreamPosition(uint64(len(testCase.facts)))
 	finalDigestBytes := [32]byte{byte(index + 1), 77}

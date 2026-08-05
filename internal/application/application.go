@@ -2269,7 +2269,16 @@ func commandAuditSubject(subject AuditSubject, commandContext CommandContext) Au
 	}
 	for _, ref := range append(spec.guards.Authorization(), spec.guards.References()...) {
 		if ref.Target().Kind() == domain.AggregateKindActorDelegation {
-			subject.delegations = append(subject.delegations, ref)
+			present := false
+			for _, existing := range subject.delegations {
+				if existing == ref {
+					present = true
+					break
+				}
+			}
+			if !present {
+				subject.delegations = append(subject.delegations, ref)
+			}
 		}
 	}
 	return subject
