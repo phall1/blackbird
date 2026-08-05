@@ -84,6 +84,9 @@ func (store *Store) Backup(ctx context.Context, target string) (BackupManifest, 
 	if err != nil {
 		return BackupManifest{}, fmt.Errorf("verify retained SQLite backup %s: %w", partial, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return BackupManifest{}, fmt.Errorf("cancel SQLite backup before publication: %w", err)
+	}
 	if err := publishPartial(partial, target); err != nil {
 		return BackupManifest{}, err
 	}
@@ -167,6 +170,9 @@ func Restore(ctx context.Context, backupPath string, manifest BackupManifest, ta
 	}
 	if err := verifyRestoreSeal(ctx, partial); err != nil {
 		return BackupManifest{}, fmt.Errorf("verify retained SQLite restore %s: %w", partial, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return BackupManifest{}, fmt.Errorf("cancel SQLite restore before publication: %w", err)
 	}
 	if err := publishPartial(partial, target); err != nil {
 		return BackupManifest{}, err
@@ -262,7 +268,25 @@ func deriveBackupManifest(ctx context.Context, path string, createdAt time.Time)
 		return BackupManifest{}, fmt.Errorf("open SQLite snapshot for hashing: %w", err)
 	}
 	hash := sha256.New()
-	result.DatabaseBytes, err = io.Copy(hash, file)
+	buffer := make([]byte, 128*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = file.Close()
+			return BackupManifest{}, err
+		}
+		read, readErr := file.Read(buffer)
+		if read > 0 {
+			result.DatabaseBytes += int64(read)
+			_, _ = hash.Write(buffer[:read])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			err = readErr
+			break
+		}
+	}
 	closeErr := file.Close()
 	if err != nil {
 		return BackupManifest{}, errors.Join(fmt.Errorf("hash SQLite snapshot: %w", err), closeErr)
@@ -342,12 +366,13 @@ func deriveAuthorityStreams(ctx context.Context, db *sql.DB) ([]BackupAuthorityS
 			return nil, fmt.Errorf("%w: invalid retained cursor for authority stream %s/%s/%s", ErrSchemaMismatch,
 				stream.ScopeKind, stream.ScopeID, stream.AuthorityEpoch)
 		}
+		emptyRetainedRange := expectedCount == 0
 		if eventCount != expectedCount || len(headDigest) != sha256.Size || len(eventDigest) != sha256.Size ||
-			!bytes.Equal(headDigest, eventDigest) {
+			(!emptyRetainedRange && !bytes.Equal(headDigest, eventDigest)) {
 			return nil, fmt.Errorf("%w: non-contiguous authority stream %s/%s/%s", ErrSchemaMismatch,
 				stream.ScopeKind, stream.ScopeID, stream.AuthorityEpoch)
 		}
-		copy(stream.EventHighWaterDigest[:], eventDigest)
+		copy(stream.EventHighWaterDigest[:], headDigest)
 		streams = append(streams, stream)
 	}
 	if err := rows.Err(); err != nil {
@@ -362,11 +387,27 @@ func sealRestoredDatabase(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, "UPDATE writer_control SET activation_state = 'sealed'"); err != nil {
+	var writerRows int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM writer_control").Scan(&writerRows); err != nil || writerRows > 1 {
+		return errors.Join(errors.New("invalid restored writer-control cardinality"), err)
+	}
+	if writerRows == 1 {
+		result, err := tx.ExecContext(ctx, "UPDATE writer_control SET activation_state = 'sealed' WHERE singleton = 1")
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil || affected != 1 {
+			return errors.Join(errors.New("failed to seal restored writer control"), err)
+		}
+	}
+	result, err := tx.ExecContext(ctx, "UPDATE database_runtime SET clean_shutdown = 1, closed_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER) WHERE singleton = 1")
+	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE database_runtime SET clean_shutdown = 1, closed_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER) WHERE singleton = 1"); err != nil {
-		return err
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return errors.Join(errors.New("invalid restored runtime singleton"), err)
 	}
 	return tx.Commit()
 }
@@ -377,12 +418,20 @@ func verifyRestoreSeal(ctx context.Context, path string) (finalErr error) {
 		return err
 	}
 	defer func() { finalErr = errors.Join(finalErr, db.Close()) }()
-	var writableRows int
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM writer_control WHERE activation_state <> 'sealed'").Scan(&writableRows); err != nil {
+	var writerRows, sealedRows int
+	if err := db.QueryRowContext(ctx, "SELECT count(*), count(*) FILTER (WHERE singleton = 1 AND activation_state = 'sealed') FROM writer_control").Scan(&writerRows, &sealedRows); err != nil {
 		return err
 	}
-	if writableRows != 0 {
+	if writerRows > 1 || sealedRows != writerRows {
 		return errors.New("restored SQLite target is not sealed")
+	}
+	var runtimeRows int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM database_runtime
+		WHERE singleton = 1 AND clean_shutdown = 1 AND closed_at_us IS NOT NULL`).Scan(&runtimeRows); err != nil {
+		return err
+	}
+	if runtimeRows != 1 {
+		return errors.New("restored SQLite runtime marker is invalid")
 	}
 	return nil
 }
@@ -400,10 +449,12 @@ func validateFreshTarget(path string) error {
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("%w: target parent is not a directory", ErrInvalidConfiguration)
 	}
-	if _, err := os.Lstat(path); err == nil {
-		return ErrTargetExists
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect SQLite target: %w", err)
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Lstat(candidate); err == nil {
+			return ErrTargetExists
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect SQLite target namespace: %w", err)
+		}
 	}
 	return nil
 }
@@ -425,15 +476,34 @@ func reservePartialTarget(target string) (string, error) {
 }
 
 func publishPartial(partial, target string) error {
-	if _, err := os.Lstat(target); err == nil {
-		return fmt.Errorf("%w (verified partial retained at %s)", ErrTargetExists, partial)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect SQLite publication target: %w", err)
+	for _, candidate := range []string{target, target + "-wal", target + "-shm"} {
+		if _, err := os.Lstat(candidate); err == nil {
+			return fmt.Errorf("%w (verified partial retained at %s)", ErrTargetExists, partial)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect SQLite publication namespace: %w", err)
+		}
 	}
-	if err := os.Rename(partial, target); err != nil {
+	if err := syncPath(partial); err != nil {
+		return fmt.Errorf("sync verified SQLite partial %s: %w", partial, err)
+	}
+	if err := renameNoReplace(partial, target); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w (verified partial retained at %s)", ErrTargetExists, partial)
+		}
 		return fmt.Errorf("publish SQLite target (verified partial retained at %s): %w", partial, err)
 	}
+	if err := syncPath(filepath.Dir(target)); err != nil {
+		return fmt.Errorf("SQLite target published but directory sync failed: %w", err)
+	}
 	return nil
+}
+
+func syncPath(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(file.Sync(), file.Close())
 }
 
 func openBackupDatabase(path string, readOnly bool) (*sql.DB, error) {

@@ -70,6 +70,48 @@ func TestOnlineBackupManifestAndSealedRestore(t *testing.T) {
 	if state != "sealed" {
 		t.Fatalf("restored activation_state=%q, want sealed", state)
 	}
+	var runtimeRows int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM database_runtime
+		WHERE singleton = 1 AND clean_shutdown = 1 AND closed_at_us IS NOT NULL`).Scan(&runtimeRows); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeRows != 1 {
+		t.Fatalf("valid sealed runtime rows=%d, want 1", runtimeRows)
+	}
+}
+
+func TestBackupAcceptsFullyPrunedAuthorityStream(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := Open(ctx, Config{Path: filepath.Join(root, "source.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	head := sha256.Sum256([]byte("retained high-water digest"))
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_streams(
+		scope_kind, scope_id, authority_id, authority_epoch, next_sequence, retained_from_sequence,
+		digest_algorithm, head_digest, next_audit_sequence, audit_head_hash, authority_time_floor_us
+	) VALUES ('workspace', ?, ?, ?, 6, 6, 'sha-256', ?, 1, zeroblob(32), 1)`,
+		"01b8e094-9888-7000-8000-000000000401", "01b8e094-9888-7000-8000-000000000402",
+		"01b8e094-9888-7000-8000-000000000403", head[:],
+	); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.Backup(ctx, filepath.Join(root, "pruned.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.AuthorityStreams) != 1 || manifest.AuthorityStreams[0].EventHighWater != 5 ||
+		manifest.AuthorityStreams[0].RetainedFromSequence != 6 ||
+		manifest.AuthorityStreams[0].EventHighWaterDigest != head {
+		t.Fatalf("pruned stream manifest=%+v", manifest.AuthorityStreams)
+	}
 }
 
 func TestBackupRejectsNonFreshTargetsAndTampering(t *testing.T) {
@@ -99,6 +141,17 @@ func TestBackupRejectsNonFreshTargetsAndTampering(t *testing.T) {
 	}
 	if _, err := store.Backup(ctx, existing); !errors.Is(err, ErrTargetExists) {
 		t.Fatalf("existing target error=%v", err)
+	}
+	staleSidecarTarget := filepath.Join(root, "stale-sidecar.db")
+	staleWAL, err := os.OpenFile(staleSidecarTarget+"-wal", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := staleWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Backup(ctx, staleSidecarTarget); !errors.Is(err, ErrTargetExists) {
+		t.Fatalf("stale sidecar target error=%v", err)
 	}
 
 	backupPath := filepath.Join(root, "backup.db")
