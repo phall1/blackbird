@@ -1945,6 +1945,118 @@ type AuditTiming struct {
 	clientTime             *time.Time
 }
 
+// AuditRequestContext is trusted transport metadata that is excluded from the
+// semantic command fingerprint but retained in the required audit entry.
+type AuditRequestContext struct {
+	requestID      CanonicalIdentifier
+	traceID        CanonicalIdentifier
+	serverReceived time.Time
+	clientTime     time.Time
+	hasClientTime  bool
+}
+
+func NewAuditRequestContext(
+	requestID string,
+	traceID string,
+	serverReceived time.Time,
+	authenticatedClientTime *time.Time,
+) (AuditRequestContext, error) {
+	request, requestErr := NewCanonicalIdentifier(requestID)
+	trace, traceErr := NewCanonicalIdentifier(traceID)
+	if requestErr != nil || traceErr != nil || serverReceived.IsZero() {
+		return AuditRequestContext{}, ErrInvalidApplicationContract
+	}
+	if _, err := NewCanonicalInstant(serverReceived); err != nil {
+		return AuditRequestContext{}, ErrInvalidApplicationContract
+	}
+	result := AuditRequestContext{
+		requestID: request, traceID: trace, serverReceived: serverReceived.UTC(),
+	}
+	if authenticatedClientTime != nil {
+		if authenticatedClientTime.IsZero() {
+			return AuditRequestContext{}, ErrInvalidApplicationContract
+		}
+		if _, err := NewCanonicalInstant(*authenticatedClientTime); err != nil {
+			return AuditRequestContext{}, ErrInvalidApplicationContract
+		}
+		result.clientTime, result.hasClientTime = authenticatedClientTime.UTC(), true
+	}
+	return result, nil
+}
+
+func (context AuditRequestContext) RequestID() string { return context.requestID.String() }
+func (context AuditRequestContext) TraceID() string   { return context.traceID.String() }
+func (context AuditRequestContext) ServerReceivedAt() time.Time {
+	return context.serverReceived
+}
+func (context AuditRequestContext) AuthenticatedClientAt() (time.Time, bool) {
+	return context.clientTime, context.hasClientTime
+}
+
+func validAuditRequestContext(context AuditRequestContext) bool {
+	if context.requestID.String() == "" || context.traceID.String() == "" || context.serverReceived.IsZero() {
+		return false
+	}
+	if _, err := NewCanonicalIdentifier(context.requestID.String()); err != nil {
+		return false
+	}
+	if _, err := NewCanonicalIdentifier(context.traceID.String()); err != nil {
+		return false
+	}
+	if _, err := NewCanonicalInstant(context.serverReceived); err != nil {
+		return false
+	}
+	if context.hasClientTime {
+		_, err := NewCanonicalInstant(context.clientTime)
+		return err == nil
+	}
+	return context.clientTime.IsZero()
+}
+
+type AuditProvenanceEvidence struct {
+	sourceAuthority    domain.AuthorityID
+	federationEnvelope *CanonicalIdentifier
+}
+
+func NewAuditProvenanceEvidence(
+	sourceAuthority domain.AuthorityID,
+	federationEnvelopeID *string,
+) (AuditProvenanceEvidence, error) {
+	if sourceAuthority.IsZero() {
+		return AuditProvenanceEvidence{}, ErrInvalidApplicationContract
+	}
+	evidence := AuditProvenanceEvidence{sourceAuthority: sourceAuthority}
+	if federationEnvelopeID != nil {
+		envelope, err := NewCanonicalIdentifier(*federationEnvelopeID)
+		if err != nil {
+			return AuditProvenanceEvidence{}, ErrInvalidApplicationContract
+		}
+		evidence.federationEnvelope = &envelope
+	}
+	return evidence, nil
+}
+
+func (evidence AuditProvenanceEvidence) SourceAuthorityID() domain.AuthorityID {
+	return evidence.sourceAuthority
+}
+func (evidence AuditProvenanceEvidence) FederationEnvelopeID() (string, bool) {
+	if evidence.federationEnvelope == nil {
+		return "", false
+	}
+	return evidence.federationEnvelope.String(), true
+}
+
+func validAuditProvenanceEvidence(evidence AuditProvenanceEvidence) bool {
+	if evidence.sourceAuthority.IsZero() {
+		return false
+	}
+	if evidence.federationEnvelope == nil {
+		return true
+	}
+	_, err := NewCanonicalIdentifier(evidence.federationEnvelope.String())
+	return err == nil
+}
+
 type AuditSubjectKind string
 
 const (
@@ -2061,7 +2173,7 @@ func (intent AuditIntent) Detail() AuditDetail { return intent.detail }
 func validAuditReason(reason string) bool {
 	switch reason {
 	case "bootstrap_proof_rejected", "proof_rejected", "credential_rejected",
-		"installation_initialized", "bootstrap_generation_rotated", "bootstrap_generation_resumed":
+		"policy_denied", "installation_initialized", "bootstrap_generation_rotated", "bootstrap_generation_resumed":
 		return true
 	default:
 		return false
@@ -2086,15 +2198,14 @@ func finalizeCommandAudit(
 	if err != nil {
 		return AuditIntent{}, ErrInvalidCommandDecision
 	}
-	seed.invocation = AuditInvocation{
-		kind: AuditInvocationCommand, commandID: spec.commandID, receiptID: spec.receiptID,
-		receiptIdentityDigest: receiptDigest, correlationID: &trace,
-	}
-	seed.timing = AuditTiming{persistedAuthorityTime: commandContext.timeEvidence.value.UTC()}
-	if seed.subject.kind == "" {
-		seed.subject = commandAuditSubject(commandContext)
-	}
-	seed.provenance = AuditProvenance{sourceAuthority: spec.authorityID}
+	seed.invocation.kind = AuditInvocationCommand
+	seed.invocation.commandID = spec.commandID
+	seed.invocation.receiptID = spec.receiptID
+	seed.invocation.receiptIdentityDigest = receiptDigest
+	seed.invocation.securityOperation = ""
+	seed.invocation.correlationID = &trace
+	seed.timing.persistedAuthorityTime = commandContext.timeEvidence.value.UTC()
+	seed.subject = commandAuditSubject(seed.subject, commandContext)
 	seed.authorization = commandAuditAuthorization(commandContext)
 	seed.resources = auditResources(spec.guards.mutations)
 	for _, ceremony := range spec.guards.ceremonies {
@@ -2109,9 +2220,11 @@ func finalizeCommandAudit(
 	return seed, nil
 }
 
-func commandAuditSubject(commandContext CommandContext) AuditSubject {
+func commandAuditSubject(subject AuditSubject, commandContext CommandContext) AuditSubject {
 	spec := commandContext.spec
-	subject := AuditSubject{kind: AuditSubjectAttributed, principal: spec.authorship.principal}
+	if subject.kind == "" {
+		subject = AuditSubject{kind: AuditSubjectAttributed, principal: spec.authorship.principal}
+	}
 	if spec.authorship.hasActor {
 		subject.actor, subject.actorSession, subject.hasActor =
 			spec.authorship.actor, spec.authorship.actorSession, true
@@ -2146,11 +2259,24 @@ func commandAuditAuthorization(commandContext CommandContext) AuditAuthorization
 		guardDigest:         commandContext.guardEvidence.digest,
 		admissionGeneration: commandContext.spec.guards.admissionGeneration,
 	}
+	revisions := make(map[string]AuditRevision)
+	revisionKey := func(target domain.AggregateTarget) string {
+		return string(target.Kind()) + "\x00" + target.ID()
+	}
 	for _, ref := range commandContext.spec.guards.authorization {
 		revision := AuditRevision{target: ref.Target(), version: ref.Version()}
 		authorization.authorization = append(authorization.authorization, revision)
+		revisions[revisionKey(ref.Target())] = revision
 		if ref.Target().Kind() == domain.AggregateKindGrant {
 			authorization.grants = append(authorization.grants, revision)
+		}
+	}
+	for _, ref := range commandContext.spec.guards.references {
+		revisions[revisionKey(ref.Target())] = AuditRevision{target: ref.Target(), version: ref.Version()}
+	}
+	for _, expectation := range commandContext.spec.guards.mutations {
+		if version, present := expectation.Version(); present {
+			revisions[revisionKey(expectation.Target())] = AuditRevision{target: expectation.Target(), version: version}
 		}
 	}
 	for _, guard := range commandContext.guardEvidence.observed {
@@ -2159,6 +2285,11 @@ func commandAuditAuthorization(commandContext CommandContext) AuditAuthorization
 			authorization.policy, authorization.hasPolicy = guard.policyRevision, true
 		case EvidenceDeviceTrustRevision:
 			authorization.deviceTrustRevision, authorization.hasDeviceTrust = guard.revision, true
+		case EvidenceLifecycleStatus:
+			revision, present := revisions[guard.targetKind+"\x00"+guard.targetID]
+			if present {
+				authorization.revocations = append(authorization.revocations, revision)
+			}
 		}
 	}
 	return authorization
@@ -4614,19 +4745,35 @@ func (draft CommandDenialDraft) PolicyRevision() (domain.PolicyRevision, bool) {
 }
 
 type SecuritySpec struct {
-	operation      SecurityOperation
-	scope          domain.AuthorityScope
-	authorityID    domain.AuthorityID
-	epoch          domain.AuthorityEpoch
-	admission      GuardGeneration
-	invitation     domain.AggregateExpectation
-	attempt        domain.CommandFingerprint
-	oldGeneration  domain.BootstrapGenerationID
-	newGeneration  domain.BootstrapGenerationID
-	resumeApproval domain.CommandFingerprint
-	initialState   domain.InstallationInvitationState
-	initialization Digest
-	commandDenial  CommandDenialDraft
+	operation       SecurityOperation
+	scope           domain.AuthorityScope
+	authorityID     domain.AuthorityID
+	epoch           domain.AuthorityEpoch
+	admission       GuardGeneration
+	invitation      domain.AggregateExpectation
+	attempt         domain.CommandFingerprint
+	oldGeneration   domain.BootstrapGenerationID
+	newGeneration   domain.BootstrapGenerationID
+	resumeApproval  domain.CommandFingerprint
+	initialState    domain.InstallationInvitationState
+	initialization  Digest
+	commandDenial   CommandDenialDraft
+	auditRequest    AuditRequestContext
+	provenance      AuditProvenanceEvidence
+	hasAuditContext bool
+}
+
+func bindSecurityAuditContext(
+	spec SecuritySpec,
+	request AuditRequestContext,
+	provenance AuditProvenanceEvidence,
+) (SecuritySpec, error) {
+	if spec.operation == "" || !validAuditRequestContext(request) || !validAuditProvenanceEvidence(provenance) ||
+		spec.hasAuditContext {
+		return SecuritySpec{}, ErrInvalidSecuritySpec
+	}
+	spec.auditRequest, spec.provenance, spec.hasAuditContext = request, provenance, true
+	return spec, nil
 }
 
 // BootstrapAttempt is a secret-free, canonically fingerprinted rejected proof.
@@ -5054,6 +5201,12 @@ func NewSecurityContext(
 	if spec.operation == "" || authorityTime.IsZero() || guardDigest.IsZero() {
 		return SecurityContext{}, ErrInvalidSecurityContext
 	}
+	requestBound := spec.operation == SecurityRecordBootstrapDenial || spec.operation == SecurityRecordCommandDenial
+	if requestBound != spec.hasAuditContext ||
+		(spec.hasAuditContext && (!validAuditRequestContext(spec.auditRequest) ||
+			!validAuditProvenanceEvidence(spec.provenance))) {
+		return SecurityContext{}, ErrInvalidSecurityContext
+	}
 	if spec.operation == SecurityRecordBootstrapDenial || spec.operation == SecurityResumeBootstrapGeneration {
 		version, _ := spec.invitation.Version()
 		if invitation.IsZero() || invitation.ID().String() != spec.invitation.Target().ID() ||
@@ -5308,8 +5461,20 @@ func finalizeSecurityAudit(
 		return AuditIntent{}, ErrInvalidSecurityDecision
 	}
 	seed.invocation = AuditInvocation{kind: AuditInvocationSecurity, securityOperation: spec.operation}
-	seed.timing = AuditTiming{persistedAuthorityTime: securityContext.authorityTime.UTC()}
+	seed.timing.persistedAuthorityTime = securityContext.authorityTime.UTC()
 	seed.provenance = AuditProvenance{sourceAuthority: spec.authorityID}
+	if spec.hasAuditContext {
+		seed.invocation.requestID = &spec.auditRequest.requestID
+		seed.invocation.traceID = &spec.auditRequest.traceID
+		seed.timing.serverReceivedTime = ptrTime(spec.auditRequest.serverReceived)
+		if spec.auditRequest.hasClientTime {
+			seed.timing.clientTime = ptrTime(spec.auditRequest.clientTime)
+		}
+		seed.provenance = AuditProvenance{
+			sourceAuthority:    spec.provenance.sourceAuthority,
+			federationEnvelope: cloneCanonicalIdentifier(spec.provenance.federationEnvelope),
+		}
+	}
 	seed.authorization = AuditAuthorization{
 		guardDigest: securityContext.guardDigest, admissionGeneration: spec.admission,
 	}
@@ -5328,8 +5493,14 @@ func finalizeSecurityAudit(
 			seed.approvalEvidence = []Digest{Digest(spec.resumeApproval)}
 		}
 	case SecurityRecordBootstrapDenial:
+		if !spec.hasAuditContext {
+			return AuditIntent{}, ErrInvalidSecurityDecision
+		}
 		seed.subject = AuditSubject{kind: AuditSubjectUnattributed, unattributed: Digest(spec.attempt)}
 	case SecurityRecordCommandDenial:
+		if !spec.hasAuditContext {
+			return AuditIntent{}, ErrInvalidSecurityDecision
+		}
 		draft := spec.commandDenial
 		trace, err := NewCanonicalIdentifier(draft.correlation.String())
 		if err != nil {
@@ -5358,6 +5529,19 @@ func finalizeSecurityAudit(
 	}
 	seed.finalized = true
 	return seed, nil
+}
+
+func ptrTime(value time.Time) *time.Time {
+	copy := value
+	return &copy
+}
+
+func cloneCanonicalIdentifier(value *CanonicalIdentifier) *CanonicalIdentifier {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // ExpectedSecurityAudit returns the only operation/fingerprint pair accepted

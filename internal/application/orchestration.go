@@ -27,9 +27,10 @@ type PolicyPreparationRequest struct {
 }
 
 type AuthenticationEvidence struct {
-	principal domain.PrincipalID
-	device    domain.DeviceID
-	hasDevice bool
+	principal  domain.PrincipalID
+	device     domain.DeviceID
+	hasDevice  bool
+	provenance AuditProvenanceEvidence
 }
 
 type AuthenticationDecisionKind string
@@ -40,29 +41,34 @@ const (
 )
 
 type AuthenticationDecision struct {
-	kind      AuthenticationDecisionKind
-	evidence  AuthenticationEvidence
-	rejection *domain.CommandError
-	subject   DenialSubject
+	kind            AuthenticationDecisionKind
+	evidence        AuthenticationEvidence
+	rejection       *domain.CommandError
+	subject         DenialSubject
+	auditProvenance AuditProvenanceEvidence
 }
 
 func ValidAuthentication(evidence AuthenticationEvidence) (AuthenticationDecision, error) {
 	if evidence.principal.IsZero() {
 		return AuthenticationDecision{}, ErrInvalidApplicationContract
 	}
-	return AuthenticationDecision{kind: AuthenticationValid, evidence: evidence}, nil
+	return AuthenticationDecision{
+		kind: AuthenticationValid, evidence: evidence, auditProvenance: evidence.provenance,
+	}, nil
 }
 
 func RejectedAuthentication(
 	rejection *domain.CommandError,
 	subject DenialSubject,
+	provenance AuditProvenanceEvidence,
 ) (AuthenticationDecision, error) {
 	if rejection == nil || !requiresDenialAudit(rejection) ||
-		(subject.kind != DenialAttributedSubject && subject.kind != DenialUnattributedSource) {
+		(subject.kind != DenialAttributedSubject && subject.kind != DenialUnattributedSource) ||
+		!validAuditProvenanceEvidence(provenance) {
 		return AuthenticationDecision{}, ErrInvalidApplicationContract
 	}
 	return AuthenticationDecision{
-		kind: AuthenticationRejected, rejection: rejection, subject: subject,
+		kind: AuthenticationRejected, rejection: rejection, subject: subject, auditProvenance: provenance,
 	}, nil
 }
 
@@ -73,12 +79,19 @@ func (decision AuthenticationDecision) Evidence() (AuthenticationEvidence, bool)
 func (decision AuthenticationDecision) Rejection() (*domain.CommandError, DenialSubject, bool) {
 	return decision.rejection, decision.subject, decision.kind == AuthenticationRejected
 }
+func (decision AuthenticationDecision) provenance() AuditProvenanceEvidence {
+	return decision.auditProvenance
+}
 
-func NewAuthenticationEvidence(principal domain.PrincipalID, device *domain.DeviceID) (AuthenticationEvidence, error) {
-	if principal.IsZero() {
+func NewAuthenticationEvidence(
+	principal domain.PrincipalID,
+	device *domain.DeviceID,
+	provenance AuditProvenanceEvidence,
+) (AuthenticationEvidence, error) {
+	if principal.IsZero() || !validAuditProvenanceEvidence(provenance) {
 		return AuthenticationEvidence{}, ErrInvalidApplicationContract
 	}
-	evidence := AuthenticationEvidence{principal: principal}
+	evidence := AuthenticationEvidence{principal: principal, provenance: provenance}
 	if device != nil {
 		if device.IsZero() {
 			return AuthenticationEvidence{}, ErrInvalidApplicationContract
@@ -91,6 +104,9 @@ func NewAuthenticationEvidence(principal domain.PrincipalID, device *domain.Devi
 func (evidence AuthenticationEvidence) PrincipalID() domain.PrincipalID { return evidence.principal }
 func (evidence AuthenticationEvidence) DeviceID() (domain.DeviceID, bool) {
 	return evidence.device, evidence.hasDevice
+}
+func (evidence AuthenticationEvidence) AuditProvenance() AuditProvenanceEvidence {
+	return evidence.provenance
 }
 
 type PreparedPolicy struct {
@@ -342,6 +358,7 @@ type CommandRequest struct {
 	HashView             CommandHashView
 	Authentication       AuthenticationRequest
 	Policy               PolicyPreparationRequest
+	Audit                AuditRequestContext
 	ProtocolCapabilities []string
 }
 
@@ -376,19 +393,21 @@ func (service *OrchestrationService) executeCommand(
 	if !rejected {
 		return CommandExecution{}, ErrInvalidApplicationContract
 	}
-	return service.executePreTransactionDenial(ctx, request.Spec, policy, rejection, subject)
+	return service.executePreTransactionDenial(ctx, request, policy, rejection, subject, authenticationDecision.provenance())
 }
 
 func (service *OrchestrationService) executePreTransactionDenial(
 	ctx context.Context,
-	spec CommandSpec,
+	request CommandRequest,
 	policy PreparedPolicy,
 	rejection *domain.CommandError,
 	subject DenialSubject,
+	provenance AuditProvenanceEvidence,
 ) (CommandExecution, error) {
 	if rejection == nil || !requiresDenialAudit(rejection) {
 		return CommandExecution{}, ErrInvalidApplicationContract
 	}
+	spec := request.Spec
 	major := spec.OperationMajor()
 	draft, err := NewCommandDenialDraft(
 		spec.Operation(), major, DenialAuthentication, "credential_rejected",
@@ -400,6 +419,10 @@ func (service *OrchestrationService) executePreTransactionDenial(
 	security, err := RecordCommandDenialSecurity(
 		spec.Scope(), spec.AuthorityID(), spec.RequestedEpoch(), spec.Guards().AdmissionGeneration(), draft,
 	)
+	if err != nil {
+		return CommandExecution{}, err
+	}
+	security, err = bindSecurityAuditContext(security, request.Audit, provenance)
 	if err != nil {
 		return CommandExecution{}, err
 	}
@@ -418,8 +441,13 @@ func (service *OrchestrationService) executeProofDenial(
 	if err != nil {
 		return CommandExecution{}, fmt.Errorf("%w: policy preparation: %w", ErrOrchestrationDependency, err)
 	}
+	provenance, err := NewAuditProvenanceEvidence(request.Spec.AuthorityID(), nil)
+	if err != nil {
+		return CommandExecution{}, ErrInvalidApplicationContract
+	}
 	return service.executePreTransactionDenial(
-		ctx, request.Spec, policy, mustCommandError(domain.ErrorCodeUnauthenticated, "proof rejected"), subject,
+		ctx, request, policy, mustCommandError(domain.ErrorCodeUnauthenticated, "proof rejected"), subject,
+		provenance,
 	)
 }
 
@@ -443,7 +471,7 @@ func (service *OrchestrationService) executePreparedCommand(
 		case ReceiptExactReplay:
 			disclosure, disclosureErr := service.replayDisclosure.AuthorizeReplay(locked, authentication, policy)
 			if disclosureErr != nil {
-				return service.rollbackDecision(locked, authentication, policy, disclosureErr)
+				return service.rollbackDecision(request, locked, authentication, policy, disclosureErr)
 			}
 			return ReplayCommand(locked, disclosure)
 		case ReceiptCommandIDConflict:
@@ -464,14 +492,14 @@ func (service *OrchestrationService) executePreparedCommand(
 
 		authorization, authorizationErr := service.lockedAuthorization.AuthorizeLocked(locked, authentication, policy)
 		if authorizationErr != nil {
-			return service.rollbackDecision(locked, authentication, policy, authorizationErr)
+			return service.rollbackDecision(request, locked, authentication, policy, authorizationErr)
 		}
 		if !authorizationMatchesCommand(authorization, authentication, policy, request.Spec, locked) {
 			return CommandDecision{}, ErrInvalidApplicationContract
 		}
 		commit, transitionErr := transition(locked, authorization, authentication, policy)
 		if transitionErr != nil {
-			return service.rollbackDecision(locked, authentication, policy, transitionErr)
+			return service.rollbackDecision(request, locked, authentication, policy, transitionErr)
 		}
 		audit, auditErr := NewAuditIntent(
 			request.Spec.Operation(), AuditCommandApplied, request.Spec.RequestFingerprint(), CommandAppliedAuditDetail(),
@@ -479,7 +507,7 @@ func (service *OrchestrationService) executePreparedCommand(
 		if auditErr != nil {
 			return CommandDecision{}, auditErr
 		}
-		audit.subject = authenticatedAuditSubject(authentication, request.Spec)
+		audit = bindCommandAuditContext(audit, request, authentication)
 		planningInput, planningErr := NewEffectPlanningInput(request.Spec.CommandID(), commit.facts)
 		if planningErr != nil {
 			return CommandDecision{}, planningErr
@@ -509,7 +537,8 @@ func authorizationMatchesCommand(
 	spec CommandSpec,
 	locked CommandContext,
 ) bool {
-	if authorization.PrincipalID() != authentication.principal ||
+	if authentication.principal != spec.authorship.principal ||
+		authorization.PrincipalID() != authentication.principal ||
 		authorization.AuthorityID() != spec.authorityID || authorization.AuthorityEpoch() != spec.requestedEpoch ||
 		authorization.PolicyRevision() != policy.revision || !authorshipGuardsMatch(spec) {
 		return false
@@ -518,13 +547,14 @@ func authorizationMatchesCommand(
 	if !present || !authorization.EvaluatedAt().Equal(authorityTime) {
 		return false
 	}
-	switch spec.scope.Kind() {
+	authorizationScope := spec.guards.admissionScope
+	switch authorizationScope.Kind() {
 	case domain.ScopeKindInstallation:
-		if authorization.InstallationID().String() != spec.scope.ID() || !authorization.WorkspaceID().IsZero() {
+		if authorization.InstallationID().String() != authorizationScope.ID() || !authorization.WorkspaceID().IsZero() {
 			return false
 		}
 	case domain.ScopeKindWorkspace:
-		if authorization.WorkspaceID().String() != spec.scope.ID() || authorization.InstallationID().IsZero() {
+		if authorization.WorkspaceID().String() != authorizationScope.ID() || authorization.InstallationID().IsZero() {
 			return false
 		}
 	default:
@@ -561,6 +591,25 @@ func authenticatedAuditSubject(authentication AuthenticationEvidence, spec Comma
 			spec.authorship.actor, spec.authorship.actorSession, true
 	}
 	return subject
+}
+
+func bindCommandAuditContext(
+	audit AuditIntent,
+	request CommandRequest,
+	authentication AuthenticationEvidence,
+) AuditIntent {
+	audit.invocation.requestID = &request.Audit.requestID
+	audit.invocation.traceID = &request.Audit.traceID
+	audit.timing.serverReceivedTime = ptrTime(request.Audit.serverReceived)
+	if request.Audit.hasClientTime {
+		audit.timing.clientTime = ptrTime(request.Audit.clientTime)
+	}
+	audit.subject = authenticatedAuditSubject(authentication, request.Spec)
+	audit.provenance = AuditProvenance{
+		sourceAuthority:    authentication.provenance.sourceAuthority,
+		federationEnvelope: cloneCanonicalIdentifier(authentication.provenance.federationEnvelope),
+	}
+	return audit
 }
 
 func transactionMatchesDecision(
@@ -620,7 +669,17 @@ func sameCommandDenialSpec(left, right SecuritySpec) bool {
 		left.commandDenial.denialFingerprint == right.commandDenial.denialFingerprint &&
 		left.commandDenial.subject == right.commandDenial.subject && left.commandDenial.policy == right.commandDenial.policy &&
 		left.commandDenial.hasPolicy == right.commandDenial.hasPolicy &&
-		left.commandDenial.correlation == right.commandDenial.correlation
+		left.commandDenial.correlation == right.commandDenial.correlation &&
+		left.hasAuditContext == right.hasAuditContext && left.auditRequest == right.auditRequest &&
+		left.provenance.sourceAuthority == right.provenance.sourceAuthority &&
+		canonicalIdentifierEqual(left.provenance.federationEnvelope, right.provenance.federationEnvelope)
+}
+
+func canonicalIdentifierEqual(left, right *CanonicalIdentifier) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
 }
 
 func (service *OrchestrationService) executeBootstrapCommand(
@@ -645,7 +704,7 @@ func (service *OrchestrationService) executeBootstrapCommand(
 		case ReceiptExactReplay:
 			disclosure, disclosureErr := service.replayDisclosure.AuthorizeReplay(locked, authentication, policy)
 			if disclosureErr != nil {
-				return service.rollbackDecision(locked, authentication, policy, disclosureErr)
+				return service.rollbackDecision(request, locked, authentication, policy, disclosureErr)
 			}
 			return ReplayCommand(locked, disclosure)
 		case ReceiptCommandIDConflict:
@@ -665,7 +724,7 @@ func (service *OrchestrationService) executeBootstrapCommand(
 		}
 		commit, transitionErr := transition(locked)
 		if transitionErr != nil {
-			return service.rollbackDecision(locked, authentication, policy, transitionErr)
+			return service.rollbackDecision(request, locked, authentication, policy, transitionErr)
 		}
 		audit, auditErr := NewAuditIntent(
 			request.Spec.Operation(), AuditCommandApplied, request.Spec.RequestFingerprint(), CommandAppliedAuditDetail(),
@@ -673,7 +732,7 @@ func (service *OrchestrationService) executeBootstrapCommand(
 		if auditErr != nil {
 			return CommandDecision{}, auditErr
 		}
-		audit.subject = authenticatedAuditSubject(authentication, request.Spec)
+		audit = bindCommandAuditContext(audit, request, authentication)
 		planningInput, planningErr := NewEffectPlanningInput(request.Spec.CommandID(), commit.facts)
 		if planningErr != nil {
 			return CommandDecision{}, planningErr
@@ -699,7 +758,8 @@ func (service *OrchestrationService) executeBootstrapCommand(
 func validateCommandRequest(request CommandRequest, expected CommandOperation) error {
 	if request.Spec.CommandOperation() != expected || request.Authentication.Operation != expected ||
 		request.Policy.Operation != expected || request.Authentication.Scope != request.Spec.Scope() ||
-		request.Policy.Scope != request.Spec.Scope() || !commandHashViewMatches(expected, request.HashView) {
+		request.Policy.Scope != request.Spec.Scope() || !validAuditRequestContext(request.Audit) ||
+		!commandHashViewMatches(expected, request.HashView) {
 		return ErrInvalidCommandSpec
 	}
 	fingerprint, err := NewProductionCanonicalCodec().HashCommand(request.HashView)
@@ -876,6 +936,7 @@ func (service *OrchestrationService) prepareSigner(
 }
 
 func (service *OrchestrationService) rollbackDecision(
+	request CommandRequest,
 	locked CommandContext,
 	authentication AuthenticationEvidence,
 	policy PreparedPolicy,
@@ -889,6 +950,10 @@ func (service *OrchestrationService) rollbackDecision(
 		return RollbackCommand(locked, rejection)
 	}
 	security, err := service.denialPolicy.DenialFollowUp(locked, authentication, policy, rejection)
+	if err != nil {
+		return CommandDecision{}, err
+	}
+	security, err = bindSecurityAuditContext(security, request.Audit, authentication.provenance)
 	if err != nil {
 		return CommandDecision{}, err
 	}
@@ -1088,7 +1153,11 @@ func (service *OrchestrationService) BootstrapInstallation(ctx context.Context, 
 		!capabilitySetMatches(view.Body.OwnerGrantCapabilities, proof.OwnerCapabilities()) {
 		return CommandExecution{}, ErrInvalidCommandSpec
 	}
-	bootstrapIdentity, err := NewAuthenticationEvidence(proof.PrincipalID(), ptrDevice(proof.DeviceID()))
+	provenance, err := NewAuditProvenanceEvidence(request.Spec.AuthorityID(), nil)
+	if err != nil {
+		return CommandExecution{}, ErrInvalidApplicationContract
+	}
+	bootstrapIdentity, err := NewAuthenticationEvidence(proof.PrincipalID(), ptrDevice(proof.DeviceID()), provenance)
 	if err != nil {
 		return CommandExecution{}, ErrInvalidApplicationContract
 	}
@@ -1162,6 +1231,14 @@ func (service *OrchestrationService) rejectBootstrap(
 		request.Spec.Scope(), request.Spec.AuthorityID(), request.Spec.RequestedEpoch(),
 		request.Spec.Guards().AdmissionGeneration(), invitationExpectation, attempt,
 	)
+	if err != nil {
+		return CommandExecution{}, err
+	}
+	provenance, err := NewAuditProvenanceEvidence(request.Spec.AuthorityID(), nil)
+	if err != nil {
+		return CommandExecution{}, ErrInvalidApplicationContract
+	}
+	security, err = bindSecurityAuditContext(security, request.Audit, provenance)
 	if err != nil {
 		return CommandExecution{}, err
 	}
@@ -1679,7 +1756,9 @@ func (service *OrchestrationService) PairDevice(ctx context.Context, request Pai
 		if !rejected {
 			return CommandExecution{}, ErrInvalidApplicationContract
 		}
-		return service.executePreTransactionDenial(ctx, request.Spec, policy, rejection, subject)
+		return service.executePreTransactionDenial(
+			ctx, request.CommandRequest, policy, rejection, subject, authenticationDecision.provenance(),
+		)
 	}
 	return service.executePreparedCommand(ctx, request.CommandRequest, authentication, policy,
 		func(locked CommandContext, authorization domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {

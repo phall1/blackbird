@@ -209,6 +209,17 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 	streamDigestBytes := [32]byte{2}
 	streamDigest, _ := domain.NewStreamDigest(streamDigestBytes)
 	audit, _ := NewAuditIntent(operation, AuditCommandApplied, requestFingerprint, CommandAppliedAuditDetail())
+	auditRequest, _ := NewAuditRequestContext(
+		"request-bootstrap-1", "trace-bootstrap-1", now.Add(30*time.Second), ptrTestTime(now),
+	)
+	audit.invocation.requestID = &auditRequest.requestID
+	audit.invocation.traceID = &auditRequest.traceID
+	audit.timing.serverReceivedTime = ptrTime(auditRequest.serverReceived)
+	audit.timing.clientTime = ptrTime(auditRequest.clientTime)
+	audit.subject = AuditSubject{
+		kind: AuditSubjectAttributed, principal: principalID, device: deviceID, hasDevice: true,
+	}
+	audit.provenance = AuditProvenance{sourceAuthority: authorityID}
 	commit, err := BootstrapInstallationCommit(commandContext, result)
 	if err != nil {
 		t.Fatal(err)
@@ -229,6 +240,84 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 		receipt: receiptID, correlation: correlationID, invitation: invitation,
 		input: input, attempt: attempt, result: result, spec: spec, context: commandContext, commit: commit, decision: decision,
 		resultRecord: resultEnvelope, capsuleSigner: capsuleSigner,
+	}
+}
+
+func ptrTestTime(value time.Time) *time.Time { return &value }
+
+func testSecurityAuditContext(
+	t *testing.T,
+	spec SecuritySpec,
+	fixture bootstrapFixture,
+) SecuritySpec {
+	t.Helper()
+	request, err := NewAuditRequestContext(
+		"request-security-1", "trace-security-1", fixture.now, ptrTestTime(fixture.now.Add(-time.Second)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := NewAuditProvenanceEvidence(fixture.authority, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := bindSecurityAuditContext(spec, request, provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bound
+}
+
+func TestAuditRequestContextAndFederationProvenanceAreClosed(t *testing.T) {
+	t.Parallel()
+	fixture := buildBootstrapFixture(t)
+	clientTime := fixture.now.Add(-time.Second)
+	request, err := NewAuditRequestContext(
+		"request-audit-1", "trace-audit-1", fixture.now, &clientTime,
+	)
+	if err != nil || request.RequestID() != "request-audit-1" || request.TraceID() != "trace-audit-1" ||
+		!request.ServerReceivedAt().Equal(fixture.now) {
+		t.Fatalf("audit request=%+v error=%v", request, err)
+	}
+	if authenticated, present := request.AuthenticatedClientAt(); !present || !authenticated.Equal(clientTime) {
+		t.Fatalf("authenticated client time=%v present=%t", authenticated, present)
+	}
+	for _, invalid := range []struct {
+		request string
+		trace   string
+		at      time.Time
+	}{
+		{"", "trace-audit-1", fixture.now},
+		{"Request-Audit-1", "trace-audit-1", fixture.now},
+		{"request-audit-1", "", fixture.now},
+		{"request-audit-1", "trace-audit-1", time.Time{}},
+	} {
+		if _, invalidErr := NewAuditRequestContext(invalid.request, invalid.trace, invalid.at, nil); invalidErr == nil {
+			t.Fatalf("accepted invalid audit request: %+v", invalid)
+		}
+	}
+
+	remoteAuthority, _ := domain.ParseAuthorityID(applicationUUID(700))
+	envelope := "federation-envelope-1"
+	provenance, err := NewAuditProvenanceEvidence(remoteAuthority, &envelope)
+	if err != nil || provenance.SourceAuthorityID() != remoteAuthority {
+		t.Fatalf("provenance=%+v error=%v", provenance, err)
+	}
+	if retained, present := provenance.FederationEnvelopeID(); !present || retained != envelope {
+		t.Fatalf("federation envelope=%q present=%t", retained, present)
+	}
+	intent := fixture.decision.Audit()
+	if !intent.finalized {
+		t.Fatal("bootstrap decision omitted audit")
+	}
+	intent.provenance = AuditProvenance{
+		sourceAuthority: remoteAuthority, federationEnvelope: cloneCanonicalIdentifier(provenance.federationEnvelope),
+	}
+	if _, err = NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: fixture.scope, Sequence: 1, AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
+		RecordedAt: fixture.now, Intent: intent,
+	}); err != nil {
+		t.Fatalf("federated source authority rejected: %v", err)
 	}
 }
 
@@ -1051,6 +1140,7 @@ func TestSecurityDenialIsCommittedDataNotCallbackError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	spec = testSecurityAuditContext(t, spec, fixture)
 	if !spec.RequiresReservedAdmission() {
 		t.Fatal("bootstrap denial did not require reserved security admission")
 	}
@@ -1225,6 +1315,7 @@ func TestOrdinaryDenialAuditIsSeparateBoundedAndFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	denialSpec = testSecurityAuditContext(t, denialSpec, fixture)
 	if !denialSpec.RequiresReservedAdmission() {
 		t.Fatal("ordinary denial did not require reserved security admission")
 	}

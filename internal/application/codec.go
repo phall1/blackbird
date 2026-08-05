@@ -389,7 +389,7 @@ type identityPayloadPrincipalRegistered struct {
 	PrincipalID        CanonicalIdentifier `json:"principal_id"`
 	Kind               string              `json:"kind"`
 	DisplayName        string              `json:"display_name"`
-	PublicKeyReference string              `json:"public_key_reference"`
+	PublicKeyReference *string             `json:"public_key_reference"`
 }
 type identityPayloadDevicePairingBegan struct {
 	InstallationID     CanonicalIdentifier `json:"installation_id"`
@@ -420,11 +420,11 @@ type identityPayloadWorkspaceCreated struct {
 	PolicyRevision   string              `json:"policy_revision"`
 }
 type identityPayloadWorkspaceMemberInvited struct {
-	MembershipID CanonicalIdentifier `json:"membership_id"`
-	WorkspaceID  CanonicalIdentifier `json:"workspace_id"`
-	PrincipalID  CanonicalIdentifier `json:"principal_id"`
-	CeremonyID   CanonicalIdentifier `json:"ceremony_id"`
-	Capabilities []string            `json:"capabilities"`
+	MembershipID CanonicalIdentifier  `json:"membership_id"`
+	WorkspaceID  CanonicalIdentifier  `json:"workspace_id"`
+	PrincipalID  CanonicalIdentifier  `json:"principal_id"`
+	CeremonyID   *CanonicalIdentifier `json:"ceremony_id"`
+	Capabilities []string             `json:"capabilities"`
 }
 type identityPayloadWorkspaceMembershipAccepted struct {
 	MembershipID CanonicalIdentifier `json:"membership_id"`
@@ -550,11 +550,15 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 			GrantID: id(value.GrantID().String()), TranscriptFingerprint: digest([sha256.Size]byte(value.TranscriptFingerprint())),
 		}, nil
 	case domain.PrincipalRegisteredFact:
-		return identityPayloadPrincipalRegistered{
+		view := identityPayloadPrincipalRegistered{
 			InstallationID: id(value.InstallationID().String()), PrincipalID: id(value.PrincipalID().String()),
-			Kind:        string(value.PrincipalKind()),
-			DisplayName: value.DisplayName().String(), PublicKeyReference: value.PublicKeyReference().String(),
-		}, nil
+			Kind: string(value.PrincipalKind()), DisplayName: value.DisplayName().String(),
+		}
+		if value.PublicKeyReference().String() != "" {
+			publicKey := value.PublicKeyReference().String()
+			view.PublicKeyReference = &publicKey
+		}
+		return view, nil
 	case domain.DevicePairingBeganFact:
 		return identityPayloadDevicePairingBegan{
 			InstallationID: id(value.InstallationID().String()), DeviceID: id(value.DeviceID().String()),
@@ -580,11 +584,15 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 			DiscoveryLocator: value.DiscoveryLocator().String(), PolicyRevision: value.PolicyRevision().String(),
 		}, nil
 	case domain.WorkspaceMemberInvitedFact:
-		return identityPayloadWorkspaceMemberInvited{
+		view := identityPayloadWorkspaceMemberInvited{
 			MembershipID: id(value.MembershipID().String()), WorkspaceID: id(value.WorkspaceID().String()),
-			PrincipalID: id(value.PrincipalID().String()), CeremonyID: id(value.CeremonyID().String()),
-			Capabilities: capabilityStrings(value.Capabilities()),
-		}, nil
+			PrincipalID: id(value.PrincipalID().String()), Capabilities: capabilityStrings(value.Capabilities()),
+		}
+		if !value.CeremonyID().IsZero() {
+			ceremony := id(value.CeremonyID().String())
+			view.CeremonyID = &ceremony
+		}
+		return view, nil
 	case domain.WorkspaceMembershipAcceptedFact:
 		return identityPayloadWorkspaceMembershipAccepted{
 			MembershipID: id(value.MembershipID().String()), WorkspaceID: id(value.WorkspaceID().String()),
@@ -2839,8 +2847,11 @@ func validIdentityPayload(payload any) bool {
 		return validIDs(value.InstallationID, value.InvitationID, value.PrincipalID, value.DeviceID, value.GrantID) &&
 			value.TranscriptFingerprint.String() != ""
 	case *identityPayloadPrincipalRegistered:
-		return validIDs(value.InstallationID, value.PrincipalID) && validOpaqueText(value.Kind, 64) &&
-			validOpaqueText(value.DisplayName, 256) && validOpaqueText(value.PublicKeyReference, 4096)
+		kind := domain.PrincipalKind(value.Kind)
+		return validIDs(value.InstallationID, value.PrincipalID) && kind.Valid() &&
+			validOpaqueText(value.DisplayName, 256) &&
+			((kind == domain.PrincipalKindHuman && value.PublicKeyReference == nil) ||
+				(value.PublicKeyReference != nil && validOpaqueText(*value.PublicKeyReference, 4096)))
 	case *identityPayloadDevicePairingBegan:
 		return validIDs(value.InstallationID, value.DeviceID, value.PrincipalID, value.CeremonyID) &&
 			validOpaqueText(value.DisplayName, 256) && validOpaqueText(value.PublicKeyReference, 4096)
@@ -2853,8 +2864,8 @@ func validIdentityPayload(payload any) bool {
 		return validIDs(value.WorkspaceID, value.AuthorityID, value.AuthorityEpoch) && validOpaqueText(value.Alias, 256) &&
 			validOpaqueText(value.DiscoveryLocator, 4096) && validOpaqueText(value.PolicyRevision, 256)
 	case *identityPayloadWorkspaceMemberInvited:
-		return validIDs(value.MembershipID, value.WorkspaceID, value.PrincipalID, value.CeremonyID) &&
-			validCapabilities(value.Capabilities)
+		return validIDs(value.MembershipID, value.WorkspaceID, value.PrincipalID) &&
+			(value.CeremonyID == nil || value.CeremonyID.String() != "") && validCapabilities(value.Capabilities)
 	case *identityPayloadWorkspaceMembershipAccepted:
 		return validIDs(value.MembershipID, value.WorkspaceID, value.PrincipalID)
 	case *identityPayloadActorCreated:
@@ -3064,7 +3075,8 @@ func NewAuditEntryViewV1(params AuditEntryParams) (AuditEntryViewV1, error) {
 	if params.ChainScopeID.IsZero() || params.Sequence == 0 || params.Sequence > MaxCanonicalInteger ||
 		params.AuthorityID.IsZero() || params.AuthorityEpoch.IsZero() || params.RecordedAt.IsZero() ||
 		params.Intent.Operation().String() == "" || params.Intent.Fingerprint().IsZero() || !params.Intent.finalized ||
-		params.Intent.provenance.sourceAuthority != params.AuthorityID {
+		(params.Intent.provenance.sourceAuthority != params.AuthorityID) !=
+			(params.Intent.provenance.federationEnvelope != nil) {
 		return AuditEntryViewV1{}, ErrCanonicalProfile
 	}
 	scopeID, err := NewCanonicalIdentifier(params.ChainScopeID.ID())
@@ -3149,7 +3161,8 @@ func auditInvocationView(invocation AuditInvocation) (auditInvocationWire, error
 	switch invocation.kind {
 	case AuditInvocationCommand:
 		if invocation.commandID.IsZero() || invocation.receiptID.IsZero() || invocation.receiptIdentityDigest.IsZero() ||
-			invocation.securityOperation != "" {
+			invocation.securityOperation != "" || invocation.requestID == nil || invocation.traceID == nil ||
+			invocation.correlationID == nil {
 			return auditInvocationWire{}, ErrCanonicalProfile
 		}
 		command, err := NewCanonicalIdentifier(invocation.commandID.String())
@@ -3167,7 +3180,13 @@ func auditInvocationView(invocation AuditInvocation) (auditInvocationWire, error
 		view.CommandID, view.ReceiptID, view.ReceiptIdentityDigest = &command, &receipt, &digest
 	case AuditInvocationSecurity:
 		if !invocation.securityOperation.Valid() || !invocation.commandID.IsZero() || !invocation.receiptID.IsZero() ||
-			!invocation.receiptIdentityDigest.IsZero() || invocation.requestID != nil {
+			!invocation.receiptIdentityDigest.IsZero() {
+			return auditInvocationWire{}, ErrCanonicalProfile
+		}
+		denial := invocation.securityOperation == SecurityRecordBootstrapDenial ||
+			invocation.securityOperation == SecurityRecordCommandDenial
+		if denial != (invocation.requestID != nil && invocation.traceID != nil) ||
+			(invocation.securityOperation == SecurityRecordCommandDenial) != (invocation.correlationID != nil) {
 			return auditInvocationWire{}, ErrCanonicalProfile
 		}
 		operation := string(invocation.securityOperation)
@@ -3401,10 +3420,17 @@ func validAuditInvocationWire(view auditInvocationWire) bool {
 	case AuditInvocationCommand:
 		return view.CommandID != nil && view.CommandID.String() != "" && view.ReceiptID != nil &&
 			view.ReceiptID.String() != "" && view.ReceiptIdentityDigest != nil &&
-			view.ReceiptIdentityDigest.String() != "" && view.SecurityOperation == nil
+			view.ReceiptIdentityDigest.String() != "" && view.RequestID != nil && view.TraceID != nil &&
+			view.CorrelationID != nil && view.SecurityOperation == nil
 	case AuditInvocationSecurity:
-		return view.CommandID == nil && view.ReceiptID == nil && view.ReceiptIdentityDigest == nil &&
-			view.RequestID == nil && view.SecurityOperation != nil && SecurityOperation(*view.SecurityOperation).Valid()
+		if view.CommandID != nil || view.ReceiptID != nil || view.ReceiptIdentityDigest != nil ||
+			view.SecurityOperation == nil || !SecurityOperation(*view.SecurityOperation).Valid() {
+			return false
+		}
+		operation := SecurityOperation(*view.SecurityOperation)
+		denial := operation == SecurityRecordBootstrapDenial || operation == SecurityRecordCommandDenial
+		return denial == (view.RequestID != nil && view.TraceID != nil) &&
+			(operation == SecurityRecordCommandDenial) == (view.CorrelationID != nil)
 	default:
 		return false
 	}
@@ -3498,7 +3524,17 @@ func (view AuditEntryViewV1) valid() bool {
 		!validAuditAuthorizationWire(view.Authorization) || !validAuditResourceWires(view.Resources) {
 		return false
 	}
-	if view.Provenance.SourceAuthorityID != view.AuthorityID || !auditActionMatchesInvocation(view.Action, view.Invocation) {
+	if !auditActionMatchesInvocation(view.Action, view.Invocation) {
+		return false
+	}
+	if (view.Provenance.SourceAuthorityID != view.AuthorityID) != (view.Provenance.FederationEnvelope != nil) {
+		return false
+	}
+	denial := view.Invocation.Kind == AuditInvocationCommand ||
+		(view.Invocation.SecurityOperation != nil &&
+			(*view.Invocation.SecurityOperation == string(SecurityRecordBootstrapDenial) ||
+				*view.Invocation.SecurityOperation == string(SecurityRecordCommandDenial)))
+	if denial != (view.Timing.ServerReceivedAt != nil) {
 		return false
 	}
 	switch AuditOutcome(view.Outcome) {

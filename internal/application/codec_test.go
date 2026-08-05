@@ -2,6 +2,7 @@ package application
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -1065,18 +1066,19 @@ func TestW0ReceiptResultCatalogAcceptsExactlyElevenSemanticShapes(t *testing.T) 
 		ceremonyPurpose domain.CeremonyPurpose
 		capsuleRequired bool
 		sessionRequired bool
+		wantDigest      string
 	}{
-		{ReceiptOperationInstallationBootstrap, []domain.AggregateKind{domain.AggregateKindPrincipal, domain.AggregateKindDevice, domain.AggregateKindGrant}, 3, "", true, false},
-		{ReceiptOperationPrincipalRegister, []domain.AggregateKind{domain.AggregateKindPrincipal}, 1, "", true, false},
-		{ReceiptOperationDevicePairingBegin, []domain.AggregateKind{domain.AggregateKindDevice}, 1, domain.CeremonyPurposeDevicePairing, true, false},
-		{ReceiptOperationDevicePair, []domain.AggregateKind{domain.AggregateKindDevice}, 1, "", false, false},
-		{ReceiptOperationWorkspaceCreate, []domain.AggregateKind{domain.AggregateKindWorkspace, domain.AggregateKindMembership}, 3, "", true, false},
-		{ReceiptOperationWorkspaceMemberInvite, []domain.AggregateKind{domain.AggregateKindMembership}, 1, domain.CeremonyPurposeMembershipAcceptance, true, false},
-		{ReceiptOperationWorkspaceMembershipAccept, []domain.AggregateKind{domain.AggregateKindMembership}, 1, "", false, false},
-		{ReceiptOperationActorCreate, []domain.AggregateKind{domain.AggregateKindActor}, 1, "", true, false},
-		{ReceiptOperationActorDelegationPropose, []domain.AggregateKind{domain.AggregateKindActorDelegation}, 1, domain.CeremonyPurposeDelegationActivation, true, false},
-		{ReceiptOperationActorDelegationActivate, []domain.AggregateKind{domain.AggregateKindActorDelegation}, 1, domain.CeremonyPurposeActorSessionStart, true, false},
-		{ReceiptOperationActorSessionStart, []domain.AggregateKind{domain.AggregateKindActorSession}, 1, "", true, true},
+		{ReceiptOperationInstallationBootstrap, []domain.AggregateKind{domain.AggregateKindPrincipal, domain.AggregateKindDevice, domain.AggregateKindGrant}, 3, "", true, false, "776348629562c93f072b4d078ec5c322aa652284c72c7577784457bf152961e4"},
+		{ReceiptOperationPrincipalRegister, []domain.AggregateKind{domain.AggregateKindPrincipal}, 1, "", true, false, "a68e1e69da8da56eb759745e9e4f83bc5d38ee69fa2bae388a0912b7fe309e34"},
+		{ReceiptOperationDevicePairingBegin, []domain.AggregateKind{domain.AggregateKindDevice}, 1, domain.CeremonyPurposeDevicePairing, true, false, "b8422a9f314be087a6f6b709fbe95aef42f22ee90ac0867c39030c7a90c1d843"},
+		{ReceiptOperationDevicePair, []domain.AggregateKind{domain.AggregateKindDevice}, 1, "", false, false, "b0031162bda6be266612faa34f58c4e3dc9ff68dfff46b50cf0f44625fd9596e"},
+		{ReceiptOperationWorkspaceCreate, []domain.AggregateKind{domain.AggregateKindWorkspace, domain.AggregateKindMembership}, 3, "", true, false, "6f6cafd9ed1d7a0098ce49c841015f7cbe2207421b0d0bcf2d7f517fa9ab14c8"},
+		{ReceiptOperationWorkspaceMemberInvite, []domain.AggregateKind{domain.AggregateKindMembership}, 1, domain.CeremonyPurposeMembershipAcceptance, true, false, "3ddfb4f50bd1885c952a8f2e5bbec24af5fcbc15e764d5053af7b71d47645775"},
+		{ReceiptOperationWorkspaceMembershipAccept, []domain.AggregateKind{domain.AggregateKindMembership}, 1, "", false, false, "de3fb97bd04f34aedd44769a422cb2e0d1526301722eacc4b92cac47c68f9cb0"},
+		{ReceiptOperationActorCreate, []domain.AggregateKind{domain.AggregateKindActor}, 1, "", true, false, "11572421b8573d3e4fa81fc9899c0a0b6cf619643afae38a3449d0d0539db898"},
+		{ReceiptOperationActorDelegationPropose, []domain.AggregateKind{domain.AggregateKindActorDelegation}, 1, domain.CeremonyPurposeDelegationActivation, true, false, "97b907a9dbbefe47648be77231a0945906c8308f813002523b44c4fb85a9b3b5"},
+		{ReceiptOperationActorDelegationActivate, []domain.AggregateKind{domain.AggregateKindActorDelegation}, 1, domain.CeremonyPurposeActorSessionStart, true, false, "d07d43c6899e768f8cd00f6b41ef666b3fab71a3c905c08a79293672c5752bf0"},
+		{ReceiptOperationActorSessionStart, []domain.AggregateKind{domain.AggregateKindActorSession}, 1, "", true, true, "6cb4b53f77faf41ed40e2f6696c3203eb0f80cfbe41a3d034f2ad31351fc66b0"},
 	}
 	codec := NewProductionCanonicalCodec()
 	for _, test := range tests {
@@ -1099,6 +1101,15 @@ func TestW0ReceiptResultCatalogAcceptsExactlyElevenSemanticShapes(t *testing.T) 
 			}
 			if document.Operation() != test.operation {
 				t.Fatalf("document operation %q, want %q", document.Operation(), test.operation)
+			}
+			if got := document.Digest().String(); got != test.wantDigest {
+				t.Fatalf("receipt result golden for %s: got %s, want %s", test.operation, got, test.wantDigest)
+			}
+			mutatedView := view
+			mutatedView.wire.AcceptedAt, _ = ParseCanonicalInstant("2026-08-04T12:00:01.123000Z")
+			mutated, err := codec.EncodeReceiptResult(mutatedView)
+			if err != nil || mutated.Digest() == document.Digest() {
+				t.Fatalf("one-field receipt mutation for %s was not bound: %v", test.operation, err)
 			}
 			canonical := string(document.CanonicalBytes())
 			for _, forbidden := range []string{`"replay"`, `"request_id"`, `"capsule_digest"`, `"signature"`} {
@@ -1596,6 +1607,94 @@ func TestBootstrapAttemptMutationAndGoldenVector(t *testing.T) {
 	}
 }
 
+func TestProductionGuardDenialAndCapsuleCompositionGoldens(t *testing.T) {
+	t.Parallel()
+
+	fixture := buildBootstrapFixture(t)
+	evidence, err := NewAppliedGuardEvidence(fixture.spec.Guards(), fixture.spec.Guards().Evidence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := evidence.Digest().String(), "f341b7e664572cd63048d88f628f3a7e078462c54a6d58ecd109d3b60f5024be"; got != want {
+		t.Fatalf("actual guard-set golden: got %s, want %s", got, want)
+	}
+	changedPlan := fixture.spec.Guards()
+	changedPlan.admissionGeneration, _ = NewGuardGeneration(changedPlan.admissionGeneration.Uint64() + 1)
+	changedEvidence, err := NewAppliedGuardEvidence(changedPlan, changedPlan.Evidence())
+	if err != nil || changedEvidence.Digest() == evidence.Digest() {
+		t.Fatalf("one-field guard mutation was not bound: %v", err)
+	}
+
+	major, _ := NewOperationMajor(1)
+	subject, _ := UnattributedDenialSource(DigestBytes([]byte("codec denial source")))
+	draft, err := NewCommandDenialDraft(
+		fixture.spec.Operation(), major, DenialAuthentication, "credential_rejected",
+		fixture.spec.RequestFingerprint(), subject, nil, fixture.correlation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denialSpec, err := RecordCommandDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch,
+		fixture.spec.Guards().AdmissionGeneration(), draft,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denial, _ := denialSpec.CommandDenial()
+	if got, want := denial.DenialFingerprint().String(), "26c68f93ed1856b5436cbdde12043040297703a5e7c9a1eb16138ff18de1cfbd"; got != want {
+		t.Fatalf("command-denial draft golden: got %s, want %s", got, want)
+	}
+	changedDraft := draft
+	changedDraft.reason = "credential_stale"
+	changedSpec, err := RecordCommandDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch,
+		fixture.spec.Guards().AdmissionGeneration(), changedDraft,
+	)
+	changedDenial, _ := changedSpec.CommandDenial()
+	if err != nil || changedDenial.DenialFingerprint() == denial.DenialFingerprint() {
+		t.Fatalf("one-field command-denial mutation was not bound: %v", err)
+	}
+
+	capsule := mustCapsuleDraft(
+		t, fixture.resultRecord, fixture.command, fixture.spec.OperationMajor(), fixture.spec.RecoveryCapsule().KeyID(),
+	)
+	message, err := RecoveryCapsuleSigningMessage(capsule.Digest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hex.EncodeToString(message), "626c61636b626972642d7265636f766572792d63617073756c652d7369676e61747572652f7631006effb009718c33f23eca608ea7635b569aef6ccfe62fe51d645d93cd7dd6f23a"; got != want {
+		t.Fatalf("capsule signature-input golden: got %s, want %s", got, want)
+	}
+	envelope, err := SignRecoveryCapsule(
+		context.Background(), fixture.spec.RecoveryCapsule(), fixture.capsuleSigner, *capsule,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Draft().Digest() != capsule.Digest() || envelope.Draft().ResultDigest() != fixture.resultRecord.ResponseDigest() ||
+		envelope.Schema() != RecoveryCapsuleEnvelopeSchema || envelope.Algorithm() != RecoveryCapsuleSignatureAlgorithm ||
+		envelope.SigningKeyID() != capsule.KeyID() {
+		t.Fatal("capsule envelope lost draft, result, schema, algorithm, or key binding")
+	}
+	if got, want := envelope.SignatureBase64URL(), "oYIQykc7wJGhIG_xpQYbqmHMlfNb092VjzoSVsqT-HZTQbg_lHco8ON_7zc1NIQaCJAdetnCeGN95xnyFSFoAQ"; got != want {
+		t.Fatalf("capsule envelope signature golden: got %s, want %s", got, want)
+	}
+	message[0] ^= 1
+	if bytes.Equal(message, mustSigningMessage(t, capsule.Digest())) {
+		t.Fatal("signature-input mutation was not observable")
+	}
+}
+
+func mustSigningMessage(t *testing.T, digest Digest) []byte {
+	t.Helper()
+	message, err := RecoveryCapsuleSigningMessage(digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return message
+}
+
 func TestDomainSeparatedProfilesAndStreamGoldens(t *testing.T) {
 	t.Parallel()
 
@@ -1834,6 +1933,173 @@ func TestProductionEventSemanticMaterializationAndVerification(t *testing.T) {
 	}
 }
 
+func TestProductionCompositionCannotSubstitutePermissiveEventVerifier(t *testing.T) {
+	t.Parallel()
+
+	params := validProductionEventParams(t)
+	if _, err := domain.NewEventEnvelope(params, permissiveEventVerifier{}); err != nil {
+		t.Fatalf("permissive domain test seam rejected fixture: %v", err)
+	}
+	if _, err := NewProductionCanonicalCodec().MaterializeEvent(params); !errors.Is(err, domain.ErrEventDigestVerification) {
+		t.Fatalf("production construction boundary accepted permissive digests: %v", err)
+	}
+}
+
+func validProductionEventParams(t *testing.T) domain.EventEnvelopeParams {
+	t.Helper()
+	eventID, _ := domain.ParseEventID(codecUUID(301))
+	commandID, _ := domain.ParseCommandID(codecUUID(302))
+	authorityID, _ := domain.ParseAuthorityID(codecUUID(303))
+	epoch, _ := domain.ParseAuthorityEpoch(codecUUID(304))
+	workspaceID, _ := domain.ParseWorkspaceID(codecUUID(305))
+	membershipID, _ := domain.ParseMembershipID(codecUUID(306))
+	principalID, _ := domain.ParsePrincipalID(codecUUID(307))
+	receiptID, _ := domain.ParseReceiptID(codecUUID(308))
+	correlationID, _ := domain.ParseCorrelationID(codecUUID(309))
+	scope, _ := domain.WorkspaceScope(workspaceID)
+	position, _ := domain.NewStreamPosition(1)
+	schema, _ := domain.NewEventSchemaVersion(1)
+	payload, _ := domain.NewEventPayload([]byte(fmt.Sprintf(
+		`{"membership_id":%q,"principal_id":%q,"workspace_id":%q}`,
+		membershipID.String(), principalID.String(), workspaceID.String(),
+	)))
+	previous, _ := domain.NewStreamDigest(sha256.Sum256([]byte("production composition predecessor")))
+	eventDigest, _ := domain.NewEventDigest(sha256.Sum256([]byte("permissive semantic digest")))
+	streamDigest, _ := domain.NewStreamDigest(sha256.Sum256([]byte("permissive stream digest")))
+	authorization, _ := domain.NewAuthorizationDigest(sha256.Sum256([]byte("production composition authorization")))
+	return domain.EventEnvelopeParams{
+		EventID: eventID, CommandID: commandID, AuthorityID: authorityID, AuthorityEpoch: epoch,
+		Scope: scope, StreamPosition: position, PreviousStreamDigest: previous,
+		EventDigest: eventDigest, StreamDigest: streamDigest,
+		Aggregate: mustAggregateRef(t, membershipID, domain.InitialVersion()),
+		EventType: domain.EventTypeWorkspaceMembershipAccepted, SchemaVersion: schema, Payload: payload,
+		PrincipalID: principalID, AuthorizationDigest: authorization, CommandReceiptID: receiptID,
+		CorrelationID: correlationID, RecordedAt: time.Date(2026, 8, 5, 15, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestW0IdentityFactPayloadRetainedGoldensAndMutations(t *testing.T) {
+	t.Parallel()
+
+	path := buildOperationDomainPath(t)
+	results := [][]domain.IdentityFact{
+		path.bootstrap.Facts(), path.registered.Facts(), path.createdWorkspace.Facts(), path.invited.Facts(),
+		path.accepted.Facts(), path.createdActor.Facts(), path.proposed.Facts(), path.activated.Facts(),
+		path.pairingBegan.Facts(), path.paired.Facts(), path.sessionStarted.Facts(),
+	}
+	facts := make(map[domain.EventType]domain.IdentityFact, 11)
+	for _, result := range results {
+		for _, fact := range result {
+			facts[fact.Type()] = fact
+		}
+	}
+	want := map[domain.EventType]string{
+		domain.EventTypeInstallationBootstrapped:    `{"device_id":"01b8e094-9888-7000-8000-000000000006","grant_id":"01b8e094-9888-7000-8000-000000000007","installation_id":"01b8e094-9888-7000-8000-000000000001","invitation_id":"01b8e094-9888-7000-8000-000000000004","principal_id":"01b8e094-9888-7000-8000-000000000005","transcript_fingerprint":"d3d4fd8c6dd4628838f1cfa3580434d0b7743e49cc1603f058aa7b13102ddd62"}`,
+		domain.EventTypePrincipalRegistered:         `{"display_name":"Matrix workload","installation_id":"01b8e094-9888-7000-8000-000000000001","kind":"workload","principal_id":"01b8e094-9888-7000-8000-0000000000c9","public_key_reference":"keyref:matrix-workload"}`,
+		domain.EventTypeDevicePairingBegan:          `{"ceremony_id":"01b8e094-9888-7000-8000-0000000000d3","device_id":"01b8e094-9888-7000-8000-0000000000d2","display_name":"Matrix paired device","installation_id":"01b8e094-9888-7000-8000-000000000001","principal_id":"01b8e094-9888-7000-8000-000000000005","public_key_reference":"keyref:matrix-paired-device"}`,
+		domain.EventTypeDevicePaired:                `{"credential_algorithm":"ed25519-spki-sha256-v1","credential_transcript_fingerprint":"a9045e7f47d07506ccc5cfb3dab496061f03a332f1ae90027e76f84482efdbb0","device_id":"01b8e094-9888-7000-8000-0000000000d2","display_name":"Matrix paired device","installation_id":"01b8e094-9888-7000-8000-000000000001","principal_id":"01b8e094-9888-7000-8000-000000000005","public_key_reference":"keyref:matrix-paired-device","spki_fingerprint":"fbe1adfd69025abac14d242cadf1693a09a2e548cd22926fe5afa8e59a1204e6","transcript_fingerprint":"a9045e7f47d07506ccc5cfb3dab496061f03a332f1ae90027e76f84482efdbb0","trust_revision":2}`,
+		domain.EventTypeWorkspaceCreated:            `{"alias":"matrix-workspace","authority_epoch":"01b8e094-9888-7000-8000-000000000003","authority_id":"01b8e094-9888-7000-8000-000000000002","discovery_locator":"workspace://matrix","policy_revision":"policy:matrix:v1","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+		domain.EventTypeWorkspaceMemberInvited:      `{"capabilities":["workspace:owner"],"ceremony_id":"01b8e094-9888-7000-8000-0000000000cd","membership_id":"01b8e094-9888-7000-8000-0000000000cc","principal_id":"01b8e094-9888-7000-8000-0000000000c9","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+		domain.EventTypeWorkspaceMembershipAccepted: `{"membership_id":"01b8e094-9888-7000-8000-0000000000cc","principal_id":"01b8e094-9888-7000-8000-0000000000c9","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+		domain.EventTypeActorCreated:                `{"actor_id":"01b8e094-9888-7000-8000-0000000000ce","display_name":"Matrix agent","kind":"agent","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+		domain.EventTypeActorDelegationProposed:     `{"actor_id":"01b8e094-9888-7000-8000-0000000000ce","ceremony_id":"01b8e094-9888-7000-8000-0000000000d0","delegation_id":"01b8e094-9888-7000-8000-0000000000cf","principal_id":"01b8e094-9888-7000-8000-0000000000c9","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+		domain.EventTypeActorDelegationActivated:    `{"actor_id":"01b8e094-9888-7000-8000-0000000000ce","delegation_id":"01b8e094-9888-7000-8000-0000000000cf","principal_id":"01b8e094-9888-7000-8000-0000000000c9","session_start_ceremony_id":"01b8e094-9888-7000-8000-0000000000d1","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+		domain.EventTypeActorSessionStarted:         `{"binding_digest":"5d24033b6f989eb36518c69c92e77e4467a3fe83ebc0f44c4a630b80e9b56e1c","capabilities":["workspace:owner"],"client_instance_id":"01b8e094-9888-7000-8000-0000000000d5","client_name":"matrix-agent","client_version":"1.0.0","presentation_credential_audience":"blackbird:matrix","presentation_credential_digest":"da08299fd7e136e50b525d31f7baafd565369992279752b6561a6cae1ca57e6b","presentation_credential_reference":"credential-ref:matrix-session","presentation_credential_version":1,"session_id":"01b8e094-9888-7000-8000-0000000000d4","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`,
+	}
+	if len(facts) != len(want) {
+		t.Fatalf("production path produced %d distinct W0 fact payloads, want %d", len(facts), len(want))
+	}
+	codec := NewProductionCanonicalCodec()
+	for eventType, expected := range want {
+		fact := facts[eventType]
+		t.Run(string(eventType), func(t *testing.T) {
+			payload, err := codec.MaterializeIdentityFactPayload(fact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(payload.Bytes()); got != expected {
+				t.Fatalf("fact payload golden: got %s, want %s", got, expected)
+			}
+			view, err := identityFactPayloadView(fact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutated := mutateIdentityFactPayloadView(t, view)
+			canonical, err := codec.EncodeCanonical(mutated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(canonical, payload.Bytes()) {
+				t.Fatal("one-field fact payload mutation did not change canonical bytes")
+			}
+		})
+	}
+}
+
+func TestBootstrapAndWorkspaceOwnerFactPayloadGoldens(t *testing.T) {
+	t.Parallel()
+	codec := NewProductionCanonicalCodec()
+	fixture := buildBootstrapFixture(t)
+	principalPayload, err := codec.MaterializeIdentityFactPayload(fixture.result.Facts()[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(principalPayload.Bytes()), `{"display_name":"Owner","installation_id":"01b8e094-9888-7000-8000-000000000001","kind":"human","principal_id":"01b8e094-9888-7000-8000-000000000005","public_key_reference":null}`; got != want {
+		t.Fatalf("bootstrap human-principal payload:\n got %s\nwant %s", got, want)
+	}
+	path := buildOperationDomainPath(t)
+	ownerMembershipPayload, err := codec.MaterializeIdentityFactPayload(path.createdWorkspace.Facts()[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(ownerMembershipPayload.Bytes()), `{"capabilities":["actor:admin","delegation:admin","device:pair","membership:admin","workspace:owner"],"ceremony_id":null,"membership_id":"01b8e094-9888-7000-8000-0000000000cb","principal_id":"01b8e094-9888-7000-8000-000000000005","workspace_id":"01b8e094-9888-7000-8000-0000000000ca"}`; got != want {
+		t.Fatalf("workspace-owner membership payload:\n got %s\nwant %s", got, want)
+	}
+}
+
+func mutateIdentityFactPayloadView(t *testing.T, view IdentityFactPayloadView) IdentityFactPayloadView {
+	t.Helper()
+	mutatedID := mustCanonicalID(t, codecUUID(399))
+	switch value := view.(type) {
+	case identityPayloadInstallationBootstrapped:
+		value.InstallationID = mutatedID
+		return value
+	case identityPayloadPrincipalRegistered:
+		value.InstallationID = mutatedID
+		return value
+	case identityPayloadDevicePairingBegan:
+		value.InstallationID = mutatedID
+		return value
+	case identityPayloadDevicePaired:
+		value.InstallationID = mutatedID
+		return value
+	case identityPayloadWorkspaceCreated:
+		value.WorkspaceID = mutatedID
+		return value
+	case identityPayloadWorkspaceMemberInvited:
+		value.WorkspaceID = mutatedID
+		return value
+	case identityPayloadWorkspaceMembershipAccepted:
+		value.WorkspaceID = mutatedID
+		return value
+	case identityPayloadActorCreated:
+		value.WorkspaceID = mutatedID
+		return value
+	case identityPayloadActorDelegationProposed:
+		value.WorkspaceID = mutatedID
+		return value
+	case identityPayloadActorDelegationActivated:
+		value.WorkspaceID = mutatedID
+		return value
+	case identityPayloadActorSessionStarted:
+		value.WorkspaceID = mutatedID
+		return value
+	default:
+		t.Fatalf("unreviewed identity payload view %T", view)
+		return nil
+	}
+}
+
 func TestIdentityFactMaterializationRejectsTypedNil(t *testing.T) {
 	t.Parallel()
 	var fact *domain.InstallationBootstrappedFact
@@ -1861,10 +2127,18 @@ func TestAuditEntryGoldenAndAdversarialVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantCanonical := `{"action":"installation.bootstrap.v1","approval_evidence_digests":[],"audit_sequence":1,"authority_epoch":"01b8e094-9888-7000-8000-000000000003","authority_id":"01b8e094-9888-7000-8000-000000000002","authorization":{"admission_generation":1,"authorization_revisions":[],"device_trust_revision":null,"effective_grants":[],"guard_digest":"f341b7e664572cd63048d88f628f3a7e078462c54a6d58ecd109d3b60f5024be","new_bootstrap_generation_id":null,"old_bootstrap_generation_id":null,"policy_revision":null,"revocation_revisions":[]},"chain_scope_id":"01b8e094-9888-7000-8000-000000000001","command_fingerprint":"6e228eb595f60330181357cf513caa2054f587f1e2917d3db4c231f65cb6df61","invocation":{"command_id":"01b8e094-9888-7000-8000-000000000008","correlation_id":"01b8e094-9888-7000-8000-00000000000a","kind":"command","receipt_id":"01b8e094-9888-7000-8000-000000000009","receipt_identity_digest":"7e6facf044f61d2c13d47b81fbd348dfc7db4caa689e5236b95b1c3e881bac20","request_id":null,"security_operation":null,"trace_id":null},"outcome":"command_applied","previous_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","provenance":{"federation_envelope_id":null,"source_authority_id":"01b8e094-9888-7000-8000-000000000002"},"recorded_at":"2026-08-05T12:30:00.456000Z","resources":[{"after_version":1,"before_version":null,"id":"01b8e094-9888-7000-8000-000000000006","kind":"device_registration"},{"after_version":1,"before_version":null,"id":"01b8e094-9888-7000-8000-000000000007","kind":"grant"},{"after_version":2,"before_version":1,"id":"01b8e094-9888-7000-8000-000000000004","kind":"invitation"},{"after_version":1,"before_version":null,"id":"01b8e094-9888-7000-8000-000000000005","kind":"principal"}],"safe_reason":null,"schema":"blackbird.audit.entry/v1","subject":{"actor_id":null,"actor_session_id":null,"delegation_chain":[],"device_id":null,"kind":"attributed","principal_id":"01b8e094-9888-7000-8000-000000000005","unattributed_source_digest":null,"workload_id":null},"timing":{"authenticated_client_at":null,"persisted_authority_at":"2026-08-04T12:01:00.123456Z","server_received_at":null}}`
+	wantCanonical = strings.NewReplacer(
+		`"revocation_revisions":[]`, `"revocation_revisions":[{"id":"01b8e094-9888-7000-8000-000000000004","kind":"invitation","version":1}]`,
+		`"request_id":null`, `"request_id":"request-bootstrap-1"`,
+		`"trace_id":null`, `"trace_id":"trace-bootstrap-1"`,
+		`"device_id":null`, `"device_id":"01b8e094-9888-7000-8000-000000000006"`,
+		`"authenticated_client_at":null`, `"authenticated_client_at":"2026-08-04T12:00:00.123456Z"`,
+		`"server_received_at":null`, `"server_received_at":"2026-08-04T12:00:30.123456Z"`,
+	).Replace(wantCanonical)
 	if string(canonical) != wantCanonical {
 		t.Fatalf("audit canonical golden changed:\n got %s\nwant %s", canonical, wantCanonical)
 	}
-	if digest.String() != "03054909fbcfb2b974ae4835946a781e4eb6a8f712981641723535293ce34506" {
+	if digest.String() != "ef509869f94b0e66d0bd47e2cfbeaa39642a4615a4f74f9c0c8a80144ff3e224" {
 		t.Fatalf("audit digest golden changed: %s", digest.String())
 	}
 	if err := codec.VerifyAuditEntry(Digest{}, canonical, digest); err != nil {
@@ -1895,6 +2169,60 @@ func TestAuditEntryGoldenAndAdversarialVerification(t *testing.T) {
 	_, mutatedDigest, err := codec.EncodeAuditEntry(mutatedView)
 	if err != nil || mutatedDigest == digest {
 		t.Fatalf("one-field audit evidence mutation was not bound: %v", err)
+	}
+	otherDevice, _ := domain.ParseDeviceID(codecUUID(230))
+	otherAuthority, _ := domain.ParseAuthorityID(codecUUID(231))
+	otherEnvelope, _ := NewCanonicalIdentifier("federation-envelope-2")
+	mutations := []struct {
+		name   string
+		mutate func(*AuditIntent)
+	}{
+		{"request_id", func(value *AuditIntent) {
+			changed, _ := NewCanonicalIdentifier("request-bootstrap-2")
+			value.invocation.requestID = &changed
+		}},
+		{"trace_id", func(value *AuditIntent) {
+			changed, _ := NewCanonicalIdentifier("trace-bootstrap-2")
+			value.invocation.traceID = &changed
+		}},
+		{"server_received_at", func(value *AuditIntent) {
+			value.timing.serverReceivedTime = ptrTime(fixture.now.Add(31 * time.Second))
+		}},
+		{"authenticated_client_at", func(value *AuditIntent) {
+			value.timing.clientTime = ptrTime(fixture.now.Add(-time.Second))
+		}},
+		{"authenticated_device", func(value *AuditIntent) { value.subject.device = otherDevice }},
+		{"source_authority", func(value *AuditIntent) {
+			value.provenance.sourceAuthority = otherAuthority
+			value.provenance.federationEnvelope = &otherEnvelope
+		}},
+		{"federation_envelope", func(value *AuditIntent) {
+			value.provenance.sourceAuthority = otherAuthority
+			value.provenance.federationEnvelope = &otherEnvelope
+		}},
+	}
+	for _, mutation := range mutations {
+		mutated := intent
+		mutation.mutate(&mutated)
+		mutatedView, mutationErr := NewAuditEntryViewV1(AuditEntryParams{
+			ChainScopeID: scope, Sequence: 1, AuthorityID: authority, AuthorityEpoch: epoch,
+			RecordedAt: time.Date(2026, 8, 5, 12, 30, 0, 456_000_000, time.UTC), Intent: mutated,
+		})
+		if mutationErr != nil {
+			t.Fatalf("%s mutation view: %v", mutation.name, mutationErr)
+		}
+		_, mutationDigest, mutationErr := codec.EncodeAuditEntry(mutatedView)
+		if mutationErr != nil || mutationDigest == digest {
+			t.Fatalf("%s mutation was not bound: %v", mutation.name, mutationErr)
+		}
+	}
+	invalidProvenance := intent
+	invalidProvenance.provenance.sourceAuthority = otherAuthority
+	if _, err := NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: scope, Sequence: 1, AuthorityID: authority, AuthorityEpoch: epoch,
+		RecordedAt: time.Date(2026, 8, 5, 12, 30, 0, 456_000_000, time.UTC), Intent: invalidProvenance,
+	}); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("remote source without federation envelope accepted: %v", err)
 	}
 
 	securityOperation := string(SecurityRecordCommandDenial)
@@ -1949,6 +2277,7 @@ func TestSecurityDenialAuditEntryGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	spec = testSecurityAuditContext(t, spec, fixture)
 	context, err := NewSecurityContext(
 		spec, fixture.now.Add(time.Minute), fixture.invitation, FreshSecurityAttempt(), DenialAdmission{},
 		fixture.context.GuardEvidence().Digest(),
@@ -1980,10 +2309,16 @@ func TestSecurityDenialAuditEntryGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantCanonical := `{"action":"installation.bootstrap.v1","approval_evidence_digests":[],"audit_sequence":1,"authority_epoch":"01b8e094-9888-7000-8000-000000000003","authority_id":"01b8e094-9888-7000-8000-000000000002","authorization":{"admission_generation":1,"authorization_revisions":[],"device_trust_revision":null,"effective_grants":[],"guard_digest":"f341b7e664572cd63048d88f628f3a7e078462c54a6d58ecd109d3b60f5024be","new_bootstrap_generation_id":null,"old_bootstrap_generation_id":null,"policy_revision":null,"revocation_revisions":[]},"chain_scope_id":"01b8e094-9888-7000-8000-000000000001","command_fingerprint":"9cffe0456302ab253d281a341e3c3717f51a066f054e26edb22f0abbe469c39b","invocation":{"command_id":null,"correlation_id":null,"kind":"security","receipt_id":null,"receipt_identity_digest":null,"request_id":null,"security_operation":"record_bootstrap_denial","trace_id":null},"outcome":"security_denied","previous_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","provenance":{"federation_envelope_id":null,"source_authority_id":"01b8e094-9888-7000-8000-000000000002"},"recorded_at":"2026-08-04T12:01:00.123456Z","resources":[{"after_version":2,"before_version":1,"id":"01b8e094-9888-7000-8000-000000000004","kind":"invitation"}],"safe_reason":"bootstrap_proof_rejected","schema":"blackbird.audit.entry/v1","subject":{"actor_id":null,"actor_session_id":null,"delegation_chain":[],"device_id":null,"kind":"unattributed","principal_id":null,"unattributed_source_digest":"9cffe0456302ab253d281a341e3c3717f51a066f054e26edb22f0abbe469c39b","workload_id":null},"timing":{"authenticated_client_at":null,"persisted_authority_at":"2026-08-04T12:01:00.123456Z","server_received_at":null}}`
+	wantCanonical = strings.NewReplacer(
+		`"request_id":null`, `"request_id":"request-security-1"`,
+		`"trace_id":null`, `"trace_id":"trace-security-1"`,
+		`"authenticated_client_at":null`, `"authenticated_client_at":"2026-08-04T11:59:59.123456Z"`,
+		`"server_received_at":null`, `"server_received_at":"2026-08-04T12:00:00.123456Z"`,
+	).Replace(wantCanonical)
 	if string(canonical) != wantCanonical {
 		t.Fatalf("security denial canonical golden changed:\n got %s\nwant %s", canonical, wantCanonical)
 	}
-	if digest.String() != "cf88ac5ed1306f12814b23c4e749c6fb65323ea8d98d344a336575b73cae29e3" {
+	if digest.String() != "cd6d172d0dcbb13b90fc0449fc0d4e765c0ac5a1a4e630e9ef0d7672b9331150" {
 		t.Fatalf("security denial digest golden changed: %s", digest.String())
 	}
 }
@@ -2013,18 +2348,18 @@ func FuzzCanonicalizeStrictNeverPanics(f *testing.F) {
 
 func newReceiptFixture(t *testing.T) receiptFixture {
 	t.Helper()
-	authority, _ := domain.NewAuthorityID()
-	epoch, _ := domain.NewAuthorityEpoch()
-	installation, _ := domain.NewInstallationID()
-	workspace, _ := domain.NewWorkspaceID()
-	principal, _ := domain.NewPrincipalID()
-	device, _ := domain.NewDeviceID()
-	grant, _ := domain.NewGrantID()
-	membership, _ := domain.NewMembershipID()
-	actor, _ := domain.NewActorID()
-	delegation, _ := domain.NewActorDelegationID()
-	session, _ := domain.NewActorSessionID()
-	client, _ := domain.NewClientInstanceID()
+	authority, _ := domain.ParseAuthorityID(codecUUID(401))
+	epoch, _ := domain.ParseAuthorityEpoch(codecUUID(402))
+	installation, _ := domain.ParseInstallationID(codecUUID(403))
+	workspace, _ := domain.ParseWorkspaceID(codecUUID(404))
+	principal, _ := domain.ParsePrincipalID(codecUUID(405))
+	device, _ := domain.ParseDeviceID(codecUUID(406))
+	grant, _ := domain.ParseGrantID(codecUUID(407))
+	membership, _ := domain.ParseMembershipID(codecUUID(408))
+	actor, _ := domain.ParseActorID(codecUUID(409))
+	delegation, _ := domain.ParseActorDelegationID(codecUUID(410))
+	session, _ := domain.ParseActorSessionID(codecUUID(411))
+	client, _ := domain.ParseClientInstanceID(codecUUID(412))
 	authorization, _ := domain.NewAuthorizationDigest(sha256.Sum256([]byte("receipt authorization")))
 	finalStream, _ := domain.NewStreamDigest(sha256.Sum256([]byte("receipt final stream")))
 	return receiptFixture{
@@ -2059,8 +2394,8 @@ func (fixture receiptFixture) paramsFor(
 		resources = append(resources, fixture.resource(t, kind))
 	}
 	events := make([]domain.EventID, 0, eventCount)
-	for range eventCount {
-		eventID, _ := domain.NewEventID()
+	for index := range eventCount {
+		eventID, _ := domain.ParseEventID(codecUUID(500 + index))
 		events = append(events, eventID)
 	}
 	first, _ := domain.NewStreamPosition(100)
@@ -2117,7 +2452,13 @@ func (fixture receiptFixture) resource(t *testing.T, kind domain.AggregateKind) 
 
 func (fixture receiptFixture) ceremony(t *testing.T, purpose domain.CeremonyPurpose) domain.CeremonyChallenge {
 	t.Helper()
-	id := mustCeremonyID(t)
+	purposeIndex := map[domain.CeremonyPurpose]int{
+		domain.CeremonyPurposeMembershipAcceptance: 601,
+		domain.CeremonyPurposeDelegationActivation: 602,
+		domain.CeremonyPurposeDevicePairing:        603,
+		domain.CeremonyPurposeActorSessionStart:    604,
+	}[purpose]
+	id, _ := domain.ParseCeremonyID(codecUUID(purposeIndex))
 	proof := domain.FingerprintCommand([]byte("receipt ceremony " + string(purpose)))
 	expiresAt := fixture.acceptedAt.Add(time.Minute)
 	var (
