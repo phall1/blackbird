@@ -399,6 +399,7 @@ CREATE TABLE security_denials (
     scope_id TEXT NOT NULL CHECK (length(scope_id) = 36),
     subject_kind TEXT NOT NULL,
     subject_id TEXT,
+    operation TEXT,
     operation_major INTEGER,
     denial_class TEXT NOT NULL,
     reason TEXT NOT NULL,
@@ -406,13 +407,21 @@ CREATE TABLE security_denials (
     occurrence_count INTEGER NOT NULL CHECK (occurrence_count > 0),
     first_recorded_at_us INTEGER NOT NULL CHECK (first_recorded_at_us > 0),
     last_recorded_at_us INTEGER NOT NULL CHECK (last_recorded_at_us >= first_recorded_at_us),
-    PRIMARY KEY (record_kind, denial_fingerprint, bucket),
     CHECK (
         (record_kind = 'bootstrap' AND subject_kind = 'invitation' AND subject_id IS NOT NULL AND
-            operation_major IS NULL AND bucket = 0) OR
-        (record_kind = 'command' AND operation_major IS NOT NULL AND operation_major > 0)
+            operation IS NULL AND operation_major IS NULL AND bucket = 0) OR
+        (record_kind = 'command' AND operation IS NOT NULL AND operation_major IS NOT NULL AND operation_major > 0)
     )
 ) STRICT;
+
+CREATE UNIQUE INDEX security_denials_bootstrap_identity
+    ON security_denials(subject_id, denial_fingerprint)
+    WHERE record_kind = 'bootstrap';
+CREATE UNIQUE INDEX security_denials_command_identity
+    ON security_denials(
+        scope_kind, scope_id, subject_kind, subject_id, operation, operation_major,
+        denial_class, bucket, denial_fingerprint
+    ) WHERE record_kind = 'command';
 
 CREATE TABLE outbox_jobs (
     job_id TEXT PRIMARY KEY CHECK (length(job_id) = 36),

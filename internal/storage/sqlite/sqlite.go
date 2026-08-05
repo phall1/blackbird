@@ -35,7 +35,7 @@ const (
 	maximumBusyTimeout  = 30 * time.Second
 	initialMigrationID  = "0001_w0.sql"
 	maximumReadPoolSize = 5
-	schemaChecksumHex   = "ba46f3d864050e5d964da72698d8c8a13aa39071ad7b37d6a5973987b06c6f1d"
+	schemaChecksumHex   = "053a68afbfa283a58a274d9bd3abb79d2e44c03eb974331f380313dc9228a95c"
 )
 
 var (
@@ -763,10 +763,12 @@ func (store *Store) lockSecurityContext(
 		if spec.Operation() == application.SecurityRecordBootstrapDenial {
 			attempt = application.FreshSecurityAttempt()
 			fingerprint, _ := spec.AttemptFingerprint()
+			expectation, _ := spec.InvitationExpectation()
 			var version uint64
 			var deniedAt int64
 			err = tx.QueryRowContext(ctx, `SELECT occurrence_count, first_recorded_at_us FROM security_denials
-				WHERE record_kind = 'bootstrap' AND denial_fingerprint = ? AND bucket = 0`, fingerprint[:],
+				WHERE record_kind = 'bootstrap' AND subject_id = ? AND denial_fingerprint = ? AND bucket = 0`,
+				expectation.Target().ID(), fingerprint[:],
 			).Scan(&version, &deniedAt)
 			if err == nil {
 				record, recordErr := application.NewSecurityDenialRecord(
@@ -863,17 +865,20 @@ func commandDenialAdmission(
 	denialFingerprint := draft.DenialFingerprint()
 	var duplicate int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM security_denials
-		WHERE record_kind = 'command' AND denial_fingerprint = ? AND bucket = ?`,
-		denialFingerprint[:], bucket,
+		WHERE record_kind = 'command' AND scope_kind = ? AND scope_id = ?
+		AND subject_kind = ? AND subject_id = ? AND operation = ? AND operation_major = ?
+		AND denial_class = ? AND bucket = ? AND denial_fingerprint = ?`,
+		string(spec.Scope().Kind()), spec.Scope().ID(), subjectKind, subjectID, draft.Operation().String(),
+		draft.OperationMajor().Uint16(), string(draft.Class()), bucket, denialFingerprint[:],
 	).Scan(&duplicate); err != nil {
 		return application.DenialAdmission{}, err
 	}
 	var distinct, scopeEntries int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM security_denials WHERE record_kind = 'command'
 		AND scope_kind = ? AND scope_id = ? AND subject_kind = ? AND subject_id = ?
-		AND operation_major = ? AND denial_class = ? AND bucket = ?`,
+		AND operation = ? AND operation_major = ? AND denial_class = ? AND bucket = ?`,
 		string(spec.Scope().Kind()), spec.Scope().ID(), subjectKind, subjectID,
-		draft.OperationMajor().Uint16(), string(draft.Class()), bucket,
+		draft.Operation().String(), draft.OperationMajor().Uint16(), string(draft.Class()), bucket,
 	).Scan(&distinct); err != nil {
 		return application.DenialAdmission{}, err
 	}
@@ -910,9 +915,10 @@ func commandDenialAdmission(
 		var summary int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM security_denials WHERE record_kind = 'command'
 			AND scope_kind = ? AND scope_id = ? AND subject_kind = ? AND subject_id = ?
-			AND operation_major = ? AND denial_class = ? AND bucket = ? AND reason = 'denial_bucket_saturated'`,
+			AND operation = ? AND operation_major = ? AND denial_class = ? AND bucket = ?
+			AND reason = 'denial_bucket_saturated'`,
 			string(spec.Scope().Kind()), spec.Scope().ID(), subjectKind, subjectID,
-			draft.OperationMajor().Uint16(), string(draft.Class()), bucket,
+			draft.Operation().String(), draft.OperationMajor().Uint16(), string(draft.Class()), bucket,
 		).Scan(&summary); err != nil {
 			return application.DenialAdmission{}, err
 		}
@@ -1177,12 +1183,14 @@ func (store *Store) insertCommandDenial(
 	nowMicros := timeMicros(state.authorityTime)
 	return tx.ExecContext(ctx, `INSERT INTO security_denials(
 		record_kind, denial_fingerprint, scope_kind, scope_id, subject_kind, subject_id,
-		operation_major, denial_class, reason, bucket, occurrence_count, first_recorded_at_us, last_recorded_at_us
-	) SELECT 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?
+		operation, operation_major, denial_class, reason, bucket, occurrence_count,
+		first_recorded_at_us, last_recorded_at_us
+	) SELECT 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?
 	WHERE EXISTS (SELECT 1 FROM scope_guards WHERE scope_kind = ? AND scope_id = ?
 		AND authority_id = ? AND authority_epoch = ? AND guard_generation = ?)`,
 		fingerprint[:], string(state.spec.Scope().Kind()), state.spec.Scope().ID(), subjectKind, subjectID,
-		draft.OperationMajor().Uint16(), string(draft.Class()), reason, record.MinuteBucket(), nowMicros, nowMicros,
+		draft.Operation().String(), draft.OperationMajor().Uint16(), string(draft.Class()), reason,
+		record.MinuteBucket(), nowMicros, nowMicros,
 		string(state.spec.Scope().Kind()), state.spec.Scope().ID(), state.spec.AuthorityID().String(),
 		state.spec.AuthorityEpoch().String(), state.spec.AdmissionGeneration().Uint64(),
 	)

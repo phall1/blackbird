@@ -551,9 +551,9 @@ func TestExecuteSecurityScopeDenialSaturationSummaryIsUnique(t *testing.T) {
 			fingerprint := sha256.Sum256([]byte(fmt.Sprintf("scope-entry-%d", index)))
 			if _, err := tx.Exec(`INSERT INTO security_denials(
 				record_kind, denial_fingerprint, scope_kind, scope_id, subject_kind, subject_id,
-				operation_major, denial_class, reason, bucket, occurrence_count,
+				operation, operation_major, denial_class, reason, bucket, occurrence_count,
 				first_recorded_at_us, last_recorded_at_us
-			) VALUES ('command', ?, 'installation', ?, 'unattributed_source', ?, 1,
+			) VALUES ('command', ?, 'installation', ?, 'unattributed_source', ?, 'actor.create.v1', 1,
 				'authentication', 'proof_rejected', ?, 1, 1, 1)`,
 				fingerprint[:], fixture.scope.ID(), fmt.Sprintf("source-%d", index), bucket,
 			); err != nil {
@@ -591,6 +591,37 @@ func TestExecuteSecurityScopeDenialSaturationSummaryIsUnique(t *testing.T) {
 	}
 	if summaries != 1 {
 		t.Fatalf("scope saturation summaries=%d, want 1", summaries)
+	}
+}
+
+func TestSecurityDenialIdentityIsScopedAndOperationSpecific(t *testing.T) {
+	t.Parallel()
+	store := openSecurityStore(t)
+	fingerprint := sha256.Sum256([]byte("same safe denial draft"))
+	insert := func(scopeID, operation string) error {
+		_, err := store.db.Exec(`INSERT INTO security_denials(
+			record_kind, denial_fingerprint, scope_kind, scope_id, subject_kind, subject_id,
+			operation, operation_major, denial_class, reason, bucket, occurrence_count,
+			first_recorded_at_us, last_recorded_at_us
+		) VALUES ('command', ?, 'installation', ?, 'unattributed_source', 'same-source',
+			?, 1, 'authentication', 'proof_rejected', 1, 1, 1, 1)`,
+			fingerprint[:], scopeID, operation,
+		)
+		return err
+	}
+	scopeA := "01b8e094-9888-7000-8000-000000000301"
+	scopeB := "01b8e094-9888-7000-8000-000000000302"
+	if err := insert(scopeA, "actor.create.v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := insert(scopeB, "actor.create.v1"); err != nil {
+		t.Fatalf("same fingerprint in another scope was suppressed: %v", err)
+	}
+	if err := insert(scopeA, "session.start.v1"); err != nil {
+		t.Fatalf("same fingerprint for another operation was suppressed: %v", err)
+	}
+	if err := insert(scopeA, "actor.create.v1"); err == nil {
+		t.Fatal("exact scoped denial identity was accepted twice")
 	}
 }
 
