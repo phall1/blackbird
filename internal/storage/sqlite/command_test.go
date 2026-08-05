@@ -627,13 +627,18 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 			t.Fatal(err)
 		}
 		checkpointID, _ := application.NewCheckpointID("checkpoint:sqlite-production")
-		contextQuery, _ := application.NewContextGetQuery(subject, checkpointID)
-		checkpoint, err := store.GetContext(context.Background(), contextQuery)
+		contextQuery, _ := application.NewContextGetQuery(subject, checkpointID, application.EventCursor{}, 2)
+		contextPage, err := store.GetContext(context.Background(), contextQuery)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if checkpoint.CheckpointID() != checkpointID || checkpoint.ThroughCursor().IsZero() ||
-			checkpoint.Session().WorkspaceID() != workspace.ID() || len(checkpoint.Records()) != 6 {
+		checkpoint, present := contextPage.Checkpoint()
+		if !present || checkpoint.CheckpointID() != checkpointID || checkpoint.ThroughCursor().IsZero() ||
+			checkpoint.AuthorityID() != security.authority || checkpoint.AuthorityEpoch() != security.epoch ||
+			checkpoint.ProjectionVersion() != 1 || checkpoint.ServerTime().IsZero() ||
+			checkpoint.Session().WorkspaceID() != workspace.ID() || len(checkpoint.Records()) != 6 ||
+			contextPage.NextCursor() != checkpoint.ThroughCursor() || contextPage.HeadCursor() != checkpoint.ThroughCursor() ||
+			contextPage.HasMore() || len(contextPage.Deltas()) != 0 {
 			t.Fatalf("unexpected context checkpoint records=%d cursor=%q", len(checkpoint.Records()), checkpoint.ThroughCursor().String())
 		}
 		records := checkpoint.Records()
@@ -651,6 +656,18 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		if len(first.Events()) != 2 || !first.HasMore() || first.NextCursor().IsZero() {
 			t.Fatalf("first event page events=%d has_more=%v", len(first.Events()), first.HasMore())
 		}
+		for _, event := range first.Events() {
+			if event.EventVersion().IsZero() || event.AuthorityID() != security.authority ||
+				event.AuthorityEpoch() != security.epoch || event.Scope() != workspaceScope ||
+				!event.OriginPosition().Valid() || event.Aggregate().IsZero() || event.PrincipalID().IsZero() ||
+				event.CommandID().IsZero() || event.CorrelationID().IsZero() || event.OccurredAt().IsZero() ||
+				event.RecordedAt().IsZero() || len(event.Payload()) == 0 {
+				t.Fatal("event sync omitted required envelope headers")
+			}
+		}
+		if first.HeadCursor() != checkpoint.ThroughCursor() || first.NextCursor() == first.HeadCursor() {
+			t.Fatal("event page did not expose distinct next and head cursors")
+		}
 		secondQuery, _ := application.NewEventsSyncQuery(subject, first.NextCursor(), 2)
 		second, err := store.SyncEvents(context.Background(), secondQuery)
 		if err != nil {
@@ -658,6 +675,27 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		}
 		if len(second.Events()) != 2 || second.Events()[0].Sequence() <= first.Events()[1].Sequence() {
 			t.Fatal("event cursor did not advance in journal order")
+		}
+		deltaQuery, _ := application.NewContextGetQuery(subject, checkpointID, first.NextCursor(), 2)
+		deltaPage, err := store.GetContext(context.Background(), deltaQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, present := deltaPage.Checkpoint(); present || len(deltaPage.Deltas()) != 2 || !deltaPage.HasMore() ||
+			deltaPage.NextCursor() != deltaPage.Deltas()[1].AfterCursor() || deltaPage.HeadCursor() != checkpoint.ThroughCursor() {
+			t.Fatalf("unexpected context delta page deltas=%d has_more=%v", len(deltaPage.Deltas()), deltaPage.HasMore())
+		}
+		for _, delta := range deltaPage.Deltas() {
+			if delta.EventID().IsZero() || delta.DeltaType() != application.ContextDeltaUpsert ||
+				delta.Resource().IsZero() || !delta.Version().Valid() || len(delta.Value()) == 0 {
+				t.Fatal("context delta omitted required projected state")
+			}
+		}
+		nextDeltaQuery, _ := application.NewContextGetQuery(subject, checkpointID, deltaPage.NextCursor(), 2)
+		nextDeltaPage, err := store.GetContext(context.Background(), nextDeltaQuery)
+		if err != nil || len(nextDeltaPage.Deltas()) == 0 ||
+			nextDeltaPage.Deltas()[0].AfterCursor() == deltaPage.Deltas()[1].AfterCursor() {
+			t.Fatalf("context delta cursor did not advance: deltas=%d error=%v", len(nextDeltaPage.Deltas()), err)
 		}
 		checkpointSync, _ := application.NewEventsSyncQuery(subject, checkpoint.ThroughCursor(), 2)
 		current, err := store.SyncEvents(context.Background(), checkpointSync)
@@ -668,6 +706,9 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		invalidQuery, _ := application.NewEventsSyncQuery(subject, invalidCursor, 2)
 		_, err = store.SyncEvents(context.Background(), invalidQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorInvalid)
+		invalidContextQuery, _ := application.NewContextGetQuery(subject, checkpointID, invalidCursor, 2)
+		_, err = store.GetContext(context.Background(), invalidContextQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorInvalid)
 
 		otherWorkspace, _ := domain.ParseWorkspaceID(commandTestUUID(199))
 		var digest [sha256.Size]byte
@@ -675,12 +716,23 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		mismatchQuery, _ := application.NewEventsSyncQuery(subject, otherCursor, 2)
 		_, err = store.SyncEvents(context.Background(), mismatchQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorScopeMismatch)
+		mismatchContextQuery, _ := application.NewContextGetQuery(subject, checkpointID, otherCursor, 2)
+		_, err = store.GetContext(context.Background(), mismatchContextQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorScopeMismatch)
+
+		otherEpoch, _ := domain.ParseAuthorityEpoch(commandTestUUID(198))
+		expiredCursor, _ := encodeEventCursor(workspace.ID(), otherEpoch, 0, digest)
+		expiredContextQuery, _ := application.NewContextGetQuery(subject, checkpointID, expiredCursor, 2)
+		_, err = store.GetContext(context.Background(), expiredContextQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
 
 		if _, err = store.db.Exec(`UPDATE authority_streams SET retained_from_sequence = 4
 			WHERE scope_kind = 'workspace' AND scope_id = ?`, workspace.ID().String()); err != nil {
 			t.Fatal(err)
 		}
 		_, err = store.SyncEvents(context.Background(), secondQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
+		_, err = store.GetContext(context.Background(), deltaQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
 		if _, err = store.db.Exec(`UPDATE authority_streams SET retained_from_sequence = 1
 			WHERE scope_kind = 'workspace' AND scope_id = ?`, workspace.ID().String()); err != nil {
@@ -691,6 +743,9 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		cancel()
 		if _, err = store.GetContext(cancelled, contextQuery); !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled context query error=%v", err)
+		}
+		if _, err = store.SyncEvents(cancelled, pageQuery); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled event query error=%v", err)
 		}
 
 		var originalExpiry int64
@@ -710,12 +765,15 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 	t.Run("production queries reject stale session authorization revisions", func(t *testing.T) {
 		subject, _ := application.NewQuerySubject(workload.ID(), sessionID)
 		checkpointID, _ := application.NewCheckpointID("checkpoint:stale-authorization")
-		query, _ := application.NewContextGetQuery(subject, checkpointID)
+		query, _ := application.NewContextGetQuery(subject, checkpointID, application.EventCursor{}, 2)
 		if _, err := store.db.Exec(`UPDATE workspace_memberships SET version = version + 1
 			WHERE membership_id = ?`, membershipID.String()); err != nil {
 			t.Fatal(err)
 		}
 		_, err := store.GetContext(context.Background(), query)
+		assertQueryErrorCode(t, err, domain.ErrorCodeForbidden)
+		eventsQuery, _ := application.NewEventsSyncQuery(subject, application.EventCursor{}, 2)
+		_, err = store.SyncEvents(context.Background(), eventsQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeForbidden)
 		if _, err = store.db.Exec(`UPDATE workspace_memberships SET version = version - 1
 			WHERE membership_id = ?`, membershipID.String()); err != nil {

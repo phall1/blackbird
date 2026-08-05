@@ -160,6 +160,65 @@ CREATE TABLE actor_session_grant_revisions (
     session_id uuid NOT NULL REFERENCES actor_sessions, grant_id uuid NOT NULL REFERENCES grants,
     grant_version bigint NOT NULL CHECK (grant_version BETWEEN 1 AND 9007199254740991), PRIMARY KEY (session_id, grant_id)
 );
+CREATE TABLE work_references (
+    work_reference_id uuid PRIMARY KEY, workspace_id uuid NOT NULL REFERENCES workspaces,
+    provider_namespace text NOT NULL CHECK (length(provider_namespace) BETWEEN 1 AND 4096),
+    provider_object_id text NOT NULL CHECK (length(provider_object_id) BETWEEN 1 AND 4096),
+    provider_locator text NOT NULL CHECK (length(provider_locator) BETWEEN 1 AND 4096),
+    provider_version text NOT NULL CHECK (length(provider_version) BETWEEN 1 AND 4096),
+    selected_fields jsonb NOT NULL CHECK (octet_length(selected_fields::text) BETWEEN 2 AND 65536),
+    adapter_principal_id uuid NOT NULL REFERENCES principals,
+    observed_at_us bigint NOT NULL CHECK (observed_at_us > 0),
+    version bigint NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us bigint NOT NULL CHECK (created_at_us > 0),
+    updated_at_us bigint NOT NULL CHECK (updated_at_us >= created_at_us),
+    UNIQUE (workspace_id, provider_namespace, provider_object_id)
+);
+CREATE TABLE objectives (
+    objective_id uuid PRIMARY KEY, workspace_id uuid NOT NULL REFERENCES workspaces,
+    title text NOT NULL CHECK (length(title) BETWEEN 1 AND 512),
+    acceptance_criteria text NOT NULL CHECK (length(acceptance_criteria) BETWEEN 1 AND 8192),
+    status text NOT NULL CHECK (status IN ('draft', 'active')),
+    version bigint NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us bigint NOT NULL CHECK (created_at_us > 0),
+    updated_at_us bigint NOT NULL CHECK (updated_at_us >= created_at_us),
+    CHECK ((status = 'draft' AND version = 1) OR (status = 'active' AND version >= 2))
+);
+CREATE TABLE work_units (
+    work_unit_id uuid PRIMARY KEY, workspace_id uuid NOT NULL REFERENCES workspaces,
+    objective_id uuid NOT NULL REFERENCES objectives, work_reference_id uuid NOT NULL REFERENCES work_references,
+    title text NOT NULL CHECK (length(title) BETWEEN 1 AND 512),
+    status text NOT NULL CHECK (status = 'proposed'), version bigint NOT NULL CHECK (version = 1),
+    created_at_us bigint NOT NULL CHECK (created_at_us > 0),
+    updated_at_us bigint NOT NULL CHECK (updated_at_us >= created_at_us), UNIQUE (workspace_id, work_unit_id)
+);
+CREATE TABLE runs (
+    run_id uuid PRIMARY KEY, workspace_id uuid NOT NULL REFERENCES workspaces,
+    objective_id uuid NOT NULL REFERENCES objectives, work_unit_id uuid NOT NULL REFERENCES work_units,
+    operator_actor_id uuid NOT NULL REFERENCES actors,
+    status text NOT NULL CHECK (status IN ('planned', 'starting')),
+    version bigint NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us bigint NOT NULL CHECK (created_at_us > 0),
+    updated_at_us bigint NOT NULL CHECK (updated_at_us >= created_at_us),
+    CHECK ((status = 'planned' AND version = 1) OR (status = 'starting' AND version >= 2))
+);
+CREATE TABLE run_participations (
+    participation_id uuid PRIMARY KEY, run_id uuid NOT NULL REFERENCES runs, actor_id uuid NOT NULL REFERENCES actors,
+    role text NOT NULL CHECK (length(role) BETWEEN 1 AND 128), session_id uuid REFERENCES actor_sessions,
+    status text NOT NULL CHECK (status IN ('invited', 'active')),
+    version bigint NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us bigint NOT NULL CHECK (created_at_us > 0),
+    updated_at_us bigint NOT NULL CHECK (updated_at_us >= created_at_us), UNIQUE (run_id, actor_id),
+    CHECK ((status = 'invited' AND session_id IS NULL AND version = 1) OR
+           (status = 'active' AND session_id IS NOT NULL AND version >= 2))
+);
+CREATE TABLE runtime_bindings (
+    binding_id uuid PRIMARY KEY, run_id uuid NOT NULL REFERENCES runs,
+    participation_id uuid NOT NULL REFERENCES run_participations, session_id uuid NOT NULL REFERENCES actor_sessions,
+    runtime_endpoint_id uuid NOT NULL, status text NOT NULL CHECK (status = 'requested'),
+    version bigint NOT NULL CHECK (version = 1), created_at_us bigint NOT NULL CHECK (created_at_us > 0),
+    updated_at_us bigint NOT NULL CHECK (updated_at_us >= created_at_us), UNIQUE (run_id, binding_id)
+);
 CREATE TABLE ceremony_challenges (
     ceremony_id uuid PRIMARY KEY, scope_kind text NOT NULL CHECK (scope_kind IN ('installation', 'workspace')), scope_id uuid NOT NULL,
     purpose text NOT NULL, proof_fingerprint bytea NOT NULL CHECK (octet_length(proof_fingerprint) = 32),

@@ -71,18 +71,18 @@ func (store *Store) ExecuteCommand(
 			return nil
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("lock SQLite command context: %w", err)
 		}
 		decision, err := decide(locked)
 		if err != nil {
-			return err
+			return fmt.Errorf("decide SQLite command: %w", err)
 		}
 		if err := application.ValidateCommandDecision(locked, decision); err != nil {
-			return err
+			return fmt.Errorf("validate SQLite command decision: %w", err)
 		}
 		execution, err = store.applyCommandDecision(ctx, tx, state, decision)
 		if err != nil {
-			return err
+			return fmt.Errorf("apply SQLite command decision: %w", err)
 		}
 		if decision.Kind() == application.CommandDecisionReplay || decision.Kind() == application.CommandDecisionRollback {
 			return errCommandNoCommit
@@ -597,12 +597,31 @@ func (store *Store) rehydrateReceipt(ctx context.Context, tx *sql.Tx, spec appli
 		}
 		draft = &value
 	}
+	eventCursor, err := commandEventCursor(header.identity.Scope(), header.epoch, last, header.finalDigest)
+	if err != nil {
+		return application.ReceiptSnapshot{}, err
+	}
 	return application.NewReceiptSnapshot(application.ReceiptSnapshotParams{
 		ReceiptID: header.receiptID, CommandID: header.commandID, Identity: header.identity,
 		RequestFingerprint: header.requestFingerprint, Result: result, AuthorityID: header.authorityID,
-		AuthorityEpoch: header.epoch, GuardDigest: header.guardDigest, Events: events,
+		AuthorityEpoch: header.epoch, GuardDigest: header.guardDigest, Events: events, EventCursor: eventCursor,
 		CapsuleRequirement: plan.Requirement(), RecoveryCapsule: draft,
 	})
+}
+
+func commandEventCursor(scope domain.AuthorityScope, epoch domain.AuthorityEpoch, position domain.StreamPosition,
+	digest domain.StreamDigest) (application.EventCursor, error) {
+	if scope.Kind() == domain.ScopeKindWorkspace {
+		workspace, err := domain.ParseWorkspaceID(scope.ID())
+		if err != nil {
+			return application.EventCursor{}, err
+		}
+		return encodeEventCursor(workspace, epoch, position.Uint64(), digest.Bytes())
+	}
+	material := fmt.Sprintf("blackbird-receipt-cursor/v1\x00%s\x00%s\x00%s\x00%d\x00%s",
+		scope.Kind(), scope.ID(), epoch.String(), position.Uint64(), digest.String())
+	checksum := sha256.Sum256([]byte(material))
+	return application.NewEventCursor("bbec1_receipt_" + hex.EncodeToString(checksum[:]))
 }
 
 func (store *Store) applyCommandDecision(ctx context.Context, tx *sql.Tx, state lockedCommandState, decision application.CommandDecision) (application.CommandTransactionExecution, error) {
@@ -697,7 +716,7 @@ func (store *Store) commitAppliedCommand(ctx context.Context, tx *sql.Tx, state 
 	}
 	result, err := codec.MaterializeReceiptResult(decision.ResultPlan(), first, last, previous)
 	if err != nil {
-		return application.CommandTransactionExecution{}, err
+		return application.CommandTransactionExecution{}, fmt.Errorf("materialize SQLite command receipt: %w", err)
 	}
 	var capsule *application.RecoveryCapsuleDraft
 	if spec.RecoveryCapsule().Requirement() == application.RecoveryCapsuleRequired {
@@ -711,14 +730,19 @@ func (store *Store) commitAppliedCommand(ctx context.Context, tx *sql.Tx, state 
 		}
 		capsule = &draft
 	}
-	receipt, err := application.NewReceiptSnapshot(application.ReceiptSnapshotParams{ReceiptID: spec.ReceiptID(), CommandID: spec.CommandID(), Identity: spec.ReceiptIdentity(),
-		RequestFingerprint: spec.RequestFingerprint(), Result: result, AuthorityID: spec.AuthorityID(), AuthorityEpoch: spec.RequestedEpoch(),
-		GuardDigest: state.evidence.Digest(), Events: eventRange, CapsuleRequirement: spec.RecoveryCapsule().Requirement(), RecoveryCapsule: capsule})
+	eventCursor, err := commandEventCursor(spec.Scope(), spec.RequestedEpoch(), last, previous)
 	if err != nil {
 		return application.CommandTransactionExecution{}, err
 	}
+	receipt, err := application.NewReceiptSnapshot(application.ReceiptSnapshotParams{ReceiptID: spec.ReceiptID(), CommandID: spec.CommandID(), Identity: spec.ReceiptIdentity(),
+		RequestFingerprint: spec.RequestFingerprint(), Result: result, AuthorityID: spec.AuthorityID(), AuthorityEpoch: spec.RequestedEpoch(),
+		GuardDigest: state.evidence.Digest(), Events: eventRange, EventCursor: eventCursor,
+		CapsuleRequirement: spec.RecoveryCapsule().Requirement(), RecoveryCapsule: capsule})
+	if err != nil {
+		return application.CommandTransactionExecution{}, fmt.Errorf("construct SQLite command receipt: %w", err)
+	}
 	if err := insertCommandReceipt(ctx, tx, receipt, decision.ResultPlan(), previous, state.time.Value()); err != nil {
-		return application.CommandTransactionExecution{}, err
+		return application.CommandTransactionExecution{}, fmt.Errorf("insert SQLite command receipt: %w", err)
 	}
 	for _, event := range events {
 		if err := insertDomainEvent(ctx, tx, event); err != nil {
@@ -732,7 +756,7 @@ func (store *Store) commitAppliedCommand(ctx context.Context, tx *sql.Tx, state 
 		return application.CommandTransactionExecution{}, err
 	}
 	if err := verifyFinalCommandState(ctx, tx, state, decision); err != nil {
-		return application.CommandTransactionExecution{}, err
+		return application.CommandTransactionExecution{}, fmt.Errorf("verify final SQLite command state: %w", err)
 	}
 	if err := advanceCommandStream(ctx, tx, state, previous, uint64(len(events))); err != nil {
 		return application.CommandTransactionExecution{}, err
@@ -918,6 +942,64 @@ func writeIdentityState(ctx context.Context, tx *sql.Tx, state application.Ident
 		}
 	case domain.ActorSessionState:
 		result, err = insertActorSessionState(ctx, tx, value, timestamp)
+	case domain.WorkReferenceState:
+		observation := value.Observation()
+		if current == 1 {
+			result, err = tx.ExecContext(ctx, `INSERT INTO work_references(work_reference_id, workspace_id,
+				provider_namespace, provider_object_id, provider_locator, provider_version, selected_fields,
+				adapter_principal_id, observed_at_us, version, created_at_us, updated_at_us)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.ID().String(), value.WorkspaceID().String(),
+				observation.Namespace().String(), observation.ObjectID().String(), observation.Locator().String(),
+				observation.ProviderVersion().String(), observation.Fields().Bytes(), observation.AdapterPrincipalID().String(),
+				timeMicros(observation.ObservedAt()), current, timestamp, timestamp)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE work_references SET provider_locator = ?, provider_version = ?,
+				selected_fields = ?, observed_at_us = ?, version = ?, updated_at_us = ? WHERE work_reference_id = ?
+				AND provider_namespace = ? AND provider_object_id = ? AND adapter_principal_id = ? AND version = ?`,
+				observation.Locator().String(), observation.ProviderVersion().String(), observation.Fields().Bytes(),
+				timeMicros(observation.ObservedAt()), current, timestamp, value.ID().String(), observation.Namespace().String(),
+				observation.ObjectID().String(), observation.AdapterPrincipalID().String(), prior)
+		}
+	case domain.ObjectiveState:
+		if current == 1 {
+			result, err = tx.ExecContext(ctx, `INSERT INTO objectives(objective_id, workspace_id, title,
+				acceptance_criteria, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				value.ID().String(), value.WorkspaceID().String(), value.Title(), value.AcceptanceCriteria(),
+				string(value.Status()), current, timestamp, timestamp)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE objectives SET status = ?, version = ?, updated_at_us = ?
+				WHERE objective_id = ? AND version = ?`, string(value.Status()), current, timestamp, value.ID().String(), prior)
+		}
+	case domain.WorkUnitState:
+		result, err = tx.ExecContext(ctx, `INSERT INTO work_units(work_unit_id, workspace_id, objective_id,
+			work_reference_id, title, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			value.ID().String(), value.WorkspaceID().String(), value.ObjectiveID().String(), value.WorkReferenceID().String(),
+			value.Title(), string(value.Status()), current, timestamp, timestamp)
+	case domain.RunState:
+		if current == 1 {
+			result, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id, workspace_id, objective_id, work_unit_id,
+				operator_actor_id, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				value.ID().String(), value.WorkspaceID().String(), value.ObjectiveID().String(), value.WorkUnitID().String(),
+				value.OperatorID().String(), string(value.Status()), current, timestamp, timestamp)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE runs SET status = ?, version = ?, updated_at_us = ?
+				WHERE run_id = ? AND version = ?`, string(value.Status()), current, timestamp, value.ID().String(), prior)
+		}
+	case domain.RunParticipationState:
+		if current == 1 {
+			result, err = tx.ExecContext(ctx, `INSERT INTO run_participations(participation_id, run_id, actor_id,
+				role, session_id, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+				value.ID().String(), value.RunID().String(), value.ActorID().String(), value.Role(), string(value.Status()), current, timestamp, timestamp)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE run_participations SET session_id = ?, status = ?, version = ?,
+				updated_at_us = ? WHERE participation_id = ? AND version = ?`, value.ActorSessionID().String(),
+				string(value.Status()), current, timestamp, value.ID().String(), prior)
+		}
+	case domain.RuntimeBindingState:
+		result, err = tx.ExecContext(ctx, `INSERT INTO runtime_bindings(binding_id, run_id, participation_id,
+			session_id, runtime_endpoint_id, status, version, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			value.ID().String(), value.RunID().String(), value.ParticipationID().String(), value.ActorSessionID().String(),
+			value.RuntimeEndpointID().String(), string(value.Status()), current, timestamp, timestamp)
 	default:
 		return application.ErrInvalidCommandDecision
 	}
@@ -1310,6 +1392,16 @@ func identityStateMatchesEvidence(state application.IdentityState, guard applica
 			return string(value.Status()) == status
 		case domain.ActorSessionState:
 			return string(value.Status()) == status
+		case domain.ObjectiveState:
+			return string(value.Status()) == status
+		case domain.WorkUnitState:
+			return string(value.Status()) == status
+		case domain.RunState:
+			return string(value.Status()) == status
+		case domain.RunParticipationState:
+			return string(value.Status()) == status
+		case domain.RuntimeBindingState:
+			return string(value.Status()) == status
 		}
 	case application.EvidenceDeviceTrustRevision:
 		revision, _ := guard.Revision()
@@ -1423,6 +1515,48 @@ func aggregateRefFromParts(kind domain.AggregateKind, id string, version domain.
 		return domain.NewAggregateRef(value, version)
 	case domain.AggregateKindActorSession:
 		value, err := domain.ParseActorSessionID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindWorkReference:
+		value, err := domain.ParseWorkReferenceID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindObjective:
+		value, err := domain.ParseObjectiveID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindWorkUnit:
+		value, err := domain.ParseWorkUnitID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRun:
+		value, err := domain.ParseRunID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRunParticipation:
+		value, err := domain.ParseRunParticipationID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRuntimeBinding:
+		value, err := domain.ParseRuntimeBindingID(id)
+		if err != nil {
+			return domain.AggregateRef{}, err
+		}
+		return domain.NewAggregateRef(value, version)
+	case domain.AggregateKindRuntimeEndpoint:
+		value, err := domain.ParseRuntimeEndpointID(id)
 		if err != nil {
 			return domain.AggregateRef{}, err
 		}
@@ -1594,6 +1728,18 @@ func stateTable(kind domain.AggregateKind) (string, string, error) {
 		return "actor_delegations", "delegation_id", nil
 	case domain.AggregateKindActorSession:
 		return "actor_sessions", "session_id", nil
+	case domain.AggregateKindWorkReference:
+		return "work_references", "work_reference_id", nil
+	case domain.AggregateKindObjective:
+		return "objectives", "objective_id", nil
+	case domain.AggregateKindWorkUnit:
+		return "work_units", "work_unit_id", nil
+	case domain.AggregateKindRun:
+		return "runs", "run_id", nil
+	case domain.AggregateKindRunParticipation:
+		return "run_participations", "participation_id", nil
+	case domain.AggregateKindRuntimeBinding:
+		return "runtime_bindings", "binding_id", nil
 	default:
 		return "", "", application.ErrInvalidCommandContext
 	}
@@ -1621,6 +1767,18 @@ func loadIdentityState(ctx context.Context, tx *sql.Tx, target domain.AggregateT
 		value, err = loadDelegationState(ctx, tx, target.ID())
 	case domain.AggregateKindActorSession:
 		value, err = loadActorSessionState(ctx, tx, target.ID())
+	case domain.AggregateKindWorkReference:
+		value, err = loadWorkReferenceState(ctx, tx, target.ID())
+	case domain.AggregateKindObjective:
+		value, err = loadObjectiveState(ctx, tx, target.ID())
+	case domain.AggregateKindWorkUnit:
+		value, err = loadWorkUnitState(ctx, tx, target.ID())
+	case domain.AggregateKindRun:
+		value, err = loadRunState(ctx, tx, target.ID())
+	case domain.AggregateKindRunParticipation:
+		value, err = loadRunParticipationState(ctx, tx, target.ID())
+	case domain.AggregateKindRuntimeBinding:
+		value, err = loadRuntimeBindingState(ctx, tx, target.ID())
 	default:
 		err = application.ErrInvalidCommandContext
 	}
@@ -2130,6 +2288,203 @@ func loadActorSessionState(ctx context.Context, tx *sql.Tx, id string) (domain.A
 		return domain.ActorSessionState{}, err
 	}
 	return domain.RehydrateActorSession(domain.ActorSessionRehydrationParams{ID: sid, ClientInstanceID: cid, ClientMetadata: metadata, Status: domain.ActorSessionStatus(status), Version: mustVersion(version), Binding: binding, Capabilities: set, PresentationCredential: presentation})
+}
+
+func loadWorkReferenceState(ctx context.Context, tx *sql.Tx, id string) (domain.WorkReferenceState, error) {
+	var workReferenceID, workspaceID, namespace, objectID, locator, providerVersion, adapterID string
+	var fields []byte
+	var observedAt int64
+	var version uint64
+	err := tx.QueryRowContext(ctx, `SELECT work_reference_id, workspace_id, provider_namespace, provider_object_id,
+		provider_locator, provider_version, selected_fields, adapter_principal_id, observed_at_us, version
+		FROM work_references WHERE work_reference_id = ?`, id).Scan(&workReferenceID, &workspaceID, &namespace,
+		&objectID, &locator, &providerVersion, &fields, &adapterID, &observedAt, &version)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	wid, err := domain.ParseWorkReferenceID(workReferenceID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	adapter, err := domain.ParsePrincipalID(adapterID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	namespaceValue, err := domain.NewOpaqueProviderValue(namespace)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	objectValue, err := domain.NewOpaqueProviderValue(objectID)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	locatorValue, err := domain.NewOpaqueProviderValue(locator)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	versionValue, err := domain.NewOpaqueProviderValue(providerVersion)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	payload, err := domain.NewEventPayload(fields)
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	observation, err := domain.NewProviderObservation(namespaceValue, objectValue, locatorValue, versionValue, payload, adapter, microsTime(observedAt))
+	if err != nil {
+		return domain.WorkReferenceState{}, err
+	}
+	return domain.RehydrateWorkReference(domain.WorkReferenceRehydrationParams{ID: wid, WorkspaceID: workspace, Observation: observation, Version: mustVersion(version)})
+}
+
+func loadObjectiveState(ctx context.Context, tx *sql.Tx, id string) (domain.ObjectiveState, error) {
+	var objectiveID, workspaceID, title, criteria, status string
+	var version uint64
+	err := tx.QueryRowContext(ctx, `SELECT objective_id, workspace_id, title, acceptance_criteria, status, version
+		FROM objectives WHERE objective_id = ?`, id).Scan(&objectiveID, &workspaceID, &title, &criteria, &status, &version)
+	if err != nil {
+		return domain.ObjectiveState{}, err
+	}
+	oid, err := domain.ParseObjectiveID(objectiveID)
+	if err != nil {
+		return domain.ObjectiveState{}, err
+	}
+	wid, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.ObjectiveState{}, err
+	}
+	return domain.RehydrateObjective(domain.ObjectiveRehydrationParams{ID: oid, WorkspaceID: wid, Title: title,
+		AcceptanceCriteria: criteria, Status: domain.ObjectiveStatus(status), Version: mustVersion(version)})
+}
+
+func loadWorkUnitState(ctx context.Context, tx *sql.Tx, id string) (domain.WorkUnitState, error) {
+	var workUnitID, workspaceID, objectiveID, workReferenceID, title, status string
+	var version uint64
+	err := tx.QueryRowContext(ctx, `SELECT work_unit_id, workspace_id, objective_id, work_reference_id, title, status,
+		version FROM work_units WHERE work_unit_id = ?`, id).Scan(&workUnitID, &workspaceID, &objectiveID,
+		&workReferenceID, &title, &status, &version)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	wid, err := domain.ParseWorkUnitID(workUnitID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	objective, err := domain.ParseObjectiveID(objectiveID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	workReference, err := domain.ParseWorkReferenceID(workReferenceID)
+	if err != nil {
+		return domain.WorkUnitState{}, err
+	}
+	return domain.RehydrateWorkUnit(domain.WorkUnitRehydrationParams{ID: wid, WorkspaceID: workspace, ObjectiveID: objective,
+		WorkReferenceID: workReference, Title: title, Status: domain.WorkUnitStatus(status), Version: mustVersion(version)})
+}
+
+func loadRunState(ctx context.Context, tx *sql.Tx, id string) (domain.RunState, error) {
+	var runID, workspaceID, objectiveID, workUnitID, operatorID, status string
+	var version uint64
+	err := tx.QueryRowContext(ctx, `SELECT run_id, workspace_id, objective_id, work_unit_id, operator_actor_id, status,
+		version FROM runs WHERE run_id = ?`, id).Scan(&runID, &workspaceID, &objectiveID, &workUnitID, &operatorID, &status, &version)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	rid, err := domain.ParseRunID(runID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	workspace, err := domain.ParseWorkspaceID(workspaceID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	objective, err := domain.ParseObjectiveID(objectiveID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	workUnit, err := domain.ParseWorkUnitID(workUnitID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	operator, err := domain.ParseActorID(operatorID)
+	if err != nil {
+		return domain.RunState{}, err
+	}
+	return domain.RehydrateRun(domain.RunRehydrationParams{ID: rid, WorkspaceID: workspace, ObjectiveID: objective,
+		WorkUnitID: workUnit, OperatorID: operator, Status: domain.RunStatus(status), Version: mustVersion(version)})
+}
+
+func loadRunParticipationState(ctx context.Context, tx *sql.Tx, id string) (domain.RunParticipationState, error) {
+	var participationID, runID, actorID, role, status string
+	var sessionID sql.NullString
+	var version uint64
+	err := tx.QueryRowContext(ctx, `SELECT participation_id, run_id, actor_id, role, session_id, status, version
+		FROM run_participations WHERE participation_id = ?`, id).Scan(&participationID, &runID, &actorID, &role, &sessionID, &status, &version)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	pid, err := domain.ParseRunParticipationID(participationID)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	rid, err := domain.ParseRunID(runID)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	actor, err := domain.ParseActorID(actorID)
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	var session domain.ActorSessionID
+	if sessionID.Valid {
+		session, err = domain.ParseActorSessionID(sessionID.String)
+	}
+	if err != nil {
+		return domain.RunParticipationState{}, err
+	}
+	return domain.RehydrateRunParticipation(domain.RunParticipationRehydrationParams{ID: pid, RunID: rid, ActorID: actor,
+		Role: role, ActorSessionID: session, Status: domain.RunParticipationStatus(status), Version: mustVersion(version)})
+}
+
+func loadRuntimeBindingState(ctx context.Context, tx *sql.Tx, id string) (domain.RuntimeBindingState, error) {
+	var bindingID, runID, participationID, sessionID, endpointID, status string
+	var version uint64
+	err := tx.QueryRowContext(ctx, `SELECT binding_id, run_id, participation_id, session_id, runtime_endpoint_id,
+		status, version FROM runtime_bindings WHERE binding_id = ?`, id).Scan(&bindingID, &runID, &participationID,
+		&sessionID, &endpointID, &status, &version)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	bid, err := domain.ParseRuntimeBindingID(bindingID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	rid, err := domain.ParseRunID(runID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	pid, err := domain.ParseRunParticipationID(participationID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	sid, err := domain.ParseActorSessionID(sessionID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	eid, err := domain.ParseRuntimeEndpointID(endpointID)
+	if err != nil {
+		return domain.RuntimeBindingState{}, err
+	}
+	return domain.RehydrateRuntimeBinding(domain.RuntimeBindingRehydrationParams{ID: bid, RunID: rid, ParticipationID: pid,
+		ActorSessionID: sid, RuntimeEndpointID: eid, Status: domain.RuntimeBindingStatus(status), Version: mustVersion(version)})
 }
 
 func loadOptionalCeremonyByOwner(ctx context.Context, tx *sql.Tx, purpose domain.CeremonyPurpose, column, id string) (domain.CeremonyChallenge, error) {

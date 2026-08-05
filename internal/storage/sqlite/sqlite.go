@@ -35,7 +35,7 @@ const (
 	maximumBusyTimeout  = 30 * time.Second
 	initialMigrationID  = "0001_w0.sql"
 	maximumReadPoolSize = 5
-	schemaChecksumHex   = "c65ad6fe01a576d2777cdcdd69869c124d27f00818dd0b4199137c335e673fdd"
+	schemaChecksumHex   = "b72cf72313dcfadc39ce59d83c35bd7d99ef85918eee6542a1e1372baf44e17d"
 )
 
 var (

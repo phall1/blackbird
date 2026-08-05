@@ -33,15 +33,16 @@ const (
 	migrationLockID     = int64(0x42424d4c)
 	MaxCanonicalInteger = int64(9_007_199_254_740_991)
 
-	defaultApplicationName  = "blackbird"
-	defaultAcquireTimeout   = 5 * time.Second
-	defaultConnectTimeout   = 5 * time.Second
-	defaultStatementTimeout = 10 * time.Second
-	defaultLockTimeout      = 5 * time.Second
-	defaultIdleTxTimeout    = 10 * time.Second
-	defaultHealthCheck      = 30 * time.Second
-	defaultMaxConnLifetime  = 30 * time.Minute
-	defaultMaxConnIdleTime  = 5 * time.Minute
+	defaultApplicationName   = "blackbird"
+	defaultAcquireTimeout    = 5 * time.Second
+	defaultConnectTimeout    = 5 * time.Second
+	defaultStatementTimeout  = 10 * time.Second
+	defaultLockTimeout       = 5 * time.Second
+	defaultIdleTxTimeout     = 10 * time.Second
+	defaultHealthCheck       = 30 * time.Second
+	defaultMaxConnLifetime   = 30 * time.Minute
+	defaultMaxConnIdleTime   = 5 * time.Minute
+	contextProjectionVersion = uint32(1)
 )
 
 var (
@@ -107,9 +108,11 @@ type eventCursorWire struct {
 }
 
 type authorizedQueryState struct {
-	view      application.AuthorizedSessionView
-	workspace domain.WorkspaceID
-	epoch     domain.AuthorityEpoch
+	view       application.AuthorizedSessionView
+	workspace  domain.WorkspaceID
+	authority  domain.AuthorityID
+	epoch      domain.AuthorityEpoch
+	serverTime time.Time
 }
 
 func Open(ctx context.Context, config Config) (*Store, error) {
@@ -156,32 +159,95 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	return store, nil
 }
 
-func (store *Store) GetContext(ctx context.Context, query application.ContextGetQuery) (application.ContextCheckpoint, error) {
+func (store *Store) GetContext(ctx context.Context, query application.ContextGetQuery) (application.ContextPage, error) {
 	if err := ctx.Err(); err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return application.ContextCheckpoint{}, fmt.Errorf("begin PostgreSQL context query: %w", err)
+		return application.ContextPage{}, fmt.Errorf("begin PostgreSQL context query: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	authorized, err := authorizeSessionQuery(ctx, tx, query.Subject(), "context:read")
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	records, err := loadContextRecords(ctx, tx, authorized)
+	headSequence, headDigest, retainedFrom, err := streamHead(ctx, tx, authorized.workspace, authorized.authority,
+		authorized.epoch)
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	sequence, digest, _, err := streamHead(ctx, tx, authorized.workspace, authorized.epoch)
+	head, err := encodeEventCursor(authorized.workspace, authorized.epoch, headSequence, headDigest)
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	cursor, err := encodeEventCursor(authorized.workspace, authorized.epoch, sequence, digest)
+	if query.Cursor().IsZero() {
+		records, loadErr := loadContextRecords(ctx, tx, authorized)
+		if loadErr != nil {
+			return application.ContextPage{}, loadErr
+		}
+		checkpoint, checkpointErr := application.NewContextCheckpoint(application.ContextCheckpointParams{
+			CheckpointID: query.CheckpointID(), AuthorityID: authorized.authority,
+			AuthorityEpoch: authorized.epoch, ThroughCursor: head, ProjectionVersion: contextProjectionVersion,
+			ServerTime: authorized.serverTime, Session: authorized.view, Records: records,
+		})
+		if checkpointErr != nil {
+			return application.ContextPage{}, checkpointErr
+		}
+		return application.NewContextCheckpointPage(checkpoint, head)
+	}
+	afterSequence, _, err := validateEventCursor(ctx, tx, query.Cursor(), authorized.workspace, authorized.epoch,
+		headSequence, retainedFrom)
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	return application.NewContextCheckpoint(query.CheckpointID(), cursor, authorized.view, records)
+	rows, err := tx.Query(ctx, `SELECT event_id::text, stream_sequence, aggregate_kind, aggregate_id::text,
+		aggregate_version, payload, stream_digest FROM domain_events
+		WHERE scope_kind = 'workspace' AND scope_id = $1 AND authority_epoch = $2 AND stream_sequence > $3
+		ORDER BY stream_sequence ASC LIMIT $4`, authorized.workspace.String(), authorized.epoch.String(),
+		afterSequence, int(query.Limit())+1)
+	if err != nil {
+		return application.ContextPage{}, fmt.Errorf("query PostgreSQL context delta page: %w", err)
+	}
+	defer rows.Close()
+	deltas := make([]application.ContextDelta, 0, query.Limit())
+	next := query.Cursor()
+	hasMore := false
+	for rows.Next() {
+		var eventText, aggregateKind, aggregateID string
+		var sequence, aggregateVersion uint64
+		var payload, digestBytes []byte
+		if err := rows.Scan(&eventText, &sequence, &aggregateKind, &aggregateID, &aggregateVersion, &payload, &digestBytes); err != nil {
+			return application.ContextPage{}, fmt.Errorf("scan PostgreSQL context delta page: %w", err)
+		}
+		if len(deltas) == int(query.Limit()) {
+			hasMore = true
+			break
+		}
+		if len(digestBytes) != sha256.Size {
+			return application.ContextPage{}, application.ErrInvalidQuery
+		}
+		eventID, eventErr := domain.ParseEventID(eventText)
+		version, versionErr := domain.NewVersion(aggregateVersion)
+		aggregate, aggregateErr := aggregateRefFromParts(domain.AggregateKind(aggregateKind), aggregateID, version)
+		var digest [sha256.Size]byte
+		copy(digest[:], digestBytes)
+		after, cursorErr := encodeEventCursor(authorized.workspace, authorized.epoch, sequence, digest)
+		if eventErr != nil || versionErr != nil || aggregateErr != nil || cursorErr != nil {
+			return application.ContextPage{}, application.ErrInvalidQuery
+		}
+		delta, deltaErr := application.NewContextDelta(eventID, application.ContextDeltaUpsert,
+			aggregate.Target(), version, payload, after)
+		if deltaErr != nil {
+			return application.ContextPage{}, deltaErr
+		}
+		deltas = append(deltas, delta)
+		next = after
+	}
+	if err := rows.Err(); err != nil {
+		return application.ContextPage{}, fmt.Errorf("iterate PostgreSQL context delta page: %w", err)
+	}
+	return application.NewContextDeltaPage(deltas, next, head, hasMore)
 }
 
 func (store *Store) SyncEvents(ctx context.Context, query application.EventsSyncQuery) (application.EventsPage, error) {
@@ -197,7 +263,8 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	if err != nil {
 		return application.EventsPage{}, err
 	}
-	headSequence, _, retainedFrom, err := streamHead(ctx, tx, authorized.workspace, authorized.epoch)
+	headSequence, headDigest, retainedFrom, err := streamHead(ctx, tx, authorized.workspace, authorized.authority,
+		authorized.epoch)
 	if err != nil {
 		return application.EventsPage{}, err
 	}
@@ -212,10 +279,18 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	if err != nil {
 		return application.EventsPage{}, err
 	}
-	rows, err := tx.Query(ctx, `SELECT event_id::text, stream_sequence, event_type, aggregate_kind,
-		aggregate_id::text, aggregate_version, payload, recorded_at_us, stream_digest
-		FROM domain_events WHERE scope_kind = 'workspace' AND scope_id = $1 AND authority_epoch = $2
-		AND stream_sequence > $3 ORDER BY stream_sequence ASC LIMIT $4`, authorized.workspace.String(),
+	head, err := encodeEventCursor(authorized.workspace, authorized.epoch, headSequence, headDigest)
+	if err != nil {
+		return application.EventsPage{}, err
+	}
+	rows, err := tx.Query(ctx, `SELECT event.event_id::text, event.stream_sequence, event.event_type, event.aggregate_kind,
+		event.aggregate_id::text, event.aggregate_version, event.payload, event.recorded_at_us, event.stream_digest, event.event_schema,
+		event.authority_id::text, event.authority_epoch::text, event.scope_kind, event.scope_id::text, event.principal_id::text,
+		event.actor_session_id::text, session.actor_id::text, command_id::text, causation_event_id::text,
+		correlation_id::text FROM domain_events AS event
+		LEFT JOIN actor_sessions AS session ON session.session_id = event.actor_session_id
+		WHERE event.scope_kind = 'workspace' AND event.scope_id = $1 AND event.authority_epoch = $2
+		AND event.stream_sequence > $3 ORDER BY event.stream_sequence ASC LIMIT $4`, authorized.workspace.String(),
 		authorized.epoch.String(), afterSequence, int(query.Limit())+1)
 	if err != nil {
 		return application.EventsPage{}, fmt.Errorf("query PostgreSQL event page: %w", err)
@@ -225,25 +300,65 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	nextSequence, nextDigest := afterSequence, afterDigest
 	hasMore := false
 	for rows.Next() {
-		var eventID, eventType, aggregateKind, aggregateID string
+		var eventID, eventType, aggregateKind, aggregateID, authorityID, authorityEpoch string
+		var scopeKind, scopeID, principalID, commandID, correlationID string
+		var actorSessionID, actorID, causationID *string
 		var sequence, aggregateVersion uint64
+		var eventVersion uint16
 		var payload, streamDigest []byte
 		var recordedAt int64
 		if err := rows.Scan(&eventID, &sequence, &eventType, &aggregateKind, &aggregateID, &aggregateVersion,
-			&payload, &recordedAt, &streamDigest); err != nil {
+			&payload, &recordedAt, &streamDigest, &eventVersion, &authorityID, &authorityEpoch, &scopeKind,
+			&scopeID, &principalID, &actorSessionID, &actorID, &commandID, &causationID, &correlationID); err != nil {
 			return application.EventsPage{}, fmt.Errorf("scan PostgreSQL event page: %w", err)
 		}
 		if len(events) == int(query.Limit()) {
 			hasMore = true
 			break
 		}
-		id, parseErr := domain.ParseEventID(eventID)
+		id, idErr := domain.ParseEventID(eventID)
 		version, versionErr := domain.NewVersion(aggregateVersion)
-		if parseErr != nil || versionErr != nil || len(streamDigest) != sha256.Size {
+		schema, schemaErr := domain.NewEventSchemaVersion(eventVersion)
+		authority, authorityErr := domain.ParseAuthorityID(authorityID)
+		epoch, epochErr := domain.ParseAuthorityEpoch(authorityEpoch)
+		workspace, workspaceErr := domain.ParseWorkspaceID(scopeID)
+		scope, scopeErr := domain.WorkspaceScope(workspace)
+		position, positionErr := domain.NewStreamPosition(sequence)
+		aggregate, aggregateErr := aggregateRefFromParts(domain.AggregateKind(aggregateKind), aggregateID, version)
+		principal, principalErr := domain.ParsePrincipalID(principalID)
+		command, commandErr := domain.ParseCommandID(commandID)
+		correlation, correlationErr := domain.ParseCorrelationID(correlationID)
+		if idErr != nil || versionErr != nil || schemaErr != nil || authorityErr != nil || epochErr != nil ||
+			workspaceErr != nil || scopeErr != nil || positionErr != nil || aggregateErr != nil || principalErr != nil ||
+			commandErr != nil || correlationErr != nil || scopeKind != string(domain.ScopeKindWorkspace) ||
+			scope.ID() != authorized.workspace.String() || authority != authorized.authority || epoch != authorized.epoch ||
+			len(streamDigest) != sha256.Size {
 			return application.EventsPage{}, application.ErrInvalidQuery
 		}
-		event, eventErr := application.NewSyncedEvent(id, sequence, domain.EventType(eventType),
-			domain.AggregateKind(aggregateKind), aggregateID, version, payload, microsTime(recordedAt))
+		params := application.SyncedEventParams{EventID: id, EventType: domain.EventType(eventType), EventVersion: schema,
+			AuthorityID: authority, AuthorityEpoch: epoch, Scope: scope, OriginPosition: position, Aggregate: aggregate,
+			PrincipalID: principal, CommandID: command, CorrelationID: correlation,
+			// Authority journal events occur when they are atomically recorded; recorded_at_us is the persisted time for both semantics.
+			OccurredAt: microsTime(recordedAt), RecordedAt: microsTime(recordedAt), Payload: payload}
+		if actorSessionID != nil {
+			if actorID == nil {
+				return application.EventsPage{}, application.ErrInvalidQuery
+			}
+			session, sessionErr := domain.ParseActorSessionID(*actorSessionID)
+			actor, actorErr := domain.ParseActorID(*actorID)
+			if sessionErr != nil || actorErr != nil {
+				return application.EventsPage{}, application.ErrInvalidQuery
+			}
+			params.ActorSessionID, params.ActorID = &session, &actor
+		}
+		if causationID != nil {
+			cause, causeErr := domain.ParseEventID(*causationID)
+			if causeErr != nil {
+				return application.EventsPage{}, application.ErrInvalidQuery
+			}
+			params.CausationID = &cause
+		}
+		event, eventErr := application.NewSyncedEvent(params)
 		if eventErr != nil {
 			return application.EventsPage{}, eventErr
 		}
@@ -261,12 +376,12 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	if err != nil {
 		return application.EventsPage{}, err
 	}
-	return application.NewEventsPage(authorized.view, query.AfterCursor(), next, events, hasMore)
+	return application.NewEventsPage(authorized.view, query.AfterCursor(), next, head, events, hasMore)
 }
 
 func authorizeSessionQuery(ctx context.Context, tx pgx.Tx, subject application.QuerySubject,
 	requiredCapability string) (authorizedQueryState, error) {
-	var workspaceText, principalText, actorText, sessionText, epochText, policyText string
+	var workspaceText, principalText, actorText, sessionText, authorityText, epochText, policyText string
 	var membershipID, delegationID string
 	var sessionVersion, membershipVersion, delegationVersion, currentMembershipVersion, currentDelegationVersion uint64
 	var expiresAt, authorityMicros int64
@@ -276,7 +391,7 @@ func authorizeSessionQuery(ctx context.Context, tx pgx.Tx, subject application.Q
 	var deviceID, deviceStatus *string
 	var deviceVersion, deviceTrustRevision, currentDeviceVersion, currentDeviceTrustRevision *int64
 	err := tx.QueryRow(ctx, `SELECT session.workspace_id::text, session.principal_id::text, session.actor_id::text,
-		session.session_id::text, session.authority_epoch::text, session.policy_revision, session.expires_at_us,
+		session.session_id::text, session.authority_id::text, session.authority_epoch::text, session.policy_revision, session.expires_at_us,
 		session.capabilities_json, session.version, session.membership_id::text, session.membership_version,
 		session.delegation_id::text, session.delegation_version, session.status, workspace.status, workspace.policy_revision,
 		principal.status, actor.status, membership.status, membership.version, delegation.status, delegation.version,
@@ -293,7 +408,7 @@ func authorizeSessionQuery(ctx context.Context, tx pgx.Tx, subject application.Q
 			AND delegation.actor_id = session.actor_id
 		LEFT JOIN device_registrations AS device ON device.device_id = session.device_id
 		WHERE session.session_id = $1`, subject.ActorSessionID().String()).Scan(&workspaceText, &principalText,
-		&actorText, &sessionText, &epochText, &policyText, &expiresAt, &capabilitiesJSON, &sessionVersion,
+		&actorText, &sessionText, &authorityText, &epochText, &policyText, &expiresAt, &capabilitiesJSON, &sessionVersion,
 		&membershipID, &membershipVersion, &delegationID, &delegationVersion, &sessionStatus, &workspaceStatus,
 		&workspacePolicy, &principalStatus, &actorStatus, &membershipStatus, &currentMembershipVersion,
 		&delegationStatus, &currentDelegationVersion, &deviceID, &deviceVersion, &deviceTrustRevision, &deviceStatus,
@@ -331,9 +446,10 @@ func authorizeSessionQuery(ctx context.Context, tx pgx.Tx, subject application.Q
 	principal, principalErr := domain.ParsePrincipalID(principalText)
 	actor, actorErr := domain.ParseActorID(actorText)
 	session, sessionErr := domain.ParseActorSessionID(sessionText)
+	authority, authorityErr := domain.ParseAuthorityID(authorityText)
 	epoch, epochErr := domain.ParseAuthorityEpoch(epochText)
 	policy, policyErr := domain.NewPolicyRevision(policyText)
-	if workspaceErr != nil || principalErr != nil || actorErr != nil || sessionErr != nil || epochErr != nil || policyErr != nil {
+	if workspaceErr != nil || principalErr != nil || actorErr != nil || sessionErr != nil || authorityErr != nil || epochErr != nil || policyErr != nil {
 		return authorizedQueryState{}, application.ErrInvalidQuery
 	}
 	revisions := make([]application.AuthorizationRevision, 0, application.MaxContextGrantRevisions+4)
@@ -403,7 +519,8 @@ func authorizeSessionQuery(ctx context.Context, tx pgx.Tx, subject application.Q
 	if err != nil {
 		return authorizedQueryState{}, err
 	}
-	return authorizedQueryState{view: view, workspace: workspace, epoch: epoch}, nil
+	return authorizedQueryState{view: view, workspace: workspace, authority: authority, epoch: epoch,
+		serverTime: microsTime(authorityMicros)}, nil
 }
 
 func loadContextRecords(ctx context.Context, tx pgx.Tx, state authorizedQueryState) ([]application.ContextRecord, error) {
@@ -491,11 +608,13 @@ func loadContextRecords(ctx context.Context, tx pgx.Tx, state authorizedQuerySta
 	return records, nil
 }
 
-func streamHead(ctx context.Context, tx pgx.Tx, workspace domain.WorkspaceID, epoch domain.AuthorityEpoch) (uint64, [sha256.Size]byte, uint64, error) {
+func streamHead(ctx context.Context, tx pgx.Tx, workspace domain.WorkspaceID, authority domain.AuthorityID,
+	epoch domain.AuthorityEpoch) (uint64, [sha256.Size]byte, uint64, error) {
 	var next, retained uint64
 	var digestBytes []byte
 	err := tx.QueryRow(ctx, `SELECT next_sequence, retained_from_sequence, head_digest FROM authority_streams
-		WHERE scope_kind = 'workspace' AND scope_id = $1 AND authority_epoch = $2`, workspace.String(), epoch.String()).Scan(&next, &retained, &digestBytes)
+		WHERE scope_kind = 'workspace' AND scope_id = $1 AND authority_id = $2 AND authority_epoch = $3`,
+		workspace.String(), authority.String(), epoch.String()).Scan(&next, &retained, &digestBytes)
 	if err != nil {
 		return 0, [sha256.Size]byte{}, 0, fmt.Errorf("read PostgreSQL workspace stream head: %w", err)
 	}
@@ -557,7 +676,7 @@ func validateEventCursor(ctx context.Context, tx pgx.Tx, cursor application.Even
 	if wire.Epoch != epoch.String() {
 		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorExpired, "event cursor authority epoch has expired; fetch context.get.v1")
 	}
-	if wire.Sequence+1 < retained {
+	if wire.Sequence < retained-1 {
 		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorExpired, "event cursor was pruned; fetch context.get.v1")
 	}
 	if wire.Sequence > head {
@@ -885,7 +1004,7 @@ func inspect(ctx context.Context, pool *pgxpool.Pool, config Config) (Diagnostic
 		return Diagnostics{}, err
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = 'blackbird' AND c.relkind = 'r'`).Scan(&tableCount); err != nil || tableCount != 27 {
+		WHERE n.nspname = 'blackbird' AND c.relkind = 'r'`).Scan(&tableCount); err != nil || tableCount != 33 {
 		return Diagnostics{}, fmt.Errorf("%w: table count=%d error=%v", ErrSchemaMismatch, tableCount, err)
 	}
 	if err := verifyPrivileges(ctx, pool); err != nil {

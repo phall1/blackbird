@@ -87,9 +87,29 @@ func (store *Store) rehydrateReceipt(ctx context.Context, tx pgx.Tx, spec applic
 		}
 		draft = &value
 	}
+	eventCursor, err := commandEventCursor(header.identity.Scope(), header.epoch, events.Last(), header.finalDigest)
+	if err != nil {
+		return application.ReceiptSnapshot{}, err
+	}
 	return application.NewReceiptSnapshot(application.ReceiptSnapshotParams{ReceiptID: header.receiptID, CommandID: header.commandID,
 		Identity: header.identity, RequestFingerprint: header.requestFingerprint, Result: result, AuthorityID: header.authorityID,
-		AuthorityEpoch: header.epoch, GuardDigest: header.guardDigest, Events: events, CapsuleRequirement: plan.Requirement(), RecoveryCapsule: draft})
+		AuthorityEpoch: header.epoch, GuardDigest: header.guardDigest, Events: events, EventCursor: eventCursor,
+		CapsuleRequirement: plan.Requirement(), RecoveryCapsule: draft})
+}
+
+func commandEventCursor(scope domain.AuthorityScope, epoch domain.AuthorityEpoch, position domain.StreamPosition,
+	digest domain.StreamDigest) (application.EventCursor, error) {
+	if scope.Kind() == domain.ScopeKindWorkspace {
+		workspace, err := domain.ParseWorkspaceID(scope.ID())
+		if err != nil {
+			return application.EventCursor{}, err
+		}
+		return encodeEventCursor(workspace, epoch, position.Uint64(), digest.Bytes())
+	}
+	material := fmt.Sprintf("blackbird-receipt-cursor/v1\x00%s\x00%s\x00%s\x00%d\x00%s",
+		scope.Kind(), scope.ID(), epoch.String(), position.Uint64(), digest.String())
+	checksum := sha256.Sum256([]byte(material))
+	return application.NewEventCursor("bbec1_receipt_" + hex.EncodeToString(checksum[:]))
 }
 
 func loadReceiptResources(ctx context.Context, tx pgx.Tx, receipt domain.ReceiptID) ([]domain.AggregateRef, error) {
@@ -315,7 +335,11 @@ func (store *Store) commitAppliedCommand(ctx context.Context, tx pgx.Tx, state l
 		}
 		capsule = &draft
 	}
-	receipt, err := application.NewReceiptSnapshot(application.ReceiptSnapshotParams{ReceiptID: spec.ReceiptID(), CommandID: spec.CommandID(), Identity: spec.ReceiptIdentity(), RequestFingerprint: spec.RequestFingerprint(), Result: result, AuthorityID: spec.AuthorityID(), AuthorityEpoch: spec.RequestedEpoch(), GuardDigest: state.evidence.Digest(), Events: eventRange, CapsuleRequirement: spec.RecoveryCapsule().Requirement(), RecoveryCapsule: capsule})
+	eventCursor, err := commandEventCursor(spec.Scope(), spec.RequestedEpoch(), last, previous)
+	if err != nil {
+		return application.CommandTransactionExecution{}, err
+	}
+	receipt, err := application.NewReceiptSnapshot(application.ReceiptSnapshotParams{ReceiptID: spec.ReceiptID(), CommandID: spec.CommandID(), Identity: spec.ReceiptIdentity(), RequestFingerprint: spec.RequestFingerprint(), Result: result, AuthorityID: spec.AuthorityID(), AuthorityEpoch: spec.RequestedEpoch(), GuardDigest: state.evidence.Digest(), Events: eventRange, EventCursor: eventCursor, CapsuleRequirement: spec.RecoveryCapsule().Requirement(), RecoveryCapsule: capsule})
 	if err != nil {
 		return application.CommandTransactionExecution{}, err
 	}

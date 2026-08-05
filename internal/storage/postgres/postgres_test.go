@@ -35,14 +35,18 @@ func TestSchemaStaticallyMatchesSQLiteLogicalTablesAndNativeTypes(t *testing.T) 
 	if strings.Join(postgresTables, ",") != strings.Join(sqliteTables, ",") {
 		t.Fatalf("PostgreSQL tables=%v, SQLite tables=%v", postgresTables, sqliteTables)
 	}
-	if len(postgresTables) != 27 {
-		t.Fatalf("PostgreSQL table count=%d, want 27", len(postgresTables))
+	if len(postgresTables) != 33 {
+		t.Fatalf("PostgreSQL table count=%d, want 33", len(postgresTables))
 	}
 
 	schema := string(postgresBody)
 	for _, required := range []string{
 		"scope_id uuid", "event_id uuid PRIMARY KEY", "payload bytea NOT NULL",
 		"recorded_at_us bigint", "capabilities_json jsonb NOT NULL",
+		"work_reference_id uuid PRIMARY KEY", "selected_fields jsonb NOT NULL",
+		"objective_id uuid PRIMARY KEY", "work_unit_id uuid PRIMARY KEY", "run_id uuid PRIMARY KEY",
+		"participation_id uuid PRIMARY KEY", "binding_id uuid PRIMARY KEY", "runtime_endpoint_id uuid NOT NULL",
+		"CHECK ((status = 'invited' AND session_id IS NULL AND version = 1) OR",
 		"BETWEEN 1 AND 9007199254740991", "BETWEEN 0 AND 9007199254740991",
 	} {
 		if !strings.Contains(schema, required) {
@@ -65,7 +69,8 @@ func TestEmbeddedMigrationChecksumIsStableAndComplete(t *testing.T) {
 	if checksum != sha256.Sum256(body) || checksum == ([sha256.Size]byte{}) {
 		t.Fatal("embedded migration checksum is not its immutable SHA-256")
 	}
-	for _, object := range []string{"schema_migrations", "schema_manifest", "domain_events", "audit_entries", "outbox_jobs"} {
+	for _, object := range []string{"schema_migrations", "schema_manifest", "work_references", "objectives",
+		"work_units", "runs", "run_participations", "runtime_bindings", "domain_events", "audit_entries", "outbox_jobs"} {
 		if !strings.Contains(string(body), "CREATE TABLE "+object) {
 			t.Errorf("migration does not create %s", object)
 		}

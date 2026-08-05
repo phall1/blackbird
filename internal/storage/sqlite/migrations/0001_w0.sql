@@ -262,6 +262,88 @@ CREATE TABLE actor_session_grant_revisions (
     PRIMARY KEY (session_id, grant_id)
 ) STRICT;
 
+CREATE TABLE work_references (
+    work_reference_id TEXT PRIMARY KEY CHECK (length(work_reference_id) = 36),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    provider_namespace TEXT NOT NULL CHECK (length(provider_namespace) BETWEEN 1 AND 4096),
+    provider_object_id TEXT NOT NULL CHECK (length(provider_object_id) BETWEEN 1 AND 4096),
+    provider_locator TEXT NOT NULL CHECK (length(provider_locator) BETWEEN 1 AND 4096),
+    provider_version TEXT NOT NULL CHECK (length(provider_version) BETWEEN 1 AND 4096),
+    selected_fields BLOB NOT NULL CHECK (length(selected_fields) BETWEEN 2 AND 65536),
+    adapter_principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+    observed_at_us INTEGER NOT NULL CHECK (observed_at_us > 0),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
+    updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    UNIQUE (workspace_id, provider_namespace, provider_object_id)
+) STRICT;
+
+CREATE TABLE objectives (
+    objective_id TEXT PRIMARY KEY CHECK (length(objective_id) = 36),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 512),
+    acceptance_criteria TEXT NOT NULL CHECK (length(acceptance_criteria) BETWEEN 1 AND 8192),
+    status TEXT NOT NULL CHECK (status IN ('draft', 'active')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
+    updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    CHECK ((status = 'draft' AND version = 1) OR (status = 'active' AND version >= 2))
+) STRICT;
+
+CREATE TABLE work_units (
+    work_unit_id TEXT PRIMARY KEY CHECK (length(work_unit_id) = 36),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    objective_id TEXT NOT NULL REFERENCES objectives(objective_id),
+    work_reference_id TEXT NOT NULL REFERENCES work_references(work_reference_id),
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 512),
+    status TEXT NOT NULL CHECK (status = 'proposed'),
+    version INTEGER NOT NULL CHECK (version = 1),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
+    updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    UNIQUE (workspace_id, work_unit_id)
+) STRICT;
+
+CREATE TABLE runs (
+    run_id TEXT PRIMARY KEY CHECK (length(run_id) = 36),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    objective_id TEXT NOT NULL REFERENCES objectives(objective_id),
+    work_unit_id TEXT NOT NULL REFERENCES work_units(work_unit_id),
+    operator_actor_id TEXT NOT NULL REFERENCES actors(actor_id),
+    status TEXT NOT NULL CHECK (status IN ('planned', 'starting')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
+    updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    CHECK ((status = 'planned' AND version = 1) OR (status = 'starting' AND version >= 2))
+) STRICT;
+
+CREATE TABLE run_participations (
+    participation_id TEXT PRIMARY KEY CHECK (length(participation_id) = 36),
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    actor_id TEXT NOT NULL REFERENCES actors(actor_id),
+    role TEXT NOT NULL CHECK (length(role) BETWEEN 1 AND 128),
+    session_id TEXT REFERENCES actor_sessions(session_id),
+    status TEXT NOT NULL CHECK (status IN ('invited', 'active')),
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
+    updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    UNIQUE (run_id, actor_id),
+    CHECK ((status = 'invited' AND session_id IS NULL AND version = 1) OR
+           (status = 'active' AND session_id IS NOT NULL AND version >= 2))
+) STRICT;
+
+CREATE TABLE runtime_bindings (
+    binding_id TEXT PRIMARY KEY CHECK (length(binding_id) = 36),
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    participation_id TEXT NOT NULL REFERENCES run_participations(participation_id),
+    session_id TEXT NOT NULL REFERENCES actor_sessions(session_id),
+    runtime_endpoint_id TEXT NOT NULL CHECK (length(runtime_endpoint_id) = 36),
+    status TEXT NOT NULL CHECK (status = 'requested'),
+    version INTEGER NOT NULL CHECK (version = 1),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us > 0),
+    updated_at_us INTEGER NOT NULL CHECK (updated_at_us >= created_at_us),
+    UNIQUE (run_id, binding_id)
+) STRICT;
+
 CREATE TABLE ceremony_challenges (
     ceremony_id TEXT PRIMARY KEY CHECK (length(ceremony_id) = 36),
     scope_kind TEXT NOT NULL CHECK (scope_kind IN ('installation', 'workspace')),

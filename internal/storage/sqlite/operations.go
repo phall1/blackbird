@@ -36,35 +36,58 @@ type eventCursorWire struct {
 type authorizedQueryState struct {
 	view      application.AuthorizedSessionView
 	workspace domain.WorkspaceID
+	authority domain.AuthorityID
 	epoch     domain.AuthorityEpoch
 }
 
-func (store *Store) GetContext(ctx context.Context, query application.ContextGetQuery) (application.ContextCheckpoint, error) {
+const contextProjectionVersion uint32 = 1
+
+func (store *Store) GetContext(ctx context.Context, query application.ContextGetQuery) (application.ContextPage, error) {
 	if err := ctx.Err(); err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
 	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return application.ContextCheckpoint{}, fmt.Errorf("begin SQLite context query: %w", err)
+		return application.ContextPage{}, fmt.Errorf("begin SQLite context query: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	authorized, err := authorizeSessionQuery(ctx, tx, query.Subject(), "context:read")
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	records, err := loadContextRecords(ctx, tx, authorized)
+	headSequence, headDigest, retainedFrom, err := streamHead(ctx, tx, authorized.workspace, authorized.epoch)
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	sequence, digest, _, err := streamHead(ctx, tx, authorized.workspace, authorized.epoch)
+	head, err := encodeEventCursor(authorized.workspace, authorized.epoch, headSequence, headDigest)
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	cursor, err := encodeEventCursor(authorized.workspace, authorized.epoch, sequence, digest)
+	if query.Cursor().IsZero() {
+		records, loadErr := loadContextRecords(ctx, tx, authorized)
+		if loadErr != nil {
+			return application.ContextPage{}, loadErr
+		}
+		var serverMicros int64
+		if err := tx.QueryRowContext(ctx, "SELECT CAST(unixepoch('subsec') * 1000000 AS INTEGER)").Scan(&serverMicros); err != nil {
+			return application.ContextPage{}, fmt.Errorf("read SQLite context server time: %w", err)
+		}
+		checkpoint, checkpointErr := application.NewContextCheckpoint(application.ContextCheckpointParams{
+			CheckpointID: query.CheckpointID(), AuthorityID: authorized.authority, AuthorityEpoch: authorized.epoch,
+			ThroughCursor: head, ProjectionVersion: contextProjectionVersion, ServerTime: microsTime(serverMicros),
+			Session: authorized.view, Records: records,
+		})
+		if checkpointErr != nil {
+			return application.ContextPage{}, checkpointErr
+		}
+		return application.NewContextCheckpointPage(checkpoint, head)
+	}
+	afterSequence, _, err := validateEventCursor(ctx, tx, query.Cursor(), authorized.workspace,
+		authorized.epoch, headSequence, retainedFrom)
 	if err != nil {
-		return application.ContextCheckpoint{}, err
+		return application.ContextPage{}, err
 	}
-	return application.NewContextCheckpoint(query.CheckpointID(), cursor, authorized.view, records)
+	return loadContextDeltas(ctx, tx, query, authorized, afterSequence, head)
 }
 
 func (store *Store) SyncEvents(ctx context.Context, query application.EventsSyncQuery) (application.EventsPage, error) {
@@ -80,7 +103,7 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	if err != nil {
 		return application.EventsPage{}, err
 	}
-	headSequence, _, retainedFrom, err := streamHead(ctx, tx, authorized.workspace, authorized.epoch)
+	headSequence, headDigest, retainedFrom, err := streamHead(ctx, tx, authorized.workspace, authorized.epoch)
 	if err != nil {
 		return application.EventsPage{}, err
 	}
@@ -95,9 +118,18 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	if err != nil {
 		return application.EventsPage{}, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT event_id, stream_sequence, event_type, aggregate_kind,
-		aggregate_id, aggregate_version, payload, recorded_at_us, stream_digest
-		FROM domain_events WHERE scope_kind = 'workspace' AND scope_id = ? AND authority_epoch = ?
+	head, err := encodeEventCursor(authorized.workspace, authorized.epoch, headSequence, headDigest)
+	if err != nil {
+		return application.EventsPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT event.event_id, event.stream_sequence, event.event_type, event.aggregate_kind,
+		event.aggregate_id, event.aggregate_version, event.payload, event.event_schema, event.authority_id,
+		event.authority_epoch, event.scope_kind, event.scope_id, event.principal_id, event.actor_session_id, session.actor_id,
+		event.command_id, event.causation_event_id, event.correlation_id,
+		receipt.committed_at_us, event.recorded_at_us, stream_digest
+		FROM domain_events AS event JOIN command_receipts AS receipt USING (receipt_id)
+		LEFT JOIN actor_sessions AS session ON session.session_id = event.actor_session_id
+		WHERE event.scope_kind = 'workspace' AND event.scope_id = ? AND event.authority_epoch = ?
 		AND stream_sequence > ? ORDER BY stream_sequence ASC LIMIT ?`, authorized.workspace.String(),
 		authorized.epoch.String(), afterSequence, int(query.Limit())+1)
 	if err != nil {
@@ -108,27 +140,30 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	nextSequence, nextDigest := afterSequence, afterDigest
 	hasMore := false
 	for rows.Next() {
-		var eventID, eventType, aggregateKind, aggregateID string
+		var eventID, eventType, aggregateKind, aggregateID, authorityID, authorityEpoch, scopeKind, scopeID string
+		var principalID, commandID, correlationID string
+		var actorSessionID, actorID, causationID sql.NullString
 		var sequence, aggregateVersion uint64
+		var eventSchema uint16
 		var payload, streamDigest []byte
-		var recordedAt int64
+		var occurredAt, recordedAt int64
 		if err := rows.Scan(&eventID, &sequence, &eventType, &aggregateKind, &aggregateID, &aggregateVersion,
-			&payload, &recordedAt, &streamDigest); err != nil {
+			&payload, &eventSchema, &authorityID, &authorityEpoch, &scopeKind, &scopeID, &principalID, &actorSessionID, &actorID,
+			&commandID, &causationID, &correlationID, &occurredAt, &recordedAt, &streamDigest); err != nil {
 			return application.EventsPage{}, fmt.Errorf("scan SQLite event page: %w", err)
 		}
 		if len(events) == int(query.Limit()) {
 			hasMore = true
 			break
 		}
-		id, parseErr := domain.ParseEventID(eventID)
-		version, versionErr := domain.NewVersion(aggregateVersion)
-		if parseErr != nil || versionErr != nil || len(streamDigest) != sha256.Size {
+		event, parseErr := decodeSyncedEvent(syncedEventRow{eventID: eventID, eventType: eventType,
+			eventSchema: eventSchema, authorityID: authorityID, authorityEpoch: authorityEpoch,
+			scopeKind: scopeKind, scopeID: scopeID, sequence: sequence, aggregateKind: aggregateKind,
+			aggregateID: aggregateID, aggregateVersion: aggregateVersion, principalID: principalID,
+			actorID: actorID, actorSessionID: actorSessionID, commandID: commandID, causationID: causationID,
+			correlationID: correlationID, occurredAt: occurredAt, recordedAt: recordedAt, payload: payload})
+		if parseErr != nil || len(streamDigest) != sha256.Size {
 			return application.EventsPage{}, application.ErrInvalidQuery
-		}
-		event, eventErr := application.NewSyncedEvent(id, sequence, domain.EventType(eventType),
-			domain.AggregateKind(aggregateKind), aggregateID, version, payload, microsTime(recordedAt))
-		if eventErr != nil {
-			return application.EventsPage{}, eventErr
 		}
 		events = append(events, event)
 		nextSequence = sequence
@@ -144,7 +179,158 @@ func (store *Store) SyncEvents(ctx context.Context, query application.EventsSync
 	if err != nil {
 		return application.EventsPage{}, err
 	}
-	return application.NewEventsPage(authorized.view, query.AfterCursor(), next, events, hasMore)
+	return application.NewEventsPage(authorized.view, query.AfterCursor(), next, head, events, hasMore)
+}
+
+type syncedEventRow struct {
+	eventID, eventType, authorityID, authorityEpoch, scopeKind, scopeID string
+	aggregateKind, aggregateID, principalID, commandID, correlationID   string
+	eventSchema                                                         uint16
+	sequence, aggregateVersion                                          uint64
+	actorID, actorSessionID, causationID                                sql.NullString
+	occurredAt, recordedAt                                              int64
+	payload                                                             []byte
+}
+
+func decodeSyncedEvent(row syncedEventRow) (application.SyncedEvent, error) {
+	eventID, eventErr := domain.ParseEventID(row.eventID)
+	eventVersion, schemaErr := domain.NewEventSchemaVersion(row.eventSchema)
+	authorityID, authorityErr := domain.ParseAuthorityID(row.authorityID)
+	epoch, epochErr := domain.ParseAuthorityEpoch(row.authorityEpoch)
+	position, positionErr := domain.NewStreamPosition(row.sequence)
+	version, versionErr := domain.NewVersion(row.aggregateVersion)
+	aggregate, aggregateErr := aggregateRefFromParts(domain.AggregateKind(row.aggregateKind), row.aggregateID, version)
+	principalID, principalErr := domain.ParsePrincipalID(row.principalID)
+	commandID, commandErr := domain.ParseCommandID(row.commandID)
+	correlationID, correlationErr := domain.ParseCorrelationID(row.correlationID)
+	var scope domain.AuthorityScope
+	var scopeErr error
+	switch domain.ScopeKind(row.scopeKind) {
+	case domain.ScopeKindWorkspace:
+		workspaceID, err := domain.ParseWorkspaceID(row.scopeID)
+		if err == nil {
+			scope, scopeErr = domain.WorkspaceScope(workspaceID)
+		} else {
+			scopeErr = err
+		}
+	case domain.ScopeKindInstallation:
+		installationID, err := domain.ParseInstallationID(row.scopeID)
+		if err == nil {
+			scope, scopeErr = domain.InstallationScope(installationID)
+		} else {
+			scopeErr = err
+		}
+	default:
+		scopeErr = application.ErrInvalidQuery
+	}
+	if eventErr != nil || schemaErr != nil || authorityErr != nil || epochErr != nil || scopeErr != nil ||
+		positionErr != nil || versionErr != nil || aggregateErr != nil || principalErr != nil || commandErr != nil ||
+		correlationErr != nil {
+		return application.SyncedEvent{}, application.ErrInvalidQuery
+	}
+	params := application.SyncedEventParams{EventID: eventID, EventType: domain.EventType(row.eventType),
+		EventVersion: eventVersion, AuthorityID: authorityID, AuthorityEpoch: epoch, Scope: scope,
+		OriginPosition: position, Aggregate: aggregate, PrincipalID: principalID, CommandID: commandID,
+		CorrelationID: correlationID, OccurredAt: microsTime(row.occurredAt), RecordedAt: microsTime(row.recordedAt),
+		Payload: row.payload}
+	if row.actorID.Valid {
+		value, err := domain.ParseActorID(row.actorID.String)
+		if err != nil {
+			return application.SyncedEvent{}, application.ErrInvalidQuery
+		}
+		params.ActorID = &value
+	}
+	if row.actorSessionID.Valid {
+		value, err := domain.ParseActorSessionID(row.actorSessionID.String)
+		if err != nil {
+			return application.SyncedEvent{}, application.ErrInvalidQuery
+		}
+		params.ActorSessionID = &value
+	}
+	if row.causationID.Valid {
+		value, err := domain.ParseEventID(row.causationID.String)
+		if err != nil {
+			return application.SyncedEvent{}, application.ErrInvalidQuery
+		}
+		params.CausationID = &value
+	}
+	return application.NewSyncedEvent(params)
+}
+
+func loadContextDeltas(ctx context.Context, tx *sql.Tx, query application.ContextGetQuery,
+	state authorizedQueryState, afterSequence uint64, head application.EventCursor) (application.ContextPage, error) {
+	// Reuse the checkpoint visibility read to enforce the same collaborator bound
+	// and authorization snapshot before exposing incremental facts.
+	if _, err := loadContextRecords(ctx, tx, state); err != nil {
+		return application.ContextPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT event_id, stream_sequence, stream_digest, aggregate_kind,
+		aggregate_id, aggregate_version, payload FROM domain_events WHERE scope_kind = 'workspace' AND scope_id = ?
+		AND authority_epoch = ? AND stream_sequence > ? AND (
+			(aggregate_kind = 'workspace' AND aggregate_id = ?) OR
+			(aggregate_kind = 'principal' AND aggregate_id = ?) OR
+			(aggregate_kind = 'actor') OR
+			(aggregate_kind = 'workspace_membership' AND aggregate_id IN
+				(SELECT membership_id FROM workspace_memberships WHERE workspace_id = ? AND principal_id = ?)) OR
+			(aggregate_kind = 'actor_delegation' AND aggregate_id IN
+				(SELECT delegation_id FROM actor_delegations WHERE workspace_id = ? AND principal_id = ? AND actor_id = ?)) OR
+			(aggregate_kind = 'actor_session' AND aggregate_id = ?)
+		) ORDER BY stream_sequence ASC LIMIT ?`, state.workspace.String(), state.epoch.String(), afterSequence,
+		state.workspace.String(), state.view.PrincipalID().String(), state.workspace.String(), state.view.PrincipalID().String(),
+		state.workspace.String(), state.view.PrincipalID().String(), state.view.ActorID().String(),
+		state.view.ActorSessionID().String(), int(query.Limit())+1)
+	if err != nil {
+		return application.ContextPage{}, fmt.Errorf("query SQLite context deltas: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	deltas := make([]application.ContextDelta, 0, query.Limit())
+	next := query.Cursor()
+	hasMore := false
+	for rows.Next() {
+		var eventText, kindText, id string
+		var sequence, versionValue uint64
+		var digestBytes, payload []byte
+		if err := rows.Scan(&eventText, &sequence, &digestBytes, &kindText, &id, &versionValue, &payload); err != nil {
+			return application.ContextPage{}, fmt.Errorf("scan SQLite context delta: %w", err)
+		}
+		if len(deltas) == int(query.Limit()) {
+			hasMore = true
+			break
+		}
+		if len(digestBytes) != sha256.Size {
+			return application.ContextPage{}, application.ErrInvalidQuery
+		}
+		var digest [sha256.Size]byte
+		copy(digest[:], digestBytes)
+		after, cursorErr := encodeEventCursor(state.workspace, state.epoch, sequence, digest)
+		eventID, eventErr := domain.ParseEventID(eventText)
+		version, versionErr := domain.NewVersion(versionValue)
+		ref, refErr := aggregateRefFromParts(domain.AggregateKind(kindText), id, version)
+		if cursorErr != nil || eventErr != nil || versionErr != nil || refErr != nil {
+			return application.ContextPage{}, application.ErrInvalidQuery
+		}
+		delta, deltaErr := application.NewContextDelta(eventID, application.ContextDeltaUpsert, ref.Target(),
+			version, payload, after)
+		if deltaErr != nil {
+			return application.ContextPage{}, deltaErr
+		}
+		deltas = append(deltas, delta)
+		next = after
+	}
+	if err := rows.Err(); err != nil {
+		return application.ContextPage{}, fmt.Errorf("iterate SQLite context deltas: %w", err)
+	}
+	if !hasMore && len(deltas) != 0 && next != head {
+		last := deltas[len(deltas)-1]
+		last, err = application.NewContextDelta(last.EventID(), last.DeltaType(), last.Resource(),
+			last.Version(), last.Value(), head)
+		if err != nil {
+			return application.ContextPage{}, err
+		}
+		deltas[len(deltas)-1] = last
+		next = head
+	}
+	return application.NewContextDeltaPage(deltas, next, head, hasMore)
 }
 
 func authorizeSessionQuery(ctx context.Context, tx *sql.Tx, subject application.QuerySubject,
@@ -220,6 +406,15 @@ func authorizeSessionQuery(ctx context.Context, tx *sql.Tx, subject application.
 	if workspaceErr != nil || principalErr != nil || actorErr != nil || sessionErr != nil || epochErr != nil || policyErr != nil {
 		return authorizedQueryState{}, application.ErrInvalidQuery
 	}
+	var authorityText string
+	if err := tx.QueryRowContext(ctx, `SELECT authority_id FROM authority_streams WHERE scope_kind = 'workspace'
+		AND scope_id = ? AND authority_epoch = ?`, workspace.String(), epoch.String()).Scan(&authorityText); err != nil {
+		return authorizedQueryState{}, fmt.Errorf("read SQLite query authority: %w", err)
+	}
+	authority, authorityErr := domain.ParseAuthorityID(authorityText)
+	if authorityErr != nil {
+		return authorizedQueryState{}, application.ErrInvalidQuery
+	}
 	revisions := make([]application.AuthorizationRevision, 0, application.MaxContextGrantRevisions+4)
 	addRevision := func(kind domain.AggregateKind, id string, value uint64) error {
 		version, versionErr := domain.NewVersion(value)
@@ -287,7 +482,7 @@ func authorizeSessionQuery(ctx context.Context, tx *sql.Tx, subject application.
 	if err != nil {
 		return authorizedQueryState{}, err
 	}
-	return authorizedQueryState{view: view, workspace: workspace, epoch: epoch}, nil
+	return authorizedQueryState{view: view, workspace: workspace, authority: authority, epoch: epoch}, nil
 }
 
 func loadContextRecords(ctx context.Context, tx *sql.Tx, state authorizedQueryState) ([]application.ContextRecord, error) {
@@ -441,11 +636,11 @@ func validateEventCursor(ctx context.Context, tx *sql.Tx, cursor application.Eve
 	if wire.Epoch != epoch.String() {
 		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorExpired, "event cursor authority epoch has expired; fetch context.get.v1")
 	}
-	if wire.Sequence+1 < retained {
-		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorExpired, "event cursor was pruned; fetch context.get.v1")
-	}
 	if wire.Sequence > head {
 		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorInvalid, "event cursor is ahead of the workspace stream")
+	}
+	if wire.Sequence+1 < retained {
+		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorExpired, "event cursor was pruned; fetch context.get.v1")
 	}
 	digestBytes, decodeErr := hex.DecodeString(wire.Digest)
 	if decodeErr != nil || len(digestBytes) != sha256.Size {

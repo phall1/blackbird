@@ -863,13 +863,18 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 			t.Fatal(err)
 		}
 		checkpointID, _ := application.NewCheckpointID("checkpoint:postgres-production")
-		contextQuery, _ := application.NewContextGetQuery(subject, checkpointID)
-		checkpoint, err := store.GetContext(context.Background(), contextQuery)
+		contextQuery, _ := application.NewContextGetQuery(subject, checkpointID, application.EventCursor{}, 2)
+		contextPage, err := store.GetContext(context.Background(), contextQuery)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if checkpoint.CheckpointID() != checkpointID || checkpoint.ThroughCursor().IsZero() ||
-			checkpoint.Session().WorkspaceID() != workspace.ID() || len(checkpoint.Records()) != 6 {
+		checkpoint, present := contextPage.Checkpoint()
+		if !present || checkpoint.CheckpointID() != checkpointID || checkpoint.ThroughCursor().IsZero() ||
+			checkpoint.AuthorityID() != security.authority || checkpoint.AuthorityEpoch() != security.epoch ||
+			checkpoint.ProjectionVersion() != 1 || checkpoint.ServerTime().IsZero() ||
+			checkpoint.Session().WorkspaceID() != workspace.ID() || len(checkpoint.Records()) != 6 ||
+			contextPage.NextCursor() != checkpoint.ThroughCursor() || contextPage.HeadCursor() != checkpoint.ThroughCursor() ||
+			contextPage.HasMore() || len(contextPage.Deltas()) != 0 {
 			t.Fatalf("unexpected context checkpoint records=%d cursor=%q", len(checkpoint.Records()), checkpoint.ThroughCursor().String())
 		}
 		records := checkpoint.Records()
@@ -886,6 +891,25 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		}
 		if len(first.Events()) != 2 || !first.HasMore() || first.NextCursor().IsZero() {
 			t.Fatalf("first event page events=%d has_more=%v", len(first.Events()), first.HasMore())
+		}
+		if first.HeadCursor() != checkpoint.ThroughCursor() || first.NextCursor() == first.HeadCursor() {
+			t.Fatal("event page did not distinguish bounded continuation from the snapshot head")
+		}
+		firstEvent := first.Events()[0]
+		if firstEvent.AuthorityID() != security.authority || firstEvent.AuthorityEpoch() != security.epoch ||
+			firstEvent.Scope() != workspaceScope || firstEvent.EventVersion().Uint16() != 1 ||
+			firstEvent.PrincipalID().IsZero() || firstEvent.CommandID().IsZero() || firstEvent.CorrelationID().IsZero() ||
+			firstEvent.OccurredAt().IsZero() || firstEvent.RecordedAt().IsZero() {
+			t.Fatal("synced event omitted persisted journal identity or attribution")
+		}
+		deltaQuery, _ := application.NewContextGetQuery(subject, checkpointID, first.NextCursor(), 2)
+		deltaPage, err := store.GetContext(context.Background(), deltaQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, present := deltaPage.Checkpoint(); present || len(deltaPage.Deltas()) != 2 || !deltaPage.HasMore() ||
+			deltaPage.NextCursor() == first.NextCursor() || deltaPage.HeadCursor() != checkpoint.ThroughCursor() {
+			t.Fatal("context delta page was not bounded independently from its stream head")
 		}
 		secondQuery, _ := application.NewEventsSyncQuery(subject, first.NextCursor(), 2)
 		second, err := store.SyncEvents(context.Background(), secondQuery)
@@ -904,6 +928,9 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		invalidQuery, _ := application.NewEventsSyncQuery(subject, invalidCursor, 2)
 		_, err = store.SyncEvents(context.Background(), invalidQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorInvalid)
+		invalidContext, _ := application.NewContextGetQuery(subject, checkpointID, invalidCursor, 2)
+		_, err = store.GetContext(context.Background(), invalidContext)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorInvalid)
 
 		otherWorkspace, _ := domain.ParseWorkspaceID(security.uuid(199))
 		var digest [sha256.Size]byte
@@ -911,11 +938,17 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		mismatchQuery, _ := application.NewEventsSyncQuery(subject, otherCursor, 2)
 		_, err = store.SyncEvents(context.Background(), mismatchQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorScopeMismatch)
+		mismatchContext, _ := application.NewContextGetQuery(subject, checkpointID, otherCursor, 2)
+		_, err = store.GetContext(context.Background(), mismatchContext)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorScopeMismatch)
 
 		otherEpoch, _ := domain.NewAuthorityEpoch()
 		epochCursor, _ := encodeEventCursor(workspace.ID(), otherEpoch, 0, digest)
 		epochQuery, _ := application.NewEventsSyncQuery(subject, epochCursor, 2)
 		_, err = store.SyncEvents(context.Background(), epochQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
+		epochContext, _ := application.NewContextGetQuery(subject, checkpointID, epochCursor, 2)
+		_, err = store.GetContext(context.Background(), epochContext)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
 
 		if _, err = store.pool.Exec(context.Background(), `UPDATE authority_streams SET retained_from_sequence = 4
@@ -923,6 +956,8 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 			t.Fatal(err)
 		}
 		_, err = store.SyncEvents(context.Background(), secondQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
+		_, err = store.GetContext(context.Background(), deltaQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
 		if _, err = store.pool.Exec(context.Background(), `UPDATE authority_streams SET retained_from_sequence = 1
 			WHERE scope_kind = 'workspace' AND scope_id = $1`, workspace.ID().String()); err != nil {
@@ -939,12 +974,12 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		}
 
 		otherSubject, _ := application.NewQuerySubject(owner.ID(), sessionID)
-		otherQuery, _ := application.NewContextGetQuery(otherSubject, checkpointID)
+		otherQuery, _ := application.NewContextGetQuery(otherSubject, checkpointID, application.EventCursor{}, 2)
 		_, err = store.GetContext(context.Background(), otherQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeForbidden)
 		unknownSession, _ := domain.NewActorSessionID()
 		unknownSubject, _ := application.NewQuerySubject(workload.ID(), unknownSession)
-		unknownQuery, _ := application.NewContextGetQuery(unknownSubject, checkpointID)
+		unknownQuery, _ := application.NewContextGetQuery(unknownSubject, checkpointID, application.EventCursor{}, 2)
 		_, err = store.GetContext(context.Background(), unknownQuery)
 		assertQueryErrorCode(t, err, domain.ErrorCodeUnauthenticated)
 
@@ -974,7 +1009,7 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 	t.Run("production queries reject stale session authorization revisions", func(t *testing.T) {
 		subject, _ := application.NewQuerySubject(workload.ID(), sessionID)
 		checkpointID, _ := application.NewCheckpointID("checkpoint:stale-postgres-authorization")
-		query, _ := application.NewContextGetQuery(subject, checkpointID)
+		query, _ := application.NewContextGetQuery(subject, checkpointID, application.EventCursor{}, 2)
 		assertStale := func(update, restore string, arguments ...any) {
 			t.Helper()
 			if _, err := store.pool.Exec(context.Background(), update, arguments...); err != nil {
