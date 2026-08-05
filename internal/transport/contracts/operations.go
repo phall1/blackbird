@@ -1,11 +1,58 @@
 package contracts
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/phall1/blackbird/internal/domain"
 )
+
+// AuthenticationEvidence is verified transport evidence. Adapters pass it
+// through without interpreting it or deriving identity from request bodies.
+type AuthenticationEvidence interface {
+	AuthenticationEvidence()
+}
+
+type InstallationBootstrapHandler interface {
+	HandleInstallationBootstrap(context.Context, AuthenticationEvidence, InstallationBootstrapRequestDTO) (InstallationBootstrapResultDTO, *ErrorDTO, error)
+}
+type PrincipalRegisterHandler interface {
+	HandlePrincipalRegister(context.Context, AuthenticationEvidence, PrincipalRegisterRequestDTO) (PrincipalRegisterResultDTO, *ErrorDTO, error)
+}
+type DevicePairingBeginHandler interface {
+	HandleDevicePairingBegin(context.Context, AuthenticationEvidence, DevicePairingBeginRequestDTO) (DevicePairingBeginResultDTO, *ErrorDTO, error)
+}
+type DevicePairHandler interface {
+	HandleDevicePair(context.Context, AuthenticationEvidence, DevicePairRequestDTO) (DevicePairResultDTO, *ErrorDTO, error)
+}
+type WorkspaceCreateHandler interface {
+	HandleWorkspaceCreate(context.Context, AuthenticationEvidence, WorkspaceCreateRequestDTO) (WorkspaceCreateResultDTO, *ErrorDTO, error)
+}
+type WorkspaceMemberInviteHandler interface {
+	HandleWorkspaceMemberInvite(context.Context, AuthenticationEvidence, WorkspaceMemberInviteRequestDTO) (WorkspaceMemberInviteResultDTO, *ErrorDTO, error)
+}
+type WorkspaceMembershipAcceptHandler interface {
+	HandleWorkspaceMembershipAccept(context.Context, AuthenticationEvidence, WorkspaceMembershipAcceptRequestDTO) (WorkspaceMembershipAcceptResultDTO, *ErrorDTO, error)
+}
+type ActorCreateHandler interface {
+	HandleActorCreate(context.Context, AuthenticationEvidence, ActorCreateRequestDTO) (ActorCreateResultDTO, *ErrorDTO, error)
+}
+type ActorDelegationProposeHandler interface {
+	HandleActorDelegationPropose(context.Context, AuthenticationEvidence, ActorDelegationProposeRequestDTO) (ActorDelegationProposeResultDTO, *ErrorDTO, error)
+}
+type ActorDelegationActivateHandler interface {
+	HandleActorDelegationActivate(context.Context, AuthenticationEvidence, ActorDelegationActivateRequestDTO) (ActorDelegationActivateResultDTO, *ErrorDTO, error)
+}
+type SessionStartHandler interface {
+	HandleSessionStart(context.Context, AuthenticationEvidence, SessionStartRequestDTO) (SessionStartResultDTO, *ErrorDTO, error)
+}
+type ContextGetHandler interface {
+	HandleContextGet(context.Context, AuthenticationEvidence, ContextGetRequestDTO) (ContextPageDTO, *ErrorDTO, error)
+}
+type EventsSyncHandler interface {
+	HandleEventsSync(context.Context, AuthenticationEvidence, EventsSyncRequestDTO) (EventPageDTO, *ErrorDTO, error)
+}
 
 const (
 	OperationInstallationBootstrap     = "installation.bootstrap.v1"

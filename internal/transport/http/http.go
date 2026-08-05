@@ -37,11 +37,7 @@ const (
 	mediaTypeProblem = "application/problem+json"
 )
 
-// AuthenticationEvidence is verified transport evidence. The HTTP adapter
-// passes it through without interpreting it or deriving identity from a body.
-type AuthenticationEvidence interface {
-	AuthenticationEvidence()
-}
+type AuthenticationEvidence = contracts.AuthenticationEvidence
 
 // Authenticator verifies channel or request credentials for an allow-listed
 // operation. A failure is either a typed safe failure or an internal error,
@@ -50,45 +46,19 @@ type Authenticator interface {
 	Authenticate(context.Context, *stdhttp.Request, string, string) (AuthenticationEvidence, *contracts.ErrorDTO, error)
 }
 
-type InstallationBootstrapHandler interface {
-	HandleInstallationBootstrap(context.Context, AuthenticationEvidence, contracts.InstallationBootstrapRequestDTO) (contracts.InstallationBootstrapResultDTO, *contracts.ErrorDTO, error)
-}
-type PrincipalRegisterHandler interface {
-	HandlePrincipalRegister(context.Context, AuthenticationEvidence, contracts.PrincipalRegisterRequestDTO) (contracts.PrincipalRegisterResultDTO, *contracts.ErrorDTO, error)
-}
-type DevicePairingBeginHandler interface {
-	HandleDevicePairingBegin(context.Context, AuthenticationEvidence, contracts.DevicePairingBeginRequestDTO) (contracts.DevicePairingBeginResultDTO, *contracts.ErrorDTO, error)
-}
-type DevicePairHandler interface {
-	HandleDevicePair(context.Context, AuthenticationEvidence, contracts.DevicePairRequestDTO) (contracts.DevicePairResultDTO, *contracts.ErrorDTO, error)
-}
-type WorkspaceCreateHandler interface {
-	HandleWorkspaceCreate(context.Context, AuthenticationEvidence, contracts.WorkspaceCreateRequestDTO) (contracts.WorkspaceCreateResultDTO, *contracts.ErrorDTO, error)
-}
-type WorkspaceMemberInviteHandler interface {
-	HandleWorkspaceMemberInvite(context.Context, AuthenticationEvidence, contracts.WorkspaceMemberInviteRequestDTO) (contracts.WorkspaceMemberInviteResultDTO, *contracts.ErrorDTO, error)
-}
-type WorkspaceMembershipAcceptHandler interface {
-	HandleWorkspaceMembershipAccept(context.Context, AuthenticationEvidence, contracts.WorkspaceMembershipAcceptRequestDTO) (contracts.WorkspaceMembershipAcceptResultDTO, *contracts.ErrorDTO, error)
-}
-type ActorCreateHandler interface {
-	HandleActorCreate(context.Context, AuthenticationEvidence, contracts.ActorCreateRequestDTO) (contracts.ActorCreateResultDTO, *contracts.ErrorDTO, error)
-}
-type ActorDelegationProposeHandler interface {
-	HandleActorDelegationPropose(context.Context, AuthenticationEvidence, contracts.ActorDelegationProposeRequestDTO) (contracts.ActorDelegationProposeResultDTO, *contracts.ErrorDTO, error)
-}
-type ActorDelegationActivateHandler interface {
-	HandleActorDelegationActivate(context.Context, AuthenticationEvidence, contracts.ActorDelegationActivateRequestDTO) (contracts.ActorDelegationActivateResultDTO, *contracts.ErrorDTO, error)
-}
-type SessionStartHandler interface {
-	HandleSessionStart(context.Context, AuthenticationEvidence, contracts.SessionStartRequestDTO) (contracts.SessionStartResultDTO, *contracts.ErrorDTO, error)
-}
-type ContextGetHandler interface {
-	HandleContextGet(context.Context, AuthenticationEvidence, contracts.ContextGetRequestDTO) (contracts.ContextPageDTO, *contracts.ErrorDTO, error)
-}
-type EventsSyncHandler interface {
-	HandleEventsSync(context.Context, AuthenticationEvidence, contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error)
-}
+type InstallationBootstrapHandler = contracts.InstallationBootstrapHandler
+type PrincipalRegisterHandler = contracts.PrincipalRegisterHandler
+type DevicePairingBeginHandler = contracts.DevicePairingBeginHandler
+type DevicePairHandler = contracts.DevicePairHandler
+type WorkspaceCreateHandler = contracts.WorkspaceCreateHandler
+type WorkspaceMemberInviteHandler = contracts.WorkspaceMemberInviteHandler
+type WorkspaceMembershipAcceptHandler = contracts.WorkspaceMembershipAcceptHandler
+type ActorCreateHandler = contracts.ActorCreateHandler
+type ActorDelegationProposeHandler = contracts.ActorDelegationProposeHandler
+type ActorDelegationActivateHandler = contracts.ActorDelegationActivateHandler
+type SessionStartHandler = contracts.SessionStartHandler
+type ContextGetHandler = contracts.ContextGetHandler
+type EventsSyncHandler = contracts.EventsSyncHandler
 
 type Dependencies struct {
 	Authenticator             Authenticator
