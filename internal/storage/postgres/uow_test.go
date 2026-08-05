@@ -20,6 +20,7 @@ import (
 func TestStoreStaticallyComposesAsUnitOfWork(t *testing.T) {
 	t.Parallel()
 	var _ application.UnitOfWork = (*Store)(nil)
+	var _ application.QueryStore = (*Store)(nil)
 
 	for file, required := range map[string][]string{
 		"command.go": {
@@ -852,6 +853,166 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		t.Fatal("actor session fields did not round-trip through normalized storage")
 	}
 
+	t.Run("production context and event queries are authorized bounded and cursor scoped", func(t *testing.T) {
+		if _, err := store.pool.Exec(context.Background(), `UPDATE actor_sessions SET capabilities_json = $1
+			WHERE session_id = $2`, []byte(`["context:read","events:sync"]`), sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+		subject, err := application.NewQuerySubject(workload.ID(), sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointID, _ := application.NewCheckpointID("checkpoint:postgres-production")
+		contextQuery, _ := application.NewContextGetQuery(subject, checkpointID)
+		checkpoint, err := store.GetContext(context.Background(), contextQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checkpoint.CheckpointID() != checkpointID || checkpoint.ThroughCursor().IsZero() ||
+			checkpoint.Session().WorkspaceID() != workspace.ID() || len(checkpoint.Records()) != 6 {
+			t.Fatalf("unexpected context checkpoint records=%d cursor=%q", len(checkpoint.Records()), checkpoint.ThroughCursor().String())
+		}
+		records := checkpoint.Records()
+		for index := 1; index < len(records); index++ {
+			if records[index-1].Kind() > records[index].Kind() ||
+				(records[index-1].Kind() == records[index].Kind() && records[index-1].ID() >= records[index].ID()) {
+				t.Fatal("context records are not deterministically ordered")
+			}
+		}
+		pageQuery, _ := application.NewEventsSyncQuery(subject, application.EventCursor{}, 2)
+		first, err := store.SyncEvents(context.Background(), pageQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(first.Events()) != 2 || !first.HasMore() || first.NextCursor().IsZero() {
+			t.Fatalf("first event page events=%d has_more=%v", len(first.Events()), first.HasMore())
+		}
+		secondQuery, _ := application.NewEventsSyncQuery(subject, first.NextCursor(), 2)
+		second, err := store.SyncEvents(context.Background(), secondQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(second.Events()) != 2 || second.Events()[0].Sequence() <= first.Events()[1].Sequence() {
+			t.Fatal("event cursor did not advance in journal order")
+		}
+		checkpointSync, _ := application.NewEventsSyncQuery(subject, checkpoint.ThroughCursor(), 2)
+		current, err := store.SyncEvents(context.Background(), checkpointSync)
+		if err != nil || len(current.Events()) != 0 || current.NextCursor() != checkpoint.ThroughCursor() {
+			t.Fatalf("checkpoint continuation events=%d error=%v", len(current.Events()), err)
+		}
+		invalidCursor, _ := application.NewEventCursor("bbec1_not-valid-base64")
+		invalidQuery, _ := application.NewEventsSyncQuery(subject, invalidCursor, 2)
+		_, err = store.SyncEvents(context.Background(), invalidQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorInvalid)
+
+		otherWorkspace, _ := domain.ParseWorkspaceID(security.uuid(199))
+		var digest [sha256.Size]byte
+		otherCursor, _ := encodeEventCursor(otherWorkspace, security.epoch, 0, digest)
+		mismatchQuery, _ := application.NewEventsSyncQuery(subject, otherCursor, 2)
+		_, err = store.SyncEvents(context.Background(), mismatchQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorScopeMismatch)
+
+		otherEpoch, _ := domain.NewAuthorityEpoch()
+		epochCursor, _ := encodeEventCursor(workspace.ID(), otherEpoch, 0, digest)
+		epochQuery, _ := application.NewEventsSyncQuery(subject, epochCursor, 2)
+		_, err = store.SyncEvents(context.Background(), epochQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
+
+		if _, err = store.pool.Exec(context.Background(), `UPDATE authority_streams SET retained_from_sequence = 4
+			WHERE scope_kind = 'workspace' AND scope_id = $1`, workspace.ID().String()); err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.SyncEvents(context.Background(), secondQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCursorExpired)
+		if _, err = store.pool.Exec(context.Background(), `UPDATE authority_streams SET retained_from_sequence = 1
+			WHERE scope_kind = 'workspace' AND scope_id = $1`, workspace.ID().String()); err != nil {
+			t.Fatal(err)
+		}
+
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err = store.GetContext(cancelled, contextQuery); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled context query error=%v", err)
+		}
+		if _, err = store.SyncEvents(cancelled, pageQuery); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled event query error=%v", err)
+		}
+
+		otherSubject, _ := application.NewQuerySubject(owner.ID(), sessionID)
+		otherQuery, _ := application.NewContextGetQuery(otherSubject, checkpointID)
+		_, err = store.GetContext(context.Background(), otherQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeForbidden)
+		unknownSession, _ := domain.NewActorSessionID()
+		unknownSubject, _ := application.NewQuerySubject(workload.ID(), unknownSession)
+		unknownQuery, _ := application.NewContextGetQuery(unknownSubject, checkpointID)
+		_, err = store.GetContext(context.Background(), unknownQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeUnauthenticated)
+
+		if _, err = store.pool.Exec(context.Background(), `UPDATE actor_sessions SET capabilities_json = $1
+			WHERE session_id = $2`, []byte(`["events:sync"]`), sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.GetContext(context.Background(), contextQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeCapabilityRequired)
+		if _, err = store.pool.Exec(context.Background(), `UPDATE actor_sessions SET capabilities_json = $1
+			WHERE session_id = $2`, []byte(`["context:read","events:sync"]`), sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err = store.pool.Exec(context.Background(), `UPDATE actor_sessions SET expires_at_us = issued_at_us + 1
+			WHERE session_id = $1`, sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.GetContext(context.Background(), contextQuery)
+		assertQueryErrorCode(t, err, domain.ErrorCodeSessionExpired)
+		if _, err = store.pool.Exec(context.Background(), `UPDATE actor_sessions SET expires_at_us = $1
+			WHERE session_id = $2`, expiresAt, sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("production queries reject stale session authorization revisions", func(t *testing.T) {
+		subject, _ := application.NewQuerySubject(workload.ID(), sessionID)
+		checkpointID, _ := application.NewCheckpointID("checkpoint:stale-postgres-authorization")
+		query, _ := application.NewContextGetQuery(subject, checkpointID)
+		assertStale := func(update, restore string, arguments ...any) {
+			t.Helper()
+			if _, err := store.pool.Exec(context.Background(), update, arguments...); err != nil {
+				t.Fatal(err)
+			}
+			_, err := store.GetContext(context.Background(), query)
+			assertQueryErrorCode(t, err, domain.ErrorCodeForbidden)
+			if _, err := store.pool.Exec(context.Background(), restore, arguments...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		assertStale(`UPDATE workspaces SET policy_revision = policy_revision || ':stale' WHERE workspace_id = $1`,
+			`UPDATE workspaces SET policy_revision = left(policy_revision, -6) WHERE workspace_id = $1`, workspace.ID().String())
+		assertStale(`UPDATE workspace_memberships SET version = version + 1 WHERE membership_id = $1`,
+			`UPDATE workspace_memberships SET version = version - 1 WHERE membership_id = $1`, membershipID.String())
+		assertStale(`UPDATE actor_delegations SET version = version + 1 WHERE delegation_id = $1`,
+			`UPDATE actor_delegations SET version = version - 1 WHERE delegation_id = $1`, delegationID.String())
+
+		device := paired.Device()
+		if _, err := store.pool.Exec(context.Background(), `UPDATE actor_sessions SET device_id = $1, device_version = $2,
+			device_trust_revision = $3 WHERE session_id = $4`, device.ID().String(), device.Version().Uint64(),
+			device.TrustRevision().Uint64(), sessionID.String()); err != nil {
+			t.Fatal(err)
+		}
+		assertStale(`UPDATE device_registrations SET trust_revision = trust_revision + 1 WHERE device_id = $1`,
+			`UPDATE device_registrations SET trust_revision = trust_revision - 1 WHERE device_id = $1`, device.ID().String())
+
+		if _, err := store.pool.Exec(context.Background(), `INSERT INTO actor_session_grant_revisions(session_id, grant_id, grant_version)
+			VALUES ($1, $2, $3)`, sessionID.String(), grant.ID().String(), grant.Version().Uint64()); err != nil {
+			t.Fatal(err)
+		}
+		assertStale(`UPDATE grants SET version = version + 1 WHERE grant_id = $1`,
+			`UPDATE grants SET version = version - 1 WHERE grant_id = $1`, grant.ID().String())
+		if _, err := store.GetContext(context.Background(), query); err != nil {
+			t.Fatalf("restored authorization revisions were rejected: %v", err)
+		}
+	})
+
 	t.Run("split receipt identity fails closed", func(t *testing.T) {
 		primary, secondary := specs[3], specs[5]
 		identity := primary.ReceiptIdentity()
@@ -898,6 +1059,14 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 			"command_receipts": 11, "domain_events": 15, "audit_entries": 12,
 		})
 	})
+}
+
+func assertQueryErrorCode(t *testing.T, err error, code domain.ErrorCode) {
+	t.Helper()
+	var rejection *domain.CommandError
+	if !errors.As(err, &rejection) || rejection.Code() != code {
+		t.Fatalf("query error=%v, want code %s", err, code)
+	}
 }
 
 func mustExecuteProductionCommand(
