@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	blackbirdruntime "github.com/phall1/blackbird/internal/runtime"
 )
 
 func TestExecutePrintsVersion(t *testing.T) {
@@ -54,6 +56,52 @@ func TestExecuteReturnsErrorWhenVersionCannotBeWritten(t *testing.T) {
 	}
 }
 
+func TestExecuteInjectsNonSecretConfiguration(t *testing.T) {
+	t.Parallel()
+	injected := blackbirdruntime.Config{
+		Storage: blackbirdruntime.StorageSQLite, SQLitePath: "injected.db",
+		HTTPAddress: "127.0.0.1:9000", MCPAddress: "127.0.0.1:9001",
+	}
+	var got blackbirdruntime.Config
+	factory := func(_ blackbirdruntime.BuildInfo, config blackbirdruntime.Config) (daemonRunner, error) {
+		got = config
+		return cancelledRunner{}, nil
+	}
+	code := executeConfigured(context.Background(), []string{
+		"--storage=postgres", "--http-address=127.0.0.1:9100",
+	}, ioDiscard{}, ioDiscard{}, &injected, factory)
+	if code != exitOK {
+		t.Fatalf("executeConfigured() = %d, want %d", code, exitOK)
+	}
+	if got.Storage != blackbirdruntime.StoragePostgreSQL || got.SQLitePath != "injected.db" || got.HTTPAddress != "127.0.0.1:9100" {
+		t.Fatalf("config = %#v", got)
+	}
+}
+
+func TestExecuteDoesNotAcceptSecretsOnCommandLine(t *testing.T) {
+	t.Parallel()
+	for _, argument := range []string{"--dsn=postgres://secret", "--postgres-password=secret", "--migration-dsn=postgres://secret"} {
+		var stderr bytes.Buffer
+		if code := execute(context.Background(), []string{argument}, ioDiscard{}, &stderr); code != exitUsage {
+			t.Fatalf("execute(%q) = %d, want %d", argument, code, exitUsage)
+		}
+		if !strings.Contains(stderr.String(), "flag provided but not defined") {
+			t.Fatalf("stderr for %q = %q", argument, stderr.String())
+		}
+	}
+}
+
+func TestExecuteFailsClosedWithoutHandlerComposition(t *testing.T) {
+	t.Parallel()
+	var stderr bytes.Buffer
+	if code := execute(context.Background(), nil, ioDiscard{}, &stderr); code != exitError {
+		t.Fatalf("execute() = %d, want %d", code, exitError)
+	}
+	if !strings.Contains(stderr.String(), "complete handler composer") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 type ioDiscard struct{}
 
 func (ioDiscard) Write(value []byte) (int, error) {
@@ -65,3 +113,7 @@ type errorWriter struct{}
 func (errorWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write failed")
 }
+
+type cancelledRunner struct{}
+
+func (cancelledRunner) Run(context.Context) error { return nil }
