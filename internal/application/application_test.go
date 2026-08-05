@@ -268,6 +268,28 @@ func mustCapsuleDraft(
 	return &draft
 }
 
+func bootstrapReceipt(t *testing.T, fixture bootstrapFixture) ReceiptSnapshot {
+	t.Helper()
+	first, _ := domain.NewStreamPosition(1)
+	last, _ := domain.NewStreamPosition(3)
+	events, _ := NewEventRange(first, last, 3)
+	receipt, err := NewReceiptSnapshot(ReceiptSnapshotParams{
+		ReceiptID: fixture.receipt, CommandID: fixture.command, Identity: fixture.spec.ReceiptIdentity(),
+		RequestFingerprint: fixture.spec.RequestFingerprint(), Result: fixture.resultRecord,
+		AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
+		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
+		CapsuleRequirement: RecoveryCapsuleRequired,
+		RecoveryCapsule: mustCapsuleDraft(
+			t, fixture.resultRecord, fixture.command, fixture.spec.OperationMajor(),
+			fixture.spec.RecoveryCapsule().KeyID(),
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
+}
+
 func TestCommandContractAcceptsExactBootstrapShapeAndOwnsCopies(t *testing.T) {
 	t.Parallel()
 	fixture := buildBootstrapFixture(t)
@@ -330,6 +352,8 @@ func TestReplayBindingPreservesOriginalCommandAndAcceptedAuthority(t *testing.T)
 	retrySpec := fixture.spec
 	retryCommand, _ := domain.ParseCommandID(applicationUUID(93))
 	retrySpec.commandID = retryCommand
+	retrySigner := newTestCapsuleSigner("ed25519:rotated-current")
+	retrySpec.recoveryCapsule, _ = PrepareRecoveryCapsulePlan(retrySigner)
 	acceptedAuthority, _ := domain.ParseAuthorityID(applicationUUID(94))
 	acceptedEpoch, _ := domain.ParseAuthorityEpoch(applicationUUID(95))
 	first, _ := domain.NewStreamPosition(1)
@@ -344,6 +368,7 @@ func TestReplayBindingPreservesOriginalCommandAndAcceptedAuthority(t *testing.T)
 		AcceptedAt: resultPlan.AcceptedAt(), Resources: resultPlan.Resources(),
 		IssuedCeremonies: resultPlan.IssuedCeremonies(), EventIDs: resultPlan.EventIDs(),
 		Events: events, FinalStreamDigest: streamDigest,
+		RecoveryCapsulePlan: fixture.spec.RecoveryCapsule(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -352,12 +377,17 @@ func TestReplayBindingPreservesOriginalCommandAndAcceptedAuthority(t *testing.T)
 		binding.AuthorityID() != acceptedAuthority || binding.AuthorityEpoch() != acceptedEpoch {
 		t.Fatal("replay binding replaced original receipt provenance with current routing provenance")
 	}
+	if binding.RecoveryCapsulePlan().KeyID() != fixture.spec.RecoveryCapsule().KeyID() ||
+		binding.RecoveryCapsulePlan().KeyID() == retrySpec.RecoveryCapsule().KeyID() {
+		t.Fatal("replay binding replaced the receipt's historical capsule key with the retry key")
+	}
 	verificationBinding, err := NewReceiptResultReplayBinding(retrySpec, ReceiptResultReplayBindingParams{
 		OriginalCommandID: fixture.command, AcceptedAuthorityID: fixture.authority,
 		AcceptedAuthorityEpoch: fixture.epoch, GuardDigest: fixture.context.GuardEvidence().Digest(),
 		AcceptedAt: resultPlan.AcceptedAt(), Resources: resultPlan.Resources(),
 		IssuedCeremonies: resultPlan.IssuedCeremonies(), EventIDs: resultPlan.EventIDs(),
 		Events: events, FinalStreamDigest: streamDigest,
+		RecoveryCapsulePlan: fixture.spec.RecoveryCapsule(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -391,6 +421,7 @@ func TestReplayBindingPreservesOriginalCommandAndAcceptedAuthority(t *testing.T)
 		AcceptedAt: resultPlan.AcceptedAt(), Resources: resultPlan.Resources(),
 		IssuedCeremonies: resultPlan.IssuedCeremonies(), EventIDs: resultPlan.EventIDs(),
 		Events: shortRange, FinalStreamDigest: streamDigest,
+		RecoveryCapsulePlan: fixture.spec.RecoveryCapsule(),
 	}); !errors.Is(err, ErrInvalidApplicationContract) {
 		t.Fatalf("replay binding accepted wrong operation event count: %v", err)
 	}
@@ -1357,8 +1388,8 @@ func TestRecoveryCapsulePlanDraftSigningAndPendingOutcome(t *testing.T) {
 		GuardDigest: fixture.context.GuardEvidence().Digest(), Events: events,
 		CapsuleRequirement: RecoveryCapsuleRequired, RecoveryCapsule: draft,
 	})
-	pending, err := CapsulePendingCommandExecution(receipt)
-	if err != nil || pending.Kind() != CommandCapsulePending {
+	pending, err := CommittedCapsulePendingCommandExecution(receipt)
+	if err != nil || pending.Kind() != CommandCommittedCapsulePending {
 		t.Fatalf("pending execution=%s error=%v", pending.Kind(), err)
 	}
 	if _, err = AppliedCommandExecution(receipt, nil); !errors.Is(err, ErrInvalidCommandExecution) {
@@ -1388,27 +1419,27 @@ func (unit *recordingUnitOfWork) ExecuteCommand(
 	ctx context.Context,
 	spec CommandSpec,
 	decide func(CommandContext) (CommandDecision, error),
-) (execution CommandExecution, err error) {
+) (execution CommandTransactionExecution, err error) {
 	_ = ctx
 	_ = spec
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			execution = CommandExecution{}
+			execution = CommandTransactionExecution{}
 			err = ErrInvalidCommandDecision
 		}
 	}()
 	decision, err := decide(CommandContext{})
 	if err != nil {
-		return CommandExecution{}, err
+		return CommandTransactionExecution{}, err
 	}
 	if decision.kind != CommandDecisionApplied && decision.kind != CommandDecisionReplay &&
 		decision.kind != CommandDecisionRollback {
-		return CommandExecution{}, ErrInvalidCommandDecision
+		return CommandTransactionExecution{}, ErrInvalidCommandDecision
 	}
 	if decision.Kind() == CommandDecisionApplied {
 		unit.commits++
 	}
-	return CommandExecution{}, nil
+	return CommandTransactionExecution{}, nil
 }
 
 func (*recordingUnitOfWork) ExecuteSecurity(
@@ -1454,6 +1485,111 @@ func TestUnitOfWorkRejectsZeroDecisionAndPanic(t *testing.T) {
 			}
 			if unit.commits != 0 {
 				t.Fatal("invalid callback committed")
+			}
+		})
+	}
+}
+
+func TestCommandTransactionExecutionErrorMatrixAndRetryIdentity(t *testing.T) {
+	t.Parallel()
+	fixture := buildBootstrapFixture(t)
+	receipt := bootstrapReceipt(t, fixture)
+	rejection, _ := domain.NewCommandError(domain.ErrorCodeInvalidArgument, "invalid", nil)
+	committed, _ := CommittedCommandTransactionExecution(receipt)
+	replayed, _ := ReplayedCommandTransactionExecution(receipt, ReplayDiscloseResult)
+	rejected, _ := RejectedCommandTransactionExecution(rejection, SecuritySpec{})
+	mandatoryDenial, _ := domain.NewCommandError(domain.ErrorCodeForbidden, "denied", nil)
+	if _, err := RejectedCommandTransactionExecution(mandatoryDenial, SecuritySpec{}); !errors.Is(err, ErrInvalidCommandExecution) {
+		t.Fatalf("mandatory denial without security follow-up error=%v", err)
+	}
+	mixedCommitted := committed
+	mixedCommitted.rejection = rejection
+	if err := ValidateCommandTransactionResult(mixedCommitted, nil); !errors.Is(err, ErrInvalidCommandExecution) {
+		t.Fatalf("mixed committed/rejected union error=%v", err)
+	}
+	indeterminate, err := IndeterminateCommandTransactionExecution(fixture.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, ok := indeterminate.RetryIdentity()
+	if !ok || retry.CommandID() != fixture.command || retry.ReceiptID() != fixture.receipt ||
+		retry.ReceiptIdentity() != fixture.spec.ReceiptIdentity() ||
+		retry.RequestFingerprint() != fixture.spec.RequestFingerprint() {
+		t.Fatal("indeterminate outcome lost stable command retry identity")
+	}
+	final, err := IndeterminateCommandExecution(fixture.spec)
+	finalRetry, finalHasRetry := final.RetryIdentity()
+	if err != nil || !finalHasRetry || finalRetry != retry {
+		t.Fatal("post-transaction indeterminate outcome lost stable command retry identity")
+	}
+	operational := errors.New("commit acknowledgement lost")
+	tests := []struct {
+		name      string
+		execution CommandTransactionExecution
+		err       error
+		valid     bool
+	}{
+		{name: "pre-outcome failure", err: operational, valid: true},
+		{name: "domain rejection through error", err: rejection},
+		{name: "committed", execution: committed, valid: true},
+		{name: "replayed", execution: replayed, valid: true},
+		{name: "rejected", execution: rejected, valid: true},
+		{name: "indeterminate", execution: indeterminate, valid: true},
+		{name: "zero success"},
+		{name: "committed with error", execution: committed, err: operational},
+		{name: "replayed with error", execution: replayed, err: operational},
+		{name: "rejected with error", execution: rejected, err: operational},
+		{name: "indeterminate with error", execution: indeterminate, err: operational},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateCommandTransactionResult(test.execution, test.err)
+			if (err == nil) != test.valid {
+				t.Fatalf("validation error=%v valid=%t", err, test.valid)
+			}
+		})
+	}
+}
+
+func TestSecurityExecutionErrorMatrixRetainsOperation(t *testing.T) {
+	t.Parallel()
+	rejection, _ := domain.NewCommandError(domain.ErrorCodeForbidden, "denied", nil)
+	applied, _ := AppliedSecurityExecution(SecurityRotateBootstrapGeneration)
+	rejected, err := RejectedSecurityExecution(SecurityRecordCommandDenial, rejection)
+	if err != nil || rejected.Operation() != SecurityRecordCommandDenial {
+		t.Fatalf("rejected operation=%q error=%v", rejected.Operation(), err)
+	}
+	indeterminate, err := IndeterminateSecurityExecution(SecurityResumeBootstrapGeneration)
+	if err != nil || indeterminate.Operation() != SecurityResumeBootstrapGeneration {
+		t.Fatalf("indeterminate operation=%q error=%v", indeterminate.Operation(), err)
+	}
+	mixedApplied := applied
+	mixedApplied.rejection = rejection
+	if err := ValidateSecurityExecutionResult(mixedApplied, nil); !errors.Is(err, ErrInvalidSecurityExecution) {
+		t.Fatalf("mixed applied/rejected security union error=%v", err)
+	}
+	operational := errors.New("commit acknowledgement lost")
+	tests := []struct {
+		name      string
+		execution SecurityExecution
+		err       error
+		valid     bool
+	}{
+		{name: "pre-outcome failure", err: operational, valid: true},
+		{name: "domain rejection through error", err: rejection},
+		{name: "applied", execution: applied, valid: true},
+		{name: "rejected", execution: rejected, valid: true},
+		{name: "indeterminate", execution: indeterminate, valid: true},
+		{name: "zero success"},
+		{name: "applied with error", execution: applied, err: operational},
+		{name: "rejected with error", execution: rejected, err: operational},
+		{name: "indeterminate with error", execution: indeterminate, err: operational},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateSecurityExecutionResult(test.execution, test.err)
+			if (err == nil) != test.valid {
+				t.Fatalf("validation error=%v valid=%t", err, test.valid)
 			}
 		})
 	}
@@ -1676,7 +1812,8 @@ func buildOperationDomainPath(t *testing.T) operationDomainPath {
 		t.Fatal(err)
 	}
 	paired, err := domain.PairDevice(domain.PairDeviceInput{
-		Authorization: pairingAuth, CurrentAuthorization: ownerAuth, Principal: fixture.result.Principal(),
+		Authorization: pairingAuth, CurrentAuthorization: ownerAuth, AuthorityTime: now,
+		Principal:                fixture.result.Principal(),
 		ExpectedPrincipalVersion: fixture.result.Principal().Version(), Device: pairingBegan.Device(),
 		ExpectedDeviceVersion: pairingBegan.Device().Version(),
 		ExpectedTrustRevision: pairingBegan.Device().TrustRevision(), Proof: pairingProof,
@@ -2169,7 +2306,8 @@ func TestVersionedCommitRejectsResultComputedFromAlternateLockedState(t *testing
 		path.policy, path.assurance, path.now, domain.MaxActorSessionLifetime,
 	)
 	laundered, err := domain.PairDevice(domain.PairDeviceInput{
-		Authorization: authorization, CurrentAuthorization: currentAuthorization, Principal: path.bootstrap.Principal(),
+		Authorization: authorization, CurrentAuthorization: currentAuthorization, AuthorityTime: path.now,
+		Principal:                path.bootstrap.Principal(),
 		ExpectedPrincipalVersion: path.bootstrap.Principal().Version(), Device: alternate,
 		ExpectedDeviceVersion: alternate.Version(), ExpectedTrustRevision: alternate.TrustRevision(), Proof: proof,
 	})

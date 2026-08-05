@@ -126,6 +126,15 @@ func TestEventPayloadIsBoundedObjectAndImmutable(t *testing.T) {
 			t.Errorf("non-I-JSON payload %q error = %v", nonIJSON, err)
 		}
 	}
+	for _, size := range []int{MaxEventPayloadBytes - 1, MaxEventPayloadBytes} {
+		payload := []byte(`{"value":"` + strings.Repeat("x", size-len(`{"value":""}`)) + `"}`)
+		if len(payload) != size {
+			t.Fatalf("boundary payload size = %d, want %d", len(payload), size)
+		}
+		if _, err := NewEventPayload(payload); err != nil {
+			t.Fatalf("payload size %d rejected: %v", size, err)
+		}
+	}
 	if _, err := NewEventPayload(bytes.Repeat([]byte{'x'}, MaxEventPayloadBytes+1)); !errors.Is(err, ErrEventPayloadTooLarge) {
 		t.Fatalf("oversize error = %v", err)
 	}

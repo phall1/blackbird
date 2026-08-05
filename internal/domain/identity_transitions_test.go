@@ -276,6 +276,412 @@ func ceremonyRehydrationParams(challenge CeremonyChallenge) CeremonyChallengeReh
 	}
 }
 
+func fuzzRehydrationVersion(selector uint8, raw uint64) Version {
+	values := [...]uint64{0, 1, 2, MaxCanonicalInteger - 1, MaxCanonicalInteger, MaxCanonicalInteger + 1, ^uint64(0), raw}
+	return Version{value: values[int(selector)%len(values)]}
+}
+
+func requireFuzzRehydration(t *testing.T, aggregate string, valid bool, zero bool, err error) {
+	t.Helper()
+	if valid {
+		if err != nil || zero {
+			t.Fatalf("%s valid persisted shape rejected: zero=%t error=%v", aggregate, zero, err)
+		}
+		return
+	}
+	if !errors.Is(err, ErrInvalidIdentityState) || !zero {
+		t.Fatalf("%s impossible persisted shape accepted: zero=%t error=%v", aggregate, zero, err)
+	}
+}
+
+// FuzzIdentityAggregateRehydration exercises typed persisted values rather than
+// spending the corpus on UUID parsing. Each seed selects one aggregate and an
+// intentional lifecycle, numeric-boundary, or cross-binding mutation.
+func FuzzIdentityAggregateRehydration(f *testing.F) {
+	now := time.Date(2026, 8, 4, 16, 0, 0, 123456000, time.UTC)
+	authorityID, _ := ParseAuthorityID(identityUUID(400))
+	epoch, _ := ParseAuthorityEpoch(identityUUID(401))
+	installationID, _ := ParseInstallationID(identityUUID(402))
+	workspaceID, _ := ParseWorkspaceID(identityUUID(403))
+	principalID, _ := ParsePrincipalID(identityUUID(404))
+	otherPrincipalID, _ := ParsePrincipalID(identityUUID(405))
+	deviceID, _ := ParseDeviceID(identityUUID(406))
+	otherDeviceID, _ := ParseDeviceID(identityUUID(407))
+	grantID, _ := ParseGrantID(identityUUID(408))
+	membershipID, _ := ParseMembershipID(identityUUID(409))
+	otherMembershipID, _ := ParseMembershipID(identityUUID(410))
+	actorID, _ := ParseActorID(identityUUID(411))
+	delegationID, _ := ParseActorDelegationID(identityUUID(412))
+	sessionID, _ := ParseActorSessionID(identityUUID(413))
+	clientID, _ := ParseClientInstanceID(identityUUID(414))
+	invitationID, _ := ParseInvitationID(identityUUID(415))
+	generationID, _ := ParseBootstrapGenerationID(identityUUID(416))
+	pairingID, _ := ParseCeremonyID(identityUUID(417))
+	membershipChallengeID, _ := ParseCeremonyID(identityUUID(418))
+	delegationChallengeID, _ := ParseCeremonyID(identityUUID(419))
+
+	displayName := DisplayName{value: "Fuzz Identity"}
+	publicKey := PublicKeyReference{value: "keyref:fuzz-device"}
+	otherPublicKey := PublicKeyReference{value: "keyref:fuzz-other-device"}
+	digest := FingerprintCommand([]byte("fuzz rehydration digest"))
+	otherDigest := FingerprintCommand([]byte("cross-bound digest"))
+	credentialDigest := CredentialDigest(FingerprintCommand([]byte("fuzz credential digest")))
+	credential := DeviceCredentialBinding{
+		publicKeyReference: publicKey,
+		spkiFingerprint:    credentialDigest,
+		transcript:         digest,
+	}
+	capabilities := CapabilitySet{values: []Capability{{value: "work:read"}}}
+	pairing := CeremonyChallenge{
+		id: pairingID, purpose: CeremonyPurposeDevicePairing, proofDigest: digest,
+		expiresAt: now.Add(time.Minute), status: CeremonyPending,
+		installationID: installationID, principalID: principalID, deviceID: deviceID,
+	}
+	acceptance := CeremonyChallenge{
+		id: membershipChallengeID, purpose: CeremonyPurposeMembershipAcceptance, proofDigest: digest,
+		expiresAt: now.Add(time.Minute), status: CeremonyPending,
+		workspaceID: workspaceID, principalID: principalID, membershipID: membershipID,
+	}
+	activation := CeremonyChallenge{
+		id: delegationChallengeID, purpose: CeremonyPurposeDelegationActivation, proofDigest: digest,
+		expiresAt: now.Add(time.Minute), status: CeremonyPending,
+		workspaceID: workspaceID, principalID: principalID, actorID: actorID, delegationID: delegationID,
+	}
+	membershipRef, _ := NewAggregateRef(membershipID, InitialVersion())
+	delegationRef, _ := NewAggregateRef(delegationID, InitialVersion())
+	policy := PolicyRevision{value: "local-policy:fuzz"}
+	assurance := AssuranceClass{value: "strong-factor"}
+	binding, _ := NewSessionBinding(
+		authorityID, epoch, workspaceID, principalID, actorID, membershipRef, delegationRef,
+		nil, Version{}, nil, policy, assurance, now, now.Add(time.Hour),
+	)
+	presentation := PresentationCredentialBinding{
+		digest: credentialDigest, reference: CredentialReference{value: "credential-ref:fuzz"},
+		audience: CredentialAudience{value: "blackbird:fuzz"}, version: PresentationCredentialVersion,
+	}
+
+	for aggregate := uint8(0); aggregate < 9; aggregate++ {
+		for mutation := uint8(0); mutation < 6; mutation++ {
+			f.Add(aggregate, mutation, uint8(0), uint8(1), uint64(2))
+		}
+	}
+	for selector := uint8(0); selector < 7; selector++ {
+		f.Add(uint8(7), uint8(0), selector, selector, uint64(37))
+	}
+
+	f.Fuzz(func(t *testing.T, aggregate uint8, mutation uint8, versionSelector uint8, trustSelector uint8, raw uint64) {
+		version := fuzzRehydrationVersion(versionSelector, raw)
+		trust := fuzzRehydrationVersion(trustSelector, raw)
+		validVersion := version.Valid()
+		switch aggregate % 9 {
+		case 0:
+			failures := uint8(mutation % (MaxBootstrapFailedAttempts + 1))
+			statuses := [...]InstallationInvitationStatus{
+				InstallationInvitationPending, InstallationInvitationConsumed, InstallationInvitationExhausted, "unknown",
+			}
+			status := statuses[int(mutation)%len(statuses)]
+			params := InstallationInvitationRehydrationParams{
+				ID: invitationID, InstallationID: installationID, InstallationPublicKey: publicKey,
+				InvitationVerifier: digest, BootstrapGenerationID: generationID, ExpiresAt: now,
+				FailedAttempts: failures, Status: status, Version: version,
+			}
+			wantVersion := uint64(failures) + 1
+			valid := status == InstallationInvitationPending && failures < MaxBootstrapFailedAttempts
+			if status == InstallationInvitationConsumed && failures < MaxBootstrapFailedAttempts {
+				wantVersion++
+				valid = true
+			}
+			if status == InstallationInvitationExhausted && failures == MaxBootstrapFailedAttempts {
+				wantVersion = uint64(MaxBootstrapFailedAttempts) + 1
+				valid = true
+			}
+			state, err := RehydrateInstallationInvitation(params)
+			requireFuzzRehydration(t, "invitation", valid && version.Uint64() == wantVersion, state.IsZero(), err)
+		case 1:
+			statuses := [...]PrincipalStatus{PrincipalActive, PrincipalSuspended, PrincipalDisabled, "unknown"}
+			kinds := [...]PrincipalKind{PrincipalKindHuman, PrincipalKindWorkload, PrincipalKindService, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			kind := kinds[int(mutation/2)%len(kinds)]
+			key := publicKey
+			if mutation%6 == 4 {
+				key = PublicKeyReference{}
+			}
+			params := PrincipalRehydrationParams{
+				ID: principalID, InstallationID: installationID, Kind: kind, DisplayName: displayName,
+				PublicKeyReference: key, Status: status, Version: version,
+			}
+			valid := validVersion && status.Valid() && kind.Valid() &&
+				(kind == PrincipalKindHuman || !key.valueIsZero()) && (status == PrincipalActive || version.Uint64() > 1)
+			state, err := RehydratePrincipal(params)
+			requireFuzzRehydration(t, "principal", valid, state.IsZero(), err)
+		case 2:
+			statuses := [...]DeviceStatus{DevicePending, DeviceTrusted, DeviceSuspended, DeviceRevoked, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			challenge := pairing
+			binding := DeviceCredentialBinding{}
+			if status != DevicePending {
+				challenge.status = CeremonyConsumed
+				binding = credential
+			}
+			crossBound := false
+			switch mutation % 6 {
+			case 1:
+				challenge.principalID = otherPrincipalID
+				crossBound = true
+			case 2:
+				challenge.deviceID = otherDeviceID
+				crossBound = true
+			case 3:
+				if status != DevicePending {
+					binding.publicKeyReference = otherPublicKey
+					crossBound = true
+				}
+			case 4:
+				if status != DevicePending {
+					binding.transcript = otherDigest
+					crossBound = true
+				}
+			case 5:
+				challenge = CeremonyChallenge{}
+				crossBound = status == DevicePending
+			}
+			params := DeviceRehydrationParams{
+				ID: deviceID, InstallationID: installationID, PrincipalID: principalID,
+				DisplayName: displayName, PublicKeyReference: publicKey, Status: status,
+				Version: version, TrustRevision: trust, PairingChallenge: challenge, CredentialBinding: binding,
+			}
+			valid := validVersion && trust.Valid() && trust.Uint64() <= version.Uint64() && status.Valid() && !crossBound
+			if status == DevicePending {
+				valid = valid && !challenge.IsZero() && binding.IsZero()
+			} else {
+				valid = valid && !binding.IsZero() && (challenge.IsZero() ||
+					(version.Uint64() > 1 && trust.Uint64() > 1))
+			}
+			if status == DeviceSuspended || status == DeviceRevoked {
+				valid = valid && version.Uint64() > 1
+			}
+			state, err := RehydrateDevice(params)
+			requireFuzzRehydration(t, "device", valid, state.IsZero(), err)
+		case 3:
+			statuses := [...]GrantStatus{GrantActive, GrantRevoked, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			caps := capabilities
+			if mutation%6 == 5 {
+				caps = CapabilitySet{values: []Capability{{value: "*"}}}
+			}
+			state, err := RehydrateGrant(GrantRehydrationParams{
+				ID: grantID, InstallationID: installationID, PrincipalID: principalID,
+				Status: status, Version: version, Capabilities: caps,
+			})
+			valid := validVersion && status.Valid() && caps.values[0].value != "*" &&
+				(status != GrantRevoked || version.Uint64() > 1)
+			requireFuzzRehydration(t, "grant", valid, state.IsZero(), err)
+		case 4:
+			statuses := [...]WorkspaceStatus{WorkspaceActive, WorkspaceSuspended, WorkspaceArchived, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			alias := WorkspaceAlias{value: "fuzz-workspace"}
+			if mutation%6 == 5 {
+				alias.value = " padded "
+			}
+			state, err := RehydrateWorkspace(WorkspaceRehydrationParams{
+				ID: workspaceID, InstallationID: installationID, AuthorityID: authorityID, AuthorityEpoch: epoch,
+				Alias: alias, DiscoveryLocator: DiscoveryLocator{value: "workspace://fuzz"}, PolicyRevision: policy,
+				Status: status, Version: version,
+			})
+			valid := validVersion && status.Valid() && alias.value != " padded " &&
+				(status == WorkspaceActive || version.Uint64() > 1)
+			requireFuzzRehydration(t, "workspace", valid, state.IsZero(), err)
+		case 5:
+			statuses := [...]MembershipStatus{MembershipInvited, MembershipActive, MembershipSuspended, MembershipRevoked, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			challenge := acceptance
+			if status != MembershipInvited {
+				challenge.status = CeremonyConsumed
+			}
+			crossBound := false
+			switch mutation % 6 {
+			case 1:
+				challenge.membershipID = otherMembershipID
+				crossBound = true
+			case 2:
+				challenge.principalID = otherPrincipalID
+				crossBound = true
+			case 5:
+				challenge = CeremonyChallenge{}
+				crossBound = status == MembershipInvited
+			}
+			state, err := RehydrateMembership(MembershipRehydrationParams{
+				ID: membershipID, WorkspaceID: workspaceID, PrincipalID: principalID,
+				Status: status, Version: version, Capabilities: capabilities, AcceptanceChallenge: challenge,
+			})
+			valid := validVersion && status.Valid() && !crossBound
+			if status == MembershipInvited {
+				valid = valid && !challenge.IsZero()
+			} else if !challenge.IsZero() {
+				valid = valid && version.Uint64() > 1
+			}
+			if status == MembershipSuspended || status == MembershipRevoked {
+				valid = valid && version.Uint64() > 1
+			}
+			requireFuzzRehydration(t, "membership", valid, state.IsZero(), err)
+		case 6:
+			statuses := [...]ActorStatus{ActorActive, ActorSuspended, ActorRetired, "unknown"}
+			kinds := [...]ActorKind{ActorKindHuman, ActorKindAgent, ActorKindAutomation, ActorKindService, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			kind := kinds[int(mutation)%len(kinds)]
+			profile := ActorProfile{displayName: displayName}
+			if mutation%6 == 5 {
+				profile.displayName = DisplayName{value: " padded "}
+			}
+			state, err := RehydrateActor(ActorRehydrationParams{
+				ID: actorID, WorkspaceID: workspaceID, Kind: kind, Profile: profile, Status: status, Version: version,
+			})
+			valid := validVersion && status.Valid() && kind.Valid() && mutation%6 != 5 &&
+				(status == ActorActive || version.Uint64() > 1)
+			requireFuzzRehydration(t, "actor", valid, state.IsZero(), err)
+		case 7:
+			statuses := [...]DelegationStatus{DelegationProposed, DelegationActive, DelegationSuspended, DelegationRevoked, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			challenge := activation
+			if status != DelegationProposed {
+				challenge.status = CeremonyConsumed
+			}
+			crossBound := false
+			switch mutation % 6 {
+			case 1:
+				challenge.actorID = ActorID{}
+				crossBound = true
+			case 2:
+				challenge.principalID = otherPrincipalID
+				crossBound = true
+			case 3:
+				challenge.delegationID = ActorDelegationID{}
+				crossBound = true
+			}
+			state, err := RehydrateActorDelegation(ActorDelegationRehydrationParams{
+				ID: delegationID, WorkspaceID: workspaceID, PrincipalID: principalID, ActorID: actorID,
+				MembershipID: membershipID, Status: status, Version: version,
+				Capabilities: capabilities, ActivationChallenge: challenge,
+			})
+			valid := validVersion && status.Valid() && !crossBound &&
+				(status == DelegationProposed || version.Uint64() > 1)
+			requireFuzzRehydration(t, "delegation", valid, state.IsZero(), err)
+		case 8:
+			statuses := [...]ActorSessionStatus{ActorSessionActive, ActorSessionEnded, ActorSessionRevoked, ActorSessionExpired, "unknown"}
+			status := statuses[int(mutation)%len(statuses)]
+			candidateBinding := binding
+			candidatePresentation := presentation
+			crossBound := false
+			switch mutation % 6 {
+			case 1:
+				candidateBinding.membership.version = version
+				crossBound = !version.Valid()
+			case 2:
+				candidateBinding.delegation = membershipRef
+				crossBound = true
+			case 3:
+				candidateBinding.absoluteExpiry = candidateBinding.issuedAt
+				crossBound = true
+			case 4:
+				candidatePresentation.version = PresentationCredentialVersion + 1
+				crossBound = true
+			case 5:
+				candidatePresentation.reference = CredentialReference{value: " padded "}
+				crossBound = true
+			}
+			state, err := RehydrateActorSession(ActorSessionRehydrationParams{
+				ID: sessionID, ClientInstanceID: clientID, ClientMetadata: ClientMetadata{name: "fuzzer", version: "1"},
+				Status: status, Version: version, Binding: candidateBinding,
+				Capabilities: capabilities, PresentationCredential: candidatePresentation,
+			})
+			valid := validVersion && status.Valid() && !crossBound &&
+				(status == ActorSessionActive || version.Uint64() > 1)
+			requireFuzzRehydration(t, "actor session", valid, state.IsZero(), err)
+		}
+	})
+}
+
+func FuzzCeremonyChallengeRehydrationBindings(f *testing.F) {
+	now := time.Date(2026, 8, 4, 16, 0, 0, 0, time.UTC)
+	ceremonyID, _ := ParseCeremonyID(identityUUID(430))
+	installationID, _ := ParseInstallationID(identityUUID(431))
+	workspaceID, _ := ParseWorkspaceID(identityUUID(432))
+	principalID, _ := ParsePrincipalID(identityUUID(433))
+	membershipID, _ := ParseMembershipID(identityUUID(434))
+	actorID, _ := ParseActorID(identityUUID(435))
+	delegationID, _ := ParseActorDelegationID(identityUUID(436))
+	deviceID, _ := ParseDeviceID(identityUUID(437))
+	digest := FingerprintCommand([]byte("fuzz ceremony digest"))
+
+	for purpose := uint8(0); purpose < 4; purpose++ {
+		for binding := uint8(0); binding < 9; binding++ {
+			f.Add(purpose, binding, uint8(0))
+		}
+	}
+	f.Fuzz(func(t *testing.T, purposeSelector uint8, bindingSelector uint8, lifecycleSelector uint8) {
+		purposes := [...]CeremonyPurpose{
+			CeremonyPurposeMembershipAcceptance, CeremonyPurposeDelegationActivation,
+			CeremonyPurposeDevicePairing, CeremonyPurposeActorSessionStart,
+		}
+		params := CeremonyChallengeRehydrationParams{
+			ID: ceremonyID, Purpose: purposes[int(purposeSelector)%len(purposes)], ProofDigest: digest,
+			ExpiresAt: now, Status: CeremonyPending,
+		}
+		switch params.Purpose {
+		case CeremonyPurposeMembershipAcceptance:
+			params.WorkspaceID, params.PrincipalID, params.MembershipID = workspaceID, principalID, membershipID
+		case CeremonyPurposeDelegationActivation, CeremonyPurposeActorSessionStart:
+			params.WorkspaceID, params.PrincipalID = workspaceID, principalID
+			params.ActorID, params.DelegationID = actorID, delegationID
+		case CeremonyPurposeDevicePairing:
+			params.InstallationID, params.PrincipalID, params.DeviceID = installationID, principalID, deviceID
+		}
+		switch lifecycleSelector % 3 {
+		case 1:
+			params.Status = CeremonyConsumed
+		case 2:
+			params.Status = "unknown"
+		}
+		valid := params.Status.Valid()
+		switch bindingSelector % 9 {
+		case 1:
+			params.InstallationID = installationID
+			valid = valid && params.Purpose == CeremonyPurposeDevicePairing
+		case 2:
+			params.WorkspaceID = workspaceID
+			valid = valid && params.Purpose != CeremonyPurposeDevicePairing
+		case 3:
+			params.PrincipalID = PrincipalID{}
+			valid = false
+		case 4:
+			params.MembershipID = membershipID
+			valid = valid && params.Purpose == CeremonyPurposeMembershipAcceptance
+		case 5:
+			params.ActorID = actorID
+			valid = valid && (params.Purpose == CeremonyPurposeDelegationActivation || params.Purpose == CeremonyPurposeActorSessionStart)
+		case 6:
+			params.DelegationID = delegationID
+			valid = valid && (params.Purpose == CeremonyPurposeDelegationActivation || params.Purpose == CeremonyPurposeActorSessionStart)
+		case 7:
+			params.DeviceID = deviceID
+			valid = valid && params.Purpose == CeremonyPurposeDevicePairing
+		case 8:
+			params.ProofDigest = CommandFingerprint{}
+			valid = false
+		}
+		state, err := RehydrateCeremonyChallenge(params)
+		if valid {
+			if err != nil || state.IsZero() {
+				t.Fatalf("valid %s challenge rejected: state=%#v error=%v", params.Purpose, state, err)
+			}
+			return
+		}
+		if !errors.Is(err, ErrInvalidCeremonyChallenge) || !state.IsZero() {
+			t.Fatalf("cross-bound %s challenge accepted: state=%#v error=%v", params.Purpose, state, err)
+		}
+	})
+}
+
 func TestRehydrateCeremonyChallengeRoundTripsEveryPurposeAndLifecycle(t *testing.T) {
 	fixture := buildIdentityPath(t)
 	deviceID, _ := ParseDeviceID(identityUUID(300))
@@ -358,6 +764,10 @@ func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pairingFacts := began.Facts()
+	if len(pairingFacts) != 1 || pairingFacts[0].(DevicePairingBeganFact).InstallationID() != fixture.installationID {
+		t.Fatal("device pairing fact lost installation scope")
+	}
 	deviceProof, _ := NewCeremonyProof(
 		deviceCeremonyID, CeremonyPurposeDevicePairing, deviceDigest, fixture.owner.ID(), deviceID,
 	)
@@ -370,7 +780,8 @@ func TestRehydrateEveryIdentityStateRoundTripsTransitionState(t *testing.T) {
 			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(),
 			fixture.policy, fixture.assurance, fixture.now,
 		),
-		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
+		AuthorityTime: fixture.now,
+		Principal:     fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
 		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(),
 		ExpectedTrustRevision: began.Device().TrustRevision(), Proof: deviceProof,
 	})
@@ -1248,7 +1659,11 @@ func buildIdentityPath(t *testing.T) identityPathFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireFactTypes(t, activated.Facts(), EventTypeActorDelegationActivated)
+	activationFacts := activated.Facts()
+	requireFactTypes(t, activationFacts, EventTypeActorDelegationActivated)
+	if activationFacts[0].(ActorDelegationActivatedFact).WorkspaceID() != workspaceID {
+		t.Fatal("delegation activation fact lost workspace scope")
+	}
 
 	return identityPathFixture{
 		now: now, authorityID: authorityID, epoch: epoch, installationID: installationID,
@@ -1316,7 +1731,9 @@ func TestBootstrapInstallationAtomicFactsAndOrigins(t *testing.T) {
 		t.Fatalf("bootstrap origins are incorrect: %#v", facts)
 	}
 	pairedFact := facts[2].(DevicePairedFact)
-	if pairedFact.DisplayName() != deviceName || pairedFact.TranscriptFingerprint() != proof.TranscriptFingerprint() ||
+	registeredFact := facts[1].(PrincipalRegisteredFact)
+	if registeredFact.InstallationID() != installationID || pairedFact.InstallationID() != installationID ||
+		pairedFact.DisplayName() != deviceName || pairedFact.TranscriptFingerprint() != proof.TranscriptFingerprint() ||
 		pairedFact.CredentialBinding() != result.Device().CredentialBinding() {
 		t.Fatalf("bootstrap paired fact = %#v", pairedFact)
 	}
@@ -1378,6 +1795,16 @@ func TestBootstrapInstallationRejectsConsumedExpiredAndWrongProofWithoutPartialO
 				t.Fatalf("rejection returned a partial outcome: %#v", result)
 			}
 		})
+	}
+	direct, err := RejectBootstrapProof(RejectBootstrapProofInput{
+		Invitation: invitation, ExpectedInvitationVersion: invitation.Version(),
+		CurrentGeneration: generationAuthorization.CurrentGeneration(), GenerationAuthorization: generationAuthorization,
+		AttemptFingerprint: base.AttemptFingerprint, EvaluatedAt: now,
+	})
+	if err != nil || direct.Outcome() != BootstrapInstallationProofRejected ||
+		direct.Invitation().FailedAttempts() != 1 || !direct.Principal().IsZero() ||
+		!direct.Device().IsZero() || !direct.OwnerGrant().IsZero() || len(direct.Facts()) != 0 {
+		t.Fatalf("direct verifier rejection transition = %#v, %v", direct, err)
 	}
 }
 
@@ -1704,7 +2131,8 @@ func TestStartActorSessionHandoffIsAtomicAndNarrowed(t *testing.T) {
 		t.Fatalf("session facts = %#v", facts)
 	}
 	fact := facts[0].(ActorSessionStartedFact)
-	if fact.ClientInstanceID() != input.ClientInstanceID || fact.ClientMetadata() != input.ClientMetadata ||
+	if fact.WorkspaceID() != input.Workspace.ID() || fact.ClientInstanceID() != input.ClientInstanceID ||
+		fact.ClientMetadata() != input.ClientMetadata ||
 		!fact.Capabilities().Equal(testCapabilities(t, fixture.workRead)) ||
 		fact.PresentationCredential() != input.PresentationCredential {
 		t.Fatalf("session fact lost client or capability metadata: %#v", fact)
@@ -2201,7 +2629,8 @@ func TestVersionOverflowRejectsIdentityMutationsAtomically(t *testing.T) {
 				t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.workload.ID(),
 				fixture.policy, fixture.assurance, fixture.now,
 			),
-			Principal: fixture.workload, ExpectedPrincipalVersion: fixture.workload.Version(),
+			AuthorityTime: fixture.now,
+			Principal:     fixture.workload, ExpectedPrincipalVersion: fixture.workload.Version(),
 			Device: device, ExpectedDeviceVersion: maximum, ExpectedTrustRevision: maximum, Proof: proof,
 		})
 		if !errors.Is(err, ErrVersionOverflow) || !result.Device().IsZero() || len(result.Facts()) != 0 {
@@ -2277,7 +2706,8 @@ func TestBeginAndPairDeviceSuccessFacts(t *testing.T) {
 			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(),
 			fixture.policy, fixture.assurance, fixture.now,
 		),
-		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
+		AuthorityTime: fixture.now,
+		Principal:     fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
 		Device: began.Device(), ExpectedDeviceVersion: began.Device().Version(),
 		ExpectedTrustRevision: began.Device().TrustRevision(), Proof: proof,
 	})
@@ -2294,7 +2724,8 @@ func TestBeginAndPairDeviceSuccessFacts(t *testing.T) {
 		t.Fatalf("pair facts = %#v", pairFacts)
 	}
 	pairedFact := pairFacts[0].(DevicePairedFact)
-	if pairedFact.TrustRevision().Uint64() != 2 || pairedFact.TranscriptFingerprint() != digest ||
+	if pairedFact.InstallationID() != fixture.installationID || pairedFact.TrustRevision().Uint64() != 2 ||
+		pairedFact.TranscriptFingerprint() != digest ||
 		pairedFact.DisplayName() != name || paired.Device().CredentialBinding() != testDeviceCredential(t, key, digest) ||
 		pairedFact.CredentialBinding() != paired.Device().CredentialBinding() {
 		t.Fatalf("paired fact = %#v", pairedFact)
@@ -2378,9 +2809,15 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 			t, fixture.authorityID, fixture.epoch, fixture.installationID, fixture.owner.ID(),
 			fixture.policy, fixture.assurance, fixture.now,
 		),
-		Principal: fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
+		AuthorityTime: fixture.now,
+		Principal:     fixture.owner, ExpectedPrincipalVersion: fixture.owner.Version(),
 		Device: device, ExpectedDeviceVersion: device.Version(),
 		ExpectedTrustRevision: device.TrustRevision(), Proof: proof,
+	}
+	historicalVerifier := base
+	historicalVerifier.Authorization.evaluatedAt = fixture.now.Add(-time.Second)
+	if result, err := PairDevice(historicalVerifier); err != nil || result.Device().IsZero() {
+		t.Fatalf("current write-time authorization did not supersede historical verifier time: %#v, %v", result, err)
 	}
 	tests := []struct {
 		name   string
@@ -2406,7 +2843,7 @@ func TestPairDeviceAdverseMatrixIsAtomic(t *testing.T) {
 		{"stale policy revision", func(input *PairDeviceInput) {
 			input.CurrentAuthorization.policy, _ = NewPolicyRevision("newer-policy")
 		}, ErrForbidden},
-		{"historical verifier evaluation", func(input *PairDeviceInput) {
+		{"authorization time differs from authority time", func(input *PairDeviceInput) {
 			input.CurrentAuthorization.evaluatedAt = input.Authorization.EvaluatedAt().Add(time.Second)
 		}, ErrForbidden},
 		{"wrong authority installation", func(input *PairDeviceInput) {

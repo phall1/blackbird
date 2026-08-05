@@ -38,33 +38,37 @@ func (fact InstallationBootstrappedFact) TranscriptFingerprint() CommandFingerpr
 }
 
 type PrincipalRegisteredFact struct {
-	origin      AggregateRef
-	principalID PrincipalID
-	kind        PrincipalKind
-	displayName DisplayName
-	publicKey   PublicKeyReference
+	origin         AggregateRef
+	installationID InstallationID
+	principalID    PrincipalID
+	kind           PrincipalKind
+	displayName    DisplayName
+	publicKey      PublicKeyReference
 }
 
 func (PrincipalRegisteredFact) Type() EventType                             { return EventTypePrincipalRegistered }
 func (PrincipalRegisteredFact) identityFact()                               {}
 func (fact PrincipalRegisteredFact) Origin() AggregateRef                   { return fact.origin }
+func (fact PrincipalRegisteredFact) InstallationID() InstallationID         { return fact.installationID }
 func (fact PrincipalRegisteredFact) PrincipalID() PrincipalID               { return fact.principalID }
 func (fact PrincipalRegisteredFact) PrincipalKind() PrincipalKind           { return fact.kind }
 func (fact PrincipalRegisteredFact) DisplayName() DisplayName               { return fact.displayName }
 func (fact PrincipalRegisteredFact) PublicKeyReference() PublicKeyReference { return fact.publicKey }
 
 type DevicePairingBeganFact struct {
-	origin      AggregateRef
-	deviceID    DeviceID
-	principalID PrincipalID
-	ceremonyID  CeremonyID
-	displayName DisplayName
-	publicKey   PublicKeyReference
+	origin         AggregateRef
+	installationID InstallationID
+	deviceID       DeviceID
+	principalID    PrincipalID
+	ceremonyID     CeremonyID
+	displayName    DisplayName
+	publicKey      PublicKeyReference
 }
 
 func (DevicePairingBeganFact) Type() EventType                             { return EventTypeDevicePairingBegan }
 func (DevicePairingBeganFact) identityFact()                               {}
 func (fact DevicePairingBeganFact) Origin() AggregateRef                   { return fact.origin }
+func (fact DevicePairingBeganFact) InstallationID() InstallationID         { return fact.installationID }
 func (fact DevicePairingBeganFact) DeviceID() DeviceID                     { return fact.deviceID }
 func (fact DevicePairingBeganFact) PrincipalID() PrincipalID               { return fact.principalID }
 func (fact DevicePairingBeganFact) CeremonyID() CeremonyID                 { return fact.ceremonyID }
@@ -72,18 +76,20 @@ func (fact DevicePairingBeganFact) DisplayName() DisplayName               { ret
 func (fact DevicePairingBeganFact) PublicKeyReference() PublicKeyReference { return fact.publicKey }
 
 type DevicePairedFact struct {
-	origin        AggregateRef
-	deviceID      DeviceID
-	principalID   PrincipalID
-	displayName   DisplayName
-	transcript    CommandFingerprint
-	trustRevision Version
-	credential    DeviceCredentialBinding
+	origin         AggregateRef
+	installationID InstallationID
+	deviceID       DeviceID
+	principalID    PrincipalID
+	displayName    DisplayName
+	transcript     CommandFingerprint
+	trustRevision  Version
+	credential     DeviceCredentialBinding
 }
 
 func (DevicePairedFact) Type() EventType                                 { return EventTypeDevicePaired }
 func (DevicePairedFact) identityFact()                                   {}
 func (fact DevicePairedFact) Origin() AggregateRef                       { return fact.origin }
+func (fact DevicePairedFact) InstallationID() InstallationID             { return fact.installationID }
 func (fact DevicePairedFact) DeviceID() DeviceID                         { return fact.deviceID }
 func (fact DevicePairedFact) PrincipalID() PrincipalID                   { return fact.principalID }
 func (fact DevicePairedFact) DisplayName() DisplayName                   { return fact.displayName }
@@ -182,6 +188,7 @@ func (fact ActorDelegationProposedFact) CeremonyID() CeremonyID          { retur
 type ActorDelegationActivatedFact struct {
 	origin       AggregateRef
 	delegationID ActorDelegationID
+	workspaceID  WorkspaceID
 	principalID  PrincipalID
 	actorID      ActorID
 	sessionStart CeremonyID
@@ -191,6 +198,7 @@ func (ActorDelegationActivatedFact) Type() EventType                      { retu
 func (ActorDelegationActivatedFact) identityFact()                        {}
 func (fact ActorDelegationActivatedFact) Origin() AggregateRef            { return fact.origin }
 func (fact ActorDelegationActivatedFact) DelegationID() ActorDelegationID { return fact.delegationID }
+func (fact ActorDelegationActivatedFact) WorkspaceID() WorkspaceID        { return fact.workspaceID }
 func (fact ActorDelegationActivatedFact) PrincipalID() PrincipalID        { return fact.principalID }
 func (fact ActorDelegationActivatedFact) ActorID() ActorID                { return fact.actorID }
 func (fact ActorDelegationActivatedFact) SessionStartCeremonyID() CeremonyID {
@@ -200,6 +208,7 @@ func (fact ActorDelegationActivatedFact) SessionStartCeremonyID() CeremonyID {
 type ActorSessionStartedFact struct {
 	origin         AggregateRef
 	sessionID      ActorSessionID
+	workspaceID    WorkspaceID
 	clientInstance ClientInstanceID
 	clientMetadata ClientMetadata
 	binding        SessionBinding
@@ -211,6 +220,7 @@ func (ActorSessionStartedFact) Type() EventType                         { return
 func (ActorSessionStartedFact) identityFact()                           {}
 func (fact ActorSessionStartedFact) Origin() AggregateRef               { return fact.origin }
 func (fact ActorSessionStartedFact) SessionID() ActorSessionID          { return fact.sessionID }
+func (fact ActorSessionStartedFact) WorkspaceID() WorkspaceID           { return fact.workspaceID }
 func (fact ActorSessionStartedFact) ClientInstanceID() ClientInstanceID { return fact.clientInstance }
 func (fact ActorSessionStartedFact) ClientMetadata() ClientMetadata     { return fact.clientMetadata }
 func (fact ActorSessionStartedFact) Binding() SessionBinding            { return fact.binding }
@@ -406,7 +416,14 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 		return BootstrapInstallationResult{}, transitionConflict(ConflictState, "bootstrap process generation changed without an authorized resume")
 	}
 	if !bootstrapProofMatches(input) {
-		return rejectBootstrapProof(input.Invitation, input.AttemptFingerprint)
+		return RejectBootstrapProof(RejectBootstrapProofInput{
+			Invitation:                input.Invitation,
+			ExpectedInvitationVersion: input.ExpectedInvitationVersion,
+			CurrentGeneration:         input.CurrentGeneration,
+			GenerationAuthorization:   input.GenerationAuthorization,
+			AttemptFingerprint:        input.AttemptFingerprint,
+			EvaluatedAt:               input.EvaluatedAt,
+		})
 	}
 	requiredOwnerCapabilities, _ := NewCapabilitySet(
 		capabilityInstallationOwner,
@@ -484,17 +501,18 @@ func BootstrapInstallation(input BootstrapInstallationInput) (BootstrapInstallat
 			transcript:     input.Proof.TranscriptFingerprint(),
 		},
 		PrincipalRegisteredFact{
-			origin: principalOrigin, principalID: input.PrincipalID,
+			origin: principalOrigin, installationID: input.Invitation.InstallationID(), principalID: input.PrincipalID,
 			kind: PrincipalKindHuman, displayName: principal.DisplayName(), publicKey: principal.PublicKeyReference(),
 		},
 		DevicePairedFact{
-			origin:        deviceOrigin,
-			deviceID:      input.DeviceID,
-			principalID:   input.PrincipalID,
-			displayName:   device.DisplayName(),
-			transcript:    input.Proof.TranscriptFingerprint(),
-			trustRevision: device.TrustRevision(),
-			credential:    device.CredentialBinding(),
+			origin:         deviceOrigin,
+			installationID: input.Invitation.InstallationID(),
+			deviceID:       input.DeviceID,
+			principalID:    input.PrincipalID,
+			displayName:    device.DisplayName(),
+			transcript:     input.Proof.TranscriptFingerprint(),
+			trustRevision:  device.TrustRevision(),
+			credential:     device.CredentialBinding(),
 		},
 	}
 	return BootstrapInstallationResult{
@@ -522,18 +540,39 @@ func bootstrapProofMatches(input BootstrapInstallationInput) bool {
 		proof.OwnerGrantID() == input.OwnerGrantID && proof.OwnerCapabilities().Equal(input.OwnerGrantCapabilities)
 }
 
-// rejectBootstrapProof is an accepted protocol transition, not a command
-// error. Persistence must commit this invitation revision atomically while
-// persisting none of the zero creation states or facts.
-func rejectBootstrapProof(
-	invitation InstallationInvitationState,
-	attemptFingerprint CommandFingerprint,
-) (BootstrapInstallationResult, error) {
-	nextVersion, err := nextTransitionVersion(invitation.Version())
+type RejectBootstrapProofInput struct {
+	Invitation                InstallationInvitationState
+	ExpectedInvitationVersion Version
+	CurrentGeneration         BootstrapGenerationID
+	GenerationAuthorization   BootstrapGenerationAuthorization
+	AttemptFingerprint        CommandFingerprint
+	EvaluatedAt               time.Time
+}
+
+// RejectBootstrapProof is the security-only transition for a proof verifier's
+// cryptographically_rejected decision. It cannot create bootstrap authority.
+func RejectBootstrapProof(input RejectBootstrapProofInput) (BootstrapInstallationResult, error) {
+	if input.Invitation.IsZero() || input.CurrentGeneration.IsZero() ||
+		input.AttemptFingerprint.IsZero() || input.EvaluatedAt.IsZero() {
+		return BootstrapInstallationResult{}, transitionError(ErrorCodeInvalidArgument, "bootstrap rejection input is invalid")
+	}
+	if err := checkExpectedVersion(input.Invitation.Version(), input.ExpectedInvitationVersion); err != nil {
+		return BootstrapInstallationResult{}, err
+	}
+	if input.Invitation.Status() != InstallationInvitationPending {
+		return BootstrapInstallationResult{}, transitionConflict(ConflictState, "installation invitation is consumed or exhausted")
+	}
+	if !input.EvaluatedAt.Before(input.Invitation.ExpiresAt()) {
+		return BootstrapInstallationResult{}, transitionConflict(ConflictState, "installation invitation is expired")
+	}
+	if !input.GenerationAuthorization.permits(input.Invitation, input.CurrentGeneration) {
+		return BootstrapInstallationResult{}, transitionConflict(ConflictState, "bootstrap process generation changed without an authorized resume")
+	}
+	nextVersion, err := nextTransitionVersion(input.Invitation.Version())
 	if err != nil {
 		return BootstrapInstallationResult{}, err
 	}
-	attempted := invitation
+	attempted := input.Invitation
 	attempted.failedAttempts++
 	attempted.version = nextVersion
 	if attempted.failedAttempts >= MaxBootstrapFailedAttempts {
@@ -543,8 +582,8 @@ func rejectBootstrapProof(
 		invitation: attempted,
 		outcome:    BootstrapInstallationProofRejected,
 		rejection: BootstrapProofRejection{
-			invitationID: invitation.ID(), invitationVersion: attempted.Version(),
-			attemptFingerprint: attemptFingerprint,
+			invitationID: input.Invitation.ID(), invitationVersion: attempted.Version(),
+			attemptFingerprint: input.AttemptFingerprint,
 		},
 	}, nil
 }
@@ -611,7 +650,7 @@ func RegisterPrincipal(input RegisterPrincipalInput) (RegisterPrincipalResult, e
 	return RegisterPrincipalResult{
 		principal: principal,
 		facts: []IdentityFact{PrincipalRegisteredFact{
-			origin: origin, principalID: principal.ID(), kind: principal.Kind(),
+			origin: origin, installationID: principal.InstallationID(), principalID: principal.ID(), kind: principal.Kind(),
 			displayName: principal.DisplayName(), publicKey: principal.PublicKeyReference(),
 		}},
 	}, nil
@@ -1116,7 +1155,8 @@ func ActivateActorDelegation(input ActivateActorDelegationInput) (ActivateActorD
 	}
 	fact := ActorDelegationActivatedFact{
 		origin:       origin,
-		delegationID: delegation.ID(), principalID: delegation.PrincipalID(), actorID: delegation.ActorID(),
+		delegationID: delegation.ID(), workspaceID: delegation.WorkspaceID(),
+		principalID: delegation.PrincipalID(), actorID: delegation.ActorID(),
 		sessionStart: input.SessionStartChallenge.ID(),
 	}
 	return ActivateActorDelegationResult{
@@ -1191,7 +1231,7 @@ func BeginDevicePairing(input BeginDevicePairingInput) (BeginDevicePairingResult
 		return BeginDevicePairingResult{}, err
 	}
 	fact := DevicePairingBeganFact{
-		origin: origin, deviceID: device.ID(), principalID: device.PrincipalID(),
+		origin: origin, installationID: device.InstallationID(), deviceID: device.ID(), principalID: device.PrincipalID(),
 		ceremonyID: input.Challenge.ID(), displayName: device.DisplayName(), publicKey: device.PublicKeyReference(),
 	}
 	return BeginDevicePairingResult{device: device, facts: []IdentityFact{fact}}, nil
@@ -1205,6 +1245,7 @@ func (result BeginDevicePairingResult) Facts() []IdentityFact {
 type PairDeviceInput struct {
 	Authorization            PairingRedemptionAuthorization
 	CurrentAuthorization     IdentityAuthorization
+	AuthorityTime            time.Time
 	Principal                PrincipalState
 	ExpectedPrincipalVersion Version
 	Device                   DeviceState
@@ -1238,7 +1279,7 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 		input.CurrentAuthorization.PrincipalID() != input.Authorization.PrincipalID() ||
 		input.CurrentAuthorization.PolicyRevision() != input.Authorization.PolicyRevision() ||
 		input.CurrentAuthorization.AssuranceClass() != input.Authorization.AssuranceClass() ||
-		!input.CurrentAuthorization.EvaluatedAt().Equal(input.Authorization.EvaluatedAt()) ||
+		input.AuthorityTime.IsZero() || !input.CurrentAuthorization.EvaluatedAt().Equal(input.AuthorityTime) ||
 		!input.CurrentAuthorization.Capabilities().Contains(DevicePairCapability()) ||
 		input.Authorization.InstallationID() != input.Principal.InstallationID() ||
 		input.Authorization.PrincipalID() != input.Principal.ID() ||
@@ -1260,7 +1301,7 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 		return PairDeviceResult{}, transitionConflict(ConflictReference, "device challenge binding is stale or malformed")
 	}
 	if err := checkCeremony(pairing, input.Proof,
-		CeremonyPurposeDevicePairing, input.CurrentAuthorization.EvaluatedAt()); err != nil {
+		CeremonyPurposeDevicePairing, input.AuthorityTime); err != nil {
 		return PairDeviceResult{}, err
 	}
 	nextVersion, err := nextTransitionVersion(input.Device.Version())
@@ -1282,7 +1323,7 @@ func PairDevice(input PairDeviceInput) (PairDeviceResult, error) {
 		return PairDeviceResult{}, err
 	}
 	fact := DevicePairedFact{
-		origin:   origin,
+		origin: origin, installationID: device.InstallationID(),
 		deviceID: device.ID(), principalID: device.PrincipalID(), displayName: device.DisplayName(),
 		transcript:    input.Proof.ProofDigest(),
 		trustRevision: device.TrustRevision(),
@@ -1535,7 +1576,7 @@ func StartActorSession(input StartActorSessionInput) (StartActorSessionResult, e
 		return StartActorSessionResult{}, err
 	}
 	fact := ActorSessionStartedFact{
-		origin: origin, sessionID: session.ID(),
+		origin: origin, sessionID: session.ID(), workspaceID: binding.WorkspaceID(),
 		clientInstance: session.ClientInstanceID(), clientMetadata: session.ClientMetadata(),
 		binding: binding, capabilities: session.Capabilities(), presentation: session.PresentationCredential(),
 	}

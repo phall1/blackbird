@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -325,6 +326,713 @@ func TestCanonicalScalarValidationAndTimestampNormalization(t *testing.T) {
 	boundaryZone := time.FixedZone("boundary", 14*60*60)
 	if _, err := NewCanonicalInstant(time.Date(1, 1, 1, 1, 0, 0, 0, boundaryZone)); !errors.Is(err, ErrCanonicalInstant) {
 		t.Fatalf("UTC year-zero normalization got %v", err)
+	}
+}
+
+func TestW0CommandHashViewsGoldensMutationsAndExclusions(t *testing.T) {
+	t.Parallel()
+
+	codec := NewProductionCanonicalCodec()
+	id := func(index int) CanonicalIdentifier { return mustCanonicalID(t, codecUUID(index)) }
+	digest := func(character byte) CanonicalDigest { return mustCanonicalDigest(t, character) }
+	instant, _ := ParseCanonicalInstant("2026-08-05T12:30:00.123000Z")
+	resource := func(index int) CommandExpectedResource {
+		return CommandExpectedResource{ID: id(index), ExpectedVersion: uint64(index)}
+	}
+	ceremony := func(index int, character byte) CommandCeremony {
+		return CommandCeremony{ID: id(index), ExpiresAt: instant, ProofDigest: digest(character)}
+	}
+	context := func(kind StreamScopeKind) W0CommandHashContextParams {
+		return W0CommandHashContextParams{
+			ScopeKind: kind, ScopeID: id(1), PrincipalID: id(2), ClientInstanceID: id(3),
+			CorrelationID: id(4), CausationEventID: id(5),
+			ProtocolCapabilities: []string{"batch-v1", "receipts-v1"},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		view       CommandHashView
+		mutated    CommandHashView
+		wantDigest string
+	}{
+		{
+			name: "bootstrap installation",
+			view: mustCommandHashView(NewBootstrapInstallationCommandHashView(context(StreamScopeInstallation), BootstrapInstallationCommandHashParams{
+				InstallationID: id(1), Invitation: resource(6), BootstrapGenerationID: id(7), ApprovedTranscript: digest('1'),
+				PrincipalID: id(2), PrincipalDisplayName: "Alice", DeviceID: id(8), DeviceDisplayName: "Alice phone",
+				DevicePublicKeyReference: "key://device/8", DeviceSPKIFingerprint: digest('2'), OwnerGrantID: id(9),
+				OwnerGrantCapabilities: []string{"identity_admin", "installation_owner"},
+			})),
+			mutated: mustCommandHashView(NewBootstrapInstallationCommandHashView(context(StreamScopeInstallation), BootstrapInstallationCommandHashParams{
+				InstallationID: id(1), Invitation: resource(6), BootstrapGenerationID: id(7), ApprovedTranscript: digest('1'),
+				PrincipalID: id(2), PrincipalDisplayName: "Alice changed", DeviceID: id(8), DeviceDisplayName: "Alice phone",
+				DevicePublicKeyReference: "key://device/8", DeviceSPKIFingerprint: digest('2'), OwnerGrantID: id(9),
+				OwnerGrantCapabilities: []string{"identity_admin", "installation_owner"},
+			})),
+			wantDigest: "eb415e8c43d95c283b157e13efd0ed3da52ebf6203ec1688e3d52a775e349cfc",
+		},
+		{
+			name: "register principal",
+			view: mustCommandHashView(NewRegisterPrincipalCommandHashView(context(StreamScopeInstallation), RegisterPrincipalCommandHashParams{
+				Registrar: resource(2), PrincipalID: id(10), Kind: string(domain.PrincipalKindService),
+				DisplayName: "Indexer", PublicKeyReference: "key://principal/10",
+			})),
+			mutated: mustCommandHashView(NewRegisterPrincipalCommandHashView(context(StreamScopeInstallation), RegisterPrincipalCommandHashParams{
+				Registrar: resource(2), PrincipalID: id(11), Kind: string(domain.PrincipalKindService),
+				DisplayName: "Indexer", PublicKeyReference: "key://principal/10",
+			})),
+			wantDigest: "c2fed84f6ba41bfb6958515e8cda965f276a5a9008d12504bb620664255d7cc3",
+		},
+		{
+			name: "create workspace",
+			view: mustCommandHashView(NewCreateWorkspaceCommandHashView(context(StreamScopeWorkspace), CreateWorkspaceCommandHashParams{
+				Owner: resource(2), InstallationGrant: resource(12), WorkspaceID: id(1), Alias: "acme",
+				DiscoveryLocator: "blackbird://workspace/acme", OwnerMembershipID: id(13),
+				OwnerCapabilities: []string{"actor_admin", "workspace_owner"},
+			})),
+			mutated: mustCommandHashView(NewCreateWorkspaceCommandHashView(context(StreamScopeWorkspace), CreateWorkspaceCommandHashParams{
+				Owner: resource(2), InstallationGrant: resource(12), WorkspaceID: id(1), Alias: "acme-2",
+				DiscoveryLocator: "blackbird://workspace/acme", OwnerMembershipID: id(13),
+				OwnerCapabilities: []string{"actor_admin", "workspace_owner"},
+			})),
+			wantDigest: "96dea4406a20515186398c4286322f4c2f48dbe1a6a7a9cca78c9d41be8290fb",
+		},
+		{
+			name: "invite workspace member",
+			view: mustCommandHashView(NewInviteWorkspaceMemberCommandHashView(context(StreamScopeWorkspace), InviteWorkspaceMemberCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), Principal: resource(14), MembershipID: id(15),
+				Capabilities: []string{"actor_use", "artifact_read"}, Challenge: ceremony(16, '3'),
+			})),
+			mutated: mustCommandHashView(NewInviteWorkspaceMemberCommandHashView(context(StreamScopeWorkspace), InviteWorkspaceMemberCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), Principal: resource(14), MembershipID: id(15),
+				Capabilities: []string{"actor_use", "artifact_write"}, Challenge: ceremony(16, '3'),
+			})),
+			wantDigest: "de6e7ea7fec627ab56cf2fd64a789193787e55903cfe9e3247ded66223602600",
+		},
+		{
+			name: "accept workspace membership",
+			view: mustCommandHashView(NewAcceptWorkspaceMembershipCommandHashView(context(StreamScopeWorkspace), AcceptWorkspaceMembershipCommandHashParams{
+				Workspace: resource(1), Principal: resource(14), Membership: resource(15), Proof: ceremony(16, '3'),
+			})),
+			mutated: mustCommandHashView(NewAcceptWorkspaceMembershipCommandHashView(context(StreamScopeWorkspace), AcceptWorkspaceMembershipCommandHashParams{
+				Workspace: resource(1), Principal: resource(14), Membership: resource(15), Proof: ceremony(17, '3'),
+			})),
+			wantDigest: "3626a2e36618db662633878d248ef529b7a617563bf65b0f194134fcfaa2021a",
+		},
+		{
+			name: "create actor",
+			view: mustCommandHashView(NewCreateActorCommandHashView(context(StreamScopeWorkspace), CreateActorCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), ActorID: id(18), Kind: string(domain.ActorKindAgent), DisplayName: "Researcher",
+			})),
+			mutated: mustCommandHashView(NewCreateActorCommandHashView(context(StreamScopeWorkspace), CreateActorCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), ActorID: id(18), Kind: string(domain.ActorKindAgent), DisplayName: "Writer",
+			})),
+			wantDigest: "6392c97cb4338d6f530d061c626479489b5cb37f5ffe74aed6e9bd470c372035",
+		},
+		{
+			name: "propose actor delegation",
+			view: mustCommandHashView(NewProposeActorDelegationCommandHashView(context(StreamScopeWorkspace), ProposeActorDelegationCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), Principal: resource(14), Actor: resource(18),
+				Membership: resource(15), DelegationID: id(19), Capabilities: []string{"actor_use"}, Challenge: ceremony(20, '4'),
+			})),
+			mutated: mustCommandHashView(NewProposeActorDelegationCommandHashView(context(StreamScopeWorkspace), ProposeActorDelegationCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), Principal: resource(14), Actor: resource(18),
+				Membership: resource(15), DelegationID: id(21), Capabilities: []string{"actor_use"}, Challenge: ceremony(20, '4'),
+			})),
+			wantDigest: "4ef0c40121b07c2fc297c528e73fe9558be7c0dc277c93663044596b4203e0f1",
+		},
+		{
+			name: "activate actor delegation",
+			view: mustCommandHashView(NewActivateActorDelegationCommandHashView(context(StreamScopeWorkspace), ActivateActorDelegationCommandHashParams{
+				Workspace: resource(1), Principal: resource(14), Actor: resource(18), Membership: resource(15),
+				Delegation: resource(19), ActivationProof: ceremony(20, '4'), SessionStartChallenge: ceremony(22, '5'),
+			})),
+			mutated: mustCommandHashView(NewActivateActorDelegationCommandHashView(context(StreamScopeWorkspace), ActivateActorDelegationCommandHashParams{
+				Workspace: resource(1), Principal: resource(14), Actor: resource(18), Membership: resource(15),
+				Delegation: resource(19), ActivationProof: ceremony(20, '4'), SessionStartChallenge: ceremony(22, '6'),
+			})),
+			wantDigest: "83b28f1e99897c19f9a81942d0fef91aed9d7c90084452f05dba51be1bd8775a",
+		},
+		{
+			name: "begin device pairing",
+			view: mustCommandHashView(NewBeginDevicePairingCommandHashView(context(StreamScopeInstallation), BeginDevicePairingCommandHashParams{
+				Principal: resource(2), DeviceID: id(23), DisplayName: "Tablet", PublicKeyReference: "key://device/23", Challenge: ceremony(24, '7'),
+			})),
+			mutated: mustCommandHashView(NewBeginDevicePairingCommandHashView(context(StreamScopeInstallation), BeginDevicePairingCommandHashParams{
+				Principal: resource(2), DeviceID: id(23), DisplayName: "Laptop", PublicKeyReference: "key://device/23", Challenge: ceremony(24, '7'),
+			})),
+			wantDigest: "0f2645cbd1944294d2b1c193fd3db9f1096a751fcbcab37e364004d12e237d9b",
+		},
+		{
+			name: "pair device",
+			view: mustCommandHashView(NewPairDeviceCommandHashView(context(StreamScopeInstallation), PairDeviceCommandHashParams{
+				Principal: resource(2), Device: resource(23), ExpectedTrustRevision: 2, Proof: ceremony(24, '7'),
+				CredentialPublicKey: "key://device/23", CredentialSPKIDigest: digest('8'), CredentialTranscript: digest('9'),
+			})),
+			mutated: mustCommandHashView(NewPairDeviceCommandHashView(context(StreamScopeInstallation), PairDeviceCommandHashParams{
+				Principal: resource(2), Device: resource(23), ExpectedTrustRevision: 3, Proof: ceremony(24, '7'),
+				CredentialPublicKey: "key://device/23", CredentialSPKIDigest: digest('8'), CredentialTranscript: digest('9'),
+			})),
+			wantDigest: "ab417c0f4156034d846fc546c28a61000693b3a7125dd91106c68f516622a3af",
+		},
+	}
+
+	trustedDevice := resource(23)
+	trustRevision := uint64(2)
+	sessionBase := StartActorSessionCommandHashParams{
+		SessionID: id(25), ClientName: "blackbird-cli", ClientVersion: "1.0.0", Workspace: resource(1),
+		Principal: resource(14), Membership: resource(15), Actor: resource(18), Delegation: resource(19),
+		Grants: []CommandExpectedResource{resource(26), resource(27)}, StartAuthorityKind: string(domain.SessionStartByTrustedDevice),
+		Device: &trustedDevice, ExpectedDeviceTrust: &trustRevision, AbsoluteExpiry: instant,
+		PresentationReference: "credential://presentation/1", PresentationDigest: digest('a'),
+		PresentationAudience: "blackbird", PresentationVersion: 1,
+	}
+	sessionMutation := sessionBase
+	sessionMutation.ClientVersion = "1.0.1"
+	tests = append(tests, struct {
+		name       string
+		view       CommandHashView
+		mutated    CommandHashView
+		wantDigest string
+	}{
+		name:       "start actor session",
+		view:       mustCommandHashView(NewStartActorSessionCommandHashView(context(StreamScopeWorkspace), sessionBase)),
+		mutated:    mustCommandHashView(NewStartActorSessionCommandHashView(context(StreamScopeWorkspace), sessionMutation)),
+		wantDigest: "80d7ba831d2fc8019e2e218f23cf3705f68eeb7cb581e9eedd70f686f7725c8b",
+	})
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			canonical, err := codec.EncodeCanonical(test.view)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, excluded := range []string{
+				"authority_id", "authority_epoch", "command_id", "request_id", "receipt_id", "idempotency_key",
+				"deadline", "retry_count", "network_route", "response_format",
+			} {
+				if bytes.Contains(canonical, []byte(`"`+excluded+`"`)) {
+					t.Fatalf("excluded metadata %q entered %s", excluded, canonical)
+				}
+			}
+			fingerprint, err := codec.HashCommand(test.view)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.wantDigest == "" {
+				t.Fatalf("retain command golden %q: %s", test.name, hex.EncodeToString(fingerprint[:]))
+			}
+			if got := hex.EncodeToString(fingerprint[:]); got != test.wantDigest {
+				t.Fatalf("command golden changed: got %s, want %s", got, test.wantDigest)
+			}
+			mutated, err := codec.HashCommand(test.mutated)
+			if err != nil || mutated == fingerprint {
+				t.Fatalf("one-field mutation did not change fingerprint: %x, %v", mutated, err)
+			}
+		})
+	}
+}
+
+func mustCommandHashView(view CommandHashView, err error) CommandHashView {
+	if err != nil {
+		panic(err)
+	}
+	return view
+}
+
+func TestW0CommandHashViewsHashEveryStructuralField(t *testing.T) {
+	t.Parallel()
+
+	codec := NewProductionCanonicalCodec()
+	for _, fixture := range commandHashViewFixtures(t) {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			t.Parallel()
+			baseline, err := codec.HashCommand(fixture.view)
+			if err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
+			paths := commandHashLeafPaths(reflect.ValueOf(fixture.view), nil, nil)
+			if len(paths) == 0 {
+				t.Fatal("view has no hash fields")
+			}
+			for _, path := range paths {
+				path := path
+				t.Run(path.name, func(t *testing.T) {
+					candidate := cloneCommandHashValue(reflect.ValueOf(fixture.view))
+					mutateCommandHashPath(t, candidate, path.fields)
+					mutatedView, ok := candidate.Interface().(CommandHashView)
+					if !ok {
+						t.Fatalf("cloned %T is not a command hash view", candidate.Interface())
+					}
+					fingerprint, hashErr := codec.HashCommand(mutatedView)
+					if hashErr != nil {
+						t.Fatalf("hash mutation: %v", hashErr)
+					}
+					if fingerprint == baseline {
+						t.Fatal("field mutation did not change fingerprint")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestW0CommandHashDomainProfileRejectionsAndBounds(t *testing.T) {
+	t.Parallel()
+
+	id := func(index int) CanonicalIdentifier { return mustCanonicalID(t, codecUUID(index)) }
+	digest := func(character byte) CanonicalDigest { return mustCanonicalDigest(t, character) }
+	instant, _ := ParseCanonicalInstant("2026-08-05T12:30:00.123000Z")
+	resource := func(index int) CommandExpectedResource {
+		return CommandExpectedResource{ID: id(index), ExpectedVersion: uint64(index)}
+	}
+	ceremony := CommandCeremony{ID: id(20), ExpiresAt: instant, ProofDigest: digest('4')}
+	installationContext := W0CommandHashContextParams{
+		ScopeKind: StreamScopeInstallation, ScopeID: id(1), PrincipalID: id(2), ClientInstanceID: id(3),
+		CorrelationID: id(4), ProtocolCapabilities: []string{"batch-v1", "receipts-v1"},
+	}
+	workspaceContext := installationContext
+	workspaceContext.ScopeKind = StreamScopeWorkspace
+
+	assertProfileError := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrCanonicalProfile) {
+			t.Fatalf("got %v, want canonical profile rejection", err)
+		}
+	}
+
+	principal := RegisterPrincipalCommandHashParams{
+		Registrar: resource(2), PrincipalID: id(10), Kind: string(domain.PrincipalKindService),
+		DisplayName: "Indexer", PublicKeyReference: "key://principal/10",
+	}
+	invalidPrincipal := principal
+	invalidPrincipal.Kind = "robot"
+	_, err := NewRegisterPrincipalCommandHashView(installationContext, invalidPrincipal)
+	assertProfileError(t, err)
+
+	actor := CreateActorCommandHashParams{
+		Administrator: resource(2), Workspace: resource(1), ActorID: id(18),
+		Kind: string(domain.ActorKindAgent), DisplayName: "Researcher",
+	}
+	invalidActor := actor
+	invalidActor.Kind = "robot"
+	_, err = NewCreateActorCommandHashView(workspaceContext, invalidActor)
+	assertProfileError(t, err)
+
+	for _, capabilities := range [][]string{{"Uppercase"}, {"valid", "valid"}} {
+		candidate := workspaceContext
+		candidate.ProtocolCapabilities = capabilities
+		_, err = NewCreateActorCommandHashView(candidate, actor)
+		assertProfileError(t, err)
+	}
+	for _, capabilities := range [][]string{{"bad capability"}, {"actor_use", "actor_use"}} {
+		_, err = NewInviteWorkspaceMemberCommandHashView(workspaceContext, InviteWorkspaceMemberCommandHashParams{
+			Administrator: resource(2), Workspace: resource(1), Principal: resource(14), MembershipID: id(15),
+			Capabilities: capabilities, Challenge: ceremony,
+		})
+		assertProfileError(t, err)
+	}
+
+	beginPairing := BeginDevicePairingCommandHashParams{
+		Principal: resource(2), DeviceID: id(23), DisplayName: strings.Repeat("d", 256),
+		PublicKeyReference: strings.Repeat("k", 256), Challenge: ceremony,
+	}
+	if _, err = NewBeginDevicePairingCommandHashView(installationContext, beginPairing); err != nil {
+		t.Fatalf("exact display/public-key bounds: %v", err)
+	}
+	tooLongDisplay := beginPairing
+	tooLongDisplay.DisplayName += "d"
+	_, err = NewBeginDevicePairingCommandHashView(installationContext, tooLongDisplay)
+	assertProfileError(t, err)
+	tooLongKey := beginPairing
+	tooLongKey.PublicKeyReference += "k"
+	_, err = NewBeginDevicePairingCommandHashView(installationContext, tooLongKey)
+	assertProfileError(t, err)
+
+	workspace := CreateWorkspaceCommandHashParams{
+		Owner: resource(2), InstallationGrant: resource(12), WorkspaceID: id(1),
+		Alias: strings.Repeat("a", 256), DiscoveryLocator: strings.Repeat("l", 4096),
+		OwnerMembershipID: id(13), OwnerCapabilities: []string{"workspace_owner"},
+	}
+	if _, err = NewCreateWorkspaceCommandHashView(workspaceContext, workspace); err != nil {
+		t.Fatalf("exact alias/locator bounds: %v", err)
+	}
+	tooLongAlias := workspace
+	tooLongAlias.Alias += "a"
+	_, err = NewCreateWorkspaceCommandHashView(workspaceContext, tooLongAlias)
+	assertProfileError(t, err)
+	tooLongLocator := workspace
+	tooLongLocator.DiscoveryLocator += "l"
+	_, err = NewCreateWorkspaceCommandHashView(workspaceContext, tooLongLocator)
+	assertProfileError(t, err)
+
+	device := resource(23)
+	trust := uint64(2)
+	session := StartActorSessionCommandHashParams{
+		SessionID: id(25), ClientName: strings.Repeat("c", 128), ClientVersion: strings.Repeat("v", 128),
+		Workspace: resource(1), Principal: resource(14), Membership: resource(15), Actor: resource(18),
+		Delegation: resource(19), Grants: []CommandExpectedResource{resource(26)},
+		StartAuthorityKind: string(domain.SessionStartByTrustedDevice), Device: &device, ExpectedDeviceTrust: &trust,
+		AbsoluteExpiry: instant, PresentationReference: strings.Repeat("r", 256), PresentationDigest: digest('a'),
+		PresentationAudience: strings.Repeat("p", 256), PresentationVersion: domain.PresentationCredentialVersion,
+	}
+	if _, err = NewStartActorSessionCommandHashView(workspaceContext, session); err != nil {
+		t.Fatalf("exact client/presentation bounds: %v", err)
+	}
+	for name, mutate := range map[string]func(*StartActorSessionCommandHashParams){
+		"client name":            func(value *StartActorSessionCommandHashParams) { value.ClientName += "c" },
+		"client version":         func(value *StartActorSessionCommandHashParams) { value.ClientVersion += "v" },
+		"presentation reference": func(value *StartActorSessionCommandHashParams) { value.PresentationReference += "r" },
+		"presentation audience":  func(value *StartActorSessionCommandHashParams) { value.PresentationAudience += "p" },
+	} {
+		t.Run(name+" above bound", func(t *testing.T) {
+			candidate := session
+			mutate(&candidate)
+			_, candidateErr := NewStartActorSessionCommandHashView(workspaceContext, candidate)
+			assertProfileError(t, candidateErr)
+		})
+	}
+
+	for name, mutate := range map[string]func(*StartActorSessionCommandHashParams){
+		"zero resource version": func(value *StartActorSessionCommandHashParams) { value.Workspace.ExpectedVersion = 0 },
+		"unsafe resource version": func(value *StartActorSessionCommandHashParams) {
+			value.Workspace.ExpectedVersion = MaxCanonicalInteger + 1
+		},
+		"zero trust version": func(value *StartActorSessionCommandHashParams) { zero := uint64(0); value.ExpectedDeviceTrust = &zero },
+		"unsafe trust version": func(value *StartActorSessionCommandHashParams) {
+			unsafe := uint64(MaxCanonicalInteger + 1)
+			value.ExpectedDeviceTrust = &unsafe
+		},
+		"trusted device missing device": func(value *StartActorSessionCommandHashParams) { value.Device = nil },
+		"trusted device with handoff":   func(value *StartActorSessionCommandHashParams) { value.HandoffProof = &ceremony },
+		"handoff with device union": func(value *StartActorSessionCommandHashParams) {
+			value.StartAuthorityKind = string(domain.SessionStartByHandoff)
+			value.HandoffProof = &ceremony
+		},
+		"handoff missing proof": func(value *StartActorSessionCommandHashParams) {
+			value.StartAuthorityKind = string(domain.SessionStartByHandoff)
+			value.Device, value.ExpectedDeviceTrust = nil, nil
+		},
+		"unsupported presentation version": func(value *StartActorSessionCommandHashParams) { value.PresentationVersion++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := session
+			mutate(&candidate)
+			_, candidateErr := NewStartActorSessionCommandHashView(workspaceContext, candidate)
+			assertProfileError(t, candidateErr)
+		})
+	}
+}
+
+func TestW0ProtocolCapabilityNormalizationAndFingerprintMembership(t *testing.T) {
+	t.Parallel()
+
+	id := func(index int) CanonicalIdentifier { return mustCanonicalID(t, codecUUID(index)) }
+	context := W0CommandHashContextParams{
+		ScopeKind: StreamScopeWorkspace, ScopeID: id(1), PrincipalID: id(2), ClientInstanceID: id(3),
+		CorrelationID: id(4), ProtocolCapabilities: []string{"batch-v1", "receipts-v1"},
+	}
+	commandFor := func(capabilities []string) commandHashContextWire {
+		candidate := context
+		candidate.ProtocolCapabilities = capabilities
+		command, err := commandHashContext(CommandCreateActor, candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return command
+	}
+	body := commandHashViewFixtures(t)[5].view.(createActorCommandHashView).Body
+	base := createActorCommandHashView{Command: commandFor([]string{"batch-v1", "receipts-v1"}), Body: body}
+	reordered := createActorCommandHashView{Command: commandFor([]string{"receipts-v1", "batch-v1"}), Body: body}
+	added := createActorCommandHashView{Command: commandFor([]string{"batch-v1", "receipts-v1", "streaming-v1"}), Body: body}
+	removed := createActorCommandHashView{Command: commandFor([]string{"batch-v1"}), Body: body}
+	codec := NewProductionCanonicalCodec()
+	baseline, _ := codec.HashCommand(base)
+	reorderedFingerprint, _ := codec.HashCommand(reordered)
+	addedFingerprint, _ := codec.HashCommand(added)
+	removedFingerprint, _ := codec.HashCommand(removed)
+	if reorderedFingerprint != baseline {
+		t.Fatal("equivalent protocol capability ordering changed fingerprint")
+	}
+	if addedFingerprint == baseline || removedFingerprint == baseline {
+		t.Fatal("protocol capability membership change did not change fingerprint")
+	}
+}
+
+func TestW0CommandHashContextExclusionsAreStructural(t *testing.T) {
+	t.Parallel()
+
+	contextType := reflect.TypeFor[W0CommandHashContextParams]()
+	wantFields := []string{
+		"ScopeKind", "ScopeID", "PrincipalID", "ClientInstanceID", "ActorID", "ActorSessionID",
+		"CorrelationID", "CausationEventID", "ProtocolCapabilities",
+	}
+	if contextType.NumField() != len(wantFields) {
+		t.Fatalf("context field count = %d, want %d", contextType.NumField(), len(wantFields))
+	}
+	for index, want := range wantFields {
+		if got := contextType.Field(index).Name; got != want {
+			t.Fatalf("context field %d = %q, want %q", index, got, want)
+		}
+	}
+	for _, excluded := range []string{
+		"AuthorityID", "AuthorityEpoch", "CommandID", "RequestID", "ReceiptID", "IdempotencyKey",
+		"Deadline", "RetryCount", "NetworkRoute", "ResponseFormat",
+	} {
+		if _, present := contextType.FieldByName(excluded); present {
+			t.Fatalf("excluded transport field %q became representable", excluded)
+		}
+	}
+}
+
+type commandHashFixture struct {
+	name string
+	view CommandHashView
+}
+
+func commandHashViewFixtures(t *testing.T) []commandHashFixture {
+	t.Helper()
+	id := func(index int) CanonicalIdentifier { return mustCanonicalID(t, codecUUID(index)) }
+	digest := func(character byte) CanonicalDigest { return mustCanonicalDigest(t, character) }
+	instant, _ := ParseCanonicalInstant("2026-08-05T12:30:00.123000Z")
+	resource := func(index int) CommandExpectedResource {
+		return CommandExpectedResource{ID: id(index), ExpectedVersion: uint64(index)}
+	}
+	ceremony := func(index int, character byte) CommandCeremony {
+		return CommandCeremony{ID: id(index), ExpiresAt: instant, ProofDigest: digest(character)}
+	}
+	context := func(kind StreamScopeKind) W0CommandHashContextParams {
+		return W0CommandHashContextParams{
+			ScopeKind: kind, ScopeID: id(1), PrincipalID: id(2), ClientInstanceID: id(3),
+			CorrelationID: id(4), CausationEventID: id(5),
+			ProtocolCapabilities: []string{"batch-v1", "receipts-v1"},
+		}
+	}
+	trustedDevice := resource(23)
+	trustRevision := uint64(2)
+	trustedSession := StartActorSessionCommandHashParams{
+		SessionID: id(25), ClientName: "blackbird-cli", ClientVersion: "1.0.0", Workspace: resource(1),
+		Principal: resource(14), Membership: resource(15), Actor: resource(18), Delegation: resource(19),
+		Grants: []CommandExpectedResource{resource(26), resource(27)}, StartAuthorityKind: string(domain.SessionStartByTrustedDevice),
+		Device: &trustedDevice, ExpectedDeviceTrust: &trustRevision, AbsoluteExpiry: instant,
+		PresentationReference: "credential://presentation/1", PresentationDigest: digest('a'),
+		PresentationAudience: "blackbird", PresentationVersion: domain.PresentationCredentialVersion,
+	}
+	handoffSession := trustedSession
+	handoffSession.StartAuthorityKind = string(domain.SessionStartByHandoff)
+	handoffSession.Device = nil
+	handoffSession.ExpectedDeviceTrust = nil
+	handoffProof := ceremony(28, 'b')
+	handoffSession.HandoffProof = &handoffProof
+
+	return []commandHashFixture{
+		{name: "bootstrap installation", view: mustCommandHashView(NewBootstrapInstallationCommandHashView(
+			context(StreamScopeInstallation), BootstrapInstallationCommandHashParams{
+				InstallationID: id(1), Invitation: resource(6), BootstrapGenerationID: id(7), ApprovedTranscript: digest('1'),
+				PrincipalID: id(2), PrincipalDisplayName: "Alice", DeviceID: id(8), DeviceDisplayName: "Alice phone",
+				DevicePublicKeyReference: "key://device/8", DeviceSPKIFingerprint: digest('2'), OwnerGrantID: id(9),
+				OwnerGrantCapabilities: []string{"identity_admin", "installation_owner"},
+			}))},
+		{name: "register principal", view: mustCommandHashView(NewRegisterPrincipalCommandHashView(
+			context(StreamScopeInstallation), RegisterPrincipalCommandHashParams{
+				Registrar: resource(2), PrincipalID: id(10), Kind: string(domain.PrincipalKindService),
+				DisplayName: "Indexer", PublicKeyReference: "key://principal/10",
+			}))},
+		{name: "create workspace", view: mustCommandHashView(NewCreateWorkspaceCommandHashView(
+			context(StreamScopeWorkspace), CreateWorkspaceCommandHashParams{
+				Owner: resource(2), InstallationGrant: resource(12), WorkspaceID: id(1), Alias: "acme",
+				DiscoveryLocator: "blackbird://workspace/acme", OwnerMembershipID: id(13),
+				OwnerCapabilities: []string{"actor_admin", "workspace_owner"},
+			}))},
+		{name: "invite workspace member", view: mustCommandHashView(NewInviteWorkspaceMemberCommandHashView(
+			context(StreamScopeWorkspace), InviteWorkspaceMemberCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), Principal: resource(14), MembershipID: id(15),
+				Capabilities: []string{"actor_use", "artifact_read"}, Challenge: ceremony(16, '3'),
+			}))},
+		{name: "accept workspace membership", view: mustCommandHashView(NewAcceptWorkspaceMembershipCommandHashView(
+			context(StreamScopeWorkspace), AcceptWorkspaceMembershipCommandHashParams{
+				Workspace: resource(1), Principal: resource(14), Membership: resource(15), Proof: ceremony(16, '3'),
+			}))},
+		{name: "create actor", view: mustCommandHashView(NewCreateActorCommandHashView(
+			context(StreamScopeWorkspace), CreateActorCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), ActorID: id(18),
+				Kind: string(domain.ActorKindAgent), DisplayName: "Researcher",
+			}))},
+		{name: "propose actor delegation", view: mustCommandHashView(NewProposeActorDelegationCommandHashView(
+			context(StreamScopeWorkspace), ProposeActorDelegationCommandHashParams{
+				Administrator: resource(2), Workspace: resource(1), Principal: resource(14), Actor: resource(18),
+				Membership: resource(15), DelegationID: id(19), Capabilities: []string{"actor_use"}, Challenge: ceremony(20, '4'),
+			}))},
+		{name: "activate actor delegation", view: mustCommandHashView(NewActivateActorDelegationCommandHashView(
+			context(StreamScopeWorkspace), ActivateActorDelegationCommandHashParams{
+				Workspace: resource(1), Principal: resource(14), Actor: resource(18), Membership: resource(15),
+				Delegation: resource(19), ActivationProof: ceremony(20, '4'), SessionStartChallenge: ceremony(22, '5'),
+			}))},
+		{name: "begin device pairing", view: mustCommandHashView(NewBeginDevicePairingCommandHashView(
+			context(StreamScopeInstallation), BeginDevicePairingCommandHashParams{
+				Principal: resource(2), DeviceID: id(23), DisplayName: "Tablet",
+				PublicKeyReference: "key://device/23", Challenge: ceremony(24, '7'),
+			}))},
+		{name: "pair device", view: mustCommandHashView(NewPairDeviceCommandHashView(
+			context(StreamScopeInstallation), PairDeviceCommandHashParams{
+				Principal: resource(2), Device: resource(23), ExpectedTrustRevision: 2, Proof: ceremony(24, '7'),
+				CredentialPublicKey: "key://device/23", CredentialSPKIDigest: digest('8'), CredentialTranscript: digest('9'),
+			}))},
+		{name: "start actor session trusted device", view: mustCommandHashView(NewStartActorSessionCommandHashView(
+			context(StreamScopeWorkspace), trustedSession))},
+		{name: "start actor session handoff", view: mustCommandHashView(NewStartActorSessionCommandHashView(
+			context(StreamScopeWorkspace), handoffSession))},
+	}
+}
+
+type commandHashFieldPath struct {
+	name   string
+	fields []int
+}
+
+func commandHashLeafPaths(value reflect.Value, fields []int, names []string) []commandHashFieldPath {
+	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return []commandHashFieldPath{{name: strings.Join(names, "."), fields: append([]int(nil), fields...)}}
+		}
+		value = value.Elem()
+	}
+	if isCommandHashScalar(value.Type()) || value.Kind() != reflect.Struct {
+		return []commandHashFieldPath{{name: strings.Join(names, "."), fields: append([]int(nil), fields...)}}
+	}
+	paths := make([]commandHashFieldPath, 0)
+	for index := range value.NumField() {
+		paths = append(paths, commandHashLeafPaths(
+			value.Field(index), append(fields, index), append(names, value.Type().Field(index).Name),
+		)...)
+	}
+	return paths
+}
+
+func isCommandHashScalar(valueType reflect.Type) bool {
+	return valueType == reflect.TypeFor[CanonicalIdentifier]() ||
+		valueType == reflect.TypeFor[CanonicalDigest]() ||
+		valueType == reflect.TypeFor[CanonicalInstant]()
+}
+
+func cloneCommandHashValue(value reflect.Value) reflect.Value {
+	if isCommandHashScalar(value.Type()) {
+		return value
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		clone := cloneCommandHashValue(value.Elem())
+		result := reflect.New(value.Type()).Elem()
+		result.Set(clone)
+		return result
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		result := reflect.New(value.Type().Elem())
+		result.Elem().Set(cloneCommandHashValue(value.Elem()))
+		return result
+	case reflect.Struct:
+		result := reflect.New(value.Type()).Elem()
+		for index := range value.NumField() {
+			result.Field(index).Set(cloneCommandHashValue(value.Field(index)))
+		}
+		return result
+	case reflect.Slice:
+		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := range value.Len() {
+			result.Index(index).Set(cloneCommandHashValue(value.Index(index)))
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func mutateCommandHashPath(t *testing.T, root reflect.Value, fields []int) {
+	t.Helper()
+	value := root
+	for index, field := range fields {
+		for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+			value = value.Elem()
+		}
+		value = value.Field(field)
+		if index == len(fields)-1 {
+			mutateCommandHashValue(t, value)
+			return
+		}
+	}
+}
+
+func mutateCommandHashValue(t *testing.T, value reflect.Value) {
+	t.Helper()
+	if value.Type() == reflect.TypeFor[CanonicalIdentifier]() {
+		value.Set(reflect.ValueOf(mustCanonicalID(t, codecUUID(98))))
+		return
+	}
+	if value.Type() == reflect.TypeFor[CanonicalDigest]() {
+		value.Set(reflect.ValueOf(mustCanonicalDigest(t, 'f')))
+		return
+	}
+	if value.Type() == reflect.TypeFor[CanonicalInstant]() {
+		instant, _ := ParseCanonicalInstant("2026-08-06T12:30:00.123000Z")
+		value.Set(reflect.ValueOf(instant))
+		return
+	}
+	if value.Type() == reflect.TypeFor[StreamScopeKind]() {
+		if value.Interface().(StreamScopeKind) == StreamScopeInstallation {
+			value.SetString(string(StreamScopeWorkspace))
+		} else {
+			value.SetString(string(StreamScopeInstallation))
+		}
+		return
+	}
+	switch value.Kind() {
+	case reflect.String:
+		value.SetString(value.String() + "-mutation")
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		value.SetUint(value.Uint() + 1)
+	case reflect.Slice:
+		mutated := reflect.MakeSlice(value.Type(), value.Len(), value.Len()+1)
+		reflect.Copy(mutated, value)
+		switch value.Type().Elem() {
+		case reflect.TypeFor[string]():
+			mutated = reflect.Append(mutated, reflect.ValueOf("mutation-v1"))
+		case reflect.TypeFor[CommandExpectedResource]():
+			mutated = reflect.Append(mutated, reflect.ValueOf(CommandExpectedResource{
+				ID: mustCanonicalID(t, codecUUID(97)), ExpectedVersion: 97,
+			}))
+		default:
+			t.Fatalf("unsupported command hash slice %s", value.Type())
+		}
+		value.Set(mutated)
+	case reflect.Pointer:
+		if !value.IsNil() {
+			mutateCommandHashValue(t, value.Elem())
+			return
+		}
+		switch value.Type().Elem() {
+		case reflect.TypeFor[CanonicalIdentifier]():
+			identifier := mustCanonicalID(t, codecUUID(96))
+			value.Set(reflect.ValueOf(&identifier))
+		case reflect.TypeFor[CommandExpectedResource]():
+			resource := CommandExpectedResource{ID: mustCanonicalID(t, codecUUID(95)), ExpectedVersion: 95}
+			value.Set(reflect.ValueOf(&resource))
+		case reflect.TypeFor[CommandCeremony]():
+			instant, _ := ParseCanonicalInstant("2026-08-07T12:30:00.123000Z")
+			ceremony := CommandCeremony{ID: mustCanonicalID(t, codecUUID(94)), ExpiresAt: instant, ProofDigest: mustCanonicalDigest(t, 'e')}
+			value.Set(reflect.ValueOf(&ceremony))
+		case reflect.TypeFor[uint64]():
+			number := uint64(94)
+			value.Set(reflect.ValueOf(&number))
+		default:
+			t.Fatalf("unsupported command hash pointer %s", value.Type())
+		}
+	default:
+		t.Fatalf("unsupported command hash field %s", value.Type())
 	}
 }
 
@@ -1091,23 +1799,56 @@ func TestProductionEventSemanticMaterializationAndVerification(t *testing.T) {
 	if _, err := codec.MaterializeEvent(params); !errors.Is(err, domain.ErrEventDigestVerification) {
 		t.Fatalf("stream digest tamper got %v", err)
 	}
+
+	params.StreamDigest = streamDigest
+	schema2, _ := domain.NewEventSchemaVersion(2)
+	params.SchemaVersion = schema2
+	schemaEvent, err := domain.NewEventEnvelope(params, permissiveEventVerifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = eventSemanticView(schemaEvent); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("unsupported event schema got %v", err)
+	}
+
+	params.SchemaVersion = schema
+	otherMembership, _ := domain.ParseMembershipID(codecUUID(110))
+	params.Aggregate = mustAggregateRef(t, otherMembership, domain.InitialVersion())
+	originEvent, err := domain.NewEventEnvelope(params, permissiveEventVerifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = eventSemanticView(originEvent); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("payload/aggregate mismatch got %v", err)
+	}
+
+	otherWorkspace, _ := domain.ParseWorkspaceID(codecUUID(111))
+	params.Aggregate = aggregate
+	params.Scope, _ = domain.WorkspaceScope(otherWorkspace)
+	scopeEvent, err := domain.NewEventEnvelope(params, permissiveEventVerifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = eventSemanticView(scopeEvent); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("payload/scope mismatch got %v", err)
+	}
+}
+
+func TestIdentityFactMaterializationRejectsTypedNil(t *testing.T) {
+	t.Parallel()
+	var fact *domain.InstallationBootstrappedFact
+	if _, err := NewProductionCanonicalCodec().MaterializeIdentityFactPayload(fact); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("typed-nil fact error = %v", err)
+	}
 }
 
 func TestAuditEntryGoldenAndAdversarialVerification(t *testing.T) {
 	t.Parallel()
 
 	codec := NewProductionCanonicalCodec()
-	authority, _ := domain.ParseAuthorityID(codecUUID(111))
-	epoch, _ := domain.ParseAuthorityEpoch(codecUUID(112))
-	installation, _ := domain.ParseInstallationID(codecUUID(113))
-	scope, _ := domain.InstallationScope(installation)
-	operation, _ := domain.NewOperationName(string(CommandRegisterPrincipal))
-	intent, err := NewAuditIntent(
-		operation, AuditCommandApplied, domain.FingerprintCommand([]byte("audit command")), CommandAppliedAuditDetail(),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := buildBootstrapFixture(t)
+	authority, epoch, scope := fixture.authority, fixture.epoch, fixture.scope
+	intent := fixture.decision.Audit()
 	view, err := NewAuditEntryViewV1(AuditEntryParams{
 		ChainScopeID: scope, Sequence: 1, AuthorityID: authority, AuthorityEpoch: epoch,
 		RecordedAt: time.Date(2026, 8, 5, 12, 30, 0, 456_000_000, time.UTC), Intent: intent,
@@ -1119,11 +1860,11 @@ func TestAuditEntryGoldenAndAdversarialVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCanonical := `{"action":"principal.register.v1","audit_sequence":1,"authority_epoch":"0198a0a0-0000-7000-8000-000000000112","authority_id":"0198a0a0-0000-7000-8000-000000000111","chain_scope_id":"0198a0a0-0000-7000-8000-000000000113","command_fingerprint":"8014e7cf00337fb9652679a3a38ba9564f2019844be1256ea20d6025c38cea94","detail":{"kind":"command_applied","reason":null},"outcome":"command_applied","previous_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","recorded_at":"2026-08-05T12:30:00.456000Z","schema":"blackbird.audit.entry/v1"}`
+	wantCanonical := `{"action":"installation.bootstrap.v1","approval_evidence_digests":[],"audit_sequence":1,"authority_epoch":"01b8e094-9888-7000-8000-000000000003","authority_id":"01b8e094-9888-7000-8000-000000000002","authorization":{"admission_generation":1,"authorization_revisions":[],"device_trust_revision":null,"effective_grants":[],"guard_digest":"f341b7e664572cd63048d88f628f3a7e078462c54a6d58ecd109d3b60f5024be","new_bootstrap_generation_id":null,"old_bootstrap_generation_id":null,"policy_revision":null,"revocation_revisions":[]},"chain_scope_id":"01b8e094-9888-7000-8000-000000000001","command_fingerprint":"6e228eb595f60330181357cf513caa2054f587f1e2917d3db4c231f65cb6df61","invocation":{"command_id":"01b8e094-9888-7000-8000-000000000008","correlation_id":"01b8e094-9888-7000-8000-00000000000a","kind":"command","receipt_id":"01b8e094-9888-7000-8000-000000000009","receipt_identity_digest":"7e6facf044f61d2c13d47b81fbd348dfc7db4caa689e5236b95b1c3e881bac20","request_id":null,"security_operation":null,"trace_id":null},"outcome":"command_applied","previous_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","provenance":{"federation_envelope_id":null,"source_authority_id":"01b8e094-9888-7000-8000-000000000002"},"recorded_at":"2026-08-05T12:30:00.456000Z","resources":[{"after_version":1,"before_version":null,"id":"01b8e094-9888-7000-8000-000000000006","kind":"device_registration"},{"after_version":1,"before_version":null,"id":"01b8e094-9888-7000-8000-000000000007","kind":"grant"},{"after_version":2,"before_version":1,"id":"01b8e094-9888-7000-8000-000000000004","kind":"invitation"},{"after_version":1,"before_version":null,"id":"01b8e094-9888-7000-8000-000000000005","kind":"principal"}],"safe_reason":null,"schema":"blackbird.audit.entry/v1","subject":{"actor_id":null,"actor_session_id":null,"delegation_chain":[],"device_id":null,"kind":"attributed","principal_id":"01b8e094-9888-7000-8000-000000000005","unattributed_source_digest":null,"workload_id":null},"timing":{"authenticated_client_at":null,"persisted_authority_at":"2026-08-04T12:01:00.123456Z","server_received_at":null}}`
 	if string(canonical) != wantCanonical {
 		t.Fatalf("audit canonical golden changed:\n got %s\nwant %s", canonical, wantCanonical)
 	}
-	if digest.String() != "0b3b7a6d2e41fe3ff74e93a3d68a5b8d738c7ab8173c55665c400f0bafcd8578" {
+	if digest.String() != "03054909fbcfb2b974ae4835946a781e4eb6a8f712981641723535293ce34506" {
 		t.Fatalf("audit digest golden changed: %s", digest.String())
 	}
 	if err := codec.VerifyAuditEntry(Digest{}, canonical, digest); err != nil {
@@ -1139,6 +1880,111 @@ func TestAuditEntryGoldenAndAdversarialVerification(t *testing.T) {
 	noncanonical := append([]byte(" "), canonical...)
 	if err := codec.VerifyAuditEntry(Digest{}, noncanonical, digest); err == nil {
 		t.Fatal("noncanonical retained audit entry was accepted")
+	}
+
+	mutatedIntent := intent
+	mutatedGuardBytes := [sha256.Size]byte{99}
+	mutatedIntent.authorization.guardDigest, _ = domain.NewAuthorizationDigest(mutatedGuardBytes)
+	mutatedView, err := NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: scope, Sequence: 1, AuthorityID: authority, AuthorityEpoch: epoch,
+		RecordedAt: time.Date(2026, 8, 5, 12, 30, 0, 456_000_000, time.UTC), Intent: mutatedIntent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mutatedDigest, err := codec.EncodeAuditEntry(mutatedView)
+	if err != nil || mutatedDigest == digest {
+		t.Fatalf("one-field audit evidence mutation was not bound: %v", err)
+	}
+
+	securityOperation := string(SecurityRecordCommandDenial)
+	union := view
+	union.Invocation.SecurityOperation = &securityOperation
+	if _, _, err = codec.EncodeAuditEntry(union); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("mixed command/security invocation union error = %v", err)
+	}
+	withSecret := bytes.Replace(canonical, []byte(`"safe_reason":null`), []byte(`"access_token":"secret","safe_reason":null`), 1)
+	withSecret, err = jcs.Transform(withSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = codec.VerifyAuditEntry(Digest{}, withSecret, digest); !errors.Is(err, ErrCanonicalSchema) {
+		t.Fatalf("secret-bearing audit extension error = %v", err)
+	}
+
+	second, err := NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: scope, Sequence: 2, AuthorityID: authority, AuthorityEpoch: epoch,
+		RecordedAt: time.Date(2026, 8, 5, 12, 31, 0, 456_000_000, time.UTC), Intent: intent,
+		PreviousEntryHash: digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCanonical, secondDigest, err := codec.EncodeAuditEntry(second)
+	if err != nil || codec.VerifyAuditEntry(digest, secondCanonical, secondDigest) != nil {
+		t.Fatalf("valid second chain entry failed: %v", err)
+	}
+	if _, err = NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: scope, Sequence: 2, AuthorityID: authority, AuthorityEpoch: epoch,
+		RecordedAt: time.Date(2026, 8, 5, 12, 31, 0, 456_000_000, time.UTC), Intent: intent,
+	}); !errors.Is(err, ErrCanonicalProfile) {
+		t.Fatalf("non-genesis zero predecessor error = %v", err)
+	}
+}
+
+func TestSecurityDenialAuditEntryGolden(t *testing.T) {
+	t.Parallel()
+	fixture := buildBootstrapFixture(t)
+	invalidInput := fixture.input
+	invalidInput.DeviceID, _ = domain.ParseDeviceID(codecUUID(190))
+	rejected, err := domain.BootstrapInstallation(invalidInput)
+	if err != nil || rejected.Outcome() != domain.BootstrapInstallationProofRejected {
+		t.Fatalf("bootstrap rejection: %v", err)
+	}
+	expectation, _ := domain.ExpectAggregateVersion(fixture.invitation.ID(), fixture.invitation.Version())
+	generation, _ := NewGuardGeneration(1)
+	spec, err := RecordBootstrapDenialSecurity(
+		fixture.scope, fixture.authority, fixture.epoch, generation, expectation, fixture.attempt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context, err := NewSecurityContext(
+		spec, fixture.now.Add(time.Minute), fixture.invitation, FreshSecurityAttempt(), DenialAdmission{},
+		fixture.context.GuardEvidence().Digest(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, fingerprint, _ := ExpectedSecurityAudit(spec)
+	name, _ := domain.NewOperationName(operation)
+	detail, _ := SecurityDeniedAuditDetail("bootstrap_proof_rejected")
+	seed, _ := NewAuditIntent(name, AuditSecurityDenied, fingerprint, detail)
+	decision, err := DenyBootstrapSecurity(context, rejected.Invitation(), seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, ok := decision.Audit()
+	if !ok {
+		t.Fatal("security denial omitted audit intent")
+	}
+	view, err := NewAuditEntryViewV1(AuditEntryParams{
+		ChainScopeID: fixture.scope, Sequence: 1, AuthorityID: fixture.authority, AuthorityEpoch: fixture.epoch,
+		RecordedAt: fixture.now.Add(time.Minute), Intent: intent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, digest, err := NewProductionCanonicalCodec().EncodeAuditEntry(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCanonical := `{"action":"installation.bootstrap.v1","approval_evidence_digests":[],"audit_sequence":1,"authority_epoch":"01b8e094-9888-7000-8000-000000000003","authority_id":"01b8e094-9888-7000-8000-000000000002","authorization":{"admission_generation":1,"authorization_revisions":[],"device_trust_revision":null,"effective_grants":[],"guard_digest":"f341b7e664572cd63048d88f628f3a7e078462c54a6d58ecd109d3b60f5024be","new_bootstrap_generation_id":null,"old_bootstrap_generation_id":null,"policy_revision":null,"revocation_revisions":[]},"chain_scope_id":"01b8e094-9888-7000-8000-000000000001","command_fingerprint":"9cffe0456302ab253d281a341e3c3717f51a066f054e26edb22f0abbe469c39b","invocation":{"command_id":null,"correlation_id":null,"kind":"security","receipt_id":null,"receipt_identity_digest":null,"request_id":null,"security_operation":"record_bootstrap_denial","trace_id":null},"outcome":"security_denied","previous_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","provenance":{"federation_envelope_id":null,"source_authority_id":"01b8e094-9888-7000-8000-000000000002"},"recorded_at":"2026-08-04T12:01:00.123456Z","resources":[{"after_version":2,"before_version":1,"id":"01b8e094-9888-7000-8000-000000000004","kind":"invitation"}],"safe_reason":"bootstrap_proof_rejected","schema":"blackbird.audit.entry/v1","subject":{"actor_id":null,"actor_session_id":null,"delegation_chain":[],"device_id":null,"kind":"unattributed","principal_id":null,"unattributed_source_digest":"9cffe0456302ab253d281a341e3c3717f51a066f054e26edb22f0abbe469c39b","workload_id":null},"timing":{"authenticated_client_at":null,"persisted_authority_at":"2026-08-04T12:01:00.123456Z","server_received_at":null}}`
+	if string(canonical) != wantCanonical {
+		t.Fatalf("security denial canonical golden changed:\n got %s\nwant %s", canonical, wantCanonical)
+	}
+	if digest.String() != "cf88ac5ed1306f12814b23c4e749c6fb65323ea8d98d344a336575b73cae29e3" {
+		t.Fatalf("security denial digest golden changed: %s", digest.String())
 	}
 }
 

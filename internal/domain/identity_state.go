@@ -1496,7 +1496,8 @@ func RehydrateDevice(params DeviceRehydrationParams) (DeviceState, error) {
 		params.PairingChallenge.Purpose() != CeremonyPurposeDevicePairing ||
 		params.PairingChallenge.InstallationID() != params.InstallationID ||
 		params.PairingChallenge.PrincipalID() != params.PrincipalID ||
-		params.PairingChallenge.DeviceID() != params.ID) {
+		params.PairingChallenge.DeviceID() != params.ID ||
+		(hasCredential && params.CredentialBinding.TranscriptFingerprint() != params.PairingChallenge.ProofDigest())) {
 		return DeviceState{}, ErrInvalidIdentityState
 	}
 	return DeviceState{

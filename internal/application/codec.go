@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,17 +45,18 @@ var (
 )
 
 const (
-	commandFingerprintDomain = "blackbird.command-fingerprint/v1\x00"
-	authorizationGuardDomain = "blackbird.authorization-guards/v1\x00"
-	receiptResultDomain      = "blackbird.receipt-result/v1\x00"
-	sessionBindingDomain     = "blackbird.session-binding/v1\x00"
-	recoveryCapsuleDomain    = "blackbird.recovery-capsule/v1\x00"
-	commandDenialDomain      = "blackbird-command-denial/v1\x00"
-	bootstrapAttemptDomain   = "blackbird-bootstrap-attempt/v1\x00"
-	eventDigestDomain        = "blackbird.event-digest/v1\x00"
-	streamGenesisDomain      = "blackbird.stream-genesis/v1\x00"
-	streamChainDomain        = "blackbird.stream-chain/v1\x00"
-	auditEntryDomain         = "blackbird-audit-entry/v1\x00"
+	commandFingerprintDomain   = "blackbird.command-fingerprint/v1\x00"
+	authorizationGuardDomain   = "blackbird.authorization-guards/v1\x00"
+	receiptResultDomain        = "blackbird.receipt-result/v1\x00"
+	sessionBindingDomain       = "blackbird.session-binding/v1\x00"
+	recoveryCapsuleDomain      = "blackbird.recovery-capsule/v1\x00"
+	commandDenialDomain        = "blackbird-command-denial/v1\x00"
+	bootstrapAttemptDomain     = "blackbird-bootstrap-attempt/v1\x00"
+	eventDigestDomain          = "blackbird.event-digest/v1\x00"
+	streamGenesisDomain        = "blackbird.stream-genesis/v1\x00"
+	streamChainDomain          = "blackbird.stream-chain/v1\x00"
+	auditEntryDomain           = "blackbird-audit-entry/v1\x00"
+	auditReceiptIdentityDomain = "blackbird.audit-receipt-identity/v1\x00"
 )
 
 // CanonicalView is deliberately sealed to the application package. Every
@@ -383,12 +385,14 @@ type identityPayloadInstallationBootstrapped struct {
 	TranscriptFingerprint CanonicalDigest     `json:"transcript_fingerprint"`
 }
 type identityPayloadPrincipalRegistered struct {
+	InstallationID     CanonicalIdentifier `json:"installation_id"`
 	PrincipalID        CanonicalIdentifier `json:"principal_id"`
 	Kind               string              `json:"kind"`
 	DisplayName        string              `json:"display_name"`
 	PublicKeyReference string              `json:"public_key_reference"`
 }
 type identityPayloadDevicePairingBegan struct {
+	InstallationID     CanonicalIdentifier `json:"installation_id"`
 	DeviceID           CanonicalIdentifier `json:"device_id"`
 	PrincipalID        CanonicalIdentifier `json:"principal_id"`
 	CeremonyID         CanonicalIdentifier `json:"ceremony_id"`
@@ -396,6 +400,7 @@ type identityPayloadDevicePairingBegan struct {
 	PublicKeyReference string              `json:"public_key_reference"`
 }
 type identityPayloadDevicePaired struct {
+	InstallationID                  CanonicalIdentifier `json:"installation_id"`
 	DeviceID                        CanonicalIdentifier `json:"device_id"`
 	PrincipalID                     CanonicalIdentifier `json:"principal_id"`
 	DisplayName                     string              `json:"display_name"`
@@ -441,12 +446,14 @@ type identityPayloadActorDelegationProposed struct {
 }
 type identityPayloadActorDelegationActivated struct {
 	DelegationID           CanonicalIdentifier `json:"delegation_id"`
+	WorkspaceID            CanonicalIdentifier `json:"workspace_id"`
 	PrincipalID            CanonicalIdentifier `json:"principal_id"`
 	ActorID                CanonicalIdentifier `json:"actor_id"`
 	SessionStartCeremonyID CanonicalIdentifier `json:"session_start_ceremony_id"`
 }
 type identityPayloadActorSessionStarted struct {
 	SessionID                       CanonicalIdentifier `json:"session_id"`
+	WorkspaceID                     CanonicalIdentifier `json:"workspace_id"`
 	ClientInstanceID                CanonicalIdentifier `json:"client_instance_id"`
 	ClientName                      string              `json:"client_name"`
 	ClientVersion                   string              `json:"client_version"`
@@ -523,7 +530,8 @@ func (codec ProductionCanonicalCodec) MaterializeIdentityFactPayload(
 }
 
 func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView, error) {
-	if fact == nil || fact.Origin().IsZero() || fact.Origin().Version().Uint64() > MaxCanonicalInteger {
+	if isNilInterface(fact) || reflect.TypeOf(fact).Kind() != reflect.Struct ||
+		fact.Origin().IsZero() || fact.Origin().Version().Uint64() > MaxCanonicalInteger {
 		return nil, ErrCanonicalProfile
 	}
 	id := func(text string) CanonicalIdentifier {
@@ -543,19 +551,22 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 		}, nil
 	case domain.PrincipalRegisteredFact:
 		return identityPayloadPrincipalRegistered{
-			PrincipalID: id(value.PrincipalID().String()), Kind: string(value.PrincipalKind()),
+			InstallationID: id(value.InstallationID().String()), PrincipalID: id(value.PrincipalID().String()),
+			Kind:        string(value.PrincipalKind()),
 			DisplayName: value.DisplayName().String(), PublicKeyReference: value.PublicKeyReference().String(),
 		}, nil
 	case domain.DevicePairingBeganFact:
 		return identityPayloadDevicePairingBegan{
-			DeviceID: id(value.DeviceID().String()), PrincipalID: id(value.PrincipalID().String()),
-			CeremonyID: id(value.CeremonyID().String()), DisplayName: value.DisplayName().String(),
+			InstallationID: id(value.InstallationID().String()), DeviceID: id(value.DeviceID().String()),
+			PrincipalID: id(value.PrincipalID().String()),
+			CeremonyID:  id(value.CeremonyID().String()), DisplayName: value.DisplayName().String(),
 			PublicKeyReference: value.PublicKeyReference().String(),
 		}, nil
 	case domain.DevicePairedFact:
 		credential := value.CredentialBinding()
 		return identityPayloadDevicePaired{
-			DeviceID: id(value.DeviceID().String()), PrincipalID: id(value.PrincipalID().String()),
+			InstallationID: id(value.InstallationID().String()), DeviceID: id(value.DeviceID().String()),
+			PrincipalID: id(value.PrincipalID().String()),
 			DisplayName: value.DisplayName().String(), TranscriptFingerprint: digest([sha256.Size]byte(value.TranscriptFingerprint())),
 			TrustRevision: value.TrustRevision().Uint64(), CredentialAlgorithm: credential.Algorithm(),
 			PublicKeyReference:              credential.PublicKeyReference().String(),
@@ -592,8 +603,9 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 		}, nil
 	case domain.ActorDelegationActivatedFact:
 		return identityPayloadActorDelegationActivated{
-			DelegationID: id(value.DelegationID().String()), PrincipalID: id(value.PrincipalID().String()),
-			ActorID: id(value.ActorID().String()), SessionStartCeremonyID: id(value.SessionStartCeremonyID().String()),
+			DelegationID: id(value.DelegationID().String()), WorkspaceID: id(value.WorkspaceID().String()),
+			PrincipalID: id(value.PrincipalID().String()),
+			ActorID:     id(value.ActorID().String()), SessionStartCeremonyID: id(value.SessionStartCeremonyID().String()),
 		}, nil
 	case domain.ActorSessionStartedFact:
 		bindingDigest, digestErr := hashSessionFactBinding(value)
@@ -602,8 +614,9 @@ func identityFactPayloadView(fact domain.IdentityFact) (IdentityFactPayloadView,
 		}
 		presentation := value.PresentationCredential()
 		return identityPayloadActorSessionStarted{
-			SessionID: id(value.SessionID().String()), ClientInstanceID: id(value.ClientInstanceID().String()),
-			ClientName: value.ClientMetadata().Name(), ClientVersion: value.ClientMetadata().Version(),
+			SessionID: id(value.SessionID().String()), WorkspaceID: id(value.WorkspaceID().String()),
+			ClientInstanceID: id(value.ClientInstanceID().String()),
+			ClientName:       value.ClientMetadata().Name(), ClientVersion: value.ClientMetadata().Version(),
 			BindingDigest: bindingDigest, Capabilities: capabilityStrings(value.Capabilities()),
 			PresentationCredentialReference: presentation.Reference().String(),
 			PresentationCredentialDigest:    digest(presentation.Digest().Bytes()),
@@ -1284,6 +1297,543 @@ func NewStreamGenesisViewV1(
 
 func (StreamGenesisViewV1) canonicalView()         {}
 func (StreamGenesisViewV1) streamGenesisHashView() {}
+
+const commandHashSchemaV1 = "blackbird.command-hash-view/v1"
+
+// W0CommandHashContextParams contains the semantic request envelope shared by
+// every W0 command. Routing authority, authority epoch, command/request IDs,
+// receipt and idempotency IDs, deadlines, retry counters, and response options
+// are deliberately not representable here.
+type W0CommandHashContextParams struct {
+	ScopeKind            StreamScopeKind
+	ScopeID              CanonicalIdentifier
+	PrincipalID          CanonicalIdentifier
+	ClientInstanceID     CanonicalIdentifier
+	ActorID              CanonicalIdentifier
+	ActorSessionID       CanonicalIdentifier
+	CorrelationID        CanonicalIdentifier
+	CausationEventID     CanonicalIdentifier
+	ProtocolCapabilities []string
+}
+
+type commandHashContextWire struct {
+	Schema               string               `json:"schema"`
+	Operation            string               `json:"operation"`
+	OperationMajor       uint16               `json:"operation_major"`
+	ScopeKind            StreamScopeKind      `json:"scope_kind"`
+	ScopeID              CanonicalIdentifier  `json:"scope_id"`
+	PrincipalID          *CanonicalIdentifier `json:"principal_id"`
+	ClientInstanceID     *CanonicalIdentifier `json:"client_instance_id"`
+	ActorID              *CanonicalIdentifier `json:"actor_id"`
+	ActorSessionID       *CanonicalIdentifier `json:"actor_session_id"`
+	CorrelationID        CanonicalIdentifier  `json:"correlation_id"`
+	CausationEventID     *CanonicalIdentifier `json:"causation_event_id"`
+	ProtocolCapabilities []string             `json:"protocol_capabilities"`
+}
+
+type CommandExpectedResource struct {
+	ID              CanonicalIdentifier `json:"id"`
+	ExpectedVersion uint64              `json:"expected_version"`
+}
+
+type CommandCeremony struct {
+	ID          CanonicalIdentifier `json:"id"`
+	ExpiresAt   CanonicalInstant    `json:"expires_at"`
+	ProofDigest CanonicalDigest     `json:"proof_digest"`
+}
+
+func commandHashContext(operation CommandOperation, params W0CommandHashContextParams) (commandHashContextWire, error) {
+	contract, exists := operationContracts[operation]
+	expectedScope := StreamScopeKind(contract.scope)
+	if !exists || !params.ScopeKind.Valid() || params.ScopeKind != expectedScope ||
+		params.ScopeID.String() == "" || params.PrincipalID.String() == "" ||
+		params.CorrelationID.String() == "" ||
+		(operation != CommandBootstrapInstallation && params.ClientInstanceID.String() == "") ||
+		(contract.attribution == attributionForbidden && (params.ActorID.String() != "" || params.ActorSessionID.String() != "")) ||
+		contract.attribution == attributionOptional && ((params.ActorID.String() == "") != (params.ActorSessionID.String() == "")) {
+		return commandHashContextWire{}, ErrCanonicalProfile
+	}
+	capabilities, err := canonicalProtocolCapabilities(params.ProtocolCapabilities)
+	if err != nil {
+		return commandHashContextWire{}, err
+	}
+	return commandHashContextWire{
+		Schema: commandHashSchemaV1, Operation: string(operation), OperationMajor: 1,
+		ScopeKind: params.ScopeKind, ScopeID: params.ScopeID,
+		PrincipalID: optionalCanonicalID(params.PrincipalID), ClientInstanceID: optionalCanonicalID(params.ClientInstanceID),
+		ActorID: optionalCanonicalID(params.ActorID), ActorSessionID: optionalCanonicalID(params.ActorSessionID),
+		CorrelationID: params.CorrelationID, CausationEventID: optionalCanonicalID(params.CausationEventID),
+		ProtocolCapabilities: capabilities,
+	}, nil
+}
+
+func optionalCanonicalID(value CanonicalIdentifier) *CanonicalIdentifier {
+	if value.String() == "" {
+		return nil
+	}
+	copyOfValue := value
+	return &copyOfValue
+}
+
+func canonicalProtocolCapabilities(values []string) ([]string, error) {
+	result := make([]string, len(values))
+	for index, value := range values {
+		capability, err := domain.NewCapability(value)
+		if err != nil {
+			return nil, ErrCanonicalProfile
+		}
+		result[index] = capability.String()
+	}
+	slices.Sort(result)
+	for index, value := range result {
+		if index > 0 && result[index-1] == value {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	return result, nil
+}
+
+func canonicalStringSet(values []string) ([]string, error) {
+	return canonicalProtocolCapabilities(values)
+}
+
+func canonicalCapabilitySet(values []string) ([]string, error) {
+	capabilities := make([]domain.Capability, len(values))
+	for index, value := range values {
+		capability, err := domain.NewCapability(value)
+		if err != nil {
+			return nil, ErrCanonicalProfile
+		}
+		capabilities[index] = capability
+	}
+	set, err := domain.NewCapabilitySet(capabilities...)
+	if err != nil {
+		return nil, ErrCanonicalProfile
+	}
+	return capabilityStrings(set), nil
+}
+
+func validCommandDisplayName(value string) bool {
+	_, err := domain.NewDisplayName(value)
+	return err == nil
+}
+
+func validCommandPublicKey(value string) bool {
+	_, err := domain.NewPublicKeyReference(value)
+	return err == nil
+}
+
+func validCommandWorkspaceMetadata(alias, locator string) bool {
+	_, aliasErr := domain.NewWorkspaceAlias(alias)
+	_, locatorErr := domain.NewDiscoveryLocator(locator)
+	return aliasErr == nil && locatorErr == nil
+}
+
+func validCommandClientMetadata(name, version string) bool {
+	_, err := domain.NewClientMetadata(name, version)
+	return err == nil
+}
+
+func validCommandPresentation(reference, audience string) bool {
+	_, referenceErr := domain.NewCredentialReference(reference)
+	_, audienceErr := domain.NewCredentialAudience(audience)
+	return referenceErr == nil && audienceErr == nil
+}
+
+func validCommandResource(value CommandExpectedResource) bool {
+	return value.ID.String() != "" && value.ExpectedVersion > 0 && value.ExpectedVersion <= MaxCanonicalInteger
+}
+
+func validCommandCeremony(value CommandCeremony) bool {
+	return value.ID.String() != "" && value.ExpiresAt.String() != "" && value.ProofDigest.String() != ""
+}
+
+type BootstrapInstallationCommandHashParams struct {
+	InstallationID           CanonicalIdentifier
+	Invitation               CommandExpectedResource
+	BootstrapGenerationID    CanonicalIdentifier
+	ApprovedTranscript       CanonicalDigest
+	PrincipalID              CanonicalIdentifier
+	PrincipalDisplayName     string
+	DeviceID                 CanonicalIdentifier
+	DeviceDisplayName        string
+	DevicePublicKeyReference string
+	DeviceSPKIFingerprint    CanonicalDigest
+	OwnerGrantID             CanonicalIdentifier
+	OwnerGrantCapabilities   []string
+}
+
+type bootstrapInstallationCommandBody struct {
+	InstallationID           CanonicalIdentifier     `json:"installation_id"`
+	Invitation               CommandExpectedResource `json:"invitation"`
+	BootstrapGenerationID    CanonicalIdentifier     `json:"bootstrap_generation_id"`
+	ApprovedTranscript       CanonicalDigest         `json:"approved_transcript_fingerprint"`
+	PrincipalID              CanonicalIdentifier     `json:"principal_id"`
+	PrincipalDisplayName     string                  `json:"principal_display_name"`
+	DeviceID                 CanonicalIdentifier     `json:"device_id"`
+	DeviceDisplayName        string                  `json:"device_display_name"`
+	DevicePublicKeyReference string                  `json:"device_public_key_reference"`
+	DeviceSPKIFingerprint    CanonicalDigest         `json:"device_spki_fingerprint"`
+	OwnerGrantID             CanonicalIdentifier     `json:"owner_grant_id"`
+	OwnerGrantCapabilities   []string                `json:"owner_grant_capabilities"`
+}
+
+type bootstrapInstallationCommandHashView struct {
+	Command commandHashContextWire           `json:"command"`
+	Body    bootstrapInstallationCommandBody `json:"body"`
+}
+
+func NewBootstrapInstallationCommandHashView(context W0CommandHashContextParams, params BootstrapInstallationCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandBootstrapInstallation, context)
+	capabilities, capabilityErr := canonicalCapabilitySet(params.OwnerGrantCapabilities)
+	if err != nil || capabilityErr != nil || params.InstallationID.String() == "" || !validCommandResource(params.Invitation) ||
+		params.BootstrapGenerationID.String() == "" || params.ApprovedTranscript.String() == "" ||
+		params.PrincipalID.String() == "" || !validCommandDisplayName(params.PrincipalDisplayName) ||
+		params.DeviceID.String() == "" || !validCommandDisplayName(params.DeviceDisplayName) ||
+		!validCommandPublicKey(params.DevicePublicKeyReference) || params.DeviceSPKIFingerprint.String() == "" ||
+		params.OwnerGrantID.String() == "" || len(capabilities) == 0 {
+		return nil, ErrCanonicalProfile
+	}
+	return bootstrapInstallationCommandHashView{Command: command, Body: bootstrapInstallationCommandBody{
+		InstallationID: params.InstallationID, Invitation: params.Invitation,
+		BootstrapGenerationID: params.BootstrapGenerationID, ApprovedTranscript: params.ApprovedTranscript,
+		PrincipalID: params.PrincipalID, PrincipalDisplayName: params.PrincipalDisplayName,
+		DeviceID: params.DeviceID, DeviceDisplayName: params.DeviceDisplayName,
+		DevicePublicKeyReference: params.DevicePublicKeyReference, DeviceSPKIFingerprint: params.DeviceSPKIFingerprint,
+		OwnerGrantID: params.OwnerGrantID, OwnerGrantCapabilities: capabilities,
+	}}, nil
+}
+
+func (bootstrapInstallationCommandHashView) canonicalView()   {}
+func (bootstrapInstallationCommandHashView) commandHashView() {}
+
+type RegisterPrincipalCommandHashParams struct {
+	Registrar          CommandExpectedResource `json:"registrar"`
+	PrincipalID        CanonicalIdentifier     `json:"principal_id"`
+	Kind               string                  `json:"kind"`
+	DisplayName        string                  `json:"display_name"`
+	PublicKeyReference string                  `json:"public_key_reference"`
+}
+
+type registerPrincipalCommandHashView struct {
+	Command commandHashContextWire             `json:"command"`
+	Body    RegisterPrincipalCommandHashParams `json:"body"`
+}
+
+func NewRegisterPrincipalCommandHashView(context W0CommandHashContextParams, params RegisterPrincipalCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandRegisterPrincipal, context)
+	if err != nil || !validCommandResource(params.Registrar) || params.PrincipalID.String() == "" ||
+		!domain.PrincipalKind(params.Kind).Valid() || !validCommandDisplayName(params.DisplayName) ||
+		(params.Kind != string(domain.PrincipalKindHuman) && params.PublicKeyReference == "") ||
+		(params.PublicKeyReference != "" && !validCommandPublicKey(params.PublicKeyReference)) {
+		return nil, ErrCanonicalProfile
+	}
+	return registerPrincipalCommandHashView{Command: command, Body: params}, nil
+}
+
+func (registerPrincipalCommandHashView) canonicalView()   {}
+func (registerPrincipalCommandHashView) commandHashView() {}
+
+type CreateWorkspaceCommandHashParams struct {
+	Owner             CommandExpectedResource `json:"owner"`
+	InstallationGrant CommandExpectedResource `json:"installation_grant"`
+	WorkspaceID       CanonicalIdentifier     `json:"workspace_id"`
+	Alias             string                  `json:"alias"`
+	DiscoveryLocator  string                  `json:"discovery_locator"`
+	OwnerMembershipID CanonicalIdentifier     `json:"owner_membership_id"`
+	OwnerCapabilities []string                `json:"owner_capabilities"`
+}
+
+type createWorkspaceCommandHashView struct {
+	Command commandHashContextWire           `json:"command"`
+	Body    CreateWorkspaceCommandHashParams `json:"body"`
+}
+
+func NewCreateWorkspaceCommandHashView(context W0CommandHashContextParams, params CreateWorkspaceCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandCreateWorkspace, context)
+	capabilities, capabilityErr := canonicalCapabilitySet(params.OwnerCapabilities)
+	if err != nil || capabilityErr != nil || !validCommandResource(params.Owner) ||
+		!validCommandResource(params.InstallationGrant) || params.WorkspaceID.String() == "" ||
+		!validCommandWorkspaceMetadata(params.Alias, params.DiscoveryLocator) ||
+		params.OwnerMembershipID.String() == "" || len(capabilities) == 0 {
+		return nil, ErrCanonicalProfile
+	}
+	params.OwnerCapabilities = capabilities
+	return createWorkspaceCommandHashView{Command: command, Body: params}, nil
+}
+
+func (createWorkspaceCommandHashView) canonicalView()   {}
+func (createWorkspaceCommandHashView) commandHashView() {}
+
+type InviteWorkspaceMemberCommandHashParams struct {
+	Administrator CommandExpectedResource `json:"administrator"`
+	Workspace     CommandExpectedResource `json:"workspace"`
+	Principal     CommandExpectedResource `json:"principal"`
+	MembershipID  CanonicalIdentifier     `json:"membership_id"`
+	Capabilities  []string                `json:"capabilities"`
+	Challenge     CommandCeremony         `json:"challenge"`
+}
+
+type inviteWorkspaceMemberCommandHashView struct {
+	Command commandHashContextWire                 `json:"command"`
+	Body    InviteWorkspaceMemberCommandHashParams `json:"body"`
+}
+
+func NewInviteWorkspaceMemberCommandHashView(context W0CommandHashContextParams, params InviteWorkspaceMemberCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandInviteWorkspaceMember, context)
+	capabilities, capabilityErr := canonicalCapabilitySet(params.Capabilities)
+	if err != nil || capabilityErr != nil || !validCommandResource(params.Administrator) ||
+		!validCommandResource(params.Workspace) || !validCommandResource(params.Principal) ||
+		params.MembershipID.String() == "" || len(capabilities) == 0 || !validCommandCeremony(params.Challenge) {
+		return nil, ErrCanonicalProfile
+	}
+	params.Capabilities = capabilities
+	return inviteWorkspaceMemberCommandHashView{Command: command, Body: params}, nil
+}
+
+func (inviteWorkspaceMemberCommandHashView) canonicalView()   {}
+func (inviteWorkspaceMemberCommandHashView) commandHashView() {}
+
+type AcceptWorkspaceMembershipCommandHashParams struct {
+	Workspace  CommandExpectedResource `json:"workspace"`
+	Principal  CommandExpectedResource `json:"principal"`
+	Membership CommandExpectedResource `json:"membership"`
+	Proof      CommandCeremony         `json:"proof"`
+}
+
+type acceptWorkspaceMembershipCommandHashView struct {
+	Command commandHashContextWire                     `json:"command"`
+	Body    AcceptWorkspaceMembershipCommandHashParams `json:"body"`
+}
+
+func NewAcceptWorkspaceMembershipCommandHashView(context W0CommandHashContextParams, params AcceptWorkspaceMembershipCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandAcceptWorkspaceMembership, context)
+	if err != nil || !validCommandResource(params.Workspace) || !validCommandResource(params.Principal) ||
+		!validCommandResource(params.Membership) || !validCommandCeremony(params.Proof) {
+		return nil, ErrCanonicalProfile
+	}
+	return acceptWorkspaceMembershipCommandHashView{Command: command, Body: params}, nil
+}
+
+func (acceptWorkspaceMembershipCommandHashView) canonicalView()   {}
+func (acceptWorkspaceMembershipCommandHashView) commandHashView() {}
+
+type CreateActorCommandHashParams struct {
+	Administrator CommandExpectedResource `json:"administrator"`
+	Workspace     CommandExpectedResource `json:"workspace"`
+	ActorID       CanonicalIdentifier     `json:"actor_id"`
+	Kind          string                  `json:"kind"`
+	DisplayName   string                  `json:"display_name"`
+}
+
+type createActorCommandHashView struct {
+	Command commandHashContextWire       `json:"command"`
+	Body    CreateActorCommandHashParams `json:"body"`
+}
+
+func NewCreateActorCommandHashView(context W0CommandHashContextParams, params CreateActorCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandCreateActor, context)
+	if err != nil || !validCommandResource(params.Administrator) || !validCommandResource(params.Workspace) ||
+		params.ActorID.String() == "" || !domain.ActorKind(params.Kind).Valid() || !validCommandDisplayName(params.DisplayName) {
+		return nil, ErrCanonicalProfile
+	}
+	return createActorCommandHashView{Command: command, Body: params}, nil
+}
+
+func (createActorCommandHashView) canonicalView()   {}
+func (createActorCommandHashView) commandHashView() {}
+
+type ProposeActorDelegationCommandHashParams struct {
+	Administrator CommandExpectedResource `json:"administrator"`
+	Workspace     CommandExpectedResource `json:"workspace"`
+	Principal     CommandExpectedResource `json:"principal"`
+	Actor         CommandExpectedResource `json:"actor"`
+	Membership    CommandExpectedResource `json:"membership"`
+	DelegationID  CanonicalIdentifier     `json:"delegation_id"`
+	Capabilities  []string                `json:"capabilities"`
+	Challenge     CommandCeremony         `json:"challenge"`
+}
+
+type proposeActorDelegationCommandHashView struct {
+	Command commandHashContextWire                  `json:"command"`
+	Body    ProposeActorDelegationCommandHashParams `json:"body"`
+}
+
+func NewProposeActorDelegationCommandHashView(context W0CommandHashContextParams, params ProposeActorDelegationCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandProposeActorDelegation, context)
+	capabilities, capabilityErr := canonicalCapabilitySet(params.Capabilities)
+	if err != nil || capabilityErr != nil || !validCommandResource(params.Administrator) ||
+		!validCommandResource(params.Workspace) || !validCommandResource(params.Principal) ||
+		!validCommandResource(params.Actor) || !validCommandResource(params.Membership) ||
+		params.DelegationID.String() == "" || len(capabilities) == 0 || !validCommandCeremony(params.Challenge) {
+		return nil, ErrCanonicalProfile
+	}
+	params.Capabilities = capabilities
+	return proposeActorDelegationCommandHashView{Command: command, Body: params}, nil
+}
+
+func (proposeActorDelegationCommandHashView) canonicalView()   {}
+func (proposeActorDelegationCommandHashView) commandHashView() {}
+
+type ActivateActorDelegationCommandHashParams struct {
+	Workspace             CommandExpectedResource `json:"workspace"`
+	Principal             CommandExpectedResource `json:"principal"`
+	Actor                 CommandExpectedResource `json:"actor"`
+	Membership            CommandExpectedResource `json:"membership"`
+	Delegation            CommandExpectedResource `json:"delegation"`
+	ActivationProof       CommandCeremony         `json:"activation_proof"`
+	SessionStartChallenge CommandCeremony         `json:"session_start_challenge"`
+}
+
+type activateActorDelegationCommandHashView struct {
+	Command commandHashContextWire                   `json:"command"`
+	Body    ActivateActorDelegationCommandHashParams `json:"body"`
+}
+
+func NewActivateActorDelegationCommandHashView(context W0CommandHashContextParams, params ActivateActorDelegationCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandActivateActorDelegation, context)
+	if err != nil || !validCommandResource(params.Workspace) || !validCommandResource(params.Principal) ||
+		!validCommandResource(params.Actor) || !validCommandResource(params.Membership) ||
+		!validCommandResource(params.Delegation) || !validCommandCeremony(params.ActivationProof) ||
+		!validCommandCeremony(params.SessionStartChallenge) {
+		return nil, ErrCanonicalProfile
+	}
+	return activateActorDelegationCommandHashView{Command: command, Body: params}, nil
+}
+
+func (activateActorDelegationCommandHashView) canonicalView()   {}
+func (activateActorDelegationCommandHashView) commandHashView() {}
+
+type BeginDevicePairingCommandHashParams struct {
+	Principal          CommandExpectedResource `json:"principal"`
+	DeviceID           CanonicalIdentifier     `json:"device_id"`
+	DisplayName        string                  `json:"display_name"`
+	PublicKeyReference string                  `json:"public_key_reference"`
+	Challenge          CommandCeremony         `json:"challenge"`
+}
+
+type beginDevicePairingCommandHashView struct {
+	Command commandHashContextWire              `json:"command"`
+	Body    BeginDevicePairingCommandHashParams `json:"body"`
+}
+
+func NewBeginDevicePairingCommandHashView(context W0CommandHashContextParams, params BeginDevicePairingCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandBeginDevicePairing, context)
+	if err != nil || !validCommandResource(params.Principal) || params.DeviceID.String() == "" ||
+		!validCommandDisplayName(params.DisplayName) || !validCommandPublicKey(params.PublicKeyReference) ||
+		!validCommandCeremony(params.Challenge) {
+		return nil, ErrCanonicalProfile
+	}
+	return beginDevicePairingCommandHashView{Command: command, Body: params}, nil
+}
+
+func (beginDevicePairingCommandHashView) canonicalView()   {}
+func (beginDevicePairingCommandHashView) commandHashView() {}
+
+type PairDeviceCommandHashParams struct {
+	Principal             CommandExpectedResource `json:"principal"`
+	Device                CommandExpectedResource `json:"device"`
+	ExpectedTrustRevision uint64                  `json:"expected_trust_revision"`
+	Proof                 CommandCeremony         `json:"proof"`
+	CredentialPublicKey   string                  `json:"credential_public_key_reference"`
+	CredentialSPKIDigest  CanonicalDigest         `json:"credential_spki_fingerprint"`
+	CredentialTranscript  CanonicalDigest         `json:"credential_transcript_fingerprint"`
+}
+
+type pairDeviceCommandHashView struct {
+	Command commandHashContextWire      `json:"command"`
+	Body    PairDeviceCommandHashParams `json:"body"`
+}
+
+func NewPairDeviceCommandHashView(context W0CommandHashContextParams, params PairDeviceCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandPairDevice, context)
+	if err != nil || !validCommandResource(params.Principal) || !validCommandResource(params.Device) ||
+		params.ExpectedTrustRevision == 0 || params.ExpectedTrustRevision > MaxCanonicalInteger ||
+		!validCommandCeremony(params.Proof) || !validCommandPublicKey(params.CredentialPublicKey) ||
+		params.CredentialSPKIDigest.String() == "" || params.CredentialTranscript.String() == "" {
+		return nil, ErrCanonicalProfile
+	}
+	return pairDeviceCommandHashView{Command: command, Body: params}, nil
+}
+
+func (pairDeviceCommandHashView) canonicalView()   {}
+func (pairDeviceCommandHashView) commandHashView() {}
+
+type StartActorSessionCommandHashParams struct {
+	SessionID             CanonicalIdentifier       `json:"session_id"`
+	ClientName            string                    `json:"client_name"`
+	ClientVersion         string                    `json:"client_version"`
+	Workspace             CommandExpectedResource   `json:"workspace"`
+	Principal             CommandExpectedResource   `json:"principal"`
+	Membership            CommandExpectedResource   `json:"membership"`
+	Actor                 CommandExpectedResource   `json:"actor"`
+	Delegation            CommandExpectedResource   `json:"delegation"`
+	Grants                []CommandExpectedResource `json:"grants"`
+	StartAuthorityKind    string                    `json:"start_authority_kind"`
+	Device                *CommandExpectedResource  `json:"device"`
+	ExpectedDeviceTrust   *uint64                   `json:"expected_device_trust_revision"`
+	HandoffProof          *CommandCeremony          `json:"handoff_proof"`
+	AbsoluteExpiry        CanonicalInstant          `json:"absolute_expiry"`
+	PresentationReference string                    `json:"presentation_credential_reference"`
+	PresentationDigest    CanonicalDigest           `json:"presentation_credential_digest"`
+	PresentationAudience  string                    `json:"presentation_credential_audience"`
+	PresentationVersion   uint16                    `json:"presentation_credential_version"`
+}
+
+type startActorSessionCommandHashView struct {
+	Command commandHashContextWire             `json:"command"`
+	Body    StartActorSessionCommandHashParams `json:"body"`
+}
+
+func NewStartActorSessionCommandHashView(context W0CommandHashContextParams, params StartActorSessionCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandStartActorSession, context)
+	if err != nil || params.SessionID.String() == "" || !validCommandClientMetadata(params.ClientName, params.ClientVersion) ||
+		!validCommandResource(params.Workspace) ||
+		!validCommandResource(params.Principal) || !validCommandResource(params.Membership) ||
+		!validCommandResource(params.Actor) || !validCommandResource(params.Delegation) ||
+		params.AbsoluteExpiry.String() == "" ||
+		!validCommandPresentation(params.PresentationReference, params.PresentationAudience) ||
+		params.PresentationDigest.String() == "" || params.PresentationVersion != domain.PresentationCredentialVersion {
+		return nil, ErrCanonicalProfile
+	}
+	grants := append([]CommandExpectedResource{}, params.Grants...)
+	for _, grant := range grants {
+		if !validCommandResource(grant) {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	slices.SortFunc(grants, func(left, right CommandExpectedResource) int {
+		return strings.Compare(left.ID.String(), right.ID.String())
+	})
+	for index := 1; index < len(grants); index++ {
+		if grants[index-1].ID == grants[index].ID {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	params.Grants = grants
+	switch params.StartAuthorityKind {
+	case string(domain.SessionStartByTrustedDevice):
+		if params.Device == nil || !validCommandResource(*params.Device) || params.ExpectedDeviceTrust == nil ||
+			*params.ExpectedDeviceTrust == 0 || *params.ExpectedDeviceTrust > MaxCanonicalInteger || params.HandoffProof != nil {
+			return nil, ErrCanonicalProfile
+		}
+		deviceCopy := *params.Device
+		trustCopy := *params.ExpectedDeviceTrust
+		params.Device, params.ExpectedDeviceTrust = &deviceCopy, &trustCopy
+	case string(domain.SessionStartByHandoff):
+		if params.Device != nil || params.ExpectedDeviceTrust != nil || params.HandoffProof == nil || !validCommandCeremony(*params.HandoffProof) {
+			return nil, ErrCanonicalProfile
+		}
+		proofCopy := *params.HandoffProof
+		params.HandoffProof = &proofCopy
+	default:
+		return nil, ErrCanonicalProfile
+	}
+	return startActorSessionCommandHashView{Command: command, Body: params}, nil
+}
+
+func (startActorSessionCommandHashView) canonicalView()   {}
+func (startActorSessionCommandHashView) commandHashView() {}
 
 // BootstrapAttemptViewV1 is the retained, secret-free invalid-proof identity.
 type BootstrapAttemptViewV1 struct {
@@ -2055,12 +2605,16 @@ func (eventSemanticViewV1) canonicalView()         {}
 func (eventSemanticViewV1) eventSemanticHashView() {}
 
 func eventSemanticView(event domain.EventEnvelope) (eventSemanticViewV1, error) {
-	if !event.StreamPosition().Valid() || event.Aggregate().IsZero() {
+	if !event.StreamPosition().Valid() || event.Aggregate().IsZero() || event.SchemaVersion().Uint16() != 1 {
 		return eventSemanticViewV1{}, ErrCanonicalProfile
 	}
 	payload := event.Payload().Bytes()
-	if err := validateIdentityPayload(event.EventType(), payload); err != nil {
+	decodedPayload, err := decodeIdentityPayload(event.EventType(), payload)
+	if err != nil {
 		return eventSemanticViewV1{}, err
+	}
+	if !identityPayloadMatchesEnvelope(event, decodedPayload) {
+		return eventSemanticViewV1{}, ErrCanonicalProfile
 	}
 	id := func(text string) (CanonicalIdentifier, error) { return NewCanonicalIdentifier(text) }
 	eventID, err := id(event.EventID().String())
@@ -2133,7 +2687,7 @@ func eventSemanticView(event domain.EventEnvelope) (eventSemanticViewV1, error) 
 	return view, nil
 }
 
-func validateIdentityPayload(eventType domain.EventType, canonical []byte) error {
+func decodeIdentityPayload(eventType domain.EventType, canonical []byte) (any, error) {
 	var target any
 	switch eventType {
 	case domain.EventTypeInstallationBootstrapped:
@@ -2159,23 +2713,97 @@ func validateIdentityPayload(eventType domain.EventType, canonical []byte) error
 	case domain.EventTypeActorSessionStarted:
 		target = &identityPayloadActorSessionStarted{}
 	default:
-		return ErrCanonicalProfile
+		return nil, ErrCanonicalProfile
 	}
 	if err := decodeCanonicalDocument(canonical, domain.MaxEventPayloadBytes, target); err != nil {
-		return err
+		return nil, err
 	}
 	if !validIdentityPayload(target) {
-		return ErrCanonicalProfile
+		return nil, ErrCanonicalProfile
 	}
 	view, ok := target.(CanonicalView)
 	if !ok {
-		return ErrCanonicalProfile
+		return nil, ErrCanonicalProfile
 	}
 	reencoded, err := encodeCanonical(view, domain.MaxEventPayloadBytes)
 	if err != nil || !bytes.Equal(reencoded, canonical) {
-		return fmt.Errorf("%w: retained identity payload mismatch", ErrCanonicalEncoding)
+		return nil, fmt.Errorf("%w: retained identity payload mismatch", ErrCanonicalEncoding)
 	}
-	return nil
+	return target, nil
+}
+
+func identityPayloadMatchesEnvelope(event domain.EventEnvelope, payload any) bool {
+	aggregate := event.Aggregate()
+	if aggregate.Kind() != expectedEventAggregateKind(event.EventType()) ||
+		event.Scope().Kind() != expectedEventScopeKind(event.EventType()) {
+		return false
+	}
+	matchesAggregate := func(id CanonicalIdentifier) bool { return id.String() == aggregate.ID() }
+	matchesScope := func(id CanonicalIdentifier) bool { return id.String() == event.Scope().ID() }
+	switch value := payload.(type) {
+	case *identityPayloadInstallationBootstrapped:
+		return matchesAggregate(value.InvitationID) && matchesScope(value.InstallationID)
+	case *identityPayloadPrincipalRegistered:
+		return matchesAggregate(value.PrincipalID) && matchesScope(value.InstallationID)
+	case *identityPayloadDevicePairingBegan:
+		return matchesAggregate(value.DeviceID) && matchesScope(value.InstallationID)
+	case *identityPayloadDevicePaired:
+		return matchesAggregate(value.DeviceID) && matchesScope(value.InstallationID)
+	case *identityPayloadWorkspaceCreated:
+		return matchesAggregate(value.WorkspaceID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadWorkspaceMemberInvited:
+		return matchesAggregate(value.MembershipID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadWorkspaceMembershipAccepted:
+		return matchesAggregate(value.MembershipID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadActorCreated:
+		return matchesAggregate(value.ActorID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadActorDelegationProposed:
+		return matchesAggregate(value.DelegationID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadActorDelegationActivated:
+		return matchesAggregate(value.DelegationID) && matchesScope(value.WorkspaceID)
+	case *identityPayloadActorSessionStarted:
+		return matchesAggregate(value.SessionID) && matchesScope(value.WorkspaceID)
+	default:
+		return false
+	}
+}
+
+func expectedEventScopeKind(eventType domain.EventType) domain.ScopeKind {
+	switch eventType {
+	case domain.EventTypeInstallationBootstrapped, domain.EventTypePrincipalRegistered,
+		domain.EventTypeDevicePairingBegan, domain.EventTypeDevicePaired:
+		return domain.ScopeKindInstallation
+	case domain.EventTypeWorkspaceCreated, domain.EventTypeWorkspaceMemberInvited,
+		domain.EventTypeWorkspaceMembershipAccepted, domain.EventTypeActorCreated,
+		domain.EventTypeActorDelegationProposed, domain.EventTypeActorDelegationActivated,
+		domain.EventTypeActorSessionStarted:
+		return domain.ScopeKindWorkspace
+	default:
+		return ""
+	}
+}
+
+func expectedEventAggregateKind(eventType domain.EventType) domain.AggregateKind {
+	switch eventType {
+	case domain.EventTypeInstallationBootstrapped:
+		return domain.AggregateKindInvitation
+	case domain.EventTypePrincipalRegistered:
+		return domain.AggregateKindPrincipal
+	case domain.EventTypeDevicePairingBegan, domain.EventTypeDevicePaired:
+		return domain.AggregateKindDevice
+	case domain.EventTypeWorkspaceCreated:
+		return domain.AggregateKindWorkspace
+	case domain.EventTypeWorkspaceMemberInvited, domain.EventTypeWorkspaceMembershipAccepted:
+		return domain.AggregateKindMembership
+	case domain.EventTypeActorCreated:
+		return domain.AggregateKindActor
+	case domain.EventTypeActorDelegationProposed, domain.EventTypeActorDelegationActivated:
+		return domain.AggregateKindActorDelegation
+	case domain.EventTypeActorSessionStarted:
+		return domain.AggregateKindActorSession
+	default:
+		return ""
+	}
 }
 
 func validIdentityPayload(payload any) bool {
@@ -2211,13 +2839,13 @@ func validIdentityPayload(payload any) bool {
 		return validIDs(value.InstallationID, value.InvitationID, value.PrincipalID, value.DeviceID, value.GrantID) &&
 			value.TranscriptFingerprint.String() != ""
 	case *identityPayloadPrincipalRegistered:
-		return validIDs(value.PrincipalID) && validOpaqueText(value.Kind, 64) &&
+		return validIDs(value.InstallationID, value.PrincipalID) && validOpaqueText(value.Kind, 64) &&
 			validOpaqueText(value.DisplayName, 256) && validOpaqueText(value.PublicKeyReference, 4096)
 	case *identityPayloadDevicePairingBegan:
-		return validIDs(value.DeviceID, value.PrincipalID, value.CeremonyID) &&
+		return validIDs(value.InstallationID, value.DeviceID, value.PrincipalID, value.CeremonyID) &&
 			validOpaqueText(value.DisplayName, 256) && validOpaqueText(value.PublicKeyReference, 4096)
 	case *identityPayloadDevicePaired:
-		return validIDs(value.DeviceID, value.PrincipalID) && validOpaqueText(value.DisplayName, 256) &&
+		return validIDs(value.InstallationID, value.DeviceID, value.PrincipalID) && validOpaqueText(value.DisplayName, 256) &&
 			value.TranscriptFingerprint.String() != "" && value.TrustRevision > 0 && value.TrustRevision <= MaxCanonicalInteger &&
 			value.CredentialAlgorithm == domain.DeviceCredentialAlgorithm && validOpaqueText(value.PublicKeyReference, 4096) &&
 			value.SPKIFingerprint.String() != "" && value.CredentialTranscriptFingerprint.String() != ""
@@ -2235,9 +2863,9 @@ func validIdentityPayload(payload any) bool {
 	case *identityPayloadActorDelegationProposed:
 		return validIDs(value.DelegationID, value.WorkspaceID, value.PrincipalID, value.ActorID, value.CeremonyID)
 	case *identityPayloadActorDelegationActivated:
-		return validIDs(value.DelegationID, value.PrincipalID, value.ActorID, value.SessionStartCeremonyID)
+		return validIDs(value.DelegationID, value.WorkspaceID, value.PrincipalID, value.ActorID, value.SessionStartCeremonyID)
 	case *identityPayloadActorSessionStarted:
-		return validIDs(value.SessionID, value.ClientInstanceID) && validOpaqueText(value.ClientName, 128) &&
+		return validIDs(value.SessionID, value.WorkspaceID, value.ClientInstanceID) && validOpaqueText(value.ClientName, 128) &&
 			validOpaqueText(value.ClientVersion, 128) && value.BindingDigest.String() != "" &&
 			validCapabilities(value.Capabilities) && validOpaqueText(value.PresentationCredentialReference, 256) &&
 			value.PresentationCredentialDigest.String() != "" && validOpaqueText(value.PresentationCredentialAudience, 256) &&
@@ -2276,9 +2904,126 @@ func (codec ProductionCanonicalCodec) MaterializeEvent(
 
 const auditEntrySchemaV1 = "blackbird.audit.entry/v1"
 
-type auditDetailWire struct {
-	Kind   string  `json:"kind"`
-	Reason *string `json:"reason"`
+type auditReceiptIdentityWire struct {
+	Kind                  ReceiptIdentityKind  `json:"kind"`
+	ScopeKind             string               `json:"scope_kind"`
+	ScopeID               CanonicalIdentifier  `json:"scope_id"`
+	WorkspaceID           *CanonicalIdentifier `json:"workspace_id"`
+	InstallationID        *CanonicalIdentifier `json:"installation_id"`
+	PrincipalID           *CanonicalIdentifier `json:"principal_id"`
+	ClientInstanceID      *CanonicalIdentifier `json:"client_instance_id"`
+	TranscriptFingerprint *CanonicalDigest     `json:"transcript_fingerprint"`
+	Operation             string               `json:"operation"`
+	IdempotencyKey        string               `json:"idempotency_key"`
+}
+
+func (auditReceiptIdentityWire) canonicalView() {}
+
+func hashReceiptIdentity(identity ReceiptIdentity) (Digest, error) {
+	if identity.kind == "" || identity.scope.IsZero() || identity.operation.String() == "" || identity.key.String() == "" {
+		return Digest{}, ErrCanonicalProfile
+	}
+	scopeID, err := NewCanonicalIdentifier(identity.scope.ID())
+	if err != nil {
+		return Digest{}, err
+	}
+	view := auditReceiptIdentityWire{
+		Kind: identity.kind, ScopeKind: string(identity.scope.Kind()), ScopeID: scopeID,
+		Operation: identity.operation.String(), IdempotencyKey: identity.key.String(),
+	}
+	identifier := func(text string) (*CanonicalIdentifier, error) {
+		if text == "" {
+			return nil, nil
+		}
+		value, valueErr := NewCanonicalIdentifier(text)
+		return &value, valueErr
+	}
+	view.WorkspaceID, err = identifier(identity.workspace.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	view.InstallationID, err = identifier(identity.installation.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	view.PrincipalID, err = identifier(identity.principal.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	view.ClientInstanceID, err = identifier(identity.clientInstance.String())
+	if err != nil {
+		return Digest{}, err
+	}
+	if !identity.transcript.IsZero() {
+		value, valueErr := commandFingerprintText(identity.transcript)
+		if valueErr != nil {
+			return Digest{}, valueErr
+		}
+		view.TranscriptFingerprint = &value
+	}
+	canonical, err := encodeCanonical(view, MaxAuditMetadataBytes)
+	if err != nil {
+		return Digest{}, err
+	}
+	return digestCanonical(auditReceiptIdentityDomain, canonical), nil
+}
+
+type auditInvocationWire struct {
+	Kind                  AuditInvocationKind  `json:"kind"`
+	CommandID             *CanonicalIdentifier `json:"command_id"`
+	ReceiptID             *CanonicalIdentifier `json:"receipt_id"`
+	ReceiptIdentityDigest *CanonicalDigest     `json:"receipt_identity_digest"`
+	RequestID             *CanonicalIdentifier `json:"request_id"`
+	CorrelationID         *CanonicalIdentifier `json:"correlation_id"`
+	TraceID               *CanonicalIdentifier `json:"trace_id"`
+	SecurityOperation     *string              `json:"security_operation"`
+}
+
+type auditTimingWire struct {
+	PersistedAuthorityAt  CanonicalInstant  `json:"persisted_authority_at"`
+	ServerReceivedAt      *CanonicalInstant `json:"server_received_at"`
+	AuthenticatedClientAt *CanonicalInstant `json:"authenticated_client_at"`
+}
+
+type auditRevisionWire struct {
+	Kind    string              `json:"kind"`
+	ID      CanonicalIdentifier `json:"id"`
+	Version uint64              `json:"version"`
+}
+
+type auditSubjectWire struct {
+	Kind               AuditSubjectKind     `json:"kind"`
+	PrincipalID        *CanonicalIdentifier `json:"principal_id"`
+	DeviceID           *CanonicalIdentifier `json:"device_id"`
+	WorkloadID         *CanonicalIdentifier `json:"workload_id"`
+	ActorID            *CanonicalIdentifier `json:"actor_id"`
+	ActorSessionID     *CanonicalIdentifier `json:"actor_session_id"`
+	DelegationChain    []auditRevisionWire  `json:"delegation_chain"`
+	UnattributedSource *CanonicalDigest     `json:"unattributed_source_digest"`
+}
+
+type auditProvenanceWire struct {
+	SourceAuthorityID  CanonicalIdentifier  `json:"source_authority_id"`
+	FederationEnvelope *CanonicalIdentifier `json:"federation_envelope_id"`
+}
+
+type auditAuthorizationWire struct {
+	EffectiveGrants        []auditRevisionWire  `json:"effective_grants"`
+	AuthorizationRevisions []auditRevisionWire  `json:"authorization_revisions"`
+	RevocationRevisions    []auditRevisionWire  `json:"revocation_revisions"`
+	PolicyRevision         *string              `json:"policy_revision"`
+	DeviceTrustRevision    *uint64              `json:"device_trust_revision"`
+	GuardDigest            CanonicalDigest      `json:"guard_digest"`
+	AdmissionGeneration    uint64               `json:"admission_generation"`
+	OldBootstrapGeneration *CanonicalIdentifier `json:"old_bootstrap_generation_id"`
+	NewBootstrapGeneration *CanonicalIdentifier `json:"new_bootstrap_generation_id"`
+}
+
+type auditResourceWire struct {
+	Kind          string              `json:"kind"`
+	ID            CanonicalIdentifier `json:"id"`
+	BeforeVersion *uint64             `json:"before_version"`
+	AfterVersion  *uint64             `json:"after_version"`
 }
 
 type AuditEntryParams struct {
@@ -2292,17 +3037,24 @@ type AuditEntryParams struct {
 }
 
 type AuditEntryViewV1 struct {
-	Schema             string              `json:"schema"`
-	ChainScopeID       CanonicalIdentifier `json:"chain_scope_id"`
-	AuditSequence      uint64              `json:"audit_sequence"`
-	AuthorityID        CanonicalIdentifier `json:"authority_id"`
-	AuthorityEpoch     CanonicalIdentifier `json:"authority_epoch"`
-	RecordedAt         CanonicalInstant    `json:"recorded_at"`
-	Action             string              `json:"action"`
-	Outcome            string              `json:"outcome"`
-	CommandFingerprint CanonicalDigest     `json:"command_fingerprint"`
-	Detail             auditDetailWire     `json:"detail"`
-	PreviousEntryHash  CanonicalAuditHash  `json:"previous_entry_hash"`
+	Schema             string                 `json:"schema"`
+	ChainScopeID       CanonicalIdentifier    `json:"chain_scope_id"`
+	AuditSequence      uint64                 `json:"audit_sequence"`
+	AuthorityID        CanonicalIdentifier    `json:"authority_id"`
+	AuthorityEpoch     CanonicalIdentifier    `json:"authority_epoch"`
+	RecordedAt         CanonicalInstant       `json:"recorded_at"`
+	Action             string                 `json:"action"`
+	Outcome            string                 `json:"outcome"`
+	CommandFingerprint CanonicalDigest        `json:"command_fingerprint"`
+	Invocation         auditInvocationWire    `json:"invocation"`
+	Timing             auditTimingWire        `json:"timing"`
+	Subject            auditSubjectWire       `json:"subject"`
+	Provenance         auditProvenanceWire    `json:"provenance"`
+	Authorization      auditAuthorizationWire `json:"authorization"`
+	Resources          []auditResourceWire    `json:"resources"`
+	ApprovalEvidence   []CanonicalDigest      `json:"approval_evidence_digests"`
+	SafeReason         *string                `json:"safe_reason"`
+	PreviousEntryHash  CanonicalAuditHash     `json:"previous_entry_hash"`
 }
 
 func (AuditEntryViewV1) canonicalView()      {}
@@ -2311,7 +3063,8 @@ func (AuditEntryViewV1) auditEntryHashView() {}
 func NewAuditEntryViewV1(params AuditEntryParams) (AuditEntryViewV1, error) {
 	if params.ChainScopeID.IsZero() || params.Sequence == 0 || params.Sequence > MaxCanonicalInteger ||
 		params.AuthorityID.IsZero() || params.AuthorityEpoch.IsZero() || params.RecordedAt.IsZero() ||
-		params.Intent.Operation().String() == "" || params.Intent.Fingerprint().IsZero() {
+		params.Intent.Operation().String() == "" || params.Intent.Fingerprint().IsZero() || !params.Intent.finalized ||
+		params.Intent.provenance.sourceAuthority != params.AuthorityID {
 		return AuditEntryViewV1{}, ErrCanonicalProfile
 	}
 	scopeID, err := NewCanonicalIdentifier(params.ChainScopeID.ID())
@@ -2339,17 +3092,48 @@ func NewAuditEntryViewV1(params AuditEntryParams) (AuditEntryViewV1, error) {
 	if err != nil {
 		return AuditEntryViewV1{}, err
 	}
-	detail := params.Intent.Detail()
-	wireDetail := auditDetailWire{Kind: string(detail.Kind())}
-	if reason := detail.SafeReason(); reason != "" {
-		reasonCopy := reason
-		wireDetail.Reason = &reasonCopy
+	invocation, err := auditInvocationView(params.Intent.invocation)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	timing, err := auditTimingView(params.Intent.timing)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	subject, err := auditSubjectView(params.Intent.subject)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	provenance, err := auditProvenanceView(params.Intent.provenance)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	authorization, err := auditAuthorizationView(params.Intent.authorization)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	resources, err := auditResourceViews(params.Intent.resources)
+	if err != nil {
+		return AuditEntryViewV1{}, err
+	}
+	approvals := make([]CanonicalDigest, len(params.Intent.approvalEvidence))
+	for index, evidence := range params.Intent.approvalEvidence {
+		approvals[index], err = CanonicalDigestFromDigest(evidence)
+		if err != nil {
+			return AuditEntryViewV1{}, err
+		}
+	}
+	var reason *string
+	if value := params.Intent.detail.SafeReason(); value != "" {
+		reason = &value
 	}
 	view := AuditEntryViewV1{
 		Schema: auditEntrySchemaV1, ChainScopeID: scopeID, AuditSequence: params.Sequence,
 		AuthorityID: authorityID, AuthorityEpoch: epoch, RecordedAt: recordedAt,
 		Action: params.Intent.Operation().String(), Outcome: string(params.Intent.Outcome()),
-		CommandFingerprint: fingerprint, Detail: wireDetail, PreviousEntryHash: previous,
+		CommandFingerprint: fingerprint, Invocation: invocation, Timing: timing, Subject: subject,
+		Provenance: provenance, Authorization: authorization, Resources: resources,
+		ApprovalEvidence: approvals, SafeReason: reason, PreviousEntryHash: previous,
 	}
 	if !view.valid() {
 		return AuditEntryViewV1{}, ErrCanonicalProfile
@@ -2357,20 +3141,403 @@ func NewAuditEntryViewV1(params AuditEntryParams) (AuditEntryViewV1, error) {
 	return view, nil
 }
 
+func auditInvocationView(invocation AuditInvocation) (auditInvocationWire, error) {
+	view := auditInvocationWire{
+		Kind: invocation.kind, RequestID: invocation.requestID,
+		CorrelationID: invocation.correlationID, TraceID: invocation.traceID,
+	}
+	switch invocation.kind {
+	case AuditInvocationCommand:
+		if invocation.commandID.IsZero() || invocation.receiptID.IsZero() || invocation.receiptIdentityDigest.IsZero() ||
+			invocation.securityOperation != "" {
+			return auditInvocationWire{}, ErrCanonicalProfile
+		}
+		command, err := NewCanonicalIdentifier(invocation.commandID.String())
+		if err != nil {
+			return auditInvocationWire{}, err
+		}
+		receipt, err := NewCanonicalIdentifier(invocation.receiptID.String())
+		if err != nil {
+			return auditInvocationWire{}, err
+		}
+		digest, err := CanonicalDigestFromDigest(invocation.receiptIdentityDigest)
+		if err != nil {
+			return auditInvocationWire{}, err
+		}
+		view.CommandID, view.ReceiptID, view.ReceiptIdentityDigest = &command, &receipt, &digest
+	case AuditInvocationSecurity:
+		if !invocation.securityOperation.Valid() || !invocation.commandID.IsZero() || !invocation.receiptID.IsZero() ||
+			!invocation.receiptIdentityDigest.IsZero() || invocation.requestID != nil {
+			return auditInvocationWire{}, ErrCanonicalProfile
+		}
+		operation := string(invocation.securityOperation)
+		view.SecurityOperation = &operation
+	default:
+		return auditInvocationWire{}, ErrCanonicalProfile
+	}
+	return view, nil
+}
+
+func auditTimingView(timing AuditTiming) (auditTimingWire, error) {
+	authority, err := NewCanonicalInstant(timing.persistedAuthorityTime)
+	if err != nil {
+		return auditTimingWire{}, err
+	}
+	view := auditTimingWire{PersistedAuthorityAt: authority}
+	if timing.serverReceivedTime != nil {
+		server, serverErr := NewCanonicalInstant(*timing.serverReceivedTime)
+		if serverErr != nil {
+			return auditTimingWire{}, serverErr
+		}
+		view.ServerReceivedAt = &server
+	}
+	if timing.clientTime != nil {
+		client, clientErr := NewCanonicalInstant(*timing.clientTime)
+		if clientErr != nil {
+			return auditTimingWire{}, clientErr
+		}
+		view.AuthenticatedClientAt = &client
+	}
+	return view, nil
+}
+
+func auditSubjectView(subject AuditSubject) (auditSubjectWire, error) {
+	view := auditSubjectWire{Kind: subject.kind, DelegationChain: []auditRevisionWire{}}
+	identifier := func(text string) (*CanonicalIdentifier, error) {
+		value, err := NewCanonicalIdentifier(text)
+		return &value, err
+	}
+	var err error
+	switch subject.kind {
+	case AuditSubjectAttributed:
+		if subject.principal.IsZero() || !subject.unattributed.IsZero() {
+			return auditSubjectWire{}, ErrCanonicalProfile
+		}
+		view.PrincipalID, err = identifier(subject.principal.String())
+		if err != nil {
+			return auditSubjectWire{}, err
+		}
+		if subject.hasDevice {
+			view.DeviceID, err = identifier(subject.device.String())
+			if err != nil {
+				return auditSubjectWire{}, err
+			}
+		} else if !subject.device.IsZero() {
+			return auditSubjectWire{}, ErrCanonicalProfile
+		}
+		if subject.hasWorkload {
+			view.WorkloadID, err = identifier(subject.workload.String())
+			if err != nil {
+				return auditSubjectWire{}, err
+			}
+		} else if !subject.workload.IsZero() {
+			return auditSubjectWire{}, ErrCanonicalProfile
+		}
+		if subject.hasActor {
+			if subject.actor.IsZero() || subject.actorSession.IsZero() {
+				return auditSubjectWire{}, ErrCanonicalProfile
+			}
+			view.ActorID, err = identifier(subject.actor.String())
+			if err != nil {
+				return auditSubjectWire{}, err
+			}
+			view.ActorSessionID, err = identifier(subject.actorSession.String())
+			if err != nil {
+				return auditSubjectWire{}, err
+			}
+		} else if !subject.actor.IsZero() || !subject.actorSession.IsZero() {
+			return auditSubjectWire{}, ErrCanonicalProfile
+		}
+		view.DelegationChain, err = auditAggregateRefViews(subject.delegations)
+	case AuditSubjectUnattributed:
+		if subject.unattributed.IsZero() || !subject.principal.IsZero() || subject.hasDevice || subject.hasWorkload ||
+			subject.hasActor || len(subject.delegations) != 0 {
+			return auditSubjectWire{}, ErrCanonicalProfile
+		}
+		digest, digestErr := CanonicalDigestFromDigest(subject.unattributed)
+		if digestErr != nil {
+			return auditSubjectWire{}, digestErr
+		}
+		view.UnattributedSource = &digest
+	default:
+		return auditSubjectWire{}, ErrCanonicalProfile
+	}
+	return view, err
+}
+
+func auditProvenanceView(provenance AuditProvenance) (auditProvenanceWire, error) {
+	if provenance.sourceAuthority.IsZero() {
+		return auditProvenanceWire{}, ErrCanonicalProfile
+	}
+	authority, err := NewCanonicalIdentifier(provenance.sourceAuthority.String())
+	if err != nil {
+		return auditProvenanceWire{}, err
+	}
+	return auditProvenanceWire{SourceAuthorityID: authority, FederationEnvelope: provenance.federationEnvelope}, nil
+}
+
+func auditAuthorizationView(authorization AuditAuthorization) (auditAuthorizationWire, error) {
+	if authorization.guardDigest.IsZero() || authorization.admissionGeneration.IsZero() {
+		return auditAuthorizationWire{}, ErrCanonicalProfile
+	}
+	guard, err := NewCanonicalDigest(authorization.guardDigest.String())
+	if err != nil {
+		return auditAuthorizationWire{}, err
+	}
+	view := auditAuthorizationWire{GuardDigest: guard, AdmissionGeneration: authorization.admissionGeneration.Uint64()}
+	view.EffectiveGrants, err = auditRevisionViews(authorization.grants)
+	if err != nil {
+		return auditAuthorizationWire{}, err
+	}
+	view.AuthorizationRevisions, err = auditRevisionViews(authorization.authorization)
+	if err != nil {
+		return auditAuthorizationWire{}, err
+	}
+	view.RevocationRevisions, err = auditRevisionViews(authorization.revocations)
+	if err != nil {
+		return auditAuthorizationWire{}, err
+	}
+	if authorization.hasPolicy {
+		value := authorization.policy.String()
+		if value == "" {
+			return auditAuthorizationWire{}, ErrCanonicalProfile
+		}
+		view.PolicyRevision = &value
+	} else if authorization.policy.String() != "" {
+		return auditAuthorizationWire{}, ErrCanonicalProfile
+	}
+	if authorization.hasDeviceTrust {
+		if !authorization.deviceTrustRevision.Valid() {
+			return auditAuthorizationWire{}, ErrCanonicalProfile
+		}
+		value := authorization.deviceTrustRevision.Uint64()
+		view.DeviceTrustRevision = &value
+	} else if !authorization.deviceTrustRevision.IsZero() {
+		return auditAuthorizationWire{}, ErrCanonicalProfile
+	}
+	if authorization.hasGenerationChange {
+		oldValue, oldErr := NewCanonicalIdentifier(authorization.oldGeneration.String())
+		newValue, newErr := NewCanonicalIdentifier(authorization.newGeneration.String())
+		if oldErr != nil || newErr != nil || oldValue == newValue {
+			return auditAuthorizationWire{}, ErrCanonicalProfile
+		}
+		view.OldBootstrapGeneration, view.NewBootstrapGeneration = &oldValue, &newValue
+	} else if !authorization.oldGeneration.IsZero() || !authorization.newGeneration.IsZero() {
+		return auditAuthorizationWire{}, ErrCanonicalProfile
+	}
+	return view, nil
+}
+
+func auditRevisionViews(revisions []AuditRevision) ([]auditRevisionWire, error) {
+	views := make([]auditRevisionWire, len(revisions))
+	prior := ""
+	for index, revision := range revisions {
+		if revision.target.IsZero() || !revision.version.Valid() || revision.version.Uint64() > MaxCanonicalInteger ||
+			(index > 0 && revision.target.String() <= prior) {
+			return nil, ErrCanonicalProfile
+		}
+		id, err := NewCanonicalIdentifier(revision.target.ID())
+		if err != nil {
+			return nil, err
+		}
+		views[index] = auditRevisionWire{
+			Kind: string(revision.target.Kind()), ID: id, Version: revision.version.Uint64(),
+		}
+		prior = revision.target.String()
+	}
+	return views, nil
+}
+
+func auditAggregateRefViews(refs []domain.AggregateRef) ([]auditRevisionWire, error) {
+	views := make([]auditRevisionWire, len(refs))
+	prior := ""
+	for index, ref := range refs {
+		if ref.IsZero() || ref.Version().Uint64() > MaxCanonicalInteger ||
+			(index > 0 && ref.Target().String() <= prior) {
+			return nil, ErrCanonicalProfile
+		}
+		id, err := NewCanonicalIdentifier(ref.Target().ID())
+		if err != nil {
+			return nil, err
+		}
+		views[index] = auditRevisionWire{Kind: string(ref.Target().Kind()), ID: id, Version: ref.Version().Uint64()}
+		prior = ref.Target().String()
+	}
+	return views, nil
+}
+
+func auditResourceViews(resources []AuditResourceVersion) ([]auditResourceWire, error) {
+	views := make([]auditResourceWire, len(resources))
+	prior := ""
+	for index, resource := range resources {
+		if resource.target.IsZero() || !resource.hasAfter || !resource.after.Valid() ||
+			(index > 0 && resource.target.String() <= prior) {
+			return nil, ErrCanonicalProfile
+		}
+		id, err := NewCanonicalIdentifier(resource.target.ID())
+		if err != nil {
+			return nil, err
+		}
+		view := auditResourceWire{Kind: string(resource.target.Kind()), ID: id}
+		after := resource.after.Uint64()
+		view.AfterVersion = &after
+		if resource.hasBefore {
+			if !resource.before.Valid() || resource.before.Uint64() >= resource.after.Uint64() {
+				return nil, ErrCanonicalProfile
+			}
+			before := resource.before.Uint64()
+			view.BeforeVersion = &before
+		} else if !resource.before.IsZero() || resource.after != domain.InitialVersion() {
+			return nil, ErrCanonicalProfile
+		}
+		views[index] = view
+		prior = resource.target.String()
+	}
+	return views, nil
+}
+
+func validAuditInvocationWire(view auditInvocationWire) bool {
+	switch view.Kind {
+	case AuditInvocationCommand:
+		return view.CommandID != nil && view.CommandID.String() != "" && view.ReceiptID != nil &&
+			view.ReceiptID.String() != "" && view.ReceiptIdentityDigest != nil &&
+			view.ReceiptIdentityDigest.String() != "" && view.SecurityOperation == nil
+	case AuditInvocationSecurity:
+		return view.CommandID == nil && view.ReceiptID == nil && view.ReceiptIdentityDigest == nil &&
+			view.RequestID == nil && view.SecurityOperation != nil && SecurityOperation(*view.SecurityOperation).Valid()
+	default:
+		return false
+	}
+}
+
+func validAuditSubjectWire(view auditSubjectWire) bool {
+	if !validAuditRevisionWires(view.DelegationChain) {
+		return false
+	}
+	switch view.Kind {
+	case AuditSubjectAttributed:
+		return view.PrincipalID != nil && view.PrincipalID.String() != "" && view.UnattributedSource == nil &&
+			((view.ActorID == nil) == (view.ActorSessionID == nil))
+	case AuditSubjectUnattributed:
+		return view.PrincipalID == nil && view.DeviceID == nil && view.WorkloadID == nil && view.ActorID == nil &&
+			view.ActorSessionID == nil && len(view.DelegationChain) == 0 && view.UnattributedSource != nil &&
+			view.UnattributedSource.String() != ""
+	default:
+		return false
+	}
+}
+
+func validAuditAuthorizationWire(view auditAuthorizationWire) bool {
+	if view.GuardDigest.String() == "" || view.AdmissionGeneration == 0 ||
+		view.AdmissionGeneration > MaxCanonicalInteger || !validAuditRevisionWires(view.EffectiveGrants) ||
+		!validAuditRevisionWires(view.AuthorizationRevisions) || !validAuditRevisionWires(view.RevocationRevisions) ||
+		((view.OldBootstrapGeneration == nil) != (view.NewBootstrapGeneration == nil)) {
+		return false
+	}
+	for _, grant := range view.EffectiveGrants {
+		if grant.Kind != string(domain.AggregateKindGrant) || !slices.Contains(view.AuthorizationRevisions, grant) {
+			return false
+		}
+	}
+	if view.PolicyRevision != nil && !validOpaqueText(*view.PolicyRevision, 256) {
+		return false
+	}
+	if view.DeviceTrustRevision != nil && (*view.DeviceTrustRevision == 0 || *view.DeviceTrustRevision > MaxCanonicalInteger) {
+		return false
+	}
+	return view.OldBootstrapGeneration == nil || *view.OldBootstrapGeneration != *view.NewBootstrapGeneration
+}
+
+func validAuditRevisionWires(views []auditRevisionWire) bool {
+	prior := ""
+	for index, view := range views {
+		key := view.Kind + ":" + view.ID.String()
+		if !domain.AggregateKind(view.Kind).Valid() || view.ID.String() == "" ||
+			view.Version == 0 || view.Version > MaxCanonicalInteger ||
+			(index > 0 && key <= prior) {
+			return false
+		}
+		prior = key
+	}
+	return true
+}
+
+func validAuditResourceWires(views []auditResourceWire) bool {
+	prior := ""
+	for index, view := range views {
+		key := view.Kind + ":" + view.ID.String()
+		if !domain.AggregateKind(view.Kind).Valid() || view.ID.String() == "" ||
+			view.AfterVersion == nil || *view.AfterVersion == 0 ||
+			*view.AfterVersion > MaxCanonicalInteger || (view.BeforeVersion != nil &&
+			(*view.BeforeVersion == 0 || *view.BeforeVersion >= *view.AfterVersion)) ||
+			(index > 0 && key <= prior) {
+			return false
+		}
+		if view.BeforeVersion == nil && *view.AfterVersion != domain.InitialVersion().Uint64() {
+			return false
+		}
+		prior = key
+	}
+	return true
+}
+
 func (view AuditEntryViewV1) valid() bool {
 	if view.Schema != auditEntrySchemaV1 || view.ChainScopeID.String() == "" || view.AuditSequence == 0 ||
 		view.AuditSequence > MaxCanonicalInteger || view.AuthorityID.String() == "" || view.AuthorityEpoch.String() == "" ||
 		view.RecordedAt.String() == "" || !validOpaqueText(view.Action, 256) || view.CommandFingerprint.String() == "" ||
-		view.PreviousEntryHash.String() == "" {
+		view.PreviousEntryHash.String() == "" || view.Invocation.Kind == "" || view.Timing.PersistedAuthorityAt.String() == "" ||
+		view.Subject.Kind == "" || view.Provenance.SourceAuthorityID.String() == "" ||
+		view.Authorization.GuardDigest.String() == "" || view.Authorization.AdmissionGeneration == 0 {
+		return false
+	}
+	zeroPrevious := view.PreviousEntryHash.String() == strings.Repeat("0", hex.EncodedLen(sha256.Size))
+	if (view.AuditSequence == 1) != zeroPrevious {
+		return false
+	}
+	if !validAuditInvocationWire(view.Invocation) || !validAuditSubjectWire(view.Subject) ||
+		!validAuditAuthorizationWire(view.Authorization) || !validAuditResourceWires(view.Resources) {
+		return false
+	}
+	if view.Provenance.SourceAuthorityID != view.AuthorityID || !auditActionMatchesInvocation(view.Action, view.Invocation) {
 		return false
 	}
 	switch AuditOutcome(view.Outcome) {
 	case AuditCommandApplied:
-		return view.Detail.Kind == string(AuditDetailCommandApplied) && view.Detail.Reason == nil
+		return view.Invocation.Kind == AuditInvocationCommand && view.SafeReason == nil
 	case AuditSecurityMutation:
-		return view.Detail.Kind == string(AuditDetailSecurityMutation) && view.Detail.Reason != nil && validToken(*view.Detail.Reason, 64)
+		return view.Invocation.Kind == AuditInvocationSecurity && view.SafeReason != nil && validAuditReason(*view.SafeReason) &&
+			(*view.Invocation.SecurityOperation == string(SecurityInitializeInstallation) ||
+				*view.Invocation.SecurityOperation == string(SecurityRotateBootstrapGeneration) ||
+				*view.Invocation.SecurityOperation == string(SecurityResumeBootstrapGeneration))
 	case AuditSecurityDenied:
-		return view.Detail.Kind == string(AuditDetailSecurityDenied) && view.Detail.Reason != nil && validToken(*view.Detail.Reason, 64)
+		return view.Invocation.Kind == AuditInvocationSecurity && view.SafeReason != nil && validAuditReason(*view.SafeReason) &&
+			(*view.Invocation.SecurityOperation == string(SecurityRecordBootstrapDenial) ||
+				*view.Invocation.SecurityOperation == string(SecurityRecordCommandDenial))
+	default:
+		return false
+	}
+}
+
+func auditActionMatchesInvocation(action string, invocation auditInvocationWire) bool {
+	if invocation.Kind == AuditInvocationCommand {
+		_, exists := operationContracts[CommandOperation(action)]
+		return exists
+	}
+	if invocation.SecurityOperation == nil {
+		return false
+	}
+	switch SecurityOperation(*invocation.SecurityOperation) {
+	case SecurityInitializeInstallation:
+		return action == "installation.initialize.v1"
+	case SecurityRotateBootstrapGeneration:
+		return action == "installation.bootstrap_generation.rotate.v1"
+	case SecurityResumeBootstrapGeneration:
+		return action == "installation.bootstrap_generation.resume.v1"
+	case SecurityRecordBootstrapDenial:
+		return action == "installation.bootstrap.v1"
+	case SecurityRecordCommandDenial:
+		_, exists := operationContracts[CommandOperation(action)]
+		return exists
 	default:
 		return false
 	}
@@ -2385,7 +3552,7 @@ func (view AuditEntryViewV1) MarshalJSON() ([]byte, error) {
 }
 
 func (codec ProductionCanonicalCodec) EncodeAuditEntry(view AuditEntryViewV1) ([]byte, Digest, error) {
-	canonical, err := encodeCanonical(view, MaxAuditMetadataBytes)
+	canonical, err := encodeCanonical(view, MaxAuditEntryBytes)
 	if err != nil {
 		return nil, Digest{}, err
 	}
@@ -2399,7 +3566,7 @@ func (codec ProductionCanonicalCodec) VerifyAuditEntry(previous Digest, canonica
 		return ErrCanonicalProfile
 	}
 	var view AuditEntryViewV1
-	if err := decodeCanonicalDocument(canonicalEntry, MaxAuditMetadataBytes, &view); err != nil {
+	if err := decodeCanonicalDocument(canonicalEntry, MaxAuditEntryBytes, &view); err != nil {
 		return err
 	}
 	if !view.valid() {
@@ -2466,7 +3633,7 @@ func (codec ProductionCanonicalCodec) HashStreamGenesis(view StreamGenesisHashVi
 }
 
 func (codec ProductionCanonicalCodec) HashAuditEntry(view AuditEntryHashView) (Digest, error) {
-	return codec.hashTyped(auditEntryDomain, view, MaxAuditMetadataBytes)
+	return codec.hashTyped(auditEntryDomain, view, MaxAuditEntryBytes)
 }
 
 func (ProductionCanonicalCodec) ChainStreamDigest(

@@ -38,6 +38,7 @@ const (
 
 	MaxReceiptResultBytes   = 2 * 1024
 	MaxAuditMetadataBytes   = 8 * 1024
+	MaxAuditEntryBytes      = 32 * 1024
 	MaxEffectMetadataBytes  = 8 * 1024
 	MaxRecoveryCapsuleBytes = 32 * 1024
 	Ed25519SignatureBytes   = 64
@@ -1902,10 +1903,103 @@ const (
 )
 
 type AuditIntent struct {
-	operation   domain.OperationName
-	outcome     AuditOutcome
-	fingerprint domain.CommandFingerprint
-	detail      AuditDetail
+	operation        domain.OperationName
+	outcome          AuditOutcome
+	fingerprint      domain.CommandFingerprint
+	detail           AuditDetail
+	invocation       AuditInvocation
+	timing           AuditTiming
+	subject          AuditSubject
+	provenance       AuditProvenance
+	authorization    AuditAuthorization
+	resources        []AuditResourceVersion
+	approvalEvidence []Digest
+	finalized        bool
+}
+
+type AuditInvocationKind string
+
+const (
+	AuditInvocationCommand  AuditInvocationKind = "command"
+	AuditInvocationSecurity AuditInvocationKind = "security"
+)
+
+// AuditInvocation is a closed command/security union. Command identifiers and
+// receipt identity cannot be supplied independently of the CommandSpec from
+// which they are derived. Security-only entries retain their closed operation
+// identity without pretending that a command receipt existed.
+type AuditInvocation struct {
+	kind                  AuditInvocationKind
+	commandID             domain.CommandID
+	receiptID             domain.ReceiptID
+	receiptIdentityDigest Digest
+	requestID             *CanonicalIdentifier
+	correlationID         *CanonicalIdentifier
+	traceID               *CanonicalIdentifier
+	securityOperation     SecurityOperation
+}
+
+type AuditTiming struct {
+	persistedAuthorityTime time.Time
+	serverReceivedTime     *time.Time
+	clientTime             *time.Time
+}
+
+type AuditSubjectKind string
+
+const (
+	AuditSubjectAttributed   AuditSubjectKind = "attributed"
+	AuditSubjectUnattributed AuditSubjectKind = "unattributed"
+)
+
+// AuditSubject keeps principal/device/workload attribution separate from the
+// actor/session/delegation chain. A denial before authentication uses only a
+// one-way source digest; raw addresses, channels, and credentials cannot enter.
+type AuditSubject struct {
+	kind         AuditSubjectKind
+	principal    domain.PrincipalID
+	device       domain.DeviceID
+	hasDevice    bool
+	workload     domain.PrincipalID
+	hasWorkload  bool
+	actor        domain.ActorID
+	actorSession domain.ActorSessionID
+	hasActor     bool
+	delegations  []domain.AggregateRef
+	unattributed Digest
+}
+
+type AuditProvenance struct {
+	sourceAuthority    domain.AuthorityID
+	federationEnvelope *CanonicalIdentifier
+}
+
+type AuditRevision struct {
+	target  domain.AggregateTarget
+	version domain.Version
+}
+
+type AuditAuthorization struct {
+	grants              []AuditRevision
+	authorization       []AuditRevision
+	revocations         []AuditRevision
+	policy              domain.PolicyRevision
+	hasPolicy           bool
+	deviceTrustRevision domain.Version
+	hasDeviceTrust      bool
+	guardDigest         domain.AuthorizationDigest
+	admissionGeneration GuardGeneration
+	oldGeneration       domain.BootstrapGenerationID
+	newGeneration       domain.BootstrapGenerationID
+	hasGenerationChange bool
+}
+
+type AuditResourceVersion struct {
+	target    domain.AggregateTarget
+	before    domain.Version
+	hasBefore bool
+	after     domain.Version
+	hasAfter  bool
 }
 
 type AuditDetailKind string
@@ -1931,7 +2025,7 @@ func SecurityDeniedAuditDetail(reason string) (AuditDetail, error) {
 	return newReasonAuditDetail(AuditDetailSecurityDenied, reason)
 }
 func newReasonAuditDetail(kind AuditDetailKind, reason string) (AuditDetail, error) {
-	if !validToken(reason, 64) {
+	if !validAuditReason(reason) {
 		return AuditDetail{}, ErrInvalidApplicationContract
 	}
 	return AuditDetail{kind: kind, reason: reason}, nil
@@ -1963,6 +2057,125 @@ func (intent AuditIntent) Fingerprint() domain.CommandFingerprint {
 	return intent.fingerprint
 }
 func (intent AuditIntent) Detail() AuditDetail { return intent.detail }
+
+func validAuditReason(reason string) bool {
+	switch reason {
+	case "bootstrap_proof_rejected", "proof_rejected", "credential_rejected",
+		"installation_initialized", "bootstrap_generation_rotated", "bootstrap_generation_resumed":
+		return true
+	default:
+		return false
+	}
+}
+
+func finalizeCommandAudit(
+	seed AuditIntent,
+	commandContext CommandContext,
+	commit OperationCommit,
+) (AuditIntent, error) {
+	spec := commandContext.spec
+	if seed.finalized || seed.outcome != AuditCommandApplied || seed.operation != spec.operation ||
+		seed.fingerprint != spec.requestFingerprint || commandContext.timeEvidence.mode != CommandTimePersistedWrite {
+		return AuditIntent{}, ErrInvalidCommandDecision
+	}
+	receiptDigest, err := hashReceiptIdentity(spec.receiptIdentity)
+	if err != nil {
+		return AuditIntent{}, ErrInvalidCommandDecision
+	}
+	trace, err := NewCanonicalIdentifier(spec.correlationID.String())
+	if err != nil {
+		return AuditIntent{}, ErrInvalidCommandDecision
+	}
+	seed.invocation = AuditInvocation{
+		kind: AuditInvocationCommand, commandID: spec.commandID, receiptID: spec.receiptID,
+		receiptIdentityDigest: receiptDigest, correlationID: &trace,
+	}
+	seed.timing = AuditTiming{persistedAuthorityTime: commandContext.timeEvidence.value.UTC()}
+	seed.subject = commandAuditSubject(commandContext)
+	seed.provenance = AuditProvenance{sourceAuthority: spec.authorityID}
+	seed.authorization = commandAuditAuthorization(commandContext)
+	seed.resources = auditResources(spec.guards.mutations)
+	for _, ceremony := range spec.guards.ceremonies {
+		if ceremony.kind == CeremonyConsumeEmbedded || ceremony.kind == CeremonyConsumeStandalone {
+			seed.approvalEvidence = append(seed.approvalEvidence, Digest(ceremony.proof))
+		}
+	}
+	if len(seed.resources) != len(commit.writes) || seed.subject.kind == "" || seed.authorization.guardDigest.IsZero() {
+		return AuditIntent{}, ErrInvalidCommandDecision
+	}
+	seed.finalized = true
+	return seed, nil
+}
+
+func commandAuditSubject(commandContext CommandContext) AuditSubject {
+	spec := commandContext.spec
+	subject := AuditSubject{kind: AuditSubjectAttributed, principal: spec.authorship.principal}
+	if spec.authorship.hasActor {
+		subject.actor, subject.actorSession, subject.hasActor =
+			spec.authorship.actor, spec.authorship.actorSession, true
+	}
+	for _, state := range commandContext.states {
+		switch value := state.value.(type) {
+		case domain.PrincipalState:
+			if value.ID() == spec.authorship.principal &&
+				(value.Kind() == domain.PrincipalKindWorkload || value.Kind() == domain.PrincipalKindService) {
+				subject.workload, subject.hasWorkload = value.ID(), true
+			}
+		case domain.DeviceState:
+			if spec.commandOperation == CommandStartActorSession && !subject.hasDevice {
+				for _, guard := range spec.guards.evidence {
+					if guard.kind == EvidenceDeviceTrustRevision && guard.targetID == value.ID().String() {
+						subject.device, subject.hasDevice = value.ID(), true
+					}
+				}
+			}
+		}
+	}
+	for _, ref := range append(spec.guards.Authorization(), spec.guards.References()...) {
+		if ref.Target().Kind() == domain.AggregateKindActorDelegation {
+			subject.delegations = append(subject.delegations, ref)
+		}
+	}
+	return subject
+}
+
+func commandAuditAuthorization(commandContext CommandContext) AuditAuthorization {
+	authorization := AuditAuthorization{
+		guardDigest:         commandContext.guardEvidence.digest,
+		admissionGeneration: commandContext.spec.guards.admissionGeneration,
+	}
+	for _, ref := range commandContext.spec.guards.authorization {
+		revision := AuditRevision{target: ref.Target(), version: ref.Version()}
+		authorization.authorization = append(authorization.authorization, revision)
+		if ref.Target().Kind() == domain.AggregateKindGrant {
+			authorization.grants = append(authorization.grants, revision)
+		}
+	}
+	for _, guard := range commandContext.guardEvidence.observed {
+		switch guard.kind {
+		case EvidencePolicyRevision:
+			authorization.policy, authorization.hasPolicy = guard.policyRevision, true
+		case EvidenceDeviceTrustRevision:
+			authorization.deviceTrustRevision, authorization.hasDeviceTrust = guard.revision, true
+		}
+	}
+	return authorization
+}
+
+func auditResources(expectations []domain.AggregateExpectation) []AuditResourceVersion {
+	resources := make([]AuditResourceVersion, len(expectations))
+	for index, expectation := range expectations {
+		resources[index].target = expectation.Target()
+		if before, present := expectation.Version(); present {
+			resources[index].before, resources[index].hasBefore = before, true
+			resources[index].after, _ = before.Next()
+			resources[index].hasAfter = true
+		} else {
+			resources[index].after, resources[index].hasAfter = domain.InitialVersion(), true
+		}
+	}
+	return resources
+}
 
 type EffectIntent struct {
 	causingEvent   domain.EventID
@@ -2121,6 +2334,9 @@ type ReceiptResultReplayBindingParams struct {
 	SessionBinding         *domain.SessionBinding
 	SessionClient          domain.ClientInstanceID
 	PresentationCredential domain.PresentationCredentialBinding
+	// RecoveryCapsulePlan is the plan reconstructed from the receipt's
+	// historical signing-key reference, not the plan prepared for this retry.
+	RecoveryCapsulePlan RecoveryCapsulePlan
 }
 
 func NewReceiptResultReplayBinding(
@@ -2132,10 +2348,13 @@ func NewReceiptResultReplayBinding(
 		params.AcceptedAuthorityEpoch.IsZero() || params.GuardDigest.IsZero() || params.FinalStreamDigest.IsZero() ||
 		params.Events.count != uint16(len(spec.expectedFacts)) || params.Events.count != uint16(len(contract.facts)) ||
 		spec.receiptIdentity.operation != spec.operation || spec.receiptIdentity.scope != spec.scope ||
-		spec.recoveryCapsule.requirement != contract.recovery {
+		spec.recoveryCapsule.requirement != contract.recovery ||
+		!validRecoveryCapsulePlan(params.RecoveryCapsulePlan, contract.recovery) {
 		return ReceiptResultReplayBinding{}, ErrInvalidApplicationContract
 	}
-	expectedPlan, err := NewStoredReceiptResultPlan(spec, StoredReceiptResultPlanParams{
+	storedSpec := spec
+	storedSpec.recoveryCapsule = cloneRecoveryCapsulePlan(params.RecoveryCapsulePlan)
+	expectedPlan, err := NewStoredReceiptResultPlan(storedSpec, StoredReceiptResultPlanParams{
 		OriginalCommandID: params.OriginalCommandID, AcceptedAuthorityID: params.AcceptedAuthorityID,
 		AcceptedAuthorityEpoch: params.AcceptedAuthorityEpoch, AcceptedAt: params.AcceptedAt,
 		AuthorizationDigest: params.GuardDigest, Resources: params.Resources,
@@ -2152,9 +2371,20 @@ func NewReceiptResultReplayBinding(
 		requestFingerprint: spec.requestFingerprint, authorityID: params.AcceptedAuthorityID,
 		authorityEpoch: params.AcceptedAuthorityEpoch, guardDigest: params.GuardDigest,
 		events: params.Events, finalStreamDigest: params.FinalStreamDigest,
-		capsulePlan:  cloneRecoveryCapsulePlan(spec.recoveryCapsule),
+		capsulePlan:  cloneRecoveryCapsulePlan(params.RecoveryCapsulePlan),
 		expectedPlan: cloneReceiptResultPlan(expectedPlan),
 	}, nil
+}
+
+func validRecoveryCapsulePlan(plan RecoveryCapsulePlan, requirement RecoveryCapsuleRequirement) bool {
+	if plan.requirement != requirement {
+		return false
+	}
+	if requirement == RecoveryCapsuleNotApplicable {
+		return plan.keyID == "" && len(plan.publicKey) == 0
+	}
+	return requirement == RecoveryCapsuleRequired && validOpaqueText(plan.keyID, 256) &&
+		len(plan.publicKey) == ed25519.PublicKeySize
 }
 
 func (binding ReceiptResultReplayBinding) OriginalCommandID() domain.CommandID {
@@ -2799,8 +3029,7 @@ func validReceiptResolution(spec CommandSpec, resolution ReceiptResolution) bool
 			resolution.receipt.requestFingerprint == spec.requestFingerprint &&
 			resolution.receipt.capsuleRequirement == spec.recoveryCapsule.requirement &&
 			((spec.recoveryCapsule.requirement == RecoveryCapsuleRequired &&
-				resolution.receipt.hasRecoveryCapsule &&
-				resolution.receipt.recoveryCapsule.keyID == spec.recoveryCapsule.keyID) ||
+				resolution.receipt.hasRecoveryCapsule) ||
 				(spec.recoveryCapsule.requirement == RecoveryCapsuleNotApplicable &&
 					!resolution.receipt.hasRecoveryCapsule))
 	case ReceiptCommandIDConflict, ReceiptIdempotencyConflict, ReceiptInProgress:
@@ -3678,6 +3907,10 @@ func ApplyCommand(
 	if err != nil {
 		return CommandDecision{}, err
 	}
+	audit, err = finalizeCommandAudit(audit, commandContext, commit)
+	if err != nil {
+		return CommandDecision{}, err
+	}
 	return CommandDecision{
 		kind: CommandDecisionApplied, writes: append([]IdentityState(nil), commit.writes...),
 		facts:      append([]FactIntent(nil), commit.facts...),
@@ -3917,11 +4150,11 @@ func (decision CommandDecision) DenialAudit() (SecuritySpec, bool) {
 type CommandExecutionKind string
 
 const (
-	CommandApplied        CommandExecutionKind = "applied"
-	CommandReplayed       CommandExecutionKind = "replay"
-	CommandRejected       CommandExecutionKind = "rejected"
-	CommandIndeterminate  CommandExecutionKind = "indeterminate"
-	CommandCapsulePending CommandExecutionKind = "capsule_pending"
+	CommandApplied                 CommandExecutionKind = "applied"
+	CommandReplayed                CommandExecutionKind = "replay"
+	CommandRejected                CommandExecutionKind = "rejected"
+	CommandIndeterminate           CommandExecutionKind = "indeterminate"
+	CommandCommittedCapsulePending CommandExecutionKind = "committed_capsule_pending"
 )
 
 type CommandExecution struct {
@@ -3930,6 +4163,7 @@ type CommandExecution struct {
 	appliedOnly AppliedOnlyReceipt
 	disclosure  ReplayDisclosure
 	rejection   *domain.CommandError
+	retry       CommandRetryIdentity
 	capsule     RecoveryCapsuleEnvelope
 	hasCapsule  bool
 }
@@ -3990,23 +4224,211 @@ func RejectedCommandExecution(rejection *domain.CommandError) (CommandExecution,
 	return CommandExecution{kind: CommandRejected, rejection: rejection}, nil
 }
 
-func IndeterminateCommandExecution() CommandExecution {
-	return CommandExecution{kind: CommandIndeterminate}
+func IndeterminateCommandExecution(spec CommandSpec) (CommandExecution, error) {
+	identity, err := newCommandRetryIdentity(spec)
+	if err != nil {
+		return CommandExecution{}, err
+	}
+	return CommandExecution{kind: CommandIndeterminate, retry: identity}, nil
 }
 
-// CapsulePendingCommandExecution means the database commit is known durable;
+// CommittedCapsulePendingCommandExecution means the database commit is known durable;
 // only post-commit deterministic signing failed. It is never DB-indeterminate.
-func CapsulePendingCommandExecution(receipt ReceiptSnapshot) (CommandExecution, error) {
+func CommittedCapsulePendingCommandExecution(receipt ReceiptSnapshot) (CommandExecution, error) {
 	if receipt.receiptID.IsZero() || !receipt.hasRecoveryCapsule {
 		return CommandExecution{}, ErrInvalidCommandExecution
 	}
-	return CommandExecution{kind: CommandCapsulePending, receipt: receipt}, nil
+	return CommandExecution{kind: CommandCommittedCapsulePending, receipt: receipt}, nil
 }
 
 func (execution CommandExecution) Kind() CommandExecutionKind { return execution.kind }
 func (execution CommandExecution) Receipt() (ReceiptSnapshot, bool) {
-	return execution.receipt, execution.kind == CommandApplied || execution.kind == CommandCapsulePending ||
+	return execution.receipt, execution.kind == CommandApplied || execution.kind == CommandCommittedCapsulePending ||
 		(execution.kind == CommandReplayed && execution.disclosure == ReplayDiscloseResult)
+}
+
+// CommandRetryIdentity is the immutable receipt admission identity needed to
+// resolve an unknown commit. A retry must reuse all four values exactly.
+type CommandRetryIdentity struct {
+	commandID          domain.CommandID
+	receiptID          domain.ReceiptID
+	receiptIdentity    ReceiptIdentity
+	requestFingerprint domain.CommandFingerprint
+}
+
+func newCommandRetryIdentity(spec CommandSpec) (CommandRetryIdentity, error) {
+	identity := CommandRetryIdentity{
+		commandID: spec.commandID, receiptID: spec.receiptID,
+		receiptIdentity: spec.receiptIdentity, requestFingerprint: spec.requestFingerprint,
+	}
+	if !validCommandRetryIdentity(identity) {
+		return CommandRetryIdentity{}, ErrInvalidCommandExecution
+	}
+	return identity, nil
+}
+
+func validCommandRetryIdentity(identity CommandRetryIdentity) bool {
+	return !identity.commandID.IsZero() && !identity.receiptID.IsZero() &&
+		identity.receiptIdentity.kind != "" && !identity.requestFingerprint.IsZero()
+}
+
+func (identity CommandRetryIdentity) CommandID() domain.CommandID { return identity.commandID }
+func (identity CommandRetryIdentity) ReceiptID() domain.ReceiptID { return identity.receiptID }
+func (identity CommandRetryIdentity) ReceiptIdentity() ReceiptIdentity {
+	return identity.receiptIdentity
+}
+func (identity CommandRetryIdentity) RequestFingerprint() domain.CommandFingerprint {
+	return identity.requestFingerprint
+}
+
+type CommandTransactionExecutionKind string
+
+const (
+	CommandTransactionCommitted     CommandTransactionExecutionKind = "committed"
+	CommandTransactionReplayed      CommandTransactionExecutionKind = "replay"
+	CommandTransactionRejected      CommandTransactionExecutionKind = "rejected"
+	CommandTransactionIndeterminate CommandTransactionExecutionKind = "indeterminate"
+)
+
+// CommandTransactionExecution closes the database outcome before any required
+// post-commit capsule signing is attempted.
+type CommandTransactionExecution struct {
+	kind          CommandTransactionExecutionKind
+	receipt       ReceiptSnapshot
+	appliedOnly   AppliedOnlyReceipt
+	disclosure    ReplayDisclosure
+	rejection     *domain.CommandError
+	denialAudit   SecuritySpec
+	retryIdentity CommandRetryIdentity
+}
+
+func CommittedCommandTransactionExecution(receipt ReceiptSnapshot) (CommandTransactionExecution, error) {
+	if receipt.receiptID.IsZero() {
+		return CommandTransactionExecution{}, ErrInvalidCommandExecution
+	}
+	return CommandTransactionExecution{kind: CommandTransactionCommitted, receipt: receipt}, nil
+}
+
+func ReplayedCommandTransactionExecution(
+	receipt ReceiptSnapshot,
+	disclosure ReplayDisclosure,
+) (CommandTransactionExecution, error) {
+	if receipt.receiptID.IsZero() || (disclosure != ReplayDiscloseResult && disclosure != ReplayDiscloseAppliedOnly) {
+		return CommandTransactionExecution{}, ErrInvalidCommandExecution
+	}
+	execution := CommandTransactionExecution{kind: CommandTransactionReplayed, disclosure: disclosure}
+	if disclosure == ReplayDiscloseResult {
+		execution.receipt = receipt
+	} else {
+		execution.appliedOnly = newAppliedOnlyReceipt(receipt)
+	}
+	return execution, nil
+}
+
+func RejectedCommandTransactionExecution(
+	rejection *domain.CommandError,
+	denialAudit SecuritySpec,
+) (CommandTransactionExecution, error) {
+	hasDenial := denialAudit.operation != ""
+	if rejection == nil || hasDenial != requiresDenialAudit(rejection) ||
+		(hasDenial && denialAudit.operation != SecurityRecordCommandDenial) {
+		return CommandTransactionExecution{}, ErrInvalidCommandExecution
+	}
+	return CommandTransactionExecution{
+		kind: CommandTransactionRejected, rejection: rejection, denialAudit: denialAudit,
+	}, nil
+}
+
+func IndeterminateCommandTransactionExecution(spec CommandSpec) (CommandTransactionExecution, error) {
+	identity, err := newCommandRetryIdentity(spec)
+	if err != nil {
+		return CommandTransactionExecution{}, err
+	}
+	return CommandTransactionExecution{kind: CommandTransactionIndeterminate, retryIdentity: identity}, nil
+}
+
+func (execution CommandTransactionExecution) Kind() CommandTransactionExecutionKind {
+	return execution.kind
+}
+func (execution CommandTransactionExecution) Receipt() (ReceiptSnapshot, bool) {
+	return execution.receipt, execution.kind == CommandTransactionCommitted ||
+		(execution.kind == CommandTransactionReplayed && execution.disclosure == ReplayDiscloseResult)
+}
+func (execution CommandTransactionExecution) AppliedOnlyReceipt() (AppliedOnlyReceipt, bool) {
+	return execution.appliedOnly,
+		execution.kind == CommandTransactionReplayed && execution.disclosure == ReplayDiscloseAppliedOnly
+}
+func (execution CommandTransactionExecution) ReplayDisclosure() (ReplayDisclosure, bool) {
+	return execution.disclosure, execution.kind == CommandTransactionReplayed
+}
+func (execution CommandTransactionExecution) Rejection() (*domain.CommandError, bool) {
+	return execution.rejection, execution.kind == CommandTransactionRejected
+}
+func (execution CommandTransactionExecution) DenialAudit() (SecuritySpec, bool) {
+	return execution.denialAudit,
+		execution.kind == CommandTransactionRejected && execution.denialAudit.operation == SecurityRecordCommandDenial
+}
+func (execution CommandTransactionExecution) RetryIdentity() (CommandRetryIdentity, bool) {
+	return execution.retryIdentity, execution.kind == CommandTransactionIndeterminate
+}
+
+// ValidateCommandTransactionResult rejects ambiguous result/error pairs. A
+// known outcome has no competing Go error. A zero execution is legal only for
+// failure before an outcome exists.
+func ValidateCommandTransactionResult(execution CommandTransactionExecution, executionErr error) error {
+	if execution.kind == "" {
+		var rejection *domain.CommandError
+		if executionErr != nil && !errors.As(executionErr, &rejection) {
+			return nil
+		}
+		return ErrInvalidCommandExecution
+	}
+	if execution.kind == CommandTransactionIndeterminate {
+		if executionErr != nil || !validCommandRetryIdentity(execution.retryIdentity) ||
+			!execution.receipt.receiptID.IsZero() || !execution.appliedOnly.receiptID.IsZero() ||
+			execution.disclosure != "" || execution.rejection != nil || execution.denialAudit.operation != "" {
+			return ErrInvalidCommandExecution
+		}
+		return nil
+	}
+	if executionErr != nil {
+		return ErrInvalidCommandExecution
+	}
+	switch execution.kind {
+	case CommandTransactionCommitted:
+		if execution.receipt.receiptID.IsZero() || !execution.appliedOnly.receiptID.IsZero() ||
+			execution.disclosure != "" || execution.rejection != nil || execution.denialAudit.operation != "" ||
+			validCommandRetryIdentity(execution.retryIdentity) {
+			return ErrInvalidCommandExecution
+		}
+	case CommandTransactionReplayed:
+		if execution.rejection != nil || execution.denialAudit.operation != "" || validCommandRetryIdentity(execution.retryIdentity) {
+			return ErrInvalidCommandExecution
+		}
+		if execution.disclosure == ReplayDiscloseResult &&
+			(execution.receipt.receiptID.IsZero() || !execution.appliedOnly.receiptID.IsZero()) {
+			return ErrInvalidCommandExecution
+		}
+		if execution.disclosure == ReplayDiscloseAppliedOnly &&
+			(execution.appliedOnly.receiptID.IsZero() || !execution.receipt.receiptID.IsZero()) {
+			return ErrInvalidCommandExecution
+		}
+		if execution.disclosure != ReplayDiscloseResult && execution.disclosure != ReplayDiscloseAppliedOnly {
+			return ErrInvalidCommandExecution
+		}
+	case CommandTransactionRejected:
+		hasDenial := execution.denialAudit.operation != ""
+		if execution.rejection == nil || !execution.receipt.receiptID.IsZero() ||
+			!execution.appliedOnly.receiptID.IsZero() || execution.disclosure != "" ||
+			validCommandRetryIdentity(execution.retryIdentity) ||
+			hasDenial != requiresDenialAudit(execution.rejection) ||
+			(hasDenial && execution.denialAudit.operation != SecurityRecordCommandDenial) {
+			return ErrInvalidCommandExecution
+		}
+	default:
+		return ErrInvalidCommandExecution
+	}
+	return nil
 }
 func (execution CommandExecution) AppliedOnlyReceipt() (AppliedOnlyReceipt, bool) {
 	return execution.appliedOnly,
@@ -4022,6 +4444,9 @@ func (execution CommandExecution) ReplayDisclosure() (ReplayDisclosure, bool) {
 func (execution CommandExecution) Rejection() (*domain.CommandError, bool) {
 	return execution.rejection, execution.kind == CommandRejected
 }
+func (execution CommandExecution) RetryIdentity() (CommandRetryIdentity, bool) {
+	return execution.retry, execution.kind == CommandIndeterminate
+}
 func (execution CommandExecution) RecoveryCapsule() (RecoveryCapsuleEnvelope, bool) {
 	envelope := execution.capsule
 	envelope.signature = append([]byte(nil), envelope.signature...)
@@ -4033,14 +4458,15 @@ func (execution CommandExecution) RecoveryCapsule() (RecoveryCapsuleEnvelope, bo
 //
 // Implementations MUST roll back if decide returns an error, panics, returns a
 // zero/invalid decision, or proposes a shape outside spec. A callback error is
-// never compatible with a committed CommandExecution. Whole-command retries
-// use the identical immutable spec and rerun decide against newly locked state.
+// never compatible with a known transaction outcome. ExecuteCommand returns
+// before post-commit capsule signing. Whole-command retries use the identical
+// immutable spec and rerun decide against newly locked state.
 type UnitOfWork interface {
 	ExecuteCommand(
 		context.Context,
 		CommandSpec,
 		func(CommandContext) (CommandDecision, error),
-	) (CommandExecution, error)
+	) (CommandTransactionExecution, error)
 
 	ExecuteSecurity(
 		context.Context,
@@ -4739,6 +5165,12 @@ func InitializeSecurity(
 		!auditMatchesSecuritySpec(audit, securityContext.spec) {
 		return SecurityDecision{}, ErrInvalidSecurityDecision
 	}
+	audit, err := finalizeSecurityAudit(audit, securityContext, auditResources([]domain.AggregateExpectation{
+		securityContext.spec.invitation,
+	}))
+	if err != nil {
+		return SecurityDecision{}, err
+	}
 	return SecurityDecision{
 		kind: SecurityDecisionInitialize, invitation: securityContext.spec.initialState, audit: audit,
 	}, nil
@@ -4754,6 +5186,10 @@ func ChangeBootstrapGenerationSecurity(
 		securityContext.spec.oldGeneration.IsZero() ||
 		securityContext.spec.newGeneration.IsZero() {
 		return SecurityDecision{}, ErrInvalidSecurityDecision
+	}
+	audit, err := finalizeSecurityAudit(audit, securityContext, nil)
+	if err != nil {
+		return SecurityDecision{}, err
 	}
 	return SecurityDecision{
 		kind: SecurityDecisionGeneration, oldGeneration: securityContext.spec.oldGeneration,
@@ -4777,6 +5213,13 @@ func DenyBootstrapSecurity(
 	)
 	if err != nil {
 		return SecurityDecision{}, ErrInvalidSecurityDecision
+	}
+	audit, err = finalizeSecurityAudit(audit, securityContext, []AuditResourceVersion{{
+		target: securityContext.spec.invitation.Target(), before: securityContext.invitation.Version(), hasBefore: true,
+		after: invitation.Version(), hasAfter: true,
+	}})
+	if err != nil {
+		return SecurityDecision{}, err
 	}
 	return SecurityDecision{
 		kind: SecurityDecisionDeny, invitation: invitation, denial: record, audit: audit,
@@ -4826,6 +5269,11 @@ func AuditCommandDenialSecurity(
 		!auditMatchesSecuritySpec(audit, securityContext.spec) {
 		return SecurityDecision{}, ErrInvalidSecurityDecision
 	}
+	var err error
+	audit, err = finalizeSecurityAudit(audit, securityContext, nil)
+	if err != nil {
+		return SecurityDecision{}, err
+	}
 	variant := CommandDenialAuditDetail
 	switch securityContext.denialAdmission.kind {
 	case DenialAdmitSaturation:
@@ -4845,6 +5293,69 @@ func AuditCommandDenialSecurity(
 func auditMatchesSecuritySpec(audit AuditIntent, spec SecuritySpec) bool {
 	operation, fingerprint, ok := ExpectedSecurityAudit(spec)
 	return ok && audit.operation.String() == operation && audit.fingerprint == fingerprint
+}
+
+func finalizeSecurityAudit(
+	seed AuditIntent,
+	securityContext SecurityContext,
+	resources []AuditResourceVersion,
+) (AuditIntent, error) {
+	spec := securityContext.spec
+	if seed.finalized || !auditMatchesSecuritySpec(seed, spec) || securityContext.authorityTime.IsZero() ||
+		(seed.outcome != AuditSecurityMutation && seed.outcome != AuditSecurityDenied) {
+		return AuditIntent{}, ErrInvalidSecurityDecision
+	}
+	seed.invocation = AuditInvocation{kind: AuditInvocationSecurity, securityOperation: spec.operation}
+	seed.timing = AuditTiming{persistedAuthorityTime: securityContext.authorityTime.UTC()}
+	seed.provenance = AuditProvenance{sourceAuthority: spec.authorityID}
+	seed.authorization = AuditAuthorization{
+		guardDigest: securityContext.guardDigest, admissionGeneration: spec.admission,
+	}
+	seed.resources = append([]AuditResourceVersion(nil), resources...)
+	switch spec.operation {
+	case SecurityInitializeInstallation:
+		seed.subject = AuditSubject{kind: AuditSubjectUnattributed, unattributed: spec.initialization}
+	case SecurityRotateBootstrapGeneration, SecurityResumeBootstrapGeneration:
+		seed.subject = AuditSubject{
+			kind: AuditSubjectUnattributed, unattributed: Digest(securityGenerationFingerprint(spec)),
+		}
+		seed.authorization.oldGeneration = spec.oldGeneration
+		seed.authorization.newGeneration = spec.newGeneration
+		seed.authorization.hasGenerationChange = true
+		if spec.operation == SecurityResumeBootstrapGeneration {
+			seed.approvalEvidence = []Digest{Digest(spec.resumeApproval)}
+		}
+	case SecurityRecordBootstrapDenial:
+		seed.subject = AuditSubject{kind: AuditSubjectUnattributed, unattributed: Digest(spec.attempt)}
+	case SecurityRecordCommandDenial:
+		draft := spec.commandDenial
+		trace, err := NewCanonicalIdentifier(draft.correlation.String())
+		if err != nil {
+			return AuditIntent{}, ErrInvalidSecurityDecision
+		}
+		seed.invocation.correlationID = &trace
+		if draft.hasPolicy {
+			seed.authorization.policy, seed.authorization.hasPolicy = draft.policy, true
+		}
+		switch draft.subject.kind {
+		case DenialAttributedSubject:
+			seed.subject = AuditSubject{
+				kind: AuditSubjectAttributed, principal: draft.subject.principal,
+				device: draft.subject.device, hasDevice: draft.subject.hasDevice,
+			}
+		case DenialUnattributedSource:
+			seed.subject = AuditSubject{kind: AuditSubjectUnattributed, unattributed: draft.subject.source}
+		default:
+			return AuditIntent{}, ErrInvalidSecurityDecision
+		}
+	default:
+		return AuditIntent{}, ErrInvalidSecurityDecision
+	}
+	if seed.subject.kind == "" || seed.authorization.guardDigest.IsZero() {
+		return AuditIntent{}, ErrInvalidSecurityDecision
+	}
+	seed.finalized = true
+	return seed, nil
 }
 
 // ExpectedSecurityAudit returns the only operation/fingerprint pair accepted
@@ -4979,15 +5490,85 @@ func CommandDenialSecurityExecution(audited bool) SecurityExecution {
 	return SecurityExecution{kind: SecurityCommandDenialSuppressed, operation: SecurityRecordCommandDenial}
 }
 
-func RejectedSecurityExecution(rejection *domain.CommandError) (SecurityExecution, error) {
-	if rejection == nil {
+func RejectedSecurityExecution(
+	operation SecurityOperation,
+	rejection *domain.CommandError,
+) (SecurityExecution, error) {
+	if !operation.Valid() || rejection == nil {
 		return SecurityExecution{}, ErrInvalidSecurityExecution
 	}
-	return SecurityExecution{kind: SecurityRejected, rejection: rejection}, nil
+	return SecurityExecution{kind: SecurityRejected, operation: operation, rejection: rejection}, nil
 }
 
-func IndeterminateSecurityExecution() SecurityExecution {
-	return SecurityExecution{kind: SecurityIndeterminate}
+func IndeterminateSecurityExecution(operation SecurityOperation) (SecurityExecution, error) {
+	if !operation.Valid() {
+		return SecurityExecution{}, ErrInvalidSecurityExecution
+	}
+	return SecurityExecution{kind: SecurityIndeterminate, operation: operation}, nil
+}
+
+func (operation SecurityOperation) Valid() bool {
+	switch operation {
+	case SecurityInitializeInstallation, SecurityRotateBootstrapGeneration,
+		SecurityResumeBootstrapGeneration, SecurityRecordBootstrapDenial, SecurityRecordCommandDenial:
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateSecurityExecutionResult applies the same unambiguous error matrix as
+// command transactions while requiring every outcome to retain its operation.
+func ValidateSecurityExecutionResult(execution SecurityExecution, executionErr error) error {
+	if execution.kind == "" {
+		var rejection *domain.CommandError
+		if executionErr != nil && !errors.As(executionErr, &rejection) {
+			return nil
+		}
+		return ErrInvalidSecurityExecution
+	}
+	if !execution.operation.Valid() {
+		return ErrInvalidSecurityExecution
+	}
+	if execution.kind == SecurityIndeterminate {
+		if executionErr != nil || !securityDenialRecordZero(execution.denial) || execution.rejection != nil {
+			return ErrInvalidSecurityExecution
+		}
+		return nil
+	}
+	if executionErr != nil {
+		return ErrInvalidSecurityExecution
+	}
+	switch execution.kind {
+	case SecurityApplied:
+		if execution.operation != SecurityInitializeInstallation &&
+			execution.operation != SecurityRotateBootstrapGeneration &&
+			execution.operation != SecurityResumeBootstrapGeneration ||
+			!securityDenialRecordZero(execution.denial) || execution.rejection != nil {
+			return ErrInvalidSecurityExecution
+		}
+	case SecurityDenialCommitted, SecurityDenialReplayed:
+		if execution.operation != SecurityRecordBootstrapDenial || execution.denial.invitation.IsZero() ||
+			execution.rejection != nil {
+			return ErrInvalidSecurityExecution
+		}
+	case SecurityCommandDenialAudited, SecurityCommandDenialSuppressed:
+		if execution.operation != SecurityRecordCommandDenial ||
+			!securityDenialRecordZero(execution.denial) || execution.rejection != nil {
+			return ErrInvalidSecurityExecution
+		}
+	case SecurityRejected:
+		if execution.rejection == nil || !securityDenialRecordZero(execution.denial) {
+			return ErrInvalidSecurityExecution
+		}
+	default:
+		return ErrInvalidSecurityExecution
+	}
+	return nil
+}
+
+func securityDenialRecordZero(record SecurityDenialRecord) bool {
+	return record.invitation.IsZero() && record.attempt.IsZero() && record.version.IsZero() && record.deniedAt.IsZero()
 }
 
 func (execution SecurityExecution) Kind() SecurityExecutionKind  { return execution.kind }

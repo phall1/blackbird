@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x02')
+byte('R')
+byte(',')
+byte('\n')
+uint64(2)
