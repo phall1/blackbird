@@ -53,6 +53,7 @@ CREATE TABLE authority_streams (
     next_audit_sequence INTEGER NOT NULL CHECK (next_audit_sequence BETWEEN 1 AND 9007199254740991),
     audit_head_hash BLOB NOT NULL CHECK (length(audit_head_hash) = 32),
     authority_time_floor_us INTEGER NOT NULL CHECK (authority_time_floor_us > 0),
+    clock_status TEXT NOT NULL DEFAULT 'normal' CHECK (clock_status IN ('normal', 'clock_suspect')),
     predecessor_epoch TEXT CHECK (predecessor_epoch IS NULL OR length(predecessor_epoch) = 36),
     PRIMARY KEY (scope_kind, scope_id, authority_epoch)
 ) STRICT;

@@ -17,7 +17,12 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 )
 
-var errCommandNoCommit = errors.New("SQLite command transaction requires rollback")
+var (
+	errCommandNoCommit     = errors.New("SQLite command transaction requires rollback")
+	errCommandClockSuspect = errors.New("SQLite authority clock is suspect")
+)
+
+const backwardClockToleranceMicros int64 = 1_000_000
 
 type lockedCommandState struct {
 	spec       application.CommandSpec
@@ -30,11 +35,13 @@ type lockedCommandState struct {
 }
 
 type commandStream struct {
-	nextEvent uint64
-	head      domain.StreamDigest
-	nextAudit uint64
-	auditHead application.Digest
-	timeFloor int64
+	nextEvent           uint64
+	head                domain.StreamDigest
+	nextAudit           uint64
+	auditHead           application.Digest
+	timeFloor           int64
+	clockStatus         string
+	observedClockStatus string
 }
 
 // ExecuteCommand implements the production command transaction. The callback
@@ -56,6 +63,13 @@ func (store *Store) ExecuteCommand(
 	}()
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		locked, state, err := store.lockCommandContext(ctx, tx, spec)
+		if errors.Is(err, errCommandClockSuspect) {
+			if markErr := markCommandClockSuspect(ctx, tx, state); markErr != nil {
+				return markErr
+			}
+			executionErr = commandClockSuspectError()
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -83,6 +97,9 @@ func (store *Store) ExecuteCommand(
 	}
 	if err != nil {
 		return application.CommandTransactionExecution{}, err
+	}
+	if executionErr != nil {
+		return application.CommandTransactionExecution{}, executionErr
 	}
 	return execution, nil
 }
@@ -122,7 +139,7 @@ func (store *Store) lockCommandContext(
 		}
 	} else {
 		if resolution.Kind() == application.ReceiptExactReplay {
-			if err := verifyAdmissionGuard(ctx, tx, spec); err != nil {
+			if err := verifyCurrentAdmission(ctx, tx, spec); err != nil {
 				return application.CommandContext{}, state, err
 			}
 			state.states, _, err = loadCommandReadSet(ctx, tx, spec, false)
@@ -136,6 +153,21 @@ func (store *Store) lockCommandContext(
 		return application.CommandContext{}, state, fmt.Errorf("read SQLite command authority time: %w", err)
 	}
 	if resolution.Kind() == application.ReceiptAdmitted {
+		regression := stream.timeFloor - wallMicros
+		if regression > backwardClockToleranceMicros {
+			state.stream.clockStatus = "clock_suspect"
+			if spec.AuthorityTimeClass() != application.AuthorityTimeOrdinary {
+				return application.CommandContext{}, state, errCommandClockSuspect
+			}
+		} else if stream.clockStatus == "clock_suspect" {
+			if wallMicros < stream.timeFloor {
+				if spec.AuthorityTimeClass() != application.AuthorityTimeOrdinary {
+					return application.CommandContext{}, state, errCommandClockSuspect
+				}
+			} else {
+				state.stream.clockStatus = "normal"
+			}
+		}
 		if wallMicros <= stream.timeFloor {
 			wallMicros = stream.timeFloor + 1
 		}
@@ -160,11 +192,13 @@ func lockCommandStream(ctx context.Context, tx *sql.Tx, spec application.Command
 	var state commandStream
 	var nextEvent, nextAudit int64
 	var head, auditHead []byte
-	err := tx.QueryRowContext(ctx, `SELECT next_sequence, head_digest, next_audit_sequence,
-		audit_head_hash, authority_time_floor_us FROM authority_streams
+	var authorityID string
+	err := tx.QueryRowContext(ctx, `SELECT authority_id, next_sequence, head_digest, next_audit_sequence,
+		audit_head_hash, authority_time_floor_us, clock_status FROM authority_streams
 		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`,
 		string(spec.Scope().Kind()), spec.Scope().ID(), spec.RequestedEpoch().String(),
-	).Scan(&nextEvent, &head, &nextAudit, &auditHead, &state.timeFloor)
+	).Scan(&authorityID, &nextEvent, &head, &nextAudit, &auditHead, &state.timeFloor, &state.clockStatus)
+	state.observedClockStatus = state.clockStatus
 	if errors.Is(err, sql.ErrNoRows) && spec.CommandOperation() == application.CommandCreateWorkspace {
 		// Workspace creation allocates its stream in the same transaction. The
 		// installation admission guard is still verified separately.
@@ -175,12 +209,16 @@ func lockCommandStream(ctx context.Context, tx *sql.Tx, spec application.Command
 		state.nextEvent, state.nextAudit = 1, 1
 		state.head = genesis
 		state.timeFloor = 1
+		state.clockStatus = "normal"
+		state.observedClockStatus = "normal"
 		return state, nil
 	}
 	if err != nil {
 		return state, fmt.Errorf("lock SQLite command stream: %w", err)
 	}
-	if nextEvent <= 0 || nextAudit <= 0 || len(head) != sha256.Size || len(auditHead) != sha256.Size {
+	if authorityID != spec.AuthorityID().String() || nextEvent <= 0 || nextAudit <= 0 ||
+		len(head) != sha256.Size || len(auditHead) != sha256.Size ||
+		(state.clockStatus != "normal" && state.clockStatus != "clock_suspect") {
 		return state, application.ErrInvalidCommandContext
 	}
 	state.nextEvent, state.nextAudit = uint64(nextEvent), uint64(nextAudit)
@@ -219,25 +257,41 @@ func commandStreamGenesis(spec application.CommandSpec) (domain.StreamDigest, er
 }
 
 func verifyAdmissionGuard(ctx context.Context, tx *sql.Tx, spec application.CommandSpec) error {
-	plan := spec.Guards()
-	var authority, epoch, writeStatus string
-	var generation uint64
-	err := tx.QueryRowContext(ctx, `SELECT authority_id, authority_epoch, write_status, guard_generation FROM scope_guards
-		WHERE scope_kind = ? AND scope_id = ?`, string(plan.AdmissionScope().Kind()), plan.AdmissionScope().ID(),
-	).Scan(&authority, &epoch, &writeStatus, &generation)
-	if err != nil || authority != spec.AuthorityID().String() || epoch != spec.RequestedEpoch().String() ||
-		writeStatus != "open" || generation != plan.AdmissionGeneration().Uint64() {
-		return application.ErrInvalidCommandContext
+	if err := verifyCurrentAdmission(ctx, tx, spec); err != nil {
+		return err
 	}
+	plan := spec.Guards()
 	if genesis, present := plan.GenesisAbsence(); present {
 		var guardCount, streamCount int
 		if err := tx.QueryRowContext(ctx, `SELECT
 			(SELECT count(*) FROM scope_guards WHERE scope_kind = ? AND scope_id = ?),
 			(SELECT count(*) FROM authority_streams WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?)`,
 			string(genesis.Scope().Kind()), genesis.Scope().ID(), string(genesis.Scope().Kind()), genesis.Scope().ID(),
-			genesis.AuthorityEpoch().String()).Scan(&guardCount, &streamCount); err != nil || guardCount != 0 || streamCount != 0 {
-			return application.ErrInvalidCommandContext
+			genesis.AuthorityEpoch().String()).Scan(&guardCount, &streamCount); err != nil {
+			return fmt.Errorf("verify SQLite workspace genesis: %w", err)
+		} else if guardCount != 0 || streamCount != 0 {
+			return commandReferenceConflict("workspace genesis is no longer absent")
 		}
+	}
+	return nil
+}
+
+func verifyCurrentAdmission(ctx context.Context, tx *sql.Tx, spec application.CommandSpec) error {
+	plan := spec.Guards()
+	var authority, epoch, writeStatus string
+	var generation uint64
+	err := tx.QueryRowContext(ctx, `SELECT authority_id, authority_epoch, write_status, guard_generation FROM scope_guards
+		WHERE scope_kind = ? AND scope_id = ?`, string(plan.AdmissionScope().Kind()), plan.AdmissionScope().ID(),
+	).Scan(&authority, &epoch, &writeStatus, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return commandReferenceConflict("command admission is absent")
+	}
+	if err != nil {
+		return fmt.Errorf("verify SQLite command admission: %w", err)
+	}
+	if authority != spec.AuthorityID().String() || epoch != spec.RequestedEpoch().String() ||
+		writeStatus != "open" || generation != plan.AdmissionGeneration().Uint64() {
+		return commandReferenceConflict("command admission changed")
 	}
 	return nil
 }
@@ -677,6 +731,9 @@ func (store *Store) commitAppliedCommand(ctx context.Context, tx *sql.Tx, state 
 	if err := insertOutboxEffects(ctx, tx, spec.CommandID(), decision.Effects(), state.time.Value()); err != nil {
 		return application.CommandTransactionExecution{}, err
 	}
+	if err := verifyFinalCommandState(ctx, tx, state, decision); err != nil {
+		return application.CommandTransactionExecution{}, err
+	}
 	if err := advanceCommandStream(ctx, tx, state, previous, uint64(len(events))); err != nil {
 		return application.CommandTransactionExecution{}, err
 	}
@@ -693,8 +750,8 @@ func createWorkspaceAuthority(ctx context.Context, tx *sql.Tx, state lockedComma
 		return fmt.Errorf("create SQLite workspace guard: %w", err)
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO authority_streams(scope_kind, scope_id, authority_id, authority_epoch,
-		next_sequence, retained_from_sequence, digest_algorithm, head_digest, next_audit_sequence, audit_head_hash, authority_time_floor_us)
-		VALUES ('workspace', ?, ?, ?, 1, 1, 'sha-256', ?, 1, zeroblob(32), 1)`, spec.Scope().ID(), spec.AuthorityID().String(), spec.RequestedEpoch().String(), head[:])
+		next_sequence, retained_from_sequence, digest_algorithm, head_digest, next_audit_sequence, audit_head_hash, authority_time_floor_us, clock_status)
+		VALUES ('workspace', ?, ?, ?, 1, 1, 'sha-256', ?, 1, zeroblob(32), 1, 'normal')`, spec.Scope().ID(), spec.AuthorityID().String(), spec.RequestedEpoch().String(), head[:])
 	return err
 }
 
@@ -739,8 +796,11 @@ func applyCeremonyTransition(ctx context.Context, tx *sql.Tx, transition applica
 		return err
 	}
 	affected, err := result.RowsAffected()
-	if err != nil || affected != 1 {
-		return application.ErrInvalidCommandContext
+	if err != nil {
+		return fmt.Errorf("read SQLite ceremony CAS result: %w", err)
+	}
+	if affected != 1 {
+		return commandReferenceConflict("ceremony changed")
 	}
 	return nil
 }
@@ -865,8 +925,11 @@ func writeIdentityState(ctx context.Context, tx *sql.Tx, state application.Ident
 		return fmt.Errorf("write SQLite %s: %w", state.Target().String(), err)
 	}
 	affected, err := result.RowsAffected()
-	if err != nil || affected != 1 {
-		return application.ErrInvalidCommandContext
+	if err != nil {
+		return fmt.Errorf("read SQLite aggregate CAS result: %w", err)
+	}
+	if affected != 1 {
+		return commandReferenceConflict("aggregate changed")
 	}
 	return nil
 }
@@ -1045,26 +1108,242 @@ func digestUUID(sum [sha256.Size]byte) string {
 	return text[:8] + "-" + text[8:12] + "-" + text[12:16] + "-" + text[16:20] + "-" + text[20:32]
 }
 
+func commandReferenceConflict(message string) error {
+	conflict, err := domain.NewConflictError(
+		domain.ErrorCodeStateConflict,
+		domain.ConflictReference,
+		message,
+		application.ErrInvalidCommandContext,
+	)
+	if err != nil {
+		return err
+	}
+	return conflict
+}
+
+func commandClockSuspectError() error {
+	commandErr, err := domain.NewCommandError(
+		domain.ErrorCodeDependencyUnavailable,
+		"authority clock is suspect",
+		errCommandClockSuspect,
+	)
+	if err != nil {
+		return err
+	}
+	return commandErr
+}
+
+func markCommandClockSuspect(ctx context.Context, tx *sql.Tx, state lockedCommandState) error {
+	if err := verifyCurrentAdmission(ctx, tx, state.spec); err != nil {
+		return err
+	}
+	if err := verifyDurableCommandEvidence(ctx, tx, state, nil); err != nil {
+		return err
+	}
+	oldHead := state.stream.head.Bytes()
+	result, err := tx.ExecContext(ctx, `UPDATE authority_streams SET clock_status = 'clock_suspect'
+		WHERE scope_kind = ? AND scope_id = ? AND authority_id = ? AND authority_epoch = ?
+		AND next_sequence = ? AND head_digest = ? AND next_audit_sequence = ? AND audit_head_hash = ?
+		AND authority_time_floor_us = ? AND clock_status = ?
+		AND EXISTS (SELECT 1 FROM scope_guards WHERE scope_kind = ? AND scope_id = ?
+			AND authority_id = ? AND authority_epoch = ? AND write_status = 'open' AND guard_generation = ?)`,
+		string(state.spec.Scope().Kind()), state.spec.Scope().ID(), state.spec.AuthorityID().String(),
+		state.spec.RequestedEpoch().String(), state.stream.nextEvent, oldHead[:], state.stream.nextAudit,
+		state.stream.auditHead[:], state.stream.timeFloor, state.stream.observedClockStatus,
+		string(state.spec.Guards().AdmissionScope().Kind()), state.spec.Guards().AdmissionScope().ID(),
+		state.spec.AuthorityID().String(), state.spec.RequestedEpoch().String(),
+		state.spec.Guards().AdmissionGeneration().Uint64(),
+	)
+	if err != nil {
+		return fmt.Errorf("mark SQLite authority clock suspect: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read SQLite clock-suspect CAS result: %w", err)
+	}
+	if affected != 1 {
+		return commandReferenceConflict("authority clock state changed")
+	}
+	return nil
+}
+
+func verifyFinalCommandState(
+	ctx context.Context,
+	tx *sql.Tx,
+	state lockedCommandState,
+	decision application.CommandDecision,
+) error {
+	if err := verifyCurrentAdmission(ctx, tx, state.spec); err != nil {
+		return err
+	}
+	mutated := make(map[domain.AggregateTarget]struct{}, len(decision.Writes()))
+	for _, write := range decision.Writes() {
+		mutated[write.Target()] = struct{}{}
+		persisted, err := loadIdentityState(ctx, tx, write.Target())
+		if errors.Is(err, sql.ErrNoRows) {
+			return commandReferenceConflict("command mutation is absent")
+		}
+		if err != nil {
+			return fmt.Errorf("verify SQLite command mutation: %w", err)
+		}
+		if persisted.Version() != write.Version() {
+			return commandReferenceConflict("command mutation changed")
+		}
+	}
+	if err := verifyDurableCommandEvidence(ctx, tx, state, mutated); err != nil {
+		return err
+	}
+	for _, transition := range decision.CeremonyTransitions() {
+		proof := transition.Challenge().ProofDigest()
+		wantStatus := "pending"
+		if transition.Kind() != application.CeremonyReserveAbsent {
+			wantStatus = "consumed"
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM ceremony_challenges
+			WHERE ceremony_id = ? AND purpose = ? AND proof_fingerprint = ? AND status = ?`,
+			transition.Challenge().ID().String(), string(transition.Challenge().Purpose()), proof[:], wantStatus,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("verify SQLite ceremony mutation: %w", err)
+		}
+		if count != 1 {
+			return commandReferenceConflict("ceremony mutation changed")
+		}
+	}
+	return nil
+}
+
+func verifyDurableCommandEvidence(
+	ctx context.Context,
+	tx *sql.Tx,
+	state lockedCommandState,
+	mutated map[domain.AggregateTarget]struct{},
+) error {
+	locked := make(map[string]application.IdentityState, len(state.states))
+	for _, observed := range state.states {
+		locked[observed.Target().String()] = observed
+		if _, changed := mutated[observed.Target()]; changed {
+			continue
+		}
+		current, err := loadIdentityState(ctx, tx, observed.Target())
+		if errors.Is(err, sql.ErrNoRows) {
+			return commandReferenceConflict("locked command reference is absent")
+		}
+		if err != nil {
+			return fmt.Errorf("revalidate SQLite command reference: %w", err)
+		}
+		if current.Version() != observed.Version() {
+			return commandReferenceConflict("locked command reference changed")
+		}
+		locked[observed.Target().String()] = current
+	}
+	for _, guard := range state.spec.Guards().Evidence() {
+		switch guard.Kind() {
+		case application.EvidenceCurrentAuthorityEpoch:
+			authority, epoch, _ := guard.Authority()
+			var count int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM scope_guards WHERE scope_kind = ? AND scope_id = ?
+				AND authority_id = ? AND authority_epoch = ? AND write_status = 'open'`,
+				guard.TargetKind(), guard.TargetID(), authority.String(), epoch.String(),
+			).Scan(&count); err != nil {
+				return fmt.Errorf("revalidate SQLite authority evidence: %w", err)
+			}
+			if count != 1 {
+				return commandReferenceConflict("authority evidence changed")
+			}
+		case application.EvidenceBootstrapGeneration:
+			generation, _ := guard.BootstrapGeneration()
+			var count int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM scope_guards WHERE scope_kind = ? AND scope_id = ?
+				AND bootstrap_generation_id = ?`, guard.TargetKind(), guard.TargetID(), generation.String()).Scan(&count); err != nil {
+				return fmt.Errorf("revalidate SQLite bootstrap evidence: %w", err)
+			}
+			if count != 1 {
+				return commandReferenceConflict("bootstrap evidence changed")
+			}
+		case application.EvidencePolicyRevision, application.EvidenceLifecycleStatus,
+			application.EvidenceDeviceTrustRevision:
+			observed, present := locked[guard.TargetKind()+":"+guard.TargetID()]
+			if !present {
+				// Installation policy material has no W0 durable row. It remains
+				// prepared evidence and must not be manufactured by storage.
+				if guard.Kind() == application.EvidencePolicyRevision {
+					continue
+				}
+				return commandReferenceConflict("durable guard target is absent")
+			}
+			if _, changed := mutated[observed.Target()]; changed {
+				continue
+			}
+			if !identityStateMatchesEvidence(observed, guard) {
+				return commandReferenceConflict("durable guard evidence changed")
+			}
+		}
+	}
+	return nil
+}
+
+func identityStateMatchesEvidence(state application.IdentityState, guard application.EvidenceGuard) bool {
+	switch guard.Kind() {
+	case application.EvidencePolicyRevision:
+		revision, _ := guard.PolicyRevision()
+		workspace, ok := state.Value().(domain.WorkspaceState)
+		return ok && workspace.PolicyRevision() == revision
+	case application.EvidenceLifecycleStatus:
+		status, _ := guard.Status()
+		switch value := state.Value().(type) {
+		case domain.InstallationInvitationState:
+			return string(value.Status()) == status
+		case domain.PrincipalState:
+			return string(value.Status()) == status
+		case domain.DeviceState:
+			return string(value.Status()) == status
+		case domain.GrantState:
+			return string(value.Status()) == status
+		case domain.WorkspaceState:
+			return string(value.Status()) == status
+		case domain.MembershipState:
+			return string(value.Status()) == status
+		case domain.ActorState:
+			return string(value.Status()) == status
+		case domain.ActorDelegationState:
+			return string(value.Status()) == status
+		case domain.ActorSessionState:
+			return string(value.Status()) == status
+		}
+	case application.EvidenceDeviceTrustRevision:
+		revision, _ := guard.Revision()
+		device, ok := state.Value().(domain.DeviceState)
+		return ok && device.TrustRevision() == revision
+	}
+	return false
+}
+
 func advanceCommandStream(ctx context.Context, tx *sql.Tx, state lockedCommandState, final domain.StreamDigest, count uint64) error {
 	oldHead, finalHead := state.stream.head.Bytes(), final.Bytes()
 	result, err := tx.ExecContext(ctx, `UPDATE authority_streams SET next_sequence = next_sequence + ?, head_digest = ?,
-		next_audit_sequence = next_audit_sequence + 1, audit_head_hash = (SELECT entry_hash FROM audit_entries WHERE scope_kind = ? AND scope_id = ? AND audit_sequence = ?), authority_time_floor_us = ?
-		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ? AND next_sequence = ? AND head_digest = ?
+		next_audit_sequence = next_audit_sequence + 1, audit_head_hash = (SELECT entry_hash FROM audit_entries WHERE scope_kind = ? AND scope_id = ? AND audit_sequence = ?), authority_time_floor_us = ?, clock_status = ?
+		WHERE scope_kind = ? AND scope_id = ? AND authority_id = ? AND authority_epoch = ? AND next_sequence = ? AND head_digest = ?
 		AND next_audit_sequence = ? AND audit_head_hash = ? AND authority_time_floor_us = ?
+		AND clock_status = ?
 		AND EXISTS (SELECT 1 FROM scope_guards WHERE scope_kind = ? AND scope_id = ? AND authority_id = ?
 			AND authority_epoch = ? AND write_status = 'open' AND guard_generation = ?)`,
 		count, finalHead[:], string(state.spec.Scope().Kind()), state.spec.Scope().ID(), state.stream.nextAudit,
-		timeMicros(state.time.Value()), string(state.spec.Scope().Kind()), state.spec.Scope().ID(),
-		state.spec.RequestedEpoch().String(), state.stream.nextEvent, oldHead[:], state.stream.nextAudit,
-		state.stream.auditHead[:], state.stream.timeFloor, string(state.spec.Guards().AdmissionScope().Kind()),
+		timeMicros(state.time.Value()), state.stream.clockStatus, string(state.spec.Scope().Kind()), state.spec.Scope().ID(),
+		state.spec.AuthorityID().String(), state.spec.RequestedEpoch().String(), state.stream.nextEvent, oldHead[:], state.stream.nextAudit,
+		state.stream.auditHead[:], state.stream.timeFloor, state.stream.observedClockStatus,
+		string(state.spec.Guards().AdmissionScope().Kind()),
 		state.spec.Guards().AdmissionScope().ID(), state.spec.AuthorityID().String(), state.spec.RequestedEpoch().String(),
 		state.spec.Guards().AdmissionGeneration().Uint64())
 	if err != nil {
 		return err
 	}
 	affected, err := result.RowsAffected()
-	if err != nil || affected != 1 {
-		return application.ErrInvalidCommandContext
+	if err != nil {
+		return fmt.Errorf("read SQLite stream CAS result: %w", err)
+	}
+	if affected != 1 {
+		return commandReferenceConflict("command stream changed")
 	}
 	return nil
 }
@@ -1199,15 +1478,19 @@ func loadReceiptEventIDs(ctx context.Context, tx *sql.Tx, receipt domain.Receipt
 func loadCommandReadSet(ctx context.Context, tx *sql.Tx, spec application.CommandSpec, admitted bool) ([]application.IdentityState, []domain.CeremonyChallenge, error) {
 	plan := spec.Guards()
 	targets := make(map[domain.AggregateTarget]struct{})
+	expectedVersions := make(map[domain.AggregateTarget]domain.Version)
 	if admitted {
 		for _, group := range [][]domain.AggregateRef{plan.Authorization(), plan.References()} {
 			for _, ref := range group {
 				targets[ref.Target()] = struct{}{}
+				expectedVersions[ref.Target()] = ref.Version()
 			}
 		}
 		for _, expectation := range plan.Mutations() {
 			if expectation.Kind() == domain.ExpectationExpectedVersion {
 				targets[expectation.Target()] = struct{}{}
+				version, _ := expectation.Version()
+				expectedVersions[expectation.Target()] = version
 			}
 		}
 	} else {
@@ -1225,8 +1508,14 @@ func loadCommandReadSet(ctx context.Context, tx *sql.Tx, spec application.Comman
 	})
 	for _, target := range orderedTargets {
 		state, err := loadIdentityState(ctx, tx, target)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, commandReferenceConflict("declared command reference is absent")
+		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("load SQLite %s: %w", target.String(), err)
+		}
+		if expected, present := expectedVersions[target]; present && state.Version() != expected {
+			return nil, nil, commandReferenceConflict("declared command reference version changed")
 		}
 		states = append(states, state)
 	}
@@ -1240,7 +1529,7 @@ func loadCommandReadSet(ctx context.Context, tx *sql.Tx, spec application.Comman
 				return nil, nil, err
 			}
 			if present {
-				return nil, nil, application.ErrInvalidCommandContext
+				return nil, nil, commandReferenceConflict("command create target already exists")
 			}
 		}
 		for _, claim := range plan.Ceremonies() {
@@ -1252,7 +1541,7 @@ func loadCommandReadSet(ctx context.Context, tx *sql.Tx, spec application.Comman
 				return nil, nil, err
 			}
 			if count != 0 {
-				return nil, nil, application.ErrInvalidCommandContext
+				return nil, nil, commandReferenceConflict("ceremony identifier already exists")
 			}
 		}
 	}
@@ -1263,6 +1552,9 @@ func loadCommandReadSet(ctx context.Context, tx *sql.Tx, spec application.Comman
 				continue
 			}
 			challenge, err := loadCeremony(ctx, tx, claim.ID().String())
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil, commandReferenceConflict("ceremony is absent")
+			}
 			if err != nil {
 				return nil, nil, err
 			}

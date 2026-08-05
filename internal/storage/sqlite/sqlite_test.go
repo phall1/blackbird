@@ -490,6 +490,14 @@ func TestExecuteSecurityDenialSaturationAndReservedAdmission(t *testing.T) {
 	store := openSecurityStore(t)
 	fixture := newSecurityFixture(t)
 	initializeSecurityFixture(t, store, fixture)
+	// Keep every denial in one authority-time bucket even when the repeated
+	// race suite starts near a wall-clock minute boundary.
+	bucketFloor := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Minute).Add(10 * time.Second)
+	if _, err := store.db.Exec(`UPDATE authority_streams SET authority_time_floor_us = ?
+		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`,
+		timeMicros(bucketFloor), string(fixture.scope.Kind()), fixture.scope.ID(), fixture.epoch.String()); err != nil {
+		t.Fatal(err)
+	}
 
 	for index := range application.MaxDistinctDenialsPerMinute {
 		spec := newCommandDenialSpec(t, fixture, fmt.Sprintf("distinct-%d", index))

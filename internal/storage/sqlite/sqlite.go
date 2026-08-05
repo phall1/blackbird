@@ -35,7 +35,7 @@ const (
 	maximumBusyTimeout  = 30 * time.Second
 	initialMigrationID  = "0001_w0.sql"
 	maximumReadPoolSize = 5
-	schemaChecksumHex   = "ec8c3a7efff2b31a72334be19eb7bfb862efbf49918343a709f2ca3793bcc1ff"
+	schemaChecksumHex   = "c65ad6fe01a576d2777cdcdd69869c124d27f00818dd0b4199137c335e673fdd"
 )
 
 var (
@@ -59,23 +59,24 @@ type Config struct {
 }
 
 type Diagnostics struct {
-	DriverVersion    string
-	DriverVerified   bool
-	SQLiteVersion    string
-	SQLiteSourceID   string
-	CompileOptions   []string
-	JournalMode      string
-	ForeignKeys      bool
-	Synchronous      string
-	BusyTimeout      time.Duration
-	TrustedSchema    bool
-	ExtensionLoading bool
-	FullFSync        bool
-	CheckpointFSync  bool
-	ApplicationID    int
-	SchemaVersion    int
-	SchemaChecksum   [sha256.Size]byte
-	UncleanCheckRan  bool
+	DriverVersion          string
+	DriverVerified         bool
+	SQLiteVersion          string
+	SQLiteSourceID         string
+	CompileOptions         []string
+	JournalMode            string
+	ForeignKeys            bool
+	Synchronous            string
+	BusyTimeout            time.Duration
+	BackwardClockTolerance time.Duration
+	TrustedSchema          bool
+	ExtensionLoading       bool
+	FullFSync              bool
+	CheckpointFSync        bool
+	ApplicationID          int
+	SchemaVersion          int
+	SchemaChecksum         [sha256.Size]byte
+	UncleanCheckRan        bool
 }
 
 type Store struct {
@@ -418,7 +419,10 @@ func (store *Store) inspect(ctx context.Context) (Diagnostics, error) {
 	if err != nil {
 		return Diagnostics{}, err
 	}
-	result := Diagnostics{DriverVersion: driverVersion, DriverVerified: driverVerified}
+	result := Diagnostics{
+		DriverVersion: driverVersion, DriverVerified: driverVerified,
+		BackwardClockTolerance: time.Duration(backwardClockToleranceMicros) * time.Microsecond,
+	}
 	var foreignKeys, trustedSchema, extensionLoading, fullFSync, checkpointFSync int
 	var busyMilliseconds int64
 	if err := store.db.QueryRowContext(ctx,

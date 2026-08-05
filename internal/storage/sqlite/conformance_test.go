@@ -147,6 +147,16 @@ func TestUnitOfWorkSecurityInitializationRoundTripsStateAndAudit(t *testing.T) {
 		status != string(invitation.Status()) || version != invitation.Version().Uint64() {
 		t.Fatal("installation invitation did not round-trip through normalized state")
 	}
+	var clockStatus string
+	if err := store.db.QueryRowContext(context.Background(),
+		"SELECT clock_status FROM authority_streams WHERE scope_kind = 'installation' AND scope_id = ?",
+		invitation.InstallationID().String(),
+	).Scan(&clockStatus); err != nil {
+		t.Fatal(err)
+	}
+	if clockStatus != "normal" || store.Diagnostics().BackwardClockTolerance != time.Second {
+		t.Fatalf("authority clock status=%q tolerance=%s", clockStatus, store.Diagnostics().BackwardClockTolerance)
+	}
 	assertConformanceCounts(t, store, map[string]int{
 		"scope_guards": 1, "authority_streams": 1, "installation_invitations": 1, "audit_entries": 1,
 	})
@@ -181,6 +191,38 @@ func TestUnitOfWorkSecurityCallbackFailuresAreAtomic(t *testing.T) {
 				"security_denials": 0, "audit_entries": 0,
 			})
 		})
+	}
+}
+
+func TestExecuteCommandReplayLeavesAuthorityClockReadOnly(t *testing.T) {
+	t.Parallel()
+	store := openSecurityStore(t)
+	security := newSecurityFixture(t)
+	initializeSecurityFixture(t, store, security)
+	spec, decide, _ := newBootstrapCommand(t, security)
+	if execution, err := store.ExecuteCommand(context.Background(), spec, decide); err != nil ||
+		execution.Kind() != application.CommandTransactionCommitted {
+		t.Fatalf("bootstrap execution=%q error=%v", execution.Kind(), err)
+	}
+	var before int64
+	if err := store.db.QueryRowContext(context.Background(), `SELECT authority_time_floor_us FROM authority_streams
+		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`, string(spec.Scope().Kind()),
+		spec.Scope().ID(), spec.RequestedEpoch().String()).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if replay, err := store.ExecuteCommand(context.Background(), spec, func(locked application.CommandContext) (application.CommandDecision, error) {
+		return application.ReplayCommand(locked, application.ReplayDiscloseResult)
+	}); err != nil || replay.Kind() != application.CommandTransactionReplayed {
+		t.Fatalf("replay execution=%q error=%v", replay.Kind(), err)
+	}
+	var after int64
+	if err := store.db.QueryRowContext(context.Background(), `SELECT authority_time_floor_us FROM authority_streams
+		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`, string(spec.Scope().Kind()),
+		spec.Scope().ID(), spec.RequestedEpoch().String()).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("replay advanced authority floor from %d to %d", before, after)
 	}
 }
 

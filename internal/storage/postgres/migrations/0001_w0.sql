@@ -42,7 +42,8 @@ CREATE TABLE authority_streams (
     head_digest bytea NOT NULL CHECK (octet_length(head_digest) = 32),
     next_audit_sequence bigint NOT NULL CHECK (next_audit_sequence BETWEEN 1 AND 9007199254740991),
     audit_head_hash bytea NOT NULL CHECK (octet_length(audit_head_hash) = 32),
-    authority_time_floor_us bigint NOT NULL CHECK (authority_time_floor_us > 0), predecessor_epoch uuid,
+    authority_time_floor_us bigint NOT NULL CHECK (authority_time_floor_us > 0),
+    clock_status text NOT NULL DEFAULT 'normal' CHECK (clock_status IN ('normal', 'clock_suspect')), predecessor_epoch uuid,
     PRIMARY KEY (scope_kind, scope_id, authority_epoch)
 );
 CREATE TABLE scheduler_clocks (

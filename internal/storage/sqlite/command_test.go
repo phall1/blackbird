@@ -182,6 +182,910 @@ func TestExecuteCommandPersistsRegisterPrincipalAfterBootstrap(t *testing.T) {
 	})
 }
 
+type productionCommandStep struct {
+	operation     application.CommandOperation
+	scope         domain.AuthorityScope
+	admission     domain.AuthorityScope
+	principal     domain.PrincipalID
+	authorship    application.CommandAuthorship
+	authorization []any
+	references    []any
+	disclosure    []any
+	mutations     []domain.AggregateExpectation
+	ceremonies    []application.CeremonyClaim
+	genesis       *application.ScopeGenesisAbsence
+	evidence      []application.EvidenceGuard
+	facts         []domain.IdentityFact
+	result        any
+	resolveResult func(time.Time) (any, error)
+	recovery      bool
+	timeClass     application.AuthorityTimeClass
+}
+
+func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) {
+	store := openSecurityStore(t)
+	security := newSecurityFixture(t)
+	initializeSecurityFixture(t, store, security)
+	bootstrapSpec, bootstrapDecide, bootstrap := newBootstrapCommand(t, security)
+	mustExecuteProductionCommand(t, store, bootstrapSpec, bootstrapDecide)
+	registerSpec, registerDecide, registered := newRegisterPrincipalCommand(t, security, bootstrap)
+	mustExecuteProductionCommand(t, store, registerSpec, registerDecide)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	policy, _ := domain.NewPolicyRevision("policy:sqlite-production-path:v1")
+	assurance, _ := domain.NewAssuranceClass("sqlite-production-strong")
+	owner, grant, workload := bootstrap.Principal(), bootstrap.OwnerGrant(), registered.Principal()
+	ownerAuthorization, err := domain.NewIdentityAuthorization(
+		security.authority, security.epoch, security.invitation.InstallationID(), owner.ID(), grant.Capabilities(),
+		policy, assurance, now, domain.MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceID, _ := domain.ParseWorkspaceID(commandTestUUID(100))
+	ownerMembershipID, _ := domain.ParseMembershipID(commandTestUUID(101))
+	alias, _ := domain.NewWorkspaceAlias("sqlite-production-path")
+	discovery, _ := domain.NewDiscoveryLocator("workspace://sqlite-production-path")
+	workspaceCapabilities, _ := domain.NewCapabilitySet(
+		domain.WorkspaceOwnerCapability(), domain.MembershipAdminCapability(), domain.ActorAdminCapability(),
+		domain.DelegationAdminCapability(), domain.DevicePairCapability(),
+	)
+	createdWorkspace, err := domain.CreateWorkspace(domain.CreateWorkspaceInput{
+		Authorization: ownerAuthorization, Owner: owner, ExpectedOwnerVersion: owner.Version(),
+		InstallationGrant: grant, ExpectedGrantVersion: grant.Version(), WorkspaceID: workspaceID,
+		Alias: alias, DiscoveryLocator: discovery, OwnerMembershipID: ownerMembershipID,
+		OwnerCapabilities: workspaceCapabilities,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := createdWorkspace.Workspace()
+	workspaceScope, _ := domain.WorkspaceScope(workspace.ID())
+	ownerWorkspaceAuthorization, err := domain.NewWorkspaceIdentityAuthorization(
+		security.authority, security.epoch, security.invitation.InstallationID(), workspace.ID(), owner.ID(),
+		grant.Capabilities(), policy, assurance, now, domain.MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerAuthorship, _ := application.AuthorityAuthorship(owner.ID())
+	ownerAdminAuthorship, _ := application.WorkspaceAdminAuthorship(owner.ID(), nil)
+	workloadAuthorship, _ := application.AuthorityAuthorship(workload.ID())
+	workspaceGenesis, _ := application.AbsentScopeGenesis(workspaceScope, security.authority, security.epoch)
+
+	pairedDeviceID, _ := domain.ParseDeviceID(commandTestUUID(102))
+	pairingCeremonyID, _ := domain.ParseCeremonyID(commandTestUUID(103))
+	pairingDigest := domain.FingerprintCommand([]byte("sqlite production pairing proof"))
+	pairingChallenge, _ := domain.NewDevicePairingChallenge(
+		pairingCeremonyID, pairingDigest, now.Add(time.Hour), security.invitation.InstallationID(), owner.ID(), pairedDeviceID,
+	)
+	pairingCreation, _ := domain.ExpectCeremonyAbsent(pairingCeremonyID)
+	pairedDeviceName, _ := domain.NewDisplayName("SQLite production paired device")
+	pairedDeviceKey, _ := domain.NewPublicKeyReference("keyref:sqlite-production-paired-device")
+	pairingBegan, err := domain.BeginDevicePairing(domain.BeginDevicePairingInput{
+		Authorization: ownerAuthorization, Principal: owner, ExpectedPrincipalVersion: owner.Version(),
+		DeviceID: pairedDeviceID, DisplayName: pairedDeviceName, PublicKeyReference: pairedDeviceKey,
+		Challenge: pairingChallenge, ChallengeCreation: pairingCreation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairingProof, _ := domain.NewCeremonyProof(
+		pairingCeremonyID, domain.CeremonyPurposeDevicePairing, pairingDigest, owner.ID(), pairedDeviceID,
+	)
+	pairedSPKI, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("sqlite production paired spki")))
+	pairedCredential, _ := domain.NewDeviceCredentialBinding(pairedDeviceKey, pairedSPKI, pairingDigest)
+	pairingRedemption, err := domain.NewPairingRedemptionAuthorization(
+		security.authority, security.epoch, security.invitation.InstallationID(), owner.ID(), pairedDeviceID,
+		policy, assurance, now, pairingCeremonyID, pairingDigest, pairedCredential,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paired, err := domain.PairDevice(domain.PairDeviceInput{
+		Authorization: pairingRedemption, CurrentAuthorization: ownerAuthorization, AuthorityTime: now,
+		Principal: owner, ExpectedPrincipalVersion: owner.Version(), Device: pairingBegan.Device(),
+		ExpectedDeviceVersion: pairingBegan.Device().Version(), ExpectedTrustRevision: pairingBegan.Device().TrustRevision(),
+		Proof: pairingProof,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	memberCapabilities, _ := domain.NewCapabilitySet(domain.WorkspaceOwnerCapability())
+	membershipID, _ := domain.ParseMembershipID(commandTestUUID(104))
+	membershipCeremonyID, _ := domain.ParseCeremonyID(commandTestUUID(105))
+	membershipDigest := domain.FingerprintCommand([]byte("sqlite production membership proof"))
+	membershipChallenge, _ := domain.NewMembershipAcceptanceChallenge(
+		membershipCeremonyID, membershipDigest, now.Add(time.Hour), workspace.ID(), membershipID, workload.ID(),
+	)
+	membershipCreation, _ := domain.ExpectCeremonyAbsent(membershipCeremonyID)
+	invited, err := domain.InviteWorkspaceMember(domain.InviteWorkspaceMemberInput{
+		Authorization: ownerWorkspaceAuthorization, Administrator: owner, ExpectedAdministratorVersion: owner.Version(),
+		Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(), Principal: workload,
+		ExpectedPrincipalVersion: workload.Version(), MembershipID: membershipID, Capabilities: memberCapabilities,
+		Challenge: membershipChallenge, ChallengeCreation: membershipCreation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workloadAuthorization, err := domain.NewWorkspaceIdentityAuthorization(
+		security.authority, security.epoch, security.invitation.InstallationID(), workspace.ID(), workload.ID(),
+		memberCapabilities, policy, assurance, now, domain.MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membershipProof, _ := domain.NewCeremonyProof(
+		membershipCeremonyID, domain.CeremonyPurposeMembershipAcceptance, membershipDigest, workload.ID(), domain.DeviceID{},
+	)
+	accepted, err := domain.AcceptWorkspaceMembership(domain.AcceptWorkspaceMembershipInput{
+		Authorization: workloadAuthorization, Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(),
+		Principal: workload, ExpectedPrincipalVersion: workload.Version(), Membership: invited.Membership(),
+		ExpectedMembershipVersion: invited.Membership().Version(), Proof: membershipProof,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actorID, _ := domain.ParseActorID(commandTestUUID(106))
+	actorName, _ := domain.NewDisplayName("SQLite production actor")
+	actorProfile, _ := domain.NewActorProfile(actorName)
+	createdActor, err := domain.CreateActor(domain.CreateActorInput{
+		Authorization: ownerWorkspaceAuthorization, Administrator: owner, ExpectedAdministratorVersion: owner.Version(),
+		Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(), ActorID: actorID,
+		Kind: domain.ActorKindAgent, Profile: actorProfile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delegationID, _ := domain.ParseActorDelegationID(commandTestUUID(107))
+	delegationCeremonyID, _ := domain.ParseCeremonyID(commandTestUUID(108))
+	delegationDigest := domain.FingerprintCommand([]byte("sqlite production delegation proof"))
+	delegationChallenge, _ := domain.NewDelegationActivationChallenge(
+		delegationCeremonyID, delegationDigest, now.Add(time.Hour), workspace.ID(), delegationID, workload.ID(), actorID,
+	)
+	delegationCreation, _ := domain.ExpectCeremonyAbsent(delegationCeremonyID)
+	proposed, err := domain.ProposeActorDelegation(domain.ProposeActorDelegationInput{
+		Authorization: ownerWorkspaceAuthorization, Administrator: owner, ExpectedAdministratorVersion: owner.Version(),
+		Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(), Principal: workload,
+		ExpectedPrincipalVersion: workload.Version(), Actor: createdActor.Actor(),
+		ExpectedActorVersion: createdActor.Actor().Version(), Membership: accepted.Membership(),
+		ExpectedMembershipVersion: accepted.Membership().Version(), DelegationID: delegationID,
+		Capabilities: memberCapabilities, Challenge: delegationChallenge, ChallengeCreation: delegationCreation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegationProof, _ := domain.NewCeremonyProof(
+		delegationCeremonyID, domain.CeremonyPurposeDelegationActivation, delegationDigest, workload.ID(), domain.DeviceID{},
+	)
+	sessionCeremonyID, _ := domain.ParseCeremonyID(commandTestUUID(109))
+	sessionDigest := domain.FingerprintCommand([]byte("sqlite production session proof"))
+	sessionChallenge, _ := domain.NewSessionStartChallenge(
+		sessionCeremonyID, sessionDigest, now.Add(time.Hour), workspace.ID(), delegationID, workload.ID(), actorID,
+	)
+	sessionCreation, _ := domain.ExpectCeremonyAbsent(sessionCeremonyID)
+	activated, err := domain.ActivateActorDelegation(domain.ActivateActorDelegationInput{
+		Authorization: workloadAuthorization, Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(),
+		Principal: workload, ExpectedPrincipalVersion: workload.Version(), Actor: createdActor.Actor(),
+		ExpectedActorVersion: createdActor.Actor().Version(), Membership: accepted.Membership(),
+		ExpectedMembershipVersion: accepted.Membership().Version(), Delegation: proposed.Delegation(),
+		ExpectedDelegationVersion: proposed.Delegation().Version(), Proof: delegationProof,
+		SessionStartChallenge: sessionChallenge, SessionChallengeCreation: sessionCreation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionProof, _ := domain.NewCeremonyProof(
+		sessionCeremonyID, domain.CeremonyPurposeActorSessionStart, sessionDigest, workload.ID(), domain.DeviceID{},
+	)
+	handoff, _ := domain.HandoffSessionStart(sessionChallenge, sessionProof)
+	sessionID, _ := domain.ParseActorSessionID(commandTestUUID(110))
+	sessionClientID, _ := domain.ParseClientInstanceID(commandTestUUID(111))
+	clientMetadata, _ := domain.NewClientMetadata("sqlite-production-agent", "1.0.0")
+	credentialReference, _ := domain.NewCredentialReference("credential-ref:sqlite-production-session")
+	credentialAudience, _ := domain.NewCredentialAudience("blackbird:sqlite-production")
+	presentationDigest, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("sqlite production presentation")))
+	presentation, _ := domain.NewPresentationCredentialBinding(
+		presentationDigest, credentialReference, credentialAudience, domain.PresentationCredentialVersion,
+	)
+	sessionStarted, err := domain.StartActorSession(domain.StartActorSessionInput{
+		Authorization: workloadAuthorization, SessionID: sessionID, ClientInstanceID: sessionClientID,
+		ClientMetadata: clientMetadata, Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(),
+		Principal: workload, ExpectedPrincipalVersion: workload.Version(), Membership: accepted.Membership(),
+		ExpectedMembershipVersion: accepted.Membership().Version(), Actor: createdActor.Actor(),
+		ExpectedActorVersion: createdActor.Actor().Version(), Delegation: activated.Delegation(),
+		ExpectedDelegationVersion: activated.Delegation().Version(), StartAuthority: handoff,
+		AbsoluteExpiry: now.Add(8 * time.Hour), PresentationCredential: presentation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	installationAuthority := mustAuthorityEvidence(t, security.scope, security.authority, security.epoch)
+	installationPolicy := mustPolicyEvidence(t, security.scope, policy)
+	workspaceAuthority := mustAuthorityEvidence(t, workspaceScope, security.authority, security.epoch)
+	workspacePolicy := mustPolicyEvidence(t, workspaceScope, policy)
+	steps := []productionCommandStep{
+		{
+			operation: application.CommandCreateWorkspace, scope: workspaceScope, admission: security.scope,
+			principal: owner.ID(), authorship: ownerAuthorship, authorization: []any{owner, grant},
+			disclosure: []any{owner, workspace}, mutations: []domain.AggregateExpectation{
+				mustAbsentExpectation(t, workspace.ID()), mustAbsentExpectation(t, createdWorkspace.OwnerMembership().ID()),
+			}, genesis: &workspaceGenesis, evidence: []application.EvidenceGuard{
+				installationAuthority, installationPolicy, mustLifecycleEvidence(t, owner), mustLifecycleEvidence(t, grant),
+				mustCeilingEvidence(t, grant, "workspace-create"),
+			}, facts: createdWorkspace.Facts(), result: createdWorkspace, recovery: true,
+		},
+		{
+			operation: application.CommandBeginDevicePairing, scope: security.scope, admission: security.scope,
+			principal: owner.ID(), authorship: ownerAuthorship, authorization: []any{owner, grant},
+			disclosure: []any{owner, pairingBegan.Device()}, mutations: []domain.AggregateExpectation{mustAbsentExpectation(t, pairedDeviceID)},
+			ceremonies: []application.CeremonyClaim{mustReserveCeremony(t, pairingChallenge, pairingBegan.Device())},
+			evidence: []application.EvidenceGuard{installationAuthority, installationPolicy, mustLifecycleEvidence(t, owner),
+				mustLifecycleEvidence(t, grant), mustCeilingEvidence(t, grant, "pairing")},
+			facts: pairingBegan.Facts(), result: pairingBegan, recovery: true,
+			timeClass: application.AuthorityTimeIssuesExpiringAuthority,
+		},
+		{
+			operation: application.CommandPairDevice, scope: security.scope, admission: security.scope,
+			principal: owner.ID(), authorship: ownerAuthorship, authorization: []any{owner},
+			disclosure: []any{owner, pairingBegan.Device()}, mutations: []domain.AggregateExpectation{mustVersionExpectation(t, pairingBegan.Device())},
+			ceremonies: []application.CeremonyClaim{mustConsumeCeremony(t, pairingChallenge, pairingBegan.Device())},
+			evidence: []application.EvidenceGuard{installationAuthority, installationPolicy, mustLifecycleEvidence(t, owner),
+				mustLifecycleEvidence(t, pairingBegan.Device()), mustTrustEvidence(t, pairingBegan.Device())},
+			facts: paired.Facts(), result: paired,
+		},
+		{
+			operation: application.CommandInviteWorkspaceMember, scope: workspaceScope, admission: workspaceScope,
+			principal: owner.ID(), authorship: ownerAdminAuthorship, authorization: []any{owner, workspace}, references: []any{workload},
+			disclosure: []any{owner, workspace, invited.Membership()}, mutations: []domain.AggregateExpectation{mustAbsentExpectation(t, membershipID)},
+			ceremonies: []application.CeremonyClaim{mustReserveCeremony(t, membershipChallenge, invited.Membership())},
+			evidence: []application.EvidenceGuard{workspaceAuthority, workspacePolicy, mustLifecycleEvidence(t, owner),
+				mustLifecycleEvidence(t, workspace), mustLifecycleEvidence(t, workload), mustCeilingEvidence(t, owner, "membership")},
+			facts: invited.Facts(), result: invited, recovery: true, timeClass: application.AuthorityTimeIssuesExpiringAuthority,
+		},
+		{
+			operation: application.CommandAcceptWorkspaceMembership, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workloadAuthorship, authorization: []any{workload}, references: []any{workspace},
+			disclosure: []any{workload, workspace, invited.Membership()}, mutations: []domain.AggregateExpectation{mustVersionExpectation(t, invited.Membership())},
+			ceremonies: []application.CeremonyClaim{mustConsumeCeremony(t, membershipChallenge, invited.Membership())},
+			evidence: []application.EvidenceGuard{workspaceAuthority, workspacePolicy, mustLifecycleEvidence(t, workload),
+				mustLifecycleEvidence(t, workspace), mustLifecycleEvidence(t, invited.Membership())},
+			facts: accepted.Facts(), result: accepted,
+		},
+		{
+			operation: application.CommandCreateActor, scope: workspaceScope, admission: workspaceScope,
+			principal: owner.ID(), authorship: ownerAdminAuthorship, authorization: []any{owner, workspace},
+			disclosure: []any{owner, workspace, createdActor.Actor()}, mutations: []domain.AggregateExpectation{mustAbsentExpectation(t, actorID)},
+			evidence: []application.EvidenceGuard{workspaceAuthority, workspacePolicy, mustLifecycleEvidence(t, owner), mustLifecycleEvidence(t, workspace)},
+			facts:    createdActor.Facts(), result: createdActor, recovery: true,
+		},
+		{
+			operation: application.CommandProposeActorDelegation, scope: workspaceScope, admission: workspaceScope,
+			principal: owner.ID(), authorship: ownerAdminAuthorship, authorization: []any{owner, workspace},
+			references: []any{workload, createdActor.Actor(), accepted.Membership()}, disclosure: []any{owner, workspace, proposed.Delegation()},
+			mutations:  []domain.AggregateExpectation{mustAbsentExpectation(t, delegationID)},
+			ceremonies: []application.CeremonyClaim{mustReserveCeremony(t, delegationChallenge, proposed.Delegation())},
+			evidence: []application.EvidenceGuard{workspaceAuthority, workspacePolicy, mustLifecycleEvidence(t, owner),
+				mustLifecycleEvidence(t, workspace), mustLifecycleEvidence(t, workload), mustLifecycleEvidence(t, createdActor.Actor()),
+				mustLifecycleEvidence(t, accepted.Membership()), mustCeilingEvidence(t, accepted.Membership(), "delegation")},
+			facts: proposed.Facts(), result: proposed, recovery: true, timeClass: application.AuthorityTimeIssuesExpiringAuthority,
+		},
+		{
+			operation: application.CommandActivateActorDelegation, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workloadAuthorship, authorization: []any{workload},
+			references: []any{workspace, createdActor.Actor(), accepted.Membership()}, disclosure: []any{workload, workspace, proposed.Delegation()},
+			mutations: []domain.AggregateExpectation{mustVersionExpectation(t, proposed.Delegation())},
+			ceremonies: []application.CeremonyClaim{mustConsumeCeremony(t, delegationChallenge, proposed.Delegation()),
+				mustReserveCeremony(t, sessionChallenge, proposed.Delegation())},
+			evidence: []application.EvidenceGuard{workspaceAuthority, workspacePolicy, mustLifecycleEvidence(t, workload),
+				mustLifecycleEvidence(t, workspace), mustLifecycleEvidence(t, createdActor.Actor()), mustLifecycleEvidence(t, accepted.Membership()),
+				mustLifecycleEvidence(t, proposed.Delegation()), mustCeilingEvidence(t, accepted.Membership(), "activation")},
+			facts: activated.Facts(), result: activated, recovery: true, timeClass: application.AuthorityTimeIssuesExpiringAuthority,
+		},
+		{
+			operation: application.CommandStartActorSession, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workloadAuthorship,
+			authorization: []any{workload, workspace, accepted.Membership(), createdActor.Actor(), activated.Delegation()},
+			disclosure:    []any{workload, workspace, sessionStarted.Session()}, mutations: []domain.AggregateExpectation{mustAbsentExpectation(t, sessionID)},
+			ceremonies: []application.CeremonyClaim{mustConsumeStandaloneCeremony(t, sessionChallenge)},
+			evidence: []application.EvidenceGuard{workspaceAuthority, workspacePolicy, mustLifecycleEvidence(t, workload),
+				mustLifecycleEvidence(t, workspace), mustLifecycleEvidence(t, accepted.Membership()), mustLifecycleEvidence(t, createdActor.Actor()),
+				mustLifecycleEvidence(t, activated.Delegation()), mustCeilingEvidence(t, accepted.Membership(), "session-membership"),
+				mustCeilingEvidence(t, activated.Delegation(), "session-delegation"), mustConstraintEvidence(t, sessionStarted.Session(), "session")},
+			facts: sessionStarted.Facts(), recovery: true,
+			resolveResult: func(authorityTime time.Time) (any, error) {
+				authorization, err := domain.NewWorkspaceIdentityAuthorization(
+					security.authority, security.epoch, security.invitation.InstallationID(), workspace.ID(), workload.ID(),
+					memberCapabilities, policy, assurance, authorityTime, domain.MaxActorSessionLifetime,
+				)
+				if err != nil {
+					return nil, err
+				}
+				return domain.StartActorSession(domain.StartActorSessionInput{
+					Authorization: authorization, SessionID: sessionID, ClientInstanceID: sessionClientID,
+					ClientMetadata: clientMetadata, Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(),
+					Principal: workload, ExpectedPrincipalVersion: workload.Version(), Membership: accepted.Membership(),
+					ExpectedMembershipVersion: accepted.Membership().Version(), Actor: createdActor.Actor(),
+					ExpectedActorVersion: createdActor.Actor().Version(), Delegation: activated.Delegation(),
+					ExpectedDelegationVersion: activated.Delegation().Version(), StartAuthority: handoff,
+					AbsoluteExpiry: authorityTime.Add(8 * time.Hour), PresentationCredential: presentation,
+				})
+			},
+			timeClass: application.AuthorityTimeIssuesExpiringAuthority,
+		},
+	}
+
+	for index, step := range steps {
+		t.Run(string(step.operation), func(t *testing.T) {
+			spec := newProductionCommandSpec(t, security, step, index)
+			execution := executeProductionStep(t, store, spec, step, index)
+			if execution.Kind() != application.CommandTransactionCommitted {
+				t.Fatalf("execution kind=%q", execution.Kind())
+			}
+			receipt, present := execution.Receipt()
+			if !present || receipt.CommandID() != spec.CommandID() ||
+				receipt.Result().Operation() != step.operation || receipt.Events().Count() != uint16(len(step.facts)) {
+				t.Fatal("committed execution did not expose the expected receipt and event range")
+			}
+			var receiptRows, eventRows, auditRows int
+			if err := store.db.QueryRow(`SELECT count(*) FROM command_receipts WHERE command_id = ?`, spec.CommandID().String()).Scan(&receiptRows); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.db.QueryRow(`SELECT count(*) FROM domain_events WHERE command_id = ?`, spec.CommandID().String()).Scan(&eventRows); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.db.QueryRow(`SELECT count(*) FROM audit_entries`).Scan(&auditRows); err != nil {
+				t.Fatal(err)
+			}
+			if receiptRows != 1 || eventRows != len(step.facts) || auditRows != index+4 {
+				t.Fatalf("persisted command rows receipt=%d events=%d total_audit=%d", receiptRows, eventRows, auditRows)
+			}
+			replay, err := store.ExecuteCommand(context.Background(), spec, func(locked application.CommandContext) (application.CommandDecision, error) {
+				return application.ReplayCommand(locked, application.ReplayDiscloseResult)
+			})
+			if err != nil || replay.Kind() != application.CommandTransactionReplayed {
+				t.Fatalf("replay kind=%q error=%v", replay.Kind(), err)
+			}
+			replayedReceipt, present := replay.Receipt()
+			if !present || replayedReceipt.CommandID() != receipt.CommandID() ||
+				replayedReceipt.Result().ResponseDigest() != receipt.Result().ResponseDigest() {
+				t.Fatal("replay did not return the original committed receipt")
+			}
+		})
+	}
+
+	assertCommandRowCounts(t, store, map[string]int{
+		"workspaces": 1, "workspace_memberships": 2, "actors": 1, "actor_delegations": 1,
+		"actor_sessions": 1, "device_registrations": 2, "ceremony_challenges": 4,
+		"command_receipts": 11, "domain_events": 15, "audit_entries": 12,
+	})
+	var membershipStatus, delegationStatus, sessionStatus string
+	var membershipVersion, delegationVersion, sessionVersion uint64
+	if err := store.db.QueryRow(`SELECT status, version FROM workspace_memberships WHERE membership_id = ?`, membershipID.String()).Scan(&membershipStatus, &membershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status, version FROM actor_delegations WHERE delegation_id = ?`, delegationID.String()).Scan(&delegationStatus, &delegationVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status, version FROM actor_sessions WHERE session_id = ?`, sessionID.String()).Scan(&sessionStatus, &sessionVersion); err != nil {
+		t.Fatal(err)
+	}
+	if membershipStatus != string(domain.MembershipActive) || membershipVersion != 2 ||
+		delegationStatus != string(domain.DelegationActive) || delegationVersion != 2 ||
+		sessionStatus != string(domain.ActorSessionActive) || sessionVersion != 1 {
+		t.Fatalf("normalized lifecycle membership=(%s,%d) delegation=(%s,%d) session=(%s,%d)",
+			membershipStatus, membershipVersion, delegationStatus, delegationVersion, sessionStatus, sessionVersion)
+	}
+	var pending, consumed int
+	if err := store.db.QueryRow(`SELECT count(*) FROM ceremony_challenges WHERE status = 'pending'`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM ceremony_challenges WHERE status = 'consumed'`).Scan(&consumed); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 || consumed != 4 {
+		t.Fatalf("ceremonies pending=%d consumed=%d", pending, consumed)
+	}
+	var nextEvents, nextAudit uint64
+	if err := store.db.QueryRow(`SELECT next_sequence, next_audit_sequence FROM authority_streams WHERE scope_kind = 'workspace' AND scope_id = ?`, workspace.ID().String()).Scan(&nextEvents, &nextAudit); err != nil {
+		t.Fatal(err)
+	}
+	if nextEvents != 10 || nextAudit != 8 {
+		t.Fatalf("workspace stream cursors=(%d,%d), want (10,8)", nextEvents, nextAudit)
+	}
+	var clientName, clientVersion, credentialRef, audience string
+	var issuedAt, expiresAt int64
+	if err := store.db.QueryRow(`SELECT client_name, client_version, presentation_credential_reference,
+		presentation_credential_audience, issued_at_us, expires_at_us FROM actor_sessions WHERE session_id = ?`, sessionID.String()).Scan(
+		&clientName, &clientVersion, &credentialRef, &audience, &issuedAt, &expiresAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if clientName != clientMetadata.Name() || clientVersion != clientMetadata.Version() ||
+		credentialRef != credentialReference.String() || audience != credentialAudience.String() || issuedAt <= 0 || expiresAt <= issuedAt {
+		t.Fatal("actor session fields did not round-trip through normalized storage")
+	}
+}
+
+func mustExecuteProductionCommand(
+	t *testing.T,
+	store *Store,
+	spec application.CommandSpec,
+	decide func(application.CommandContext) (application.CommandDecision, error),
+) application.CommandTransactionExecution {
+	t.Helper()
+	execution, err := store.ExecuteCommand(context.Background(), spec, decide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Kind() != application.CommandTransactionCommitted {
+		t.Fatalf("execution kind=%q, want committed", execution.Kind())
+	}
+	return execution
+}
+
+func newProductionCommandSpec(
+	t *testing.T,
+	security securityFixture,
+	step productionCommandStep,
+	index int,
+) application.CommandSpec {
+	t.Helper()
+	operation, err := domain.NewOperationName(string(step.operation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID, err := domain.ParseClientInstanceID(commandTestUUID(220 + index*10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := domain.NewIdempotencyKey(fmt.Sprintf("sqlite-production-%02d", index))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receiptIdentity application.ReceiptIdentity
+	if step.scope.Kind() == domain.ScopeKindInstallation {
+		receiptIdentity, err = application.InstallationAdminReceiptIdentity(
+			security.invitation.InstallationID(), step.principal, clientID, operation, key,
+		)
+	} else {
+		workspaceID, parseErr := domain.ParseWorkspaceID(step.scope.ID())
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		idempotency, scopeErr := domain.NewIdempotencyScope(workspaceID, step.principal, clientID, operation, key)
+		if scopeErr != nil {
+			t.Fatal(scopeErr)
+		}
+		receiptIdentity, err = application.OrdinaryReceiptIdentity(idempotency)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := productionAggregateRefs(t, step.authorization)
+	references := productionAggregateRefs(t, step.references)
+	disclosure := productionAggregateTargets(t, step.disclosure)
+	guardPlan, err := application.NewCommandGuardPlan(application.CommandGuardPlanParams{
+		AdmissionScope: step.admission, AdmissionGeneration: security.admission,
+		Evidence: step.evidence, Authorization: authorization, References: references,
+		Disclosure: disclosure, Mutations: step.mutations, Ceremonies: step.ceremonies, Genesis: step.genesis,
+	})
+	if err != nil {
+		t.Fatalf("guard plan for %s: %v", step.operation, err)
+	}
+	expectedFacts := make([]application.FactExpectation, len(step.facts))
+	for factIndex, fact := range step.facts {
+		eventID, parseErr := domain.ParseEventID(commandTestUUID(300 + index*10 + factIndex))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		expectedFacts[factIndex], err = application.NewFactExpectation(eventID, fact.Type(), fact.Origin())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	recovery := application.NotApplicableRecoveryCapsulePlan()
+	if step.recovery {
+		seed := sha256.Sum256([]byte("sqlite production capsule:" + string(step.operation)))
+		recovery, err = application.PrepareRecoveryCapsulePlan(commandTestSigner{private: ed25519.NewKeyFromSeed(seed[:])})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	major, _ := application.NewOperationMajor(1)
+	commandID := mustCommandID(t, 221+index*10)
+	receiptID := mustReceiptID(t, 222+index*10)
+	correlationID, err := domain.ParseCorrelationID(commandTestUUID(223 + index*10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeClass := step.timeClass
+	if timeClass == "" {
+		timeClass = application.AuthorityTimeOrdinary
+	}
+	spec, err := application.NewCommandSpec(application.CommandSpecParams{
+		Scope: step.scope, AuthorityID: security.authority, RequestedEpoch: security.epoch,
+		CommandID: commandID, ReceiptID: receiptID, Operation: operation, OperationMajor: major,
+		ReceiptIdentity:    receiptIdentity,
+		RequestFingerprint: domain.FingerprintCommand([]byte("sqlite production command:" + string(step.operation))),
+		Authorship:         step.authorship, CorrelationID: correlationID, AuthorityTimeClass: timeClass,
+		RecoveryCapsule: recovery, Guards: guardPlan, ExpectedFacts: expectedFacts,
+	})
+	if err != nil {
+		t.Fatalf("command spec for %s: %v", step.operation, err)
+	}
+	return spec
+}
+
+func executeProductionStep(
+	t *testing.T,
+	store *Store,
+	spec application.CommandSpec,
+	step productionCommandStep,
+	index int,
+) application.CommandTransactionExecution {
+	t.Helper()
+	return mustExecuteProductionCommand(t, store, spec, func(locked application.CommandContext) (application.CommandDecision, error) {
+		var (
+			commit application.OperationCommit
+			err    error
+		)
+		authorityTime, present := locked.AuthorityTime()
+		if !present {
+			return application.CommandDecision{}, fmt.Errorf("persisted authority time absent")
+		}
+		result := step.result
+		if step.resolveResult != nil {
+			result, err = step.resolveResult(authorityTime)
+			if err != nil {
+				return application.CommandDecision{}, fmt.Errorf("resolve %s result: %w", step.operation, err)
+			}
+		}
+		switch result := result.(type) {
+		case domain.CreateWorkspaceResult:
+			commit, err = application.CreateWorkspaceCommit(locked, result)
+		case domain.BeginDevicePairingResult:
+			commit, err = application.BeginDevicePairingCommit(locked, result)
+		case domain.PairDeviceResult:
+			commit, err = application.PairDeviceCommit(locked, result)
+		case domain.InviteWorkspaceMemberResult:
+			commit, err = application.InviteWorkspaceMemberCommit(locked, result)
+		case domain.AcceptWorkspaceMembershipResult:
+			commit, err = application.AcceptWorkspaceMembershipCommit(locked, result)
+		case domain.CreateActorResult:
+			commit, err = application.CreateActorCommit(locked, result)
+		case domain.ProposeActorDelegationResult:
+			commit, err = application.ProposeActorDelegationCommit(locked, result)
+		case domain.ActivateActorDelegationResult:
+			commit, err = application.ActivateActorDelegationCommit(locked, result)
+		case domain.StartActorSessionResult:
+			commit, err = application.StartActorSessionCommit(locked, result)
+		default:
+			return application.CommandDecision{}, fmt.Errorf("unsupported production result %T", result)
+		}
+		if err != nil {
+			return application.CommandDecision{}, fmt.Errorf("commit %s: %w", step.operation, err)
+		}
+		audit, err := application.NewAuditIntent(
+			spec.Operation(), application.AuditCommandApplied, spec.RequestFingerprint(), application.CommandAppliedAuditDetail(),
+		)
+		if err != nil {
+			return application.CommandDecision{}, err
+		}
+		request, err := application.NewAuditRequestContext(
+			fmt.Sprintf("sqlite-production-request-%02d", index),
+			fmt.Sprintf("sqlite-production-trace-%02d", index), authorityTime, nil,
+		)
+		if err != nil {
+			return application.CommandDecision{}, err
+		}
+		provenance, err := application.NewAuditProvenanceEvidence(spec.AuthorityID(), nil)
+		if err != nil {
+			return application.CommandDecision{}, err
+		}
+		authentication, err := application.NewAuthenticationEvidence(step.principal, nil, provenance)
+		if err != nil {
+			return application.CommandDecision{}, err
+		}
+		audit, err = application.BindCommandAuditContext(audit, spec, request, authentication)
+		if err != nil {
+			return application.CommandDecision{}, err
+		}
+		effects, err := application.NewEffectSet()
+		if err != nil {
+			return application.CommandDecision{}, err
+		}
+		decision, err := application.ApplyCommand(locked, commit, audit, effects)
+		if err != nil {
+			return application.CommandDecision{}, fmt.Errorf("apply %s: %w", step.operation, err)
+		}
+		if err := application.ValidateCommandDecision(locked, decision); err != nil {
+			return application.CommandDecision{}, fmt.Errorf("validate %s: %w", step.operation, err)
+		}
+		return decision, nil
+	})
+}
+
+func productionAggregateRefs(t *testing.T, values []any) []domain.AggregateRef {
+	t.Helper()
+	refs := make([]domain.AggregateRef, len(values))
+	for index, value := range values {
+		state, err := application.NewIdentityState(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs[index], err = productionAggregateRef(value, state.Version())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return refs
+}
+
+func productionAggregateTargets(t *testing.T, values []any) []domain.AggregateTarget {
+	t.Helper()
+	targets := make([]domain.AggregateTarget, len(values))
+	for index, value := range values {
+		state, err := application.NewIdentityState(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets[index] = state.Target()
+	}
+	return targets
+}
+
+func mustAbsentExpectation(t *testing.T, id any) domain.AggregateExpectation {
+	t.Helper()
+	var (
+		expectation domain.AggregateExpectation
+		err         error
+	)
+	switch id := id.(type) {
+	case domain.WorkspaceID:
+		expectation, err = domain.ExpectAggregateAbsent(id)
+	case domain.MembershipID:
+		expectation, err = domain.ExpectAggregateAbsent(id)
+	case domain.DeviceID:
+		expectation, err = domain.ExpectAggregateAbsent(id)
+	case domain.ActorID:
+		expectation, err = domain.ExpectAggregateAbsent(id)
+	case domain.ActorDelegationID:
+		expectation, err = domain.ExpectAggregateAbsent(id)
+	case domain.ActorSessionID:
+		expectation, err = domain.ExpectAggregateAbsent(id)
+	default:
+		t.Fatalf("unsupported aggregate identifier %T", id)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return expectation
+}
+
+func mustVersionExpectation(t *testing.T, value any) domain.AggregateExpectation {
+	t.Helper()
+	state, err := application.NewIdentityState(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := productionAggregateRef(value, state.Version())
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch value := value.(type) {
+	case domain.PrincipalState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.DeviceState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.GrantState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.WorkspaceState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.MembershipState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.ActorState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.ActorDelegationState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	case domain.ActorSessionState:
+		return mustExpectedVersion(t, value.ID(), ref.Version())
+	default:
+		t.Fatalf("unsupported versioned aggregate %T", value)
+		return domain.AggregateExpectation{}
+	}
+}
+
+func mustAuthorityEvidence(t *testing.T, scope domain.AuthorityScope, authority domain.AuthorityID, epoch domain.AuthorityEpoch) application.EvidenceGuard {
+	t.Helper()
+	guard, err := application.CurrentAuthorityEpochGuard(scope, authority, epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
+}
+
+func mustPolicyEvidence(t *testing.T, scope domain.AuthorityScope, policy domain.PolicyRevision) application.EvidenceGuard {
+	t.Helper()
+	guard, err := application.PolicyRevisionGuard(scope, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
+}
+
+func mustLifecycleEvidence(t *testing.T, value any) application.EvidenceGuard {
+	t.Helper()
+	state, err := application.NewIdentityState(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	switch value := value.(type) {
+	case domain.PrincipalState:
+		status = string(value.Status())
+	case domain.DeviceState:
+		status = string(value.Status())
+	case domain.GrantState:
+		status = string(value.Status())
+	case domain.WorkspaceState:
+		status = string(value.Status())
+	case domain.MembershipState:
+		status = string(value.Status())
+	case domain.ActorState:
+		status = string(value.Status())
+	case domain.ActorDelegationState:
+		status = string(value.Status())
+	case domain.ActorSessionState:
+		status = string(value.Status())
+	default:
+		t.Fatalf("unsupported lifecycle state %T", value)
+	}
+	guard, err := application.LifecycleStatusGuard(state.Target(), status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
+}
+
+func mustTrustEvidence(t *testing.T, device domain.DeviceState) application.EvidenceGuard {
+	t.Helper()
+	guard, err := application.DeviceTrustRevisionGuard(device.ID(), device.TrustRevision())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
+}
+
+func mustCeilingEvidence(t *testing.T, value any, label string) application.EvidenceGuard {
+	t.Helper()
+	state, err := application.NewIdentityState(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := application.CapabilityCeilingGuard(state.Target(), application.DigestBytes([]byte(label)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
+}
+
+func mustConstraintEvidence(t *testing.T, value any, label string) application.EvidenceGuard {
+	t.Helper()
+	state, err := application.NewIdentityState(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := application.ResourceConstraintGuard(state.Target(), application.DigestBytes([]byte(label)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guard
+}
+
+func mustReserveCeremony(t *testing.T, challenge domain.CeremonyChallenge, owner any) application.CeremonyClaim {
+	t.Helper()
+	state, err := application.NewIdentityState(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := application.ReserveCeremony(challenge, state.Target())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+func mustConsumeCeremony(t *testing.T, challenge domain.CeremonyChallenge, owner any) application.CeremonyClaim {
+	t.Helper()
+	state, err := application.NewIdentityState(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerRef, err := productionAggregateRef(owner, state.Version())
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := application.ConsumeEmbeddedCeremony(
+		challenge.ID(), challenge.Purpose(), challenge.ProofDigest(), ownerRef,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+func productionAggregateRef(value any, version domain.Version) (domain.AggregateRef, error) {
+	switch value := value.(type) {
+	case domain.InstallationInvitationState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.PrincipalState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.DeviceState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.GrantState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.WorkspaceState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.MembershipState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.ActorState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.ActorDelegationState:
+		return domain.NewAggregateRef(value.ID(), version)
+	case domain.ActorSessionState:
+		return domain.NewAggregateRef(value.ID(), version)
+	default:
+		return domain.AggregateRef{}, fmt.Errorf("unsupported aggregate state %T", value)
+	}
+}
+
+func mustExpectedVersion[ID interface {
+	domain.PrincipalID | domain.DeviceID | domain.GrantID | domain.WorkspaceID | domain.MembershipID |
+		domain.ActorID | domain.ActorDelegationID | domain.ActorSessionID
+}](t *testing.T, id ID, version domain.Version) domain.AggregateExpectation {
+	t.Helper()
+	var (
+		expectation domain.AggregateExpectation
+		err         error
+	)
+	switch id := any(id).(type) {
+	case domain.PrincipalID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.DeviceID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.GrantID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.WorkspaceID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.MembershipID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.ActorID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.ActorDelegationID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	case domain.ActorSessionID:
+		expectation, err = domain.ExpectAggregateVersion(id, version)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return expectation
+}
+
+func mustConsumeStandaloneCeremony(t *testing.T, challenge domain.CeremonyChallenge) application.CeremonyClaim {
+	t.Helper()
+	claim, err := application.ConsumeStandaloneCeremony(challenge.ID(), challenge.Purpose(), challenge.ProofDigest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
 func TestExecuteCommandReceiptConflictsRollbackWithoutCallingAppliedPath(t *testing.T) {
 	t.Parallel()
 	store := openSecurityStore(t)
