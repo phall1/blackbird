@@ -87,6 +87,12 @@ func (provenance AuthenticationAuditProvenance) FederationEnvelopeID() (string, 
 	return provenance.federationEnvelope, provenance.hasEnvelope
 }
 
+func (provenance AuthenticationAuditProvenance) valid() bool {
+	return !provenance.sourceAuthority.IsZero() &&
+		(!provenance.hasEnvelope && provenance.federationEnvelope == "" ||
+			provenance.hasEnvelope && validCanonicalIdentifier(provenance.federationEnvelope, maxFederationEnvelopeIDBytes))
+}
+
 // AuthenticationEvidence is the immutable result of cryptographic
 // authentication. Its zero value is invalid, and only this package can create
 // a valid value, so transports cannot manufacture trusted identity evidence.
@@ -131,7 +137,7 @@ type AuthenticationEvidenceParams struct {
 func NewAuthenticationEvidence(params AuthenticationEvidenceParams) (AuthenticationEvidence, error) {
 	if params.PrincipalID.IsZero() || !params.PrincipalRevision.Valid() ||
 		params.ChannelBinding.String() == "" || params.Audience.String() == "" ||
-		params.AuditProvenance.sourceAuthority.IsZero() || params.VerifiedAt.IsZero() {
+		!params.AuditProvenance.valid() || params.VerifiedAt.IsZero() || params.VerifiedAt.After(time.Now()) {
 		return AuthenticationEvidence{}, invalid("authentication_evidence", "contains invalid trusted evidence")
 	}
 	evidence := AuthenticationEvidence{
@@ -141,7 +147,9 @@ func NewAuthenticationEvidence(params AuthenticationEvidenceParams) (Authenticat
 	}
 	if params.DeviceID != nil {
 		if params.DeviceID.IsZero() || !params.DeviceRevision.Valid() || !params.DeviceTrustRevision.Valid() ||
-			!params.DeviceRevocationRevision.Valid() || params.CredentialFingerprint.IsZero() {
+			!params.DeviceRevocationRevision.Valid() || params.CredentialFingerprint.IsZero() ||
+			params.DeviceTrustRevision.Uint64() > params.DeviceRevision.Uint64() ||
+			params.DeviceRevocationRevision.Uint64() > params.DeviceRevision.Uint64() {
 			return AuthenticationEvidence{}, invalid("device_evidence", "must contain a complete valid device evidence tuple")
 		}
 		evidence.device, evidence.hasDevice = *params.DeviceID, true

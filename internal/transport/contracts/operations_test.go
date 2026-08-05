@@ -56,9 +56,9 @@ func TestAuthenticationEvidenceIsSealedTypedAndComplete(t *testing.T) {
 		t.Fatalf("NewAuthenticationAuditProvenance() error = %v", err)
 	}
 	principalRevision, _ := domain.NewVersion(2)
-	deviceRevision, _ := domain.NewVersion(3)
+	deviceRevision, _ := domain.NewVersion(5)
 	trustRevision, _ := domain.NewVersion(4)
-	revocationRevision, _ := domain.NewVersion(5)
+	revocationRevision, _ := domain.NewVersion(3)
 	sessionRevision, _ := domain.NewVersion(6)
 	credentialFingerprint, _ := domain.NewCredentialDigest(sha256.Sum256([]byte("public credential identity")))
 	grantOne, _ := domain.NewAggregateRef(mustParseGrantID(t, idGrant), domain.InitialVersion())
@@ -140,6 +140,9 @@ func TestAuthenticationEvidenceConstructorsRejectInvalidValues(t *testing.T) {
 		{name: "zero principal", edit: func(params *AuthenticationEvidenceParams) { params.PrincipalID = domain.PrincipalID{} }},
 		{name: "zero principal revision", edit: func(params *AuthenticationEvidenceParams) { params.PrincipalRevision = domain.Version{} }},
 		{name: "zero verified at", edit: func(params *AuthenticationEvidenceParams) { params.VerifiedAt = time.Time{} }},
+		{name: "zero channel binding", edit: func(params *AuthenticationEvidenceParams) { params.ChannelBinding = ChannelBindingDigest{} }},
+		{name: "zero audience", edit: func(params *AuthenticationEvidenceParams) { params.Audience = AuthenticationAudience{} }},
+		{name: "zero provenance", edit: func(params *AuthenticationEvidenceParams) { params.AuditProvenance = AuthenticationAuditProvenance{} }},
 		{name: "device facts without device", edit: func(params *AuthenticationEvidenceParams) { params.DeviceRevision = domain.InitialVersion() }},
 		{name: "session revision without session", edit: func(params *AuthenticationEvidenceParams) { params.ActorSessionRevision = domain.InitialVersion() }},
 		{name: "zero grant", edit: func(params *AuthenticationEvidenceParams) { params.GrantRevisions = []domain.AggregateRef{{}} }},
@@ -183,6 +186,12 @@ func TestAuthenticationEvidenceRejectsInconsistentOptionalAndGrantEvidence(t *te
 		{name: "missing trust revision", edit: func(params *AuthenticationEvidenceParams) { params.DeviceTrustRevision = domain.Version{} }},
 		{name: "missing revocation revision", edit: func(params *AuthenticationEvidenceParams) { params.DeviceRevocationRevision = domain.Version{} }},
 		{name: "missing credential fingerprint", edit: func(params *AuthenticationEvidenceParams) { params.CredentialFingerprint = domain.CredentialDigest{} }},
+		{name: "trust revision beyond device", edit: func(params *AuthenticationEvidenceParams) {
+			params.DeviceTrustRevision, _ = domain.NewVersion(2)
+		}},
+		{name: "revocation revision beyond device", edit: func(params *AuthenticationEvidenceParams) {
+			params.DeviceRevocationRevision, _ = domain.NewVersion(2)
+		}},
 		{name: "zero actor session", edit: func(params *AuthenticationEvidenceParams) { params.ActorSessionID = &domain.ActorSessionID{} }},
 		{name: "missing actor session revision", edit: func(params *AuthenticationEvidenceParams) { params.ActorSessionRevision = domain.Version{} }},
 		{name: "duplicate grant", edit: func(params *AuthenticationEvidenceParams) {
@@ -229,6 +238,11 @@ func TestAuthenticationEvidenceValidRejectsForgedInternalState(t *testing.T) {
 	forged.verifiedAt = time.Time{}
 	if forged.Valid() {
 		t.Fatal("forged zero verification timestamp is valid")
+	}
+	forged = evidence
+	forged.auditProvenance.hasEnvelope = true
+	if forged.Valid() {
+		t.Fatal("forged inconsistent audit provenance is valid")
 	}
 }
 
