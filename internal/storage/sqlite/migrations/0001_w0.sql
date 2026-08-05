@@ -461,7 +461,7 @@ CREATE TABLE projection_checkpoints (
     health TEXT NOT NULL CHECK (health IN ('healthy', 'blocked', 'poisoned', 'rebuilding')),
     poison_event_id TEXT,
     updated_at_us INTEGER NOT NULL CHECK (updated_at_us > 0),
-    PRIMARY KEY (projection_name, projection_schema, scope_kind, scope_id)
+    PRIMARY KEY (projection_name, projection_schema, scope_kind, scope_id, authority_epoch)
 ) STRICT;
 
 CREATE TABLE backup_sessions (
