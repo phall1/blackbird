@@ -362,9 +362,12 @@ func FuzzIdentityAggregateRehydration(f *testing.F) {
 
 	for aggregate := uint8(0); aggregate < 9; aggregate++ {
 		for mutation := uint8(0); mutation < 6; mutation++ {
-			f.Add(aggregate, mutation, uint8(0), uint8(1), uint64(2))
+			f.Add(aggregate, mutation, uint8(1), uint8(1), uint64(2))
+			f.Add(aggregate, mutation, uint8(2), uint8(2), uint64(2))
 		}
 	}
+	// Trusted device with a valid consumed challenge but a credential bound to another transcript.
+	f.Add(uint8(2), uint8(16), uint8(2), uint8(2), uint64(2))
 	for selector := uint8(0); selector < 7; selector++ {
 		f.Add(uint8(7), uint8(0), selector, selector, uint64(37))
 	}
