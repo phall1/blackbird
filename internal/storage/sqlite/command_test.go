@@ -518,10 +518,12 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 			timeClass: application.AuthorityTimeIssuesExpiringAuthority,
 		},
 	}
+	specs := make([]application.CommandSpec, len(steps))
 
 	for index, step := range steps {
 		t.Run(string(step.operation), func(t *testing.T) {
 			spec := newProductionCommandSpec(t, security, step, index)
+			specs[index] = spec
 			execution := executeProductionStep(t, store, spec, step, index)
 			if execution.Kind() != application.CommandTransactionCommitted {
 				t.Fatalf("execution kind=%q", execution.Kind())
@@ -609,6 +611,48 @@ func TestExecuteCommandPersistsRemainingW0ProductionAggregatePath(t *testing.T) 
 		credentialRef != credentialReference.String() || audience != credentialAudience.String() || issuedAt <= 0 || expiresAt <= issuedAt {
 		t.Fatal("actor session fields did not round-trip through normalized storage")
 	}
+
+	t.Run("split receipt identity fails closed", func(t *testing.T) {
+		primary, secondary := specs[3], specs[5]
+		identity := primary.ReceiptIdentity()
+		tx, err := store.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec(`DROP TRIGGER command_receipts_no_update`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(`UPDATE command_receipts SET idempotency_key = ? WHERE command_id = ?`,
+			identity.Key().String()+"-corrupt-primary", primary.CommandID().String()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(`UPDATE command_receipts SET workspace_id = ?, principal_id = ?, client_instance_id = ?,
+			operation = ?, idempotency_key = ? WHERE command_id = ?`, identity.WorkspaceID().String(),
+			identity.PrincipalID().String(), identity.ClientInstanceID().String(), identity.Operation().String(),
+			identity.Key().String(), secondary.CommandID().String()); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		called := false
+		execution, err := store.ExecuteCommand(context.Background(), primary, func(locked application.CommandContext) (application.CommandDecision, error) {
+			called = true
+			rejection, rejectionErr := domain.NewCommandError(domain.ErrorCodeInternal, "receipt integrity conflict", nil)
+			if rejectionErr != nil {
+				return application.CommandDecision{}, rejectionErr
+			}
+			return application.RollbackCommand(locked, rejection)
+		})
+		if err != nil || execution.Kind() != application.CommandTransactionRejected || !called {
+			t.Fatalf("integrity execution=%q callback=%v error=%v", execution.Kind(), called, err)
+		}
+		assertCommandRowCounts(t, store, map[string]int{
+			"command_receipts": 11, "domain_events": 15, "audit_entries": 12,
+		})
+	})
 }
 
 func mustExecuteProductionCommand(
