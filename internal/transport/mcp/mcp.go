@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdhttp "net/http"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -132,6 +133,17 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 
 func (server *Server) NotifyContextChanged(ctx context.Context) error {
 	return server.ResourceUpdated(ctx, &sdkmcp.ResourceUpdatedNotificationParams{URI: ResourceCurrentContext})
+}
+
+// HTTPHandler exposes this server through the official Streamable HTTP
+// transport. A nil receiver remains fail-closed through the SDK's nil selector.
+func (server *Server) HTTPHandler(options *sdkmcp.StreamableHTTPOptions) stdhttp.Handler {
+	return sdkmcp.NewStreamableHTTPHandler(func(*stdhttp.Request) *sdkmcp.Server {
+		if server == nil {
+			return nil
+		}
+		return server.Server
+	}, options)
 }
 
 type operationHandler[Request, Result any] func(context.Context, contracts.AuthenticationEvidence, Request) (Result, *contracts.ErrorDTO, error)

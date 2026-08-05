@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -1261,5 +1262,176 @@ func TestErrorJSONRejectsTrailingValueAndMissingRequired(t *testing.T) {
 	trailing = append(trailing, []byte(` {}`)...)
 	if _, err := DecodeError(trailing); !errors.Is(err, ErrInvalidJSON) {
 		t.Fatalf("trailing value error = %v, want ErrInvalidJSON", err)
+	}
+}
+
+func TestApplicationQueryDTOProjection(t *testing.T) {
+	t.Parallel()
+
+	workspace := mustParseWorkspaceID(t, idWorkspace)
+	principal := mustParsePrincipalID(t, idPrincipal)
+	actor := mustParseActorID(t, idActor)
+	session := mustParseActorSessionID(t, idSession)
+	policy, err := domain.NewPolicyRevision("policy-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := application.NewAuthorizationRevision(domain.AggregateKindActorSession, session.String(), domain.InitialVersion())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := application.NewAuthorizedSessionView(
+		workspace, principal, actor, session, policy, fixtureTime.Add(time.Hour), []application.AuthorizationRevision{revision},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := func(kind application.ContextRecordKind, id string, state application.ContextLifecycleState) application.ContextRecord {
+		t.Helper()
+		value, recordErr := application.NewTypedContextRecord(application.ContextRecordParams{
+			Kind: kind, ID: id, Version: domain.InitialVersion(), LifecycleState: state, CanonicalPayload: []byte(`{}`),
+		})
+		if recordErr != nil {
+			t.Fatal(recordErr)
+		}
+		return value
+	}
+	cursor, _ := application.NewEventCursor("bbec1_projection")
+	checkpointID, _ := application.NewCheckpointID(idEventThree)
+	checkpoint, err := application.NewContextCheckpoint(application.ContextCheckpointParams{
+		CheckpointID: checkpointID, AuthorityID: mustParseAuthorityID(t, idAuthority),
+		AuthorityEpoch: mustParseAuthorityEpoch(t, idEpoch), ThroughCursor: cursor, ProjectionVersion: 1,
+		ServerTime: fixtureTime, Session: view,
+		Records: []application.ContextRecord{
+			record(application.ContextRecordWorkspace, idWorkspace, application.ContextStateActive),
+			record(application.ContextRecordPrincipal, idPrincipal, application.ContextStateActive),
+			record(application.ContextRecordActor, idActor, application.ContextStateActive),
+			record(application.ContextRecordMembership, idMembership, application.ContextStateActive),
+			record(application.ContextRecordDelegation, idDelegation, application.ContextStateActive),
+			record(application.ContextRecordSession, idSession, application.ContextStateActive),
+			record(application.ContextRecordDevice, idDevice, application.ContextStateTrusted),
+			record(application.ContextRecordGrant, idGrant, application.ContextStateActive),
+			record(application.ContextRecordCollaborator, idPrincipal, application.ContextStateSuspended),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := application.NewContextCheckpointPage(checkpoint, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := contextPageDTO("req-context-projection", page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped.Checkpoint == nil || mapped.Checkpoint.Workspace.ID != idWorkspace ||
+		mapped.Checkpoint.Device == nil || mapped.Checkpoint.Device.ID != idDevice ||
+		len(mapped.Checkpoint.Grants) != 1 || len(mapped.Checkpoint.Collaborators) != 1 {
+		t.Fatalf("mapped checkpoint omitted typed context: %+v", mapped.Checkpoint)
+	}
+
+	scope, _ := domain.WorkspaceScope(workspace)
+	aggregate, _ := domain.NewAggregateRef(workspace, domain.InitialVersion())
+	eventVersion, _ := domain.NewEventSchemaVersion(1)
+	event, err := application.NewSyncedEvent(application.SyncedEventParams{
+		EventID: mustParseEventID(t, idEventOne), EventType: domain.EventTypeRunPlanned, EventVersion: eventVersion,
+		AuthorityID: mustParseAuthorityID(t, idAuthority), AuthorityEpoch: mustParseAuthorityEpoch(t, idEpoch),
+		Scope: scope, OriginPosition: mustStreamPosition(t, 1), Aggregate: aggregate, PrincipalID: principal,
+		ActorID: &actor, ActorSessionID: &session, CommandID: mustParseCommandID(t, idCommand),
+		CorrelationID: mustParseCorrelationID(t, idCorrelation), OccurredAt: fixtureTime, RecordedAt: fixtureTime,
+		Payload: []byte(`{"future":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventPage, err := application.NewEventsPage(view, cursor, cursor, cursor, []application.SyncedEvent{event}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mappedEvents, err := eventPageDTO("req-events-projection", eventPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mappedEvents.Events) != 1 || mappedEvents.Events[0].WorkspaceID == nil ||
+		*mappedEvents.Events[0].WorkspaceID != workspace || string(mappedEvents.Events[0].Extensions) != `{}` {
+		t.Fatalf("mapped event omitted canonical envelope: %+v", mappedEvents.Events)
+	}
+}
+
+func TestApplicationQueryErrorProjection(t *testing.T) {
+	t.Parallel()
+
+	session := mustParseActorSessionID(t, idSession)
+	cases := []struct {
+		code     domain.ErrorCode
+		recovery RecoveryAction
+	}{
+		{domain.ErrorCodeUnauthenticated, RecoveryReauthenticate},
+		{domain.ErrorCodeSessionExpired, RecoveryResumeSession},
+		{domain.ErrorCodeCursorInvalid, RecoveryDiscardCursor},
+		{domain.ErrorCodeCursorScopeMismatch, RecoveryRestartQuery},
+		{domain.ErrorCodeCursorExpired, RecoveryObtainCheckpoint},
+		{domain.ErrorCodeBackpressure, RecoveryRetryAfterDelay},
+	}
+	for _, test := range cases {
+		test := test
+		t.Run(string(test.code), func(t *testing.T) {
+			t.Parallel()
+			rejection, err := domain.NewCommandError(test.code, "safe storage detail", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure, internal := queryErrorDTO("req-query-error", "events:sync", session, rejection)
+			if internal != nil || failure == nil || failure.Details.Recovery != test.recovery || failure.Validate() != nil {
+				t.Fatalf("failure=%+v internal=%v", failure, internal)
+			}
+		})
+	}
+	for _, code := range []domain.ErrorCode{domain.ErrorCodeForbidden, domain.ErrorCodeCapabilityRequired} {
+		rejection, _ := domain.NewCommandError(code, "safe storage detail", nil)
+		failure, internal := queryErrorDTO("req-query-error", "context:read", session, rejection)
+		if internal != nil || failure == nil || failure.Details.DeniedCapability != "context:read" ||
+			failure.Details.ResourceScope == nil || failure.Details.ResourceScope.ID != idSession || failure.Validate() != nil {
+			t.Fatalf("authorization failure=%+v internal=%v", failure, internal)
+		}
+	}
+}
+
+func TestApplicationQuerySubjectRequiresExactAuthenticatedSession(t *testing.T) {
+	t.Parallel()
+
+	principal := mustParsePrincipalID(t, idPrincipal)
+	session := mustParseActorSessionID(t, idSession)
+	binding, err := NewChannelBindingDigest(strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	audience, err := NewAuthenticationAudience("blackbird.http")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := NewAuthenticationAuditProvenance(mustParseAuthorityID(t, idAuthority), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := NewAuthenticationEvidence(AuthenticationEvidenceParams{
+		PrincipalID: principal, PrincipalRevision: domain.InitialVersion(), ActorSessionID: &session,
+		ActorSessionRevision: domain.InitialVersion(), ChannelBinding: binding, Audience: audience,
+		AuditProvenance: provenance, VerifiedAt: fixtureTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := querySubject(evidence, session)
+	if err != nil || subject.PrincipalID() != principal || subject.ActorSessionID() != session {
+		t.Fatalf("subject=%+v error=%v", subject, err)
+	}
+	other := mustParseActorSessionID(t, idEventTwo)
+	if _, err := querySubject(evidence, other); !errors.Is(err, application.ErrInvalidApplicationContract) {
+		t.Fatalf("mismatched session error=%v", err)
+	}
+	if _, err := NewApplicationHandler(nil); !errors.Is(err, application.ErrInvalidApplicationContract) {
+		t.Fatalf("nil query service error=%v", err)
 	}
 }

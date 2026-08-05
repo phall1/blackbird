@@ -239,6 +239,35 @@ func TestMCPDiscoveryStrictnessResourcesAndCancellation(t *testing.T) {
 	}
 }
 
+func TestStreamableHTTPHandler(t *testing.T) {
+	t.Parallel()
+
+	session := parseSession(t)
+	handlers := &testHandlers{events: successfulEvents, context: contextFailure}
+	server := newTestServer(t, handlers, &testSessionBinder{session: session})
+	httpServer := httptest.NewServer(server.HTTPHandler(&sdkmcp.StreamableHTTPOptions{
+		Stateless: true, JSONResponse: true, MaxRequestBodyBytes: contracts.MaxCommandJSONBytes,
+		PropagateRequestCancellation: true,
+	}))
+	defer httpServer.Close()
+
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "blackbird-http-test", Version: "v1"}, nil)
+	clientSession, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
+		Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect Streamable HTTP: %v", err)
+	}
+	defer func() { _ = clientSession.Close() }()
+	tools, err := clientSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools over Streamable HTTP: %v", err)
+	}
+	if len(tools.Tools) != 13 {
+		t.Fatalf("Streamable HTTP tool count = %d, want 13", len(tools.Tools))
+	}
+}
+
 func TestNewServerRequiresCompleteComposition(t *testing.T) {
 	t.Parallel()
 	if _, err := NewServer(Dependencies{}); err == nil {
