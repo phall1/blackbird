@@ -63,6 +63,69 @@ func TestFullIntegrityCheckReportsAdministrativeOperation(t *testing.T) {
 	}
 }
 
+func TestPassiveCheckpointReportsFramesPinnedByLongReader(t *testing.T) {
+	t.Parallel()
+	store := newOperationStore(t)
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, "PRAGMA wal_autocheckpoint = 0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, "CREATE TABLE reader_probe (value INTEGER NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, "INSERT INTO reader_probe VALUES (0)"); err != nil {
+		t.Fatal(err)
+	}
+	bounded, cancel := context.WithTimeout(ctx, time.Second)
+	if _, err := store.Checkpoint(bounded, CheckpointTruncate); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+
+	reader, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Rollback() })
+	var initial int
+	if err := reader.QueryRowContext(ctx, "SELECT count(*) FROM reader_probe").Scan(&initial); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 64; index++ {
+		if _, err := store.db.ExecContext(ctx, "INSERT INTO reader_probe VALUES (?)", index); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report, err := store.Checkpoint(ctx, CheckpointPassive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.LogFrames <= 0 || report.CheckpointedFrames >= report.LogFrames || report.RemainingFrames <= 0 || report.WALBytes <= 0 {
+		t.Fatalf("long-reader checkpoint report=%+v", report)
+	}
+	var pinned int
+	if err := reader.QueryRowContext(ctx, "SELECT count(*) FROM reader_probe").Scan(&pinned); err != nil {
+		t.Fatal(err)
+	}
+	if pinned != initial {
+		t.Fatalf("reader snapshot advanced from %d rows to %d", initial, pinned)
+	}
+	if err := reader.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	bounded, cancel = context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	released, err := store.Checkpoint(bounded, CheckpointTruncate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.Busy || released.RemainingFrames != 0 || released.WALBytes != 0 {
+		t.Fatalf("released-reader checkpoint report=%+v", released)
+	}
+}
+
 func TestQualifyFilesystemReportsOwnershipPermissionsSpaceAndLocks(t *testing.T) {
 	t.Parallel()
 	root := filepath.Join(t.TempDir(), "authority")

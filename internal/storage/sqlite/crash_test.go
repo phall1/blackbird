@@ -119,6 +119,40 @@ func TestCrashRecoveryRetainsAtomicCommitFromWAL(t *testing.T) {
 	}
 }
 
+func TestCrashRecoveryDiscardsTransactionWithTruncatedWALCommitTail(t *testing.T) {
+	source := newCrashDatabase(t)
+	output, err := runCrashHelper(t, source, "after-commit")
+	assertCrashExit(t, err, output)
+
+	isolated := filepath.Join(t.TempDir(), "truncated-wal.db")
+	copyCrashFixtureFile(t, source, isolated, 0)
+	walInfo, err := os.Stat(source + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walInfo.Size() < 512 {
+		t.Fatalf("crash WAL unexpectedly small: %d bytes", walInfo.Size())
+	}
+	copyCrashFixtureFile(t, source+"-wal", isolated+"-wal", walInfo.Size()-256)
+
+	store, err := Open(context.Background(), Config{Path: isolated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if !store.Diagnostics().UncleanCheckRan {
+		t.Fatal("truncated WAL fixture did not trigger unclean-startup integrity gate")
+	}
+	assertPublicationCounts(t, store.db, [3]int{})
+	if err := store.IntegrityCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCrashHarnessDistinguishesCleanAndUncleanStartup(t *testing.T) {
 	path := newCrashDatabase(t)
 	if output, err := runCrashHelper(t, path, "clean-close"); err != nil {
@@ -245,6 +279,20 @@ func assertCrashExit(t *testing.T, err error, output string) {
 	var exitError *exec.ExitError
 	if !errors.As(err, &exitError) || exitError.ExitCode() != crashExitCode {
 		t.Fatalf("helper exit=%v, want code %d\n%s", err, crashExitCode, output)
+	}
+}
+
+func copyCrashFixtureFile(t *testing.T, source, target string, limit int64) {
+	t.Helper()
+	contents, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit > 0 {
+		contents = contents[:limit]
+	}
+	if err := os.WriteFile(target, contents, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -63,6 +63,9 @@ type onlineRestorer interface {
 	NewRestore(string) (*sqlitedriver.Backup, error)
 }
 
+type backupStepHookKey struct{}
+type backupPublishHookKey struct{}
+
 // Backup creates and verifies an online snapshot without copying the live
 // database or WAL files. Failed snapshots remain under an unpublished partial
 // name for diagnosis and are never promoted to target.
@@ -87,7 +90,7 @@ func (store *Store) Backup(ctx context.Context, target string) (BackupManifest, 
 	if err := ctx.Err(); err != nil {
 		return BackupManifest{}, fmt.Errorf("cancel SQLite backup before publication: %w", err)
 	}
-	if err := publishPartial(partial, target); err != nil {
+	if err := publishPartial(ctx, partial, target); err != nil {
 		return BackupManifest{}, err
 	}
 	return manifest, nil
@@ -174,7 +177,7 @@ func Restore(ctx context.Context, backupPath string, manifest BackupManifest, ta
 	if err := ctx.Err(); err != nil {
 		return BackupManifest{}, fmt.Errorf("cancel SQLite restore before publication: %w", err)
 	}
-	if err := publishPartial(partial, target); err != nil {
+	if err := publishPartial(ctx, partial, target); err != nil {
 		return BackupManifest{}, err
 	}
 	return restored, nil
@@ -253,6 +256,9 @@ func stepBackup(ctx context.Context, backup *sqlitedriver.Backup) (finalErr erro
 		busySince = time.Time{}
 		if !more {
 			break
+		}
+		if hook, ok := ctx.Value(backupStepHookKey{}).(func()); ok {
+			hook()
 		}
 	}
 	if err := backup.Finish(); err != nil {
@@ -475,7 +481,7 @@ func reservePartialTarget(target string) (string, error) {
 	return partial, nil
 }
 
-func publishPartial(partial, target string) error {
+func publishPartial(ctx context.Context, partial, target string) error {
 	for _, candidate := range []string{target, target + "-wal", target + "-shm"} {
 		if _, err := os.Lstat(candidate); err == nil {
 			return fmt.Errorf("%w (verified partial retained at %s)", ErrTargetExists, partial)
@@ -485,6 +491,18 @@ func publishPartial(partial, target string) error {
 	}
 	if err := syncPath(partial); err != nil {
 		return fmt.Errorf("sync verified SQLite partial %s: %w", partial, err)
+	}
+	if hook, ok := ctx.Value(backupPublishHookKey{}).(func() error); ok {
+		if err := hook(); err != nil {
+			return fmt.Errorf("prepare SQLite publication fault: %w", err)
+		}
+	}
+	for _, sidecar := range []string{target + "-wal", target + "-shm"} {
+		if _, err := os.Lstat(sidecar); err == nil {
+			return fmt.Errorf("%w (verified partial retained at %s)", ErrTargetExists, partial)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect SQLite publication sidecar: %w", err)
+		}
 	}
 	if err := renameNoReplace(partial, target); err != nil {
 		if errors.Is(err, os.ErrExist) {

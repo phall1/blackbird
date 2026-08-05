@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -264,5 +265,143 @@ func TestBackupRejectsNonFreshTargetsAndTampering(t *testing.T) {
 	}
 	if len(partials) != 1 {
 		t.Fatalf("cancelled backup retained partials=%v, want one", partials)
+	}
+}
+
+func TestBackupCancellationBetweenOnlineCopyStepsRetainsOnlyPartial(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := Open(ctx, Config{Path: filepath.Join(root, "source.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := store.db.ExecContext(ctx, "CREATE TABLE copy_probe (payload BLOB NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 256; index++ {
+		if _, err := store.db.ExecContext(ctx, "INSERT INTO copy_probe VALUES (randomblob(4096))"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	steps := 0
+	cancelled = context.WithValue(cancelled, backupStepHookKey{}, func() {
+		steps++
+		cancel()
+	})
+	target := filepath.Join(root, "cancelled-mid-copy.db")
+	if _, err := store.Backup(cancelled, target); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-copy cancellation error=%v", err)
+	}
+	if steps != 1 {
+		t.Fatalf("completed online copy steps=%d, want 1 before cancellation", steps)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cancelled copy published target: %v", err)
+	}
+	partials, err := filepath.Glob(target + ".partial.*")
+	if err != nil || len(partials) != 1 {
+		t.Fatalf("retained partials=%v error=%v, want one", partials, err)
+	}
+	if _, err := store.db.ExecContext(ctx, "INSERT INTO copy_probe VALUES (X'01')"); err != nil {
+		t.Fatalf("source unusable after cancelled copy: %v", err)
+	}
+}
+
+func TestVerifyBackupRejectsTruncatedAndCorruptDatabaseBytes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := Open(ctx, Config{Path: filepath.Join(root, "source.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	backupPath := filepath.Join(root, "backup.db")
+	manifest, err := store.Backup(ctx, backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contents) < 4096 {
+		t.Fatalf("backup unexpectedly small: %d bytes", len(contents))
+	}
+
+	truncated := filepath.Join(root, "truncated.db")
+	if err := os.WriteFile(truncated, contents[:len(contents)/2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := filepath.Join(root, "corrupt.db")
+	corruptContents := append([]byte(nil), contents...)
+	corruptContents[0] ^= 0xff
+	if err := os.WriteFile(corrupt, corruptContents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{truncated, corrupt} {
+		if _, err := VerifyBackup(ctx, path, manifest); !errors.Is(err, ErrInvalidBackup) {
+			t.Fatalf("verify %s error=%v, want invalid backup", filepath.Base(path), err)
+		}
+		target := path + ".restored"
+		if _, err := Restore(ctx, path, manifest, target); !errors.Is(err, ErrInvalidBackup) {
+			t.Fatalf("restore %s error=%v, want invalid backup", filepath.Base(path), err)
+		}
+		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("invalid backup %s published restore target: %v", filepath.Base(path), err)
+		}
+	}
+	if _, err := VerifyBackup(ctx, backupPath, manifest); err != nil {
+		t.Fatalf("intact backup no longer verifies: %v", err)
+	}
+}
+
+func TestBackupPublicationRejectsSidecarCreatedAfterVerification(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := Open(ctx, Config{Path: filepath.Join(root, "source.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	target := filepath.Join(root, "raced.db")
+	ctx = context.WithValue(ctx, backupPublishHookKey{}, func() error {
+		return os.WriteFile(target+"-wal", []byte("stale"), 0o600)
+	})
+	if _, err := store.Backup(ctx, target); !errors.Is(err, ErrTargetExists) {
+		t.Fatalf("publication race error=%v, want target exists", err)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sidecar race published database target: %v", err)
+	}
+	partials, err := filepath.Glob(target + ".partial.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedDatabase := false
+	for _, partial := range partials {
+		if !strings.HasSuffix(partial, "-wal") && !strings.HasSuffix(partial, "-shm") {
+			retainedDatabase = true
+		}
+	}
+	if !retainedDatabase {
+		t.Fatalf("publication race did not retain verified database partial: %v", partials)
 	}
 }
