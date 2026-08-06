@@ -39,6 +39,11 @@ func (digest ChannelBindingDigest) String() string {
 	return hex.EncodeToString(digest.value[:])
 }
 
+// Bytes returns the raw SHA-256 digest without any credential material.
+func (digest ChannelBindingDigest) Bytes() [sha256.Size]byte {
+	return digest.value
+}
+
 // AuthenticationAudience is the exact resource-server audience validated by
 // the authenticator. Equality is byte-for-byte; it is never inferred from a
 // request target or operation body.
