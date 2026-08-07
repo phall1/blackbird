@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
@@ -13,17 +14,35 @@ import (
 const queryRetryAfterMS uint32 = 1000
 
 // ApplicationHandler is the transport-neutral production dispatcher shared by
-// HTTP and MCP. Command methods are added as their proof-bearing ingress seam is
-// composed; query methods already dispatch the complete W0 read surface.
+// HTTP and MCP. Query methods dispatch the complete W0 read surface; command
+// methods are the proof-bearing ingress seam onto the application
+// OrchestrationService. Every dependency is mandatory so a partially composed
+// handler fails closed at construction instead of mid-request.
 type ApplicationHandler struct {
-	queries *application.QueryService
+	queries        *application.QueryService
+	commands       W0CommandDispatcher
+	assembler      *W0CommandAssembler
+	signers        application.RecoveryCapsuleSignerLookup
+	capsuleKeyID   string
+	serverReceived func() time.Time
 }
 
-func NewApplicationHandler(queries *application.QueryService) (*ApplicationHandler, error) {
-	if queries == nil {
+func NewApplicationHandler(
+	queries *application.QueryService,
+	commands W0CommandDispatcher,
+	assembler *W0CommandAssembler,
+	signers application.RecoveryCapsuleSignerLookup,
+	capsuleKeyID string,
+	serverReceived func() time.Time,
+) (*ApplicationHandler, error) {
+	if queries == nil || commands == nil || assembler == nil || signers == nil ||
+		capsuleKeyID == "" || serverReceived == nil {
 		return nil, application.ErrInvalidApplicationContract
 	}
-	return &ApplicationHandler{queries: queries}, nil
+	return &ApplicationHandler{
+		queries: queries, commands: commands, assembler: assembler, signers: signers,
+		capsuleKeyID: capsuleKeyID, serverReceived: serverReceived,
+	}, nil
 }
 
 func (handler *ApplicationHandler) HandleContextGet(

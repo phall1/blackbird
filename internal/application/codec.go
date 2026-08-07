@@ -2404,6 +2404,204 @@ func NewObserveWorkRefCommandHashView(
 func (observeWorkRefCommandHashView) canonicalView()   {}
 func (observeWorkRefCommandHashView) commandHashView() {}
 
+type CreateObjectiveAndWorkCommandHashParams struct {
+	Session            CommandExpectedResource `json:"session"`
+	ObjectiveID        CanonicalIdentifier     `json:"objective_id"`
+	ObjectiveTitle     string                  `json:"objective_title"`
+	AcceptanceCriteria string                  `json:"acceptance_criteria"`
+	WorkUnitID         CanonicalIdentifier     `json:"work_unit_id"`
+	WorkUnitTitle      string                  `json:"work_unit_title"`
+	WorkReference      CommandExpectedResource `json:"work_reference"`
+}
+
+type createObjectiveAndWorkCommandHashView struct {
+	Command commandHashContextWire                  `json:"command"`
+	Body    CreateObjectiveAndWorkCommandHashParams `json:"body"`
+}
+
+func NewCreateObjectiveAndWorkCommandHashView(context W0CommandHashContextParams, params CreateObjectiveAndWorkCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandCreateObjectiveAndWork, context)
+	if err != nil || !validCommandResource(params.Session) || params.ObjectiveID.String() == "" ||
+		!validCommandBoundedText(params.ObjectiveTitle, 512) ||
+		!validCommandBoundedText(params.AcceptanceCriteria, 8192) ||
+		params.WorkUnitID.String() == "" || !validCommandBoundedText(params.WorkUnitTitle, 512) ||
+		!validCommandResource(params.WorkReference) {
+		return nil, ErrCanonicalProfile
+	}
+	return createObjectiveAndWorkCommandHashView{Command: command, Body: params}, nil
+}
+
+func (createObjectiveAndWorkCommandHashView) canonicalView()   {}
+func (createObjectiveAndWorkCommandHashView) commandHashView() {}
+
+type ActivateObjectiveCommandHashParams struct {
+	Session   CommandExpectedResource `json:"session"`
+	Objective CommandExpectedResource `json:"objective"`
+}
+
+type activateObjectiveCommandHashView struct {
+	Command commandHashContextWire             `json:"command"`
+	Body    ActivateObjectiveCommandHashParams `json:"body"`
+}
+
+func NewActivateObjectiveCommandHashView(context W0CommandHashContextParams, params ActivateObjectiveCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandActivateObjective, context)
+	if err != nil || !validCommandResource(params.Session) || !validCommandResource(params.Objective) {
+		return nil, ErrCanonicalProfile
+	}
+	return activateObjectiveCommandHashView{Command: command, Body: params}, nil
+}
+
+func (activateObjectiveCommandHashView) canonicalView()   {}
+func (activateObjectiveCommandHashView) commandHashView() {}
+
+type CommandRunParticipantPlan struct {
+	ParticipationID CanonicalIdentifier     `json:"participation_id"`
+	Actor           CommandExpectedResource `json:"actor"`
+	Session         CommandExpectedResource `json:"session"`
+	Role            string                  `json:"role"`
+}
+
+type CommandRuntimeBindingPlan struct {
+	BindingID       CanonicalIdentifier     `json:"binding_id"`
+	ParticipationID CanonicalIdentifier     `json:"participation_id"`
+	SessionID       CanonicalIdentifier     `json:"session_id"`
+	RuntimeEndpoint CommandExpectedResource `json:"runtime_endpoint"`
+}
+
+type PlanRunWithBindingsCommandHashParams struct {
+	OperatorSession CommandExpectedResource     `json:"operator_session"`
+	RunID           CanonicalIdentifier         `json:"run_id"`
+	Objective       CommandExpectedResource     `json:"objective"`
+	WorkUnit        CommandExpectedResource     `json:"work_unit"`
+	Participants    []CommandRunParticipantPlan `json:"participants"`
+	Bindings        []CommandRuntimeBindingPlan `json:"bindings"`
+}
+
+type planRunWithBindingsCommandHashView struct {
+	Command commandHashContextWire               `json:"command"`
+	Body    PlanRunWithBindingsCommandHashParams `json:"body"`
+}
+
+func NewPlanRunWithBindingsCommandHashView(context W0CommandHashContextParams, params PlanRunWithBindingsCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandPlanRunWithBindings, context)
+	if err != nil || !validCommandResource(params.OperatorSession) || params.RunID.String() == "" ||
+		!validCommandResource(params.Objective) || !validCommandResource(params.WorkUnit) ||
+		len(params.Participants) == 0 || len(params.Participants) > domain.MaxRunParticipants ||
+		len(params.Bindings) == 0 || len(params.Bindings) > domain.MaxRunBindings {
+		return nil, ErrCanonicalProfile
+	}
+	participants := append([]CommandRunParticipantPlan(nil), params.Participants...)
+	for _, participant := range participants {
+		if participant.ParticipationID.String() == "" || !validCommandResource(participant.Actor) ||
+			!validCommandResource(participant.Session) || !validCommandBoundedText(participant.Role, 128) {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	slices.SortFunc(participants, func(left, right CommandRunParticipantPlan) int {
+		return strings.Compare(left.ParticipationID.String(), right.ParticipationID.String())
+	})
+	for index := 1; index < len(participants); index++ {
+		if participants[index-1].ParticipationID == participants[index].ParticipationID {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	bindings := append([]CommandRuntimeBindingPlan(nil), params.Bindings...)
+	for _, binding := range bindings {
+		if binding.BindingID.String() == "" || binding.ParticipationID.String() == "" ||
+			binding.SessionID.String() == "" || !validCommandResource(binding.RuntimeEndpoint) {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	slices.SortFunc(bindings, func(left, right CommandRuntimeBindingPlan) int {
+		return strings.Compare(left.BindingID.String(), right.BindingID.String())
+	})
+	for index := 1; index < len(bindings); index++ {
+		if bindings[index-1].BindingID == bindings[index].BindingID {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	params.Participants = participants
+	params.Bindings = bindings
+	return planRunWithBindingsCommandHashView{Command: command, Body: params}, nil
+}
+
+func (planRunWithBindingsCommandHashView) canonicalView()   {}
+func (planRunWithBindingsCommandHashView) commandHashView() {}
+
+type JoinRunCommandHashParams struct {
+	Session       CommandExpectedResource `json:"session"`
+	Run           CommandExpectedResource `json:"run"`
+	Participation CommandExpectedResource `json:"participation"`
+}
+
+type joinRunCommandHashView struct {
+	Command commandHashContextWire   `json:"command"`
+	Body    JoinRunCommandHashParams `json:"body"`
+}
+
+func NewJoinRunCommandHashView(context W0CommandHashContextParams, params JoinRunCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandJoinRun, context)
+	if err != nil || !validCommandResource(params.Session) || !validCommandResource(params.Run) ||
+		!validCommandResource(params.Participation) {
+		return nil, ErrCanonicalProfile
+	}
+	return joinRunCommandHashView{Command: command, Body: params}, nil
+}
+
+func (joinRunCommandHashView) canonicalView()   {}
+func (joinRunCommandHashView) commandHashView() {}
+
+type StartRunCommandHashParams struct {
+	OperatorSession CommandExpectedResource   `json:"operator_session"`
+	Run             CommandExpectedResource   `json:"run"`
+	Participations  []CommandExpectedResource `json:"participations"`
+}
+
+type startRunCommandHashView struct {
+	Command commandHashContextWire    `json:"command"`
+	Body    StartRunCommandHashParams `json:"body"`
+}
+
+func NewStartRunCommandHashView(context W0CommandHashContextParams, params StartRunCommandHashParams) (CommandHashView, error) {
+	command, err := commandHashContext(CommandStartRun, context)
+	if err != nil || !validCommandResource(params.OperatorSession) || !validCommandResource(params.Run) ||
+		len(params.Participations) == 0 || len(params.Participations) > domain.MaxRunParticipants {
+		return nil, ErrCanonicalProfile
+	}
+	participations := append([]CommandExpectedResource(nil), params.Participations...)
+	for _, participation := range participations {
+		if !validCommandResource(participation) {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	slices.SortFunc(participations, func(left, right CommandExpectedResource) int {
+		return strings.Compare(left.ID.String(), right.ID.String())
+	})
+	for index := 1; index < len(participations); index++ {
+		if participations[index-1].ID == participations[index].ID {
+			return nil, ErrCanonicalProfile
+		}
+	}
+	params.Participations = participations
+	return startRunCommandHashView{Command: command, Body: params}, nil
+}
+
+func (startRunCommandHashView) canonicalView()   {}
+func (startRunCommandHashView) commandHashView() {}
+
+func validCommandBoundedText(value string, maximum int) bool {
+	if value == "" || strings.TrimSpace(value) != value || len(value) > maximum || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // BootstrapAttemptViewV1 is the retained, secret-free invalid-proof identity.
 type BootstrapAttemptViewV1 struct {
 	InvitationID         CanonicalIdentifier `json:"invitation_id"`

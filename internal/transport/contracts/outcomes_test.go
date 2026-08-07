@@ -1431,7 +1431,7 @@ func TestApplicationQuerySubjectRequiresExactAuthenticatedSession(t *testing.T) 
 	if _, err := querySubject(evidence, other); !errors.Is(err, application.ErrInvalidApplicationContract) {
 		t.Fatalf("mismatched session error=%v", err)
 	}
-	if _, err := NewApplicationHandler(nil); !errors.Is(err, application.ErrInvalidApplicationContract) {
+	if _, err := NewApplicationHandler(nil, nil, nil, nil, "", nil); !errors.Is(err, application.ErrInvalidApplicationContract) {
 		t.Fatalf("nil query service error=%v", err)
 	}
 }

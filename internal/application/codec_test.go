@@ -605,6 +605,59 @@ func TestObserveWorkRefCommandHashProfile(t *testing.T) {
 	}
 }
 
+func TestW1CommandHashProfilesRemainStable(t *testing.T) {
+	t.Parallel()
+
+	id := func(index int) CanonicalIdentifier { return mustCanonicalID(t, codecUUID(index)) }
+	resource := func(index int) CommandExpectedResource {
+		return CommandExpectedResource{ID: id(index), ExpectedVersion: uint64(index)}
+	}
+	context := W0CommandHashContextParams{
+		ScopeKind: StreamScopeWorkspace, ScopeID: id(1), PrincipalID: id(2), ClientInstanceID: id(3),
+		CorrelationID: id(4), ProtocolCapabilities: []string{"receipts-v1"},
+	}
+	codec := NewProductionCanonicalCodec()
+	assertGolden := func(name string, view CommandHashView, want string) {
+		t.Helper()
+		fingerprint, err := codec.HashCommand(view)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := hex.EncodeToString(fingerprint[:]); got != want {
+			t.Fatalf("%s golden changed: got %s, want %s", name, got, want)
+		}
+	}
+	assertGolden("create objective and work", mustCommandHashView(NewCreateObjectiveAndWorkCommandHashView(
+		context, CreateObjectiveAndWorkCommandHashParams{
+			Session: resource(25), ObjectiveID: id(30), ObjectiveTitle: "Prove W1",
+			AcceptanceCriteria: "Both participants join", WorkUnitID: id(31), WorkUnitTitle: "Execute proof",
+			WorkReference: resource(32),
+		})), "292bbdfa6a1cda97cbbb92c2d5888b6e9ffda0117931e14c09be891f63e33c1c")
+	assertGolden("activate objective", mustCommandHashView(NewActivateObjectiveCommandHashView(
+		context, ActivateObjectiveCommandHashParams{Session: resource(25), Objective: resource(30)})),
+		"c70da984ad15f110bbfb895e9a0fca6471fd7043146c4cd7a8d2a4bd45675586")
+	assertGolden("plan run with bindings", mustCommandHashView(NewPlanRunWithBindingsCommandHashView(
+		context, PlanRunWithBindingsCommandHashParams{
+			OperatorSession: resource(25), RunID: id(33), Objective: resource(30), WorkUnit: resource(31),
+			Participants: []CommandRunParticipantPlan{
+				{ParticipationID: id(35), Actor: resource(18), Session: resource(25), Role: "builder"},
+				{ParticipationID: id(36), Actor: resource(26), Session: resource(27), Role: "reviewer"},
+			},
+			Bindings: []CommandRuntimeBindingPlan{
+				{BindingID: id(37), ParticipationID: id(35), SessionID: id(25), RuntimeEndpoint: resource(39)},
+				{BindingID: id(38), ParticipationID: id(36), SessionID: id(27), RuntimeEndpoint: resource(40)},
+			},
+		})), "ba2c2ad93c0ce4e16d6feb069cbfe09172cc9b6d5a48f8394f62df0029fe8fcc")
+	assertGolden("join run", mustCommandHashView(NewJoinRunCommandHashView(
+		context, JoinRunCommandHashParams{Session: resource(25), Run: resource(33), Participation: resource(35)})),
+		"b92f13f6a59792918439183222a970b7f25c2734cd71055b8b94f22925f6c6f8")
+	assertGolden("start run", mustCommandHashView(NewStartRunCommandHashView(
+		context, StartRunCommandHashParams{
+			OperatorSession: resource(25), Run: resource(33),
+			Participations: []CommandExpectedResource{resource(35), resource(36)},
+		})), "2e79448448774c52b2c9610b6649c5149da787bb2bb697021394c687e3976b19")
+}
+
 func TestW0CommandHashViewsHashEveryStructuralField(t *testing.T) {
 	t.Parallel()
 
@@ -948,6 +1001,37 @@ func commandHashViewFixtures(t *testing.T) []commandHashFixture {
 			context(StreamScopeWorkspace), trustedSession))},
 		{name: "start actor session handoff", view: mustCommandHashView(NewStartActorSessionCommandHashView(
 			context(StreamScopeWorkspace), handoffSession))},
+		{name: "create objective and work", view: mustCommandHashView(NewCreateObjectiveAndWorkCommandHashView(
+			context(StreamScopeWorkspace), CreateObjectiveAndWorkCommandHashParams{
+				Session: resource(25), ObjectiveID: id(30), ObjectiveTitle: "Prove W1",
+				AcceptanceCriteria: "Both participants join", WorkUnitID: id(31), WorkUnitTitle: "Execute proof",
+				WorkReference: resource(32),
+			}))},
+		{name: "activate objective", view: mustCommandHashView(NewActivateObjectiveCommandHashView(
+			context(StreamScopeWorkspace), ActivateObjectiveCommandHashParams{
+				Session: resource(25), Objective: resource(30),
+			}))},
+		{name: "plan run with bindings", view: mustCommandHashView(NewPlanRunWithBindingsCommandHashView(
+			context(StreamScopeWorkspace), PlanRunWithBindingsCommandHashParams{
+				OperatorSession: resource(25), RunID: id(33), Objective: resource(30), WorkUnit: resource(31),
+				Participants: []CommandRunParticipantPlan{
+					{ParticipationID: id(35), Actor: resource(18), Session: resource(25), Role: "builder"},
+					{ParticipationID: id(36), Actor: resource(26), Session: resource(27), Role: "reviewer"},
+				},
+				Bindings: []CommandRuntimeBindingPlan{
+					{BindingID: id(37), ParticipationID: id(35), SessionID: id(25), RuntimeEndpoint: resource(39)},
+					{BindingID: id(38), ParticipationID: id(36), SessionID: id(27), RuntimeEndpoint: resource(40)},
+				},
+			}))},
+		{name: "join run", view: mustCommandHashView(NewJoinRunCommandHashView(
+			context(StreamScopeWorkspace), JoinRunCommandHashParams{
+				Session: resource(25), Run: resource(33), Participation: resource(35),
+			}))},
+		{name: "start run", view: mustCommandHashView(NewStartRunCommandHashView(
+			context(StreamScopeWorkspace), StartRunCommandHashParams{
+				OperatorSession: resource(25), Run: resource(33),
+				Participations: []CommandExpectedResource{resource(35), resource(36)},
+			}))},
 	}
 }
 
@@ -1067,6 +1151,20 @@ func mutateCommandHashValue(t *testing.T, value reflect.Value) {
 		case reflect.TypeFor[CommandExpectedResource]():
 			mutated = reflect.Append(mutated, reflect.ValueOf(CommandExpectedResource{
 				ID: mustCanonicalID(t, codecUUID(97)), ExpectedVersion: 97,
+			}))
+		case reflect.TypeFor[CommandRunParticipantPlan]():
+			mutated = reflect.Append(mutated, reflect.ValueOf(CommandRunParticipantPlan{
+				ParticipationID: mustCanonicalID(t, codecUUID(97)),
+				Actor:           CommandExpectedResource{ID: mustCanonicalID(t, codecUUID(96)), ExpectedVersion: 96},
+				Session:         CommandExpectedResource{ID: mustCanonicalID(t, codecUUID(95)), ExpectedVersion: 95},
+				Role:            "mutation-v1",
+			}))
+		case reflect.TypeFor[CommandRuntimeBindingPlan]():
+			mutated = reflect.Append(mutated, reflect.ValueOf(CommandRuntimeBindingPlan{
+				BindingID:       mustCanonicalID(t, codecUUID(97)),
+				ParticipationID: mustCanonicalID(t, codecUUID(96)),
+				SessionID:       mustCanonicalID(t, codecUUID(95)),
+				RuntimeEndpoint: CommandExpectedResource{ID: mustCanonicalID(t, codecUUID(94)), ExpectedVersion: 94},
 			}))
 		default:
 			t.Fatalf("unsupported command hash slice %s", value.Type())

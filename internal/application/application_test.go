@@ -2202,6 +2202,200 @@ func buildOperationDomainPath(t *testing.T) operationDomainPath {
 	}
 }
 
+type w1OperationDomainPath struct {
+	path           operationDomainPath
+	adapter        domain.PrincipalState
+	adapterAuth    domain.IdentityAuthorization
+	observed       domain.ObserveWorkRefResult
+	created        domain.CreateObjectiveAndWorkResult
+	activated      domain.ActivateObjectiveResult
+	actorA         domain.ActorState
+	actorB         domain.ActorState
+	sessionA       domain.ActorSessionState
+	sessionB       domain.ActorSessionState
+	planned        domain.PlanRunWithBindingsResult
+	participationA domain.RunParticipationState
+	participationB domain.RunParticipationState
+	joinedA        domain.JoinRunResult
+	joinedB        domain.JoinRunResult
+	started        domain.StartRunResult
+}
+
+func buildW1OperationDomainPath(t *testing.T) w1OperationDomainPath {
+	t.Helper()
+	path := buildOperationDomainPath(t)
+	workspace := path.createdWorkspace.Workspace()
+	actorA := path.createdActor.Actor()
+	sessionA := path.sessionStarted.Session()
+	now := path.now
+
+	adapterID, _ := domain.ParsePrincipalID(applicationUUID(700))
+	adapterName, _ := domain.NewDisplayName("Beads adapter")
+	adapterKey, _ := domain.NewPublicKeyReference("keyref:beads-adapter")
+	adapter, err := domain.RehydratePrincipal(domain.PrincipalRehydrationParams{
+		ID: adapterID, InstallationID: path.installation, Kind: domain.PrincipalKindService,
+		DisplayName: adapterName, PublicKeyReference: adapterKey, Status: domain.PrincipalActive,
+		Version: domain.InitialVersion(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapterAuth, err := domain.NewWorkspaceIdentityAuthorization(
+		path.authority, path.epoch, path.installation, workspace.ID(), adapterID, path.memberCaps,
+		path.policy, path.assurance, now, domain.MaxActorSessionLifetime,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workReferenceID, _ := domain.ParseWorkReferenceID(applicationUUID(701))
+	namespace, _ := domain.NewOpaqueProviderValue("beads")
+	objectID, _ := domain.NewOpaqueProviderValue("bd-fam.2.2")
+	locator, _ := domain.NewOpaqueProviderValue("beads://blackmail/bd-fam.2.2")
+	providerVersion, _ := domain.NewOpaqueProviderValue("beads-v7")
+	fields, _ := domain.NewEventPayload([]byte(`{"priority":1,"status":"in_progress"}`))
+	observation, err := domain.NewProviderObservation(
+		namespace, objectID, locator, providerVersion, fields, adapterID, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := domain.ObserveWorkRef(domain.ObserveWorkRefInput{
+		Authorization: adapterAuth, Adapter: adapter, ExpectedAdapterVersion: adapter.Version(),
+		Workspace: workspace, ExpectedWorkspaceVersion: workspace.Version(),
+		WorkReferenceID: workReferenceID, Observation: observation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectiveID, _ := domain.ParseObjectiveID(applicationUUID(702))
+	workUnitID, _ := domain.ParseWorkUnitID(applicationUUID(703))
+	created, err := domain.CreateObjectiveAndWork(domain.CreateObjectiveAndWorkInput{
+		Session: sessionA, ExpectedSessionVersion: sessionA.Version(), ObjectiveID: objectiveID,
+		ObjectiveTitle: "Prove W1", AcceptanceCriteria: "Both participants join",
+		WorkUnitID: workUnitID, WorkUnitTitle: "Execute proof", WorkReference: observed.WorkReference(),
+		ExpectedWorkReferenceVersion: observed.WorkReference().Version(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activated, err := domain.ActivateObjective(domain.ActivateObjectiveInput{
+		Session: sessionA, ExpectedSessionVersion: sessionA.Version(), Objective: created.Objective(),
+		ExpectedObjectiveVersion: created.Objective().Version(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actorBID, _ := domain.ParseActorID(applicationUUID(704))
+	actorB, err := domain.RehydrateActor(domain.ActorRehydrationParams{
+		ID: actorBID, WorkspaceID: actorA.WorkspaceID(), Kind: actorA.Kind(), Profile: actorA.Profile(),
+		Status: domain.ActorActive, Version: domain.InitialVersion(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBBinding, err := domain.NewSessionBinding(
+		sessionA.Binding().AuthorityID(), sessionA.Binding().AuthorityEpoch(),
+		sessionA.Binding().WorkspaceID(), sessionA.Binding().PrincipalID(), actorBID,
+		sessionA.Binding().MembershipRevision(), sessionA.Binding().DelegationRevision(), nil, domain.Version{},
+		sessionA.Binding().GrantRevisions(), sessionA.Binding().PolicyRevision(),
+		sessionA.Binding().AssuranceClass(), sessionA.Binding().IssuedAt(), sessionA.Binding().AbsoluteExpiry(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBID, _ := domain.ParseActorSessionID(applicationUUID(705))
+	clientBID, _ := domain.ParseClientInstanceID(applicationUUID(706))
+	sessionB, err := domain.RehydrateActorSession(domain.ActorSessionRehydrationParams{
+		ID: sessionBID, ClientInstanceID: clientBID, ClientMetadata: sessionA.ClientMetadata(),
+		Status: domain.ActorSessionActive, Version: domain.InitialVersion(), Binding: sessionBBinding,
+		Capabilities: sessionA.Capabilities(), PresentationCredential: sessionA.PresentationCredential(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runID, _ := domain.ParseRunID(applicationUUID(707))
+	participationAID, _ := domain.ParseRunParticipationID(applicationUUID(708))
+	participationBID, _ := domain.ParseRunParticipationID(applicationUUID(709))
+	bindingAID, _ := domain.ParseRuntimeBindingID(applicationUUID(710))
+	bindingBID, _ := domain.ParseRuntimeBindingID(applicationUUID(711))
+	endpointAID, _ := domain.ParseRuntimeEndpointID(applicationUUID(712))
+	endpointBID, _ := domain.ParseRuntimeEndpointID(applicationUUID(713))
+	endpointARef, err := domain.NewAggregateRef(endpointAID, domain.InitialVersion())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpointBRef, err := domain.NewAggregateRef(endpointBID, domain.InitialVersion())
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := domain.PlanRunWithBindings(domain.PlanRunWithBindingsInput{
+		OperatorSession: sessionA, ExpectedOperatorSessionVersion: sessionA.Version(),
+		RunID: runID, Objective: activated.Objective(), ExpectedObjectiveVersion: activated.Objective().Version(),
+		WorkUnit: created.WorkUnit(), ExpectedWorkUnitVersion: created.WorkUnit().Version(),
+		Participants: []domain.RunParticipantPlan{
+			{ParticipationID: participationBID, Actor: actorB, ExpectedActorVersion: actorB.Version(),
+				Session: sessionB, ExpectedSessionVersion: sessionB.Version(), Role: "reviewer"},
+			{ParticipationID: participationAID, Actor: actorA, ExpectedActorVersion: actorA.Version(),
+				Session: sessionA, ExpectedSessionVersion: sessionA.Version(), Role: "builder"},
+		},
+		Bindings: []domain.RuntimeBindingPlan{
+			{BindingID: bindingBID, ParticipationID: participationBID, SessionID: sessionB.ID(), Endpoint: endpointBRef},
+			{BindingID: bindingAID, ParticipationID: participationAID, SessionID: sessionA.ID(), Endpoint: endpointARef},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		participationA domain.RunParticipationState
+		participationB domain.RunParticipationState
+	)
+	for _, participation := range planned.Participations() {
+		switch participation.ActorID() {
+		case actorA.ID():
+			participationA = participation
+		case actorB.ID():
+			participationB = participation
+		}
+	}
+	joinedA, err := domain.JoinRun(domain.JoinRunInput{
+		Session: sessionA, ExpectedSessionVersion: sessionA.Version(), Run: planned.Run(),
+		ExpectedRunVersion: planned.Run().Version(), Participation: participationA,
+		ExpectedParticipationVersion: participationA.Version(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedB, err := domain.JoinRun(domain.JoinRunInput{
+		Session: sessionB, ExpectedSessionVersion: sessionB.Version(), Run: planned.Run(),
+		ExpectedRunVersion: planned.Run().Version(), Participation: participationB,
+		ExpectedParticipationVersion: participationB.Version(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := domain.StartRun(domain.StartRunInput{
+		OperatorSession: sessionA, ExpectedOperatorSessionVersion: sessionA.Version(),
+		Run: planned.Run(), ExpectedRunVersion: planned.Run().Version(),
+		Participations: []domain.RunParticipationSnapshot{
+			{Participation: joinedA.Participation(), ExpectedVersion: joinedA.Participation().Version()},
+			{Participation: joinedB.Participation(), ExpectedVersion: joinedB.Participation().Version()},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w1OperationDomainPath{
+		path: path, adapter: adapter, adapterAuth: adapterAuth, observed: observed,
+		created: created, activated: activated, actorA: actorA, actorB: actorB,
+		sessionA: sessionA, sessionB: sessionB, planned: planned,
+		participationA: participationA, participationB: participationB,
+		joinedA: joinedA, joinedB: joinedB, started: started,
+	}
+}
+
 type operationPipelineCase struct {
 	operation     CommandOperation
 	scope         domain.AuthorityScope
@@ -2260,6 +2454,18 @@ func mustAbsentTarget(t *testing.T, id any) domain.AggregateExpectation {
 		expectation, err = domain.ExpectAggregateAbsent(value)
 	case domain.ActorSessionID:
 		expectation, err = domain.ExpectAggregateAbsent(value)
+	case domain.WorkReferenceID:
+		expectation, err = domain.ExpectAggregateAbsent(value)
+	case domain.ObjectiveID:
+		expectation, err = domain.ExpectAggregateAbsent(value)
+	case domain.WorkUnitID:
+		expectation, err = domain.ExpectAggregateAbsent(value)
+	case domain.RunID:
+		expectation, err = domain.ExpectAggregateAbsent(value)
+	case domain.RunParticipationID:
+		expectation, err = domain.ExpectAggregateAbsent(value)
+	case domain.RuntimeBindingID:
+		expectation, err = domain.ExpectAggregateAbsent(value)
 	default:
 		t.Fatalf("unsupported absent target %T", id)
 	}
@@ -2281,6 +2487,18 @@ func mustExpectedState(t *testing.T, value any) domain.AggregateExpectation {
 	case domain.ActorDelegationState:
 		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
 	case domain.DeviceState:
+		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
+	case domain.WorkReferenceState:
+		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
+	case domain.ObjectiveState:
+		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
+	case domain.WorkUnitState:
+		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
+	case domain.RunState:
+		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
+	case domain.RunParticipationState:
+		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
+	case domain.RuntimeBindingState:
 		expectation, err = domain.ExpectAggregateVersion(state.ID(), state.Version())
 	default:
 		t.Fatalf("unsupported expected-version state %T", value)
@@ -2527,6 +2745,115 @@ func buildOperationPipelineCases(t *testing.T, path operationDomainPath) []opera
 	}
 }
 
+func buildW1OperationPipelineCases(t *testing.T, path w1OperationDomainPath) []operationPipelineCase {
+	t.Helper()
+	workspaceScope, _ := domain.WorkspaceScope(path.path.createdWorkspace.Workspace().ID())
+	authorityAtWorkspace, _ := CurrentAuthorityEpochGuard(workspaceScope, path.path.authority, path.path.epoch)
+	policyAtWorkspace, _ := PolicyRevisionGuard(workspaceScope, path.path.policy)
+	workload := path.path.registered.Principal()
+	actorA := path.actorA
+	sessionA := path.sessionA
+	workReference := path.observed.WorkReference()
+	objective := path.created.Objective()
+	workUnit := path.created.WorkUnit()
+	activeObjective := path.activated.Objective()
+	run := path.planned.Run()
+	attributionA := ActorAttribution{actor: actorA.ID(), session: sessionA.ID()}
+	workAuthorship, _ := WorkAuthorship(workload.ID(), attributionA)
+	return []operationPipelineCase{
+		{
+			operation: CommandCreateObjectiveAndWork, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workAuthorship,
+			authorization: []IdentityState{mustIdentityState(t, actorA), mustIdentityState(t, sessionA)},
+			references:    []IdentityState{mustIdentityState(t, workReference)},
+			disclosure:    []domain.AggregateTarget{mustTarget(t, actorA), mustTarget(t, sessionA), mustTarget(t, objective), mustTarget(t, workUnit)},
+			mutations: []domain.AggregateExpectation{
+				mustAbsentTarget(t, objective.ID()), mustAbsentTarget(t, workUnit.ID()),
+			},
+			evidence: []EvidenceGuard{authorityAtWorkspace, policyAtWorkspace, mustLifecycle(t, actorA), mustLifecycle(t, sessionA)},
+			facts:    path.created.Facts(),
+			commit: func(context CommandContext) (OperationCommit, error) {
+				return CreateObjectiveAndWorkCommit(context, path.created)
+			},
+		},
+		{
+			operation: CommandActivateObjective, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workAuthorship,
+			authorization: []IdentityState{mustIdentityState(t, actorA), mustIdentityState(t, sessionA)},
+			mutatedPrior:  []IdentityState{mustIdentityState(t, objective)},
+			disclosure:    []domain.AggregateTarget{mustTarget(t, actorA), mustTarget(t, sessionA), mustTarget(t, objective)},
+			mutations:     []domain.AggregateExpectation{mustExpectedState(t, objective)},
+			evidence:      []EvidenceGuard{authorityAtWorkspace, policyAtWorkspace, mustLifecycle(t, actorA), mustLifecycle(t, sessionA), mustLifecycle(t, objective)},
+			facts:         path.activated.Facts(),
+			commit: func(context CommandContext) (OperationCommit, error) {
+				return ActivateObjectiveCommit(context, path.activated)
+			},
+		},
+		{
+			operation: CommandPlanRunWithBindings, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workAuthorship,
+			authorization: []IdentityState{mustIdentityState(t, actorA), mustIdentityState(t, sessionA)},
+			references: []IdentityState{
+				mustIdentityState(t, activeObjective), mustIdentityState(t, workUnit),
+				mustIdentityState(t, path.actorB), mustIdentityState(t, path.sessionB),
+			},
+			disclosure: []domain.AggregateTarget{
+				mustTarget(t, actorA), mustTarget(t, sessionA), mustTarget(t, activeObjective),
+				mustTarget(t, workUnit), mustTarget(t, path.actorB), mustTarget(t, path.sessionB),
+			},
+			mutations: []domain.AggregateExpectation{
+				mustAbsentTarget(t, run.ID()),
+				mustAbsentTarget(t, path.participationA.ID()),
+				mustAbsentTarget(t, path.participationB.ID()),
+				mustAbsentTarget(t, path.planned.Bindings()[0].ID()),
+				mustAbsentTarget(t, path.planned.Bindings()[1].ID()),
+			},
+			evidence: []EvidenceGuard{
+				authorityAtWorkspace, policyAtWorkspace, mustLifecycle(t, actorA), mustLifecycle(t, sessionA),
+				mustLifecycle(t, activeObjective), mustLifecycle(t, workUnit),
+			},
+			facts: path.planned.Facts(),
+			commit: func(context CommandContext) (OperationCommit, error) {
+				return PlanRunWithBindingsCommit(context, path.planned)
+			},
+		},
+		{
+			operation: CommandJoinRun, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workAuthorship,
+			authorization: []IdentityState{mustIdentityState(t, actorA), mustIdentityState(t, sessionA)},
+			references:    []IdentityState{mustIdentityState(t, run)},
+			mutatedPrior:  []IdentityState{mustIdentityState(t, path.participationA)},
+			disclosure:    []domain.AggregateTarget{mustTarget(t, actorA), mustTarget(t, sessionA), mustTarget(t, run), mustTarget(t, path.participationA)},
+			mutations:     []domain.AggregateExpectation{mustExpectedState(t, path.participationA)},
+			evidence: []EvidenceGuard{
+				authorityAtWorkspace, policyAtWorkspace, mustLifecycle(t, actorA), mustLifecycle(t, sessionA),
+				mustLifecycle(t, run), mustLifecycle(t, path.participationA),
+			},
+			facts: path.joinedA.Facts(),
+			commit: func(context CommandContext) (OperationCommit, error) {
+				return JoinRunCommit(context, path.joinedA)
+			},
+		},
+		{
+			operation: CommandStartRun, scope: workspaceScope, admission: workspaceScope,
+			principal: workload.ID(), authorship: workAuthorship,
+			authorization: []IdentityState{mustIdentityState(t, actorA), mustIdentityState(t, sessionA)},
+			references:    []IdentityState{mustIdentityState(t, path.joinedA.Participation()), mustIdentityState(t, path.joinedB.Participation())},
+			mutatedPrior:  []IdentityState{mustIdentityState(t, run)},
+			disclosure:    []domain.AggregateTarget{mustTarget(t, actorA), mustTarget(t, sessionA), mustTarget(t, run), mustTarget(t, path.joinedA.Participation()), mustTarget(t, path.joinedB.Participation())},
+			mutations:     []domain.AggregateExpectation{mustExpectedState(t, run)},
+			evidence: []EvidenceGuard{
+				authorityAtWorkspace, policyAtWorkspace, mustLifecycle(t, actorA), mustLifecycle(t, sessionA),
+				mustLifecycle(t, run), mustLifecycle(t, path.joinedA.Participation()), mustLifecycle(t, path.joinedB.Participation()),
+			},
+			facts: path.started.Facts(),
+			commit: func(context CommandContext) (OperationCommit, error) {
+				return StartRunCommit(context, path.started)
+			},
+		},
+	}
+}
+
 type completedOperationPipeline struct {
 	caseDefinition operationPipelineCase
 	spec           CommandSpec
@@ -2592,6 +2919,60 @@ func TestAllW0OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
 			}
 			badSpecParams := commandSpecParamsFromPipeline(pipeline)
 			badSpecParams.Guards.disclosure = badSpecParams.Guards.disclosure[:len(badSpecParams.Guards.disclosure)-1]
+			if _, err := NewCommandSpec(badSpecParams); !errors.Is(err, ErrInvalidCommandSpec) {
+				t.Fatalf("disclosure-shape mutation error=%v", err)
+			}
+		})
+	}
+	for index := range completed {
+		next := completed[(index+1)%len(completed)]
+		crossOperationCommit := completed[index].commit
+		crossOperationCommit.operation = next.caseDefinition.operation
+		if _, err := ApplyCommand(
+			completed[index].context, crossOperationCommit,
+			completed[index].decision.Audit(), completed[index].decision.Effects(),
+		); !errors.Is(err, ErrInvalidCommandDecision) {
+			t.Fatalf("%s accepted commit tagged as %s: %v",
+				completed[index].caseDefinition.operation, next.caseDefinition.operation, err)
+		}
+	}
+}
+
+func TestAllW1OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
+	path := buildW1OperationDomainPath(t)
+	cases := buildW1OperationPipelineCases(t, path)
+	if len(cases) != len(w1OperationContracts)-1 {
+		t.Fatalf("W1 work-authorship pipeline cases=%d, want=%d", len(cases), len(w1OperationContracts)-1)
+	}
+	completed := make([]completedOperationPipeline, 0, len(cases))
+	for index, testCase := range cases {
+		t.Run(string(testCase.operation), func(t *testing.T) {
+			pipeline := completeOperationPipeline(t, path.path, testCase, index+100)
+			completed = append(completed, pipeline)
+			if pipeline.decision.Kind() != CommandDecisionApplied ||
+				pipeline.result.Operation() != testCase.operation ||
+				pipeline.receipt.Result().ResponseDigest() != pipeline.result.ResponseDigest() ||
+				len(pipeline.decision.Facts()) != len(testCase.facts) ||
+				len(pipeline.result.CanonicalBytes()) == 0 {
+				t.Fatal("pipeline did not retain its exact applied result")
+			}
+			wrongLast, _ := domain.NewStreamPosition(uint64(len(testCase.facts) + 1))
+			first, _ := domain.NewStreamPosition(1)
+			digest, _ := domain.NewStreamDigest([32]byte{88})
+			if _, err := NewProductionCanonicalCodec().MaterializeReceiptResult(
+				pipeline.decision.ResultPlan(), first, wrongLast, digest,
+			); err == nil {
+				t.Fatalf("wrong event shape materialization error=%v", err)
+			}
+			badCommit := pipeline.commit
+			badCommit.facts = nil
+			if _, err := ApplyCommand(
+				pipeline.context, badCommit, pipeline.decision.Audit(), pipeline.decision.Effects(),
+			); !errors.Is(err, ErrInvalidCommandDecision) {
+				t.Fatalf("fact-shape mutation error=%v", err)
+			}
+			badSpecParams := commandSpecParamsFromPipeline(pipeline)
+			badSpecParams.Guards.disclosure = nil
 			if _, err := NewCommandSpec(badSpecParams); !errors.Is(err, ErrInvalidCommandSpec) {
 				t.Fatalf("disclosure-shape mutation error=%v", err)
 			}

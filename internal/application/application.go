@@ -3931,6 +3931,18 @@ func identityStateStatus(state IdentityState) string {
 		return string(value.Status())
 	case domain.ActorSessionState:
 		return string(value.Status())
+	case domain.WorkReferenceState:
+		return ""
+	case domain.ObjectiveState:
+		return string(value.Status())
+	case domain.WorkUnitState:
+		return string(value.Status())
+	case domain.RunState:
+		return string(value.Status())
+	case domain.RunParticipationState:
+		return string(value.Status())
+	case domain.RuntimeBindingState:
+		return string(value.Status())
 	default:
 		return ""
 	}

@@ -381,6 +381,42 @@ func orchestrationPreparationRequests(
 	return authentication, policy
 }
 
+func orchestrationWorkPreparationRequests(
+	t *testing.T,
+	operation CommandOperation,
+	scope domain.AuthorityScope,
+	principal domain.PrincipalID,
+	principalRevision domain.Version,
+	authority domain.AuthorityID,
+	session domain.ActorSessionState,
+) (AuthenticationRequest, PolicyPreparationRequest) {
+	t.Helper()
+	provenance, err := NewAuditProvenanceEvidence(authority, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audience, err := domain.NewCredentialAudience("blackbird:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := session.ID()
+	authentication, err := NewAuthenticationRequest(AuthenticationRequestParams{
+		Operation: operation, Scope: scope, PrincipalID: principal, PrincipalRevision: principalRevision,
+		ActorSessionID: &sessionID, ActorSessionRevision: session.Version(), GrantRevisions: session.Binding().GrantRevisions(),
+		ChannelBinding: DigestBytes([]byte("orchestration channel binding")), Audience: audience,
+		AuditProvenance: provenance, VerifiedAt: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, _ := domain.NewPolicyRevision("policy-1")
+	policy, err := NewPolicyPreparationRequest(authentication, revision, DigestBytes([]byte("prepared policy")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authentication, policy
+}
+
 type orchestrationUOWMode uint8
 
 const (
@@ -1296,6 +1332,168 @@ func buildOrchestrationHandlerCases(t *testing.T, path operationDomainPath) []or
 	return result
 }
 
+func buildW1OrchestrationHandlerCases(t *testing.T, path w1OperationDomainPath) []orchestrationHandlerCase {
+	t.Helper()
+	definitions := buildW1OperationPipelineCases(t, path)
+	byOperation := make(map[CommandOperation]completedOperationPipeline, len(definitions))
+	for index, definition := range definitions {
+		pipeline := completeOperationPipeline(t, path.path, definition, index+100)
+		byOperation[definition.operation] = pipeline
+	}
+	sessionA := path.sessionA
+	objective := path.created.Objective()
+	activeObjective := path.activated.Objective()
+	workUnit := path.created.WorkUnit()
+	run := path.planned.Run()
+
+	makeRequest := func(pipeline completedOperationPipeline, view CommandHashView) CommandRequest {
+		principalRevision := domain.InitialVersion()
+		for _, state := range pipeline.context.States() {
+			if principal, ok := state.Value().(domain.PrincipalState); ok && principal.ID() == pipeline.spec.Authorship().PrincipalID() {
+				principalRevision = principal.Version()
+				break
+			}
+		}
+		authentication, policy := orchestrationWorkPreparationRequests(
+			t, pipeline.caseDefinition.operation, pipeline.spec.Scope(), pipeline.spec.Authorship().PrincipalID(),
+			principalRevision, pipeline.spec.AuthorityID(), sessionA,
+		)
+		return CommandRequest{
+			Spec: pipeline.spec, HashView: view,
+			Authentication: authentication,
+			Policy:         policy,
+			Audit:          orchestrationAuditContext(t),
+		}
+	}
+	result := make([]orchestrationHandlerCase, 0, len(definitions))
+	for _, definition := range definitions {
+		pipeline := byOperation[definition.operation]
+		contextParams := orchestrationCommandContext(t, pipeline)
+		var view CommandHashView
+		var err error
+		switch definition.operation {
+		case CommandCreateObjectiveAndWork:
+			view, err = NewCreateObjectiveAndWorkCommandHashView(contextParams, CreateObjectiveAndWorkCommandHashParams{
+				Session: orchestrationResource(t, sessionA), ObjectiveID: mustCanonical(t, objective.ID().String()),
+				ObjectiveTitle: objective.Title(), AcceptanceCriteria: objective.AcceptanceCriteria(),
+				WorkUnitID: mustCanonical(t, workUnit.ID().String()), WorkUnitTitle: workUnit.Title(),
+				WorkReference: orchestrationResource(t, path.observed.WorkReference()),
+			})
+			pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
+			request := CreateObjectiveAndWorkRequest{
+				CommandRequest: makeRequest(pipeline, view), SessionID: sessionA.ID(), ObjectiveID: objective.ID(),
+				ObjectiveTitle: objective.Title(), AcceptanceCriteria: objective.AcceptanceCriteria(),
+				WorkUnitID: workUnit.ID(), WorkUnitTitle: workUnit.Title(), WorkReferenceID: path.observed.WorkReference().ID(),
+			}
+			result = append(result, orchestrationHandlerCase{definition.operation, pipeline,
+				func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
+					return service.CreateObjectiveAndWork(ctx, request)
+				}})
+		case CommandActivateObjective:
+			view, err = NewActivateObjectiveCommandHashView(contextParams, ActivateObjectiveCommandHashParams{
+				Session: orchestrationResource(t, sessionA), Objective: orchestrationResource(t, objective),
+			})
+			pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
+			request := ActivateObjectiveRequest{CommandRequest: makeRequest(pipeline, view), SessionID: sessionA.ID(), ObjectiveID: objective.ID()}
+			result = append(result, orchestrationHandlerCase{definition.operation, pipeline,
+				func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
+					return service.ActivateObjective(ctx, request)
+				}})
+		case CommandPlanRunWithBindings:
+			participations := path.planned.Participations()
+			participants := make([]CommandRunParticipantPlan, len(participations))
+			requestParticipants := make([]RunParticipantPlanRequest, len(participations))
+			for index, participation := range participations {
+				var participantActor domain.ActorState
+				var participantSession domain.ActorSessionState
+				switch participation.ActorID() {
+				case path.actorA.ID():
+					participantActor, participantSession = path.actorA, sessionA
+				case path.actorB.ID():
+					participantActor, participantSession = path.actorB, path.sessionB
+				}
+				participants[index] = CommandRunParticipantPlan{
+					ParticipationID: mustCanonical(t, participation.ID().String()),
+					Actor:           orchestrationResource(t, participantActor), Session: orchestrationResource(t, participantSession),
+					Role: participation.Role(),
+				}
+				requestParticipants[index] = RunParticipantPlanRequest{
+					ParticipationID: participation.ID(), ActorID: participantActor.ID(),
+					ExpectedActorVersion: participantActor.Version(), SessionID: participantSession.ID(),
+					ExpectedSessionVersion: participantSession.Version(), Role: participation.Role(),
+				}
+			}
+			bindings := path.planned.Bindings()
+			wireBindings := make([]CommandRuntimeBindingPlan, len(bindings))
+			requestBindings := make([]RuntimeBindingPlanRequest, len(bindings))
+			for index, binding := range bindings {
+				wireBindings[index] = CommandRuntimeBindingPlan{
+					BindingID:       mustCanonical(t, binding.ID().String()),
+					ParticipationID: mustCanonical(t, binding.ParticipationID().String()),
+					SessionID:       mustCanonical(t, binding.ActorSessionID().String()),
+					RuntimeEndpoint: CommandExpectedResource{
+						ID: mustCanonical(t, binding.RuntimeEndpointID().String()), ExpectedVersion: domain.InitialVersion().Uint64(),
+					},
+				}
+				requestBindings[index] = RuntimeBindingPlanRequest{
+					BindingID: binding.ID(), ParticipationID: binding.ParticipationID(), SessionID: binding.ActorSessionID(),
+					RuntimeEndpointID: binding.RuntimeEndpointID(), ExpectedRuntimeEndpointVersion: domain.InitialVersion(),
+				}
+			}
+			view, err = NewPlanRunWithBindingsCommandHashView(contextParams, PlanRunWithBindingsCommandHashParams{
+				OperatorSession: orchestrationResource(t, sessionA), RunID: mustCanonical(t, run.ID().String()),
+				Objective: orchestrationResource(t, activeObjective), WorkUnit: orchestrationResource(t, workUnit),
+				Participants: participants, Bindings: wireBindings,
+			})
+			pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
+			request := PlanRunWithBindingsRequest{
+				CommandRequest: makeRequest(pipeline, view), OperatorSessionID: sessionA.ID(), RunID: run.ID(),
+				ObjectiveID: activeObjective.ID(), WorkUnitID: workUnit.ID(),
+				Participants: requestParticipants, Bindings: requestBindings,
+			}
+			result = append(result, orchestrationHandlerCase{definition.operation, pipeline,
+				func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
+					return service.PlanRunWithBindings(ctx, request)
+				}})
+		case CommandJoinRun:
+			view, err = NewJoinRunCommandHashView(contextParams, JoinRunCommandHashParams{
+				Session: orchestrationResource(t, sessionA), Run: orchestrationResource(t, run),
+				Participation: orchestrationResource(t, path.participationA),
+			})
+			pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
+			request := JoinRunRequest{CommandRequest: makeRequest(pipeline, view), SessionID: sessionA.ID(),
+				RunID: run.ID(), ParticipationID: path.participationA.ID()}
+			result = append(result, orchestrationHandlerCase{definition.operation, pipeline,
+				func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
+					return service.JoinRun(ctx, request)
+				}})
+		case CommandStartRun:
+			view, err = NewStartRunCommandHashView(contextParams, StartRunCommandHashParams{
+				OperatorSession: orchestrationResource(t, sessionA), Run: orchestrationResource(t, run),
+				Participations: []CommandExpectedResource{
+					orchestrationResource(t, path.joinedA.Participation()),
+					orchestrationResource(t, path.joinedB.Participation()),
+				},
+			})
+			pipeline = finalizeOrchestrationPipeline(t, pipeline, view)
+			request := StartRunRequest{CommandRequest: makeRequest(pipeline, view), OperatorSessionID: sessionA.ID(),
+				RunID: run.ID(),
+				Participations: []StartRunParticipationRequest{
+					{ParticipationID: path.joinedA.Participation().ID(), ExpectedVersion: path.joinedA.Participation().Version()},
+					{ParticipationID: path.joinedB.Participation().ID(), ExpectedVersion: path.joinedB.Participation().Version()},
+				}}
+			result = append(result, orchestrationHandlerCase{definition.operation, pipeline,
+				func(ctx context.Context, service *OrchestrationService) (CommandExecution, error) {
+					return service.StartRun(ctx, request)
+				}})
+		}
+		if err != nil {
+			t.Fatalf("%s hash view: %v", definition.operation, err)
+		}
+	}
+	return result
+}
+
 func TestAllElevenOrchestrationHandlersCommitExactRecordedShape(t *testing.T) {
 	t.Run(string(CommandBootstrapInstallation), func(t *testing.T) {
 		service, request, unit, _, _, _ := orchestrationFixture(t, orchestrationCommitted)
@@ -1315,6 +1513,26 @@ func TestAllElevenOrchestrationHandlersCommitExactRecordedShape(t *testing.T) {
 				t: t, trap: trap, mode: orchestrationCommitted, contexts: []CommandContext{testCase.pipeline.context},
 			}
 			service := orchestrationMatrixService(t, path, testCase, unit, ReplayDiscloseResult)
+
+			execution, err := testCase.invoke(context.Background(), service)
+			if err != nil || execution.Kind() != CommandApplied {
+				t.Fatalf("execution=%s error=%v callbacks=%v order=%v", execution.Kind(), err, unit.callbackErrors, trap.order)
+			}
+			assertOrchestrationDecisionShape(t, unit, testCase.pipeline.commit, testCase.pipeline.spec)
+			assertExternalOrdering(t, testCase.name, trap.order)
+		})
+	}
+}
+
+func TestAllW1OrchestrationHandlersCommitExactRecordedShape(t *testing.T) {
+	path := buildW1OperationDomainPath(t)
+	for _, testCase := range buildW1OrchestrationHandlerCases(t, path) {
+		t.Run(string(testCase.name), func(t *testing.T) {
+			trap := &orchestrationTrap{}
+			unit := &strictOrchestrationUOW{
+				t: t, trap: trap, mode: orchestrationCommitted, contexts: []CommandContext{testCase.pipeline.context},
+			}
+			service := orchestrationMatrixService(t, path.path, testCase, unit, ReplayDiscloseResult)
 
 			execution, err := testCase.invoke(context.Background(), service)
 			if err != nil || execution.Kind() != CommandApplied {

@@ -1147,6 +1147,16 @@ func commandHashContextOf(view CommandHashView) (commandHashContextWire, bool) {
 		return value.Command, true
 	case observeWorkRefCommandHashView:
 		return value.Command, true
+	case createObjectiveAndWorkCommandHashView:
+		return value.Command, true
+	case activateObjectiveCommandHashView:
+		return value.Command, true
+	case planRunWithBindingsCommandHashView:
+		return value.Command, true
+	case joinRunCommandHashView:
+		return value.Command, true
+	case startRunCommandHashView:
+		return value.Command, true
 	default:
 		return commandHashContextWire{}, false
 	}
@@ -1233,6 +1243,11 @@ func mutationTargetMatches(spec CommandSpec, id string, kind domain.AggregateKin
 		}
 	}
 	return false
+}
+
+func declaredResourceMatches(spec CommandSpec, resource CommandExpectedResource, kind domain.AggregateKind) bool {
+	return expectedResourceMatches(spec, resource, kind, resourceAuthorization) ||
+		expectedResourceMatches(spec, resource, kind, resourceReference)
 }
 
 func challengeMatches(spec CommandSpec, wire CommandCeremony, challenge domain.CeremonyChallenge, creation domain.CeremonyCreationExpectation) bool {
@@ -1438,6 +1453,21 @@ func commandHashViewMatches(operation CommandOperation, view CommandHashView) bo
 	case CommandObserveWorkRef:
 		_, ok := view.(observeWorkRefCommandHashView)
 		return ok
+	case CommandCreateObjectiveAndWork:
+		_, ok := view.(createObjectiveAndWorkCommandHashView)
+		return ok
+	case CommandActivateObjective:
+		_, ok := view.(activateObjectiveCommandHashView)
+		return ok
+	case CommandPlanRunWithBindings:
+		_, ok := view.(planRunWithBindingsCommandHashView)
+		return ok
+	case CommandJoinRun:
+		_, ok := view.(joinRunCommandHashView)
+		return ok
+	case CommandStartRun:
+		_, ok := view.(startRunCommandHashView)
+		return ok
 	default:
 		return false
 	}
@@ -1562,6 +1592,377 @@ func providerObservationMatches(
 		return body.ExpectedWorkReferenceVersion == nil && body.PreviousProviderVersion == nil && previous.String() == ""
 	}
 	return *body.PreviousProviderVersion == previous.String()
+}
+
+type CreateObjectiveAndWorkRequest struct {
+	CommandRequest
+	SessionID          domain.ActorSessionID
+	ObjectiveID        domain.ObjectiveID
+	ObjectiveTitle     string
+	AcceptanceCriteria string
+	WorkUnitID         domain.WorkUnitID
+	WorkUnitTitle      string
+	WorkReferenceID    domain.WorkReferenceID
+}
+
+func (service *OrchestrationService) CreateObjectiveAndWork(ctx context.Context, request CreateObjectiveAndWorkRequest) (CommandExecution, error) {
+	view, ok := request.HashView.(createObjectiveAndWorkCommandHashView)
+	if err := validateCommandRequest(request.CommandRequest, CommandCreateObjectiveAndWork); err != nil || !ok ||
+		!expectedResourceMatches(request.Spec, view.Body.Session, domain.AggregateKindActorSession, resourceAuthorization) ||
+		!expectedResourceMatches(request.Spec, view.Body.WorkReference, domain.AggregateKindWorkReference, resourceReference) ||
+		view.Body.Session.ID.String() != request.SessionID.String() ||
+		view.Body.ObjectiveID.String() != request.ObjectiveID.String() ||
+		view.Body.ObjectiveTitle != request.ObjectiveTitle ||
+		view.Body.AcceptanceCriteria != request.AcceptanceCriteria ||
+		view.Body.WorkUnitID.String() != request.WorkUnitID.String() ||
+		view.Body.WorkUnitTitle != request.WorkUnitTitle ||
+		view.Body.WorkReference.ID.String() != request.WorkReferenceID.String() ||
+		!mutationTargetMatches(request.Spec, request.ObjectiveID.String(), domain.AggregateKindObjective, domain.ExpectationMustNotExist) ||
+		!mutationTargetMatches(request.Spec, request.WorkUnitID.String(), domain.AggregateKindWorkUnit, domain.ExpectationMustNotExist) {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	return service.executeCommand(ctx, request.CommandRequest, CommandCreateObjectiveAndWork,
+		func(locked CommandContext, _ domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {
+			session, err := lockedState[domain.ActorSessionState](locked, request.SessionID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			workReference, err := lockedState[domain.WorkReferenceState](locked, request.WorkReferenceID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			result, err := domain.CreateObjectiveAndWork(domain.CreateObjectiveAndWorkInput{
+				Session: session, ExpectedSessionVersion: session.Version(), ObjectiveID: request.ObjectiveID,
+				ObjectiveTitle: request.ObjectiveTitle, AcceptanceCriteria: request.AcceptanceCriteria,
+				WorkUnitID: request.WorkUnitID, WorkUnitTitle: request.WorkUnitTitle, WorkReference: workReference,
+				ExpectedWorkReferenceVersion: workReference.Version(),
+			})
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			return CreateObjectiveAndWorkCommit(locked, result)
+		})
+}
+
+type ActivateObjectiveRequest struct {
+	CommandRequest
+	SessionID   domain.ActorSessionID
+	ObjectiveID domain.ObjectiveID
+}
+
+func (service *OrchestrationService) ActivateObjective(ctx context.Context, request ActivateObjectiveRequest) (CommandExecution, error) {
+	view, ok := request.HashView.(activateObjectiveCommandHashView)
+	if err := validateCommandRequest(request.CommandRequest, CommandActivateObjective); err != nil || !ok ||
+		!expectedResourceMatches(request.Spec, view.Body.Session, domain.AggregateKindActorSession, resourceAuthorization) ||
+		!expectedResourceMatches(request.Spec, view.Body.Objective, domain.AggregateKindObjective, resourceMutation) ||
+		view.Body.Session.ID.String() != request.SessionID.String() ||
+		view.Body.Objective.ID.String() != request.ObjectiveID.String() {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	return service.executeCommand(ctx, request.CommandRequest, CommandActivateObjective,
+		func(locked CommandContext, _ domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {
+			session, err := lockedState[domain.ActorSessionState](locked, request.SessionID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			objective, err := lockedState[domain.ObjectiveState](locked, request.ObjectiveID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			result, err := domain.ActivateObjective(domain.ActivateObjectiveInput{
+				Session: session, ExpectedSessionVersion: session.Version(), Objective: objective,
+				ExpectedObjectiveVersion: objective.Version(),
+			})
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			return ActivateObjectiveCommit(locked, result)
+		})
+}
+
+type RunParticipantPlanRequest struct {
+	ParticipationID        domain.RunParticipationID
+	ActorID                domain.ActorID
+	ExpectedActorVersion   domain.Version
+	SessionID              domain.ActorSessionID
+	ExpectedSessionVersion domain.Version
+	Role                   string
+}
+
+type RuntimeBindingPlanRequest struct {
+	BindingID                      domain.RuntimeBindingID
+	ParticipationID                domain.RunParticipationID
+	SessionID                      domain.ActorSessionID
+	RuntimeEndpointID              domain.RuntimeEndpointID
+	ExpectedRuntimeEndpointVersion domain.Version
+}
+
+type PlanRunWithBindingsRequest struct {
+	CommandRequest
+	OperatorSessionID domain.ActorSessionID
+	RunID             domain.RunID
+	ObjectiveID       domain.ObjectiveID
+	WorkUnitID        domain.WorkUnitID
+	Participants      []RunParticipantPlanRequest
+	Bindings          []RuntimeBindingPlanRequest
+}
+
+func (service *OrchestrationService) PlanRunWithBindings(ctx context.Context, request PlanRunWithBindingsRequest) (CommandExecution, error) {
+	view, ok := request.HashView.(planRunWithBindingsCommandHashView)
+	if err := validateCommandRequest(request.CommandRequest, CommandPlanRunWithBindings); err != nil || !ok ||
+		!expectedResourceMatches(request.Spec, view.Body.OperatorSession, domain.AggregateKindActorSession, resourceAuthorization) ||
+		!expectedResourceMatches(request.Spec, view.Body.Objective, domain.AggregateKindObjective, resourceReference) ||
+		!expectedResourceMatches(request.Spec, view.Body.WorkUnit, domain.AggregateKindWorkUnit, resourceReference) ||
+		view.Body.OperatorSession.ID.String() != request.OperatorSessionID.String() ||
+		view.Body.RunID.String() != request.RunID.String() ||
+		view.Body.Objective.ID.String() != request.ObjectiveID.String() ||
+		view.Body.WorkUnit.ID.String() != request.WorkUnitID.String() ||
+		!mutationTargetMatches(request.Spec, request.RunID.String(), domain.AggregateKindRun, domain.ExpectationMustNotExist) ||
+		!runParticipantPlanRequestMatches(request.Spec, view.Body.Participants, request.Participants) ||
+		!runtimeBindingPlanRequestMatches(request.Spec, view.Body.Bindings, request.Bindings) {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	return service.executeCommand(ctx, request.CommandRequest, CommandPlanRunWithBindings,
+		func(locked CommandContext, _ domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {
+			operatorSession, err := lockedState[domain.ActorSessionState](locked, request.OperatorSessionID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			objective, err := lockedState[domain.ObjectiveState](locked, request.ObjectiveID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			workUnit, err := lockedState[domain.WorkUnitState](locked, request.WorkUnitID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			participants := make([]domain.RunParticipantPlan, len(request.Participants))
+			for index, plan := range request.Participants {
+				actor, actorErr := lockedState[domain.ActorState](locked, plan.ActorID)
+				session, sessionErr := lockedState[domain.ActorSessionState](locked, plan.SessionID)
+				if actorErr != nil || sessionErr != nil {
+					return OperationCommit{}, ErrInvalidCommandContext
+				}
+				participants[index] = domain.RunParticipantPlan{
+					ParticipationID: plan.ParticipationID, Actor: actor, ExpectedActorVersion: plan.ExpectedActorVersion,
+					Session: session, ExpectedSessionVersion: plan.ExpectedSessionVersion, Role: plan.Role,
+				}
+			}
+			bindings := make([]domain.RuntimeBindingPlan, len(request.Bindings))
+			for index, plan := range request.Bindings {
+				endpointRef, refErr := domain.NewAggregateRef(plan.RuntimeEndpointID, plan.ExpectedRuntimeEndpointVersion)
+				if refErr != nil {
+					return OperationCommit{}, refErr
+				}
+				bindings[index] = domain.RuntimeBindingPlan{
+					BindingID: plan.BindingID, ParticipationID: plan.ParticipationID, SessionID: plan.SessionID,
+					Endpoint: endpointRef,
+				}
+			}
+			result, err := domain.PlanRunWithBindings(domain.PlanRunWithBindingsInput{
+				OperatorSession: operatorSession, ExpectedOperatorSessionVersion: operatorSession.Version(),
+				RunID: request.RunID, Objective: objective, ExpectedObjectiveVersion: objective.Version(),
+				WorkUnit: workUnit, ExpectedWorkUnitVersion: workUnit.Version(),
+				Participants: participants, Bindings: bindings,
+			})
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			return PlanRunWithBindingsCommit(locked, result)
+		})
+}
+
+func runParticipantPlanRequestMatches(
+	spec CommandSpec,
+	wire []CommandRunParticipantPlan,
+	request []RunParticipantPlanRequest,
+) bool {
+	if len(wire) != len(request) {
+		return false
+	}
+	byID := make(map[string]RunParticipantPlanRequest, len(request))
+	for _, plan := range request {
+		if plan.ParticipationID.IsZero() || plan.ActorID.IsZero() || !plan.ExpectedActorVersion.Valid() ||
+			plan.SessionID.IsZero() || !plan.ExpectedSessionVersion.Valid() {
+			return false
+		}
+		if _, duplicate := byID[plan.ParticipationID.String()]; duplicate {
+			return false
+		}
+		byID[plan.ParticipationID.String()] = plan
+	}
+	for _, plan := range wire {
+		requestPlan, exists := byID[plan.ParticipationID.String()]
+		if !exists || plan.Actor.ID.String() != requestPlan.ActorID.String() ||
+			plan.Actor.ExpectedVersion != requestPlan.ExpectedActorVersion.Uint64() ||
+			plan.Session.ID.String() != requestPlan.SessionID.String() ||
+			plan.Session.ExpectedVersion != requestPlan.ExpectedSessionVersion.Uint64() ||
+			plan.Role != requestPlan.Role ||
+			!declaredResourceMatches(spec, plan.Actor, domain.AggregateKindActor) ||
+			!declaredResourceMatches(spec, plan.Session, domain.AggregateKindActorSession) ||
+			!mutationTargetMatches(spec, requestPlan.ParticipationID.String(), domain.AggregateKindRunParticipation, domain.ExpectationMustNotExist) {
+			return false
+		}
+	}
+	return true
+}
+
+func runtimeBindingPlanRequestMatches(
+	spec CommandSpec,
+	wire []CommandRuntimeBindingPlan,
+	request []RuntimeBindingPlanRequest,
+) bool {
+	if len(wire) != len(request) {
+		return false
+	}
+	byID := make(map[string]RuntimeBindingPlanRequest, len(request))
+	for _, plan := range request {
+		if plan.BindingID.IsZero() || plan.ParticipationID.IsZero() || plan.SessionID.IsZero() ||
+			plan.RuntimeEndpointID.IsZero() || !plan.ExpectedRuntimeEndpointVersion.Valid() {
+			return false
+		}
+		if _, duplicate := byID[plan.BindingID.String()]; duplicate {
+			return false
+		}
+		byID[plan.BindingID.String()] = plan
+	}
+	for _, plan := range wire {
+		requestPlan, exists := byID[plan.BindingID.String()]
+		if !exists || plan.ParticipationID.String() != requestPlan.ParticipationID.String() ||
+			plan.SessionID.String() != requestPlan.SessionID.String() ||
+			plan.RuntimeEndpoint.ID.String() != requestPlan.RuntimeEndpointID.String() ||
+			plan.RuntimeEndpoint.ExpectedVersion != requestPlan.ExpectedRuntimeEndpointVersion.Uint64() ||
+			!mutationTargetMatches(spec, requestPlan.BindingID.String(), domain.AggregateKindRuntimeBinding, domain.ExpectationMustNotExist) {
+			return false
+		}
+	}
+	return true
+}
+
+type JoinRunRequest struct {
+	CommandRequest
+	SessionID       domain.ActorSessionID
+	RunID           domain.RunID
+	ParticipationID domain.RunParticipationID
+}
+
+func (service *OrchestrationService) JoinRun(ctx context.Context, request JoinRunRequest) (CommandExecution, error) {
+	view, ok := request.HashView.(joinRunCommandHashView)
+	if err := validateCommandRequest(request.CommandRequest, CommandJoinRun); err != nil || !ok ||
+		!expectedResourceMatches(request.Spec, view.Body.Session, domain.AggregateKindActorSession, resourceAuthorization) ||
+		!expectedResourceMatches(request.Spec, view.Body.Run, domain.AggregateKindRun, resourceReference) ||
+		!expectedResourceMatches(request.Spec, view.Body.Participation, domain.AggregateKindRunParticipation, resourceMutation) ||
+		view.Body.Session.ID.String() != request.SessionID.String() ||
+		view.Body.Run.ID.String() != request.RunID.String() ||
+		view.Body.Participation.ID.String() != request.ParticipationID.String() {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	return service.executeCommand(ctx, request.CommandRequest, CommandJoinRun,
+		func(locked CommandContext, _ domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {
+			session, err := lockedState[domain.ActorSessionState](locked, request.SessionID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			run, err := lockedState[domain.RunState](locked, request.RunID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			participation, err := lockedState[domain.RunParticipationState](locked, request.ParticipationID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			result, err := domain.JoinRun(domain.JoinRunInput{
+				Session: session, ExpectedSessionVersion: session.Version(), Run: run,
+				ExpectedRunVersion: run.Version(), Participation: participation,
+				ExpectedParticipationVersion: participation.Version(),
+			})
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			return JoinRunCommit(locked, result)
+		})
+}
+
+type StartRunParticipationRequest struct {
+	ParticipationID domain.RunParticipationID
+	ExpectedVersion domain.Version
+}
+
+type StartRunRequest struct {
+	CommandRequest
+	OperatorSessionID domain.ActorSessionID
+	RunID             domain.RunID
+	Participations    []StartRunParticipationRequest
+}
+
+func (service *OrchestrationService) StartRun(ctx context.Context, request StartRunRequest) (CommandExecution, error) {
+	view, ok := request.HashView.(startRunCommandHashView)
+	if err := validateCommandRequest(request.CommandRequest, CommandStartRun); err != nil || !ok ||
+		!expectedResourceMatches(request.Spec, view.Body.OperatorSession, domain.AggregateKindActorSession, resourceAuthorization) ||
+		!expectedResourceMatches(request.Spec, view.Body.Run, domain.AggregateKindRun, resourceMutation) ||
+		view.Body.OperatorSession.ID.String() != request.OperatorSessionID.String() ||
+		view.Body.Run.ID.String() != request.RunID.String() ||
+		!startRunParticipationRequestsMatch(request.Spec, view.Body.Participations, request.Participations) {
+		return CommandExecution{}, ErrInvalidCommandSpec
+	}
+	return service.executeCommand(ctx, request.CommandRequest, CommandStartRun,
+		func(locked CommandContext, _ domain.IdentityAuthorization, _ AuthenticationEvidence, _ PreparedPolicy) (OperationCommit, error) {
+			operatorSession, err := lockedState[domain.ActorSessionState](locked, request.OperatorSessionID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			run, err := lockedState[domain.RunState](locked, request.RunID)
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			snapshots := make([]domain.RunParticipationSnapshot, len(request.Participations))
+			for index, participation := range request.Participations {
+				if participation.ParticipationID.IsZero() || !participation.ExpectedVersion.Valid() {
+					return OperationCommit{}, ErrInvalidCommandSpec
+				}
+				state, stateErr := lockedState[domain.RunParticipationState](locked, participation.ParticipationID)
+				if stateErr != nil {
+					return OperationCommit{}, stateErr
+				}
+				snapshots[index] = domain.RunParticipationSnapshot{Participation: state, ExpectedVersion: participation.ExpectedVersion}
+			}
+			result, err := domain.StartRun(domain.StartRunInput{
+				OperatorSession: operatorSession, ExpectedOperatorSessionVersion: operatorSession.Version(),
+				Run: run, ExpectedRunVersion: run.Version(), Participations: snapshots,
+			})
+			if err != nil {
+				return OperationCommit{}, err
+			}
+			return StartRunCommit(locked, result)
+		})
+}
+
+func startRunParticipationRequestsMatch(
+	spec CommandSpec,
+	wire []CommandExpectedResource,
+	request []StartRunParticipationRequest,
+) bool {
+	if len(wire) != len(request) {
+		return false
+	}
+	byID := make(map[string]StartRunParticipationRequest, len(request))
+	for _, participation := range request {
+		if participation.ParticipationID.IsZero() || !participation.ExpectedVersion.Valid() {
+			return false
+		}
+		if _, duplicate := byID[participation.ParticipationID.String()]; duplicate {
+			return false
+		}
+		byID[participation.ParticipationID.String()] = participation
+	}
+	for _, resource := range wire {
+		requested, exists := byID[resource.ID.String()]
+		if !exists || resource.ExpectedVersion != requested.ExpectedVersion.Uint64() ||
+			!expectedResourceMatches(spec, resource, domain.AggregateKindRunParticipation, resourceReference) {
+			return false
+		}
+	}
+	return true
 }
 
 type BootstrapInstallationRequest struct {
