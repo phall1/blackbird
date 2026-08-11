@@ -1,33 +1,58 @@
 # Blackbird
 
-This directory is the isolated production Go module for Blackbird. It is kept
-extractable from the Agent Mail excavation tree and never imports the selection
-spike or the legacy Python implementation.
+Blackbird is a durable, local-first coordination service for human and AI agent
+work. It is a standalone Go replacement for the legacy Python Agent Mail
+service.
 
-The production core currently includes:
+The released product includes:
 
-- process lifecycle, build identity, and import-boundary enforcement;
-- nominal UUIDv7 identities, authority scopes, versions, stable errors, event
-  envelopes, and semantic commit-set contracts;
-- pure installation, bootstrap, principal, workspace, membership, actor,
-  delegation, device, and actor-session transitions; and
-- strict bounded public command, result, error, and event wire contracts for
-  W0; and
-- the in-progress transport-neutral W0 application contract, including closed
-  unit-of-work declarations, receipt/replay plans, security-only decisions,
-  RFC 8785 result/capsule codecs, and credential-bound identity commits.
+- a production daemon with HTTP and MCP transports and durable SQLite storage;
+- repository-scoped agent registration, secure resume tokens, and peer
+  discovery;
+- conversations, immutable messages, replies, inboxes, threads, independent
+  read and acknowledgement facts, and To/Cc/Bcc privacy;
+- shared and exclusive exact/subtree file reservations with expiry, renewal,
+  overlap detection, and fencing tokens;
+- strict W0 identity and W1 work/run contracts with idempotent orchestration;
+- per-user launchd and systemd services, unattended Homebrew updates, and
+  idempotent MCP client configuration; and
+- reproducible native releases for Apple Silicon macOS and amd64/arm64 Linux.
 
-These slices have passed their local architecture gates and native macOS/Linux
-CI. They do **not** claim that persistence, supported transports, the complete
-walking slice, an ADR is Verified, or a release candidate exists. W0.4 is the
-application/UnitOfWork boundary; SQLite, PostgreSQL, pairing, HTTP/MCP,
-context, and the integrated proof follow in dependency order. W0.4 remains in
-progress until its production command/guard/event/audit profiles and complete
-recording-UoW orchestration evidence land.
+SQLite is the supported daily-use backend. PostgreSQL remains explicit and
+fail-closed for coordination operations that have not landed there yet.
 
-The implementation authority is
-[`docs/architecture/implementation-plan.md`](../docs/architecture/implementation-plan.md),
-with decisions in [`docs/architecture/adr`](../docs/architecture/adr).
+## Install
+
+```sh
+brew install phall1/tap/blackbird
+blackbird install
+blackbird status
+```
+
+`blackbird install` starts the service and adds the remote MCP endpoint at
+`http://127.0.0.1:8081` to detected OpenCode, Claude Code, and Codex clients.
+
+## Daily Use
+
+Start with `blackbird_agent_register`, passing an absolute repository path as
+`project_key` and a stable `agent_name`. Retain the returned
+`registration_token` to resume the same identity after process or machine
+restarts.
+
+The daily-use MCP tools are:
+
+- `blackbird_agent_register` and `blackbird_agents_list`;
+- `blackbird_conversation_open`, `blackbird_message_send`, and
+  `blackbird_message_reply`;
+- `blackbird_inbox_fetch`, `blackbird_thread_fetch`,
+  `blackbird_message_mark_read`, and `blackbird_message_acknowledge`; and
+- `blackbird_reservation_acquire`, `blackbird_reservation_renew`, and
+  `blackbird_reservation_release`.
+
+All tools except initial registration authenticate with the returned
+`agent_token`. Reserve the narrowest relevant paths before editing, use one
+conversation per work item, acknowledge required handoffs, and release
+reservations when work completes.
 
 ## Development
 
