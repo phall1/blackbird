@@ -57,7 +57,9 @@ const (
 	ResourceCurrentContext = "blackbird://session/current/context"
 	ResourceContextDeltas  = "blackbird://session/current/context-deltas{?cursor,limit}"
 
-	mediaTypeJSON = "application/json"
+	mediaTypeJSON                = "application/json"
+	defaultCoordinationPageLimit = 50
+	defaultReservationTTLSeconds = 3600
 )
 
 // Authenticator establishes verified evidence from the protected MCP channel
@@ -221,7 +223,7 @@ type sendMessageInput struct {
 	To                      []string `json:"to"`
 	Subject                 string   `json:"subject"`
 	Body                    string   `json:"body"`
-	AcknowledgementRequired bool     `json:"acknowledgement_required"`
+	AcknowledgementRequired bool     `json:"acknowledgement_required,omitempty"`
 }
 type replyMessageInput struct {
 	sendMessageInput
@@ -247,15 +249,15 @@ type messageOutput struct {
 }
 type fetchInboxInput struct {
 	AgentToken string `json:"agent_token"`
-	UnreadOnly bool   `json:"unread_only"`
-	After      uint64 `json:"after"`
-	Limit      uint16 `json:"limit"`
+	UnreadOnly bool   `json:"unread_only,omitempty"`
+	After      uint64 `json:"after,omitempty"`
+	Limit      uint16 `json:"limit,omitempty"`
 }
 type fetchThreadInput struct {
 	AgentToken     string `json:"agent_token"`
 	ConversationID string `json:"conversation_id"`
-	After          uint64 `json:"after"`
-	Limit          uint16 `json:"limit"`
+	After          uint64 `json:"after,omitempty"`
+	Limit          uint16 `json:"limit,omitempty"`
 }
 type messagePageOutput struct {
 	Messages []messageOutput `json:"messages"`
@@ -277,9 +279,9 @@ type reservationSelectorInput struct {
 }
 type reservationAcquireInput struct {
 	AgentToken string                     `json:"agent_token"`
-	Mode       string                     `json:"mode" jsonschema:"shared or exclusive"`
+	Mode       string                     `json:"mode,omitempty" jsonschema:"shared or exclusive"`
 	Selectors  []reservationSelectorInput `json:"selectors"`
-	TTLSeconds uint32                     `json:"ttl_seconds"`
+	TTLSeconds uint32                     `json:"ttl_seconds,omitempty"`
 }
 type fenceOutput struct {
 	ConflictKey string `json:"conflict_key"`
@@ -289,7 +291,12 @@ type reservationChangeInput struct {
 	AgentToken string        `json:"agent_token"`
 	LeaseID    string        `json:"lease_id"`
 	Fences     []fenceOutput `json:"fences"`
-	TTLSeconds uint32        `json:"ttl_seconds"`
+	TTLSeconds uint32        `json:"ttl_seconds,omitempty"`
+}
+type reservationReleaseInput struct {
+	AgentToken string        `json:"agent_token"`
+	LeaseID    string        `json:"lease_id"`
+	Fences     []fenceOutput `json:"fences"`
 }
 type reservationOutput struct {
 	LeaseID    string                     `json:"lease_id"`
@@ -350,17 +357,28 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 			}
 			return nil, conversationOutput{ConversationID: value.ID().String(), Topic: value.Topic(), OpenedAt: value.OpenedAt().Format(time.RFC3339Nano)}, nil
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolMessageSend, Description: "Send a durable message to named agents."},
+	messageInputSchema := coordinationInputSchema[sendMessageInput](func(properties map[string]*jsonschema.Schema) {
+		properties["acknowledgement_required"].Default = json.RawMessage("false")
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolMessageSend, Description: "Send a durable message to named agents.", InputSchema: messageInputSchema},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input sendMessageInput) (*sdkmcp.CallToolResult, messageOutput, error) {
 			value, err := sendLocalMessage(ctx, store, input, "")
 			return nil, value, err
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolMessageReply, Description: "Reply to a durable message in its conversation."},
+	replyInputSchema := coordinationInputSchema[replyMessageInput](func(properties map[string]*jsonschema.Schema) {
+		properties["acknowledgement_required"].Default = json.RawMessage("false")
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolMessageReply, Description: "Reply to a durable message in its conversation.", InputSchema: replyInputSchema},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input replyMessageInput) (*sdkmcp.CallToolResult, messageOutput, error) {
 			value, err := sendLocalMessage(ctx, store, input.sendMessageInput, input.ReplyToMessageID)
 			return nil, value, err
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolInboxFetch, Description: "Fetch the caller's unread or complete inbox."},
+	inboxInputSchema := coordinationInputSchema[fetchInboxInput](func(properties map[string]*jsonschema.Schema) {
+		properties["unread_only"].Default = json.RawMessage("false")
+		properties["after"].Default = json.RawMessage("0")
+		setPageLimitSchema(properties["limit"])
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolInboxFetch, Description: "Fetch the caller's unread or complete inbox.", InputSchema: inboxInputSchema},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input fetchInboxInput) (*sdkmcp.CallToolResult, messagePageOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
@@ -373,7 +391,11 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 			}
 			return nil, coordinationPageOutput(page), nil
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolThreadFetch, Description: "Fetch visible messages in a conversation."},
+	threadInputSchema := coordinationInputSchema[fetchThreadInput](func(properties map[string]*jsonschema.Schema) {
+		properties["after"].Default = json.RawMessage("0")
+		setPageLimitSchema(properties["limit"])
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolThreadFetch, Description: "Fetch visible messages in a conversation.", InputSchema: threadInputSchema},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input fetchThreadInput) (*sdkmcp.CallToolResult, messagePageOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
@@ -520,7 +542,12 @@ func findInboxMessageDigest(ctx context.Context, store application.LocalCoordina
 }
 
 func registerReservationTools(server *sdkmcp.Server, store application.LocalCoordinationStore) {
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationAcquire, Description: "Acquire shared or exclusive exact/subtree file reservations."},
+	acquireInputSchema := coordinationInputSchema[reservationAcquireInput](func(properties map[string]*jsonschema.Schema) {
+		properties["mode"].Default = json.RawMessage(`"exclusive"`)
+		properties["mode"].Enum = []any{string(application.LeaseShared), string(application.LeaseExclusive)}
+		setTTLSchema(properties["ttl_seconds"])
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationAcquire, Description: "Acquire shared or exclusive exact/subtree file reservations.", InputSchema: acquireInputSchema},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationAcquireInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
@@ -547,19 +574,41 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 			}
 			return nil, localReservationOutput(lease), nil
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRenew, Description: "Renew a held file reservation using its current fences."},
+	renewInputSchema := coordinationInputSchema[reservationChangeInput](func(properties map[string]*jsonschema.Schema) {
+		setTTLSchema(properties["ttl_seconds"])
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRenew, Description: "Renew a held file reservation using its current fences.", InputSchema: renewInputSchema},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationChangeInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
 			lease, err := changeLocalReservation(ctx, store, input, false)
 			return nil, lease, err
 		})
 	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRelease, Description: "Release a held file reservation using its current fences."},
-		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationChangeInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
-			if input.TTLSeconds != 0 {
-				return nil, reservationOutput{}, application.ErrInvalidCoordination
-			}
-			lease, err := changeLocalReservation(ctx, store, input, true)
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationReleaseInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
+			lease, err := changeLocalReservation(ctx, store, reservationChangeInput{AgentToken: input.AgentToken,
+				LeaseID: input.LeaseID, Fences: input.Fences}, true)
 			return nil, lease, err
 		})
+}
+
+func coordinationInputSchema[Input any](configure func(map[string]*jsonschema.Schema)) *jsonschema.Schema {
+	schema, err := jsonschema.For[Input](nil)
+	if err != nil {
+		panic(fmt.Sprintf("infer local coordination input schema: %v", err))
+	}
+	configure(schema.Properties)
+	return schema
+}
+
+func setPageLimitSchema(schema *jsonschema.Schema) {
+	schema.Default = json.RawMessage(strconv.Itoa(defaultCoordinationPageLimit))
+	schema.Minimum = jsonschema.Ptr(float64(1))
+	schema.Maximum = jsonschema.Ptr(float64(application.MaxQueryPageSize))
+}
+
+func setTTLSchema(schema *jsonschema.Schema) {
+	schema.Default = json.RawMessage(strconv.Itoa(defaultReservationTTLSeconds))
+	schema.Minimum = jsonschema.Ptr(float64(1))
+	schema.Maximum = jsonschema.Ptr(application.MaxLeaseTTL.Seconds())
 }
 
 func changeLocalReservation(ctx context.Context, store application.LocalCoordinationStore, input reservationChangeInput,

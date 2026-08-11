@@ -309,6 +309,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	server := newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
 		&testSessionBinder{session: parseSession(t)}, store)
 	client, closeMCP := connect(t, server)
+	assertCoordinationToolSchemas(t, client)
 
 	alice := callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
 	bob := callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob"})
@@ -341,18 +342,19 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		t.Fatalf("read message remained unread: %+v", unread)
 	}
 	if all := callCoord[messagePageOutput](t, client, ToolInboxFetch,
-		fetchInboxInput{AgentToken: bob.RegistrationToken, Limit: 32}); len(all.Messages) != 1 {
+		map[string]any{"agent_token": bob.RegistrationToken}); len(all.Messages) != 1 {
 		t.Fatalf("all inbox omitted read message: %+v", all)
 	}
-	reply := callCoord[messageOutput](t, client, ToolMessageReply, replyMessageInput{sendMessageInput: sendMessageInput{
-		AgentToken: bob.RegistrationToken, ConversationID: conversation.ConversationID, To: []string{"alice"},
-		Subject: "re: handoff", Body: "received", AcknowledgementRequired: false}, ReplyToMessageID: message.MessageID})
+	reply := callCoord[messageOutput](t, client, ToolMessageReply, map[string]any{
+		"agent_token": bob.RegistrationToken, "conversation_id": conversation.ConversationID, "to": []string{"alice"},
+		"subject": "re: handoff", "body": "received", "reply_to_message_id": message.MessageID,
+	})
 	if reply.ReplyTo != message.MessageID {
 		t.Fatalf("reply = %+v", reply)
 	}
-	lease := callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
-		AgentToken: alice.RegistrationToken, Mode: "exclusive", TTLSeconds: 3600,
-		Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "src"}},
+	lease := callCoord[reservationOutput](t, client, ToolReservationAcquire, map[string]any{
+		"agent_token": alice.RegistrationToken,
+		"selectors":   []reservationSelectorInput{{Kind: "subtree", Path: "src"}},
 	})
 	if lease.LeaseID == "" || len(lease.Fences) == 0 {
 		t.Fatalf("lease = %+v", lease)
@@ -374,13 +376,15 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	aliceToken, bobToken := alice.RegistrationToken, bob.RegistrationToken
 	callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice", RegistrationToken: &aliceToken})
 	callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob", RegistrationToken: &bobToken})
-	renewed := callCoord[reservationOutput](t, client, ToolReservationRenew, reservationChangeInput{AgentToken: aliceToken,
-		LeaseID: lease.LeaseID, Fences: lease.Fences, TTLSeconds: 3600})
+	renewed := callCoord[reservationOutput](t, client, ToolReservationRenew, map[string]any{
+		"agent_token": aliceToken, "lease_id": lease.LeaseID, "fences": lease.Fences,
+	})
 	if renewed.LeaseID != lease.LeaseID {
 		t.Fatalf("renewed lease = %+v", renewed)
 	}
-	thread := callCoord[messagePageOutput](t, client, ToolThreadFetch, fetchThreadInput{AgentToken: aliceToken,
-		ConversationID: conversation.ConversationID, Limit: 32})
+	thread := callCoord[messagePageOutput](t, client, ToolThreadFetch, map[string]any{
+		"agent_token": aliceToken, "conversation_id": conversation.ConversationID,
+	})
 	if len(thread.Messages) != 2 || thread.Messages[0].Body != "durable payload" || !thread.Messages[0].Deliveries[0].Acknowledged ||
 		thread.Messages[1].ReplyTo != message.MessageID {
 		t.Fatalf("durable thread = %+v", thread)
@@ -394,14 +398,97 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if !conflict.IsError || !strings.Contains(strings.ToLower(conflict.Content[0].(*sdkmcp.TextContent).Text), "lease") {
 		t.Fatalf("overlapping reservation did not conflict: %+v", conflict)
 	}
-	callCoord[reservationOutput](t, client, ToolReservationRelease, reservationChangeInput{AgentToken: aliceToken,
-		LeaseID: renewed.LeaseID, Fences: renewed.Fences})
+	assertCoordinationInputRejected(t, client, ToolInboxFetch, map[string]any{"agent_token": aliceToken, "limit": 0})
+	assertCoordinationInputRejected(t, client, ToolReservationAcquire, map[string]any{"agent_token": bobToken,
+		"mode": "invalid", "selectors": []reservationSelectorInput{{Kind: "exact", Path: "other.go"}}})
+	assertCoordinationInputRejected(t, client, ToolReservationRenew, map[string]any{"agent_token": aliceToken,
+		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "ttl_seconds": 0})
+	assertCoordinationInputRejected(t, client, ToolReservationRelease, map[string]any{"agent_token": aliceToken,
+		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "ttl_seconds": 1})
+	callCoord[reservationOutput](t, client, ToolReservationRelease, map[string]any{"agent_token": aliceToken,
+		"lease_id": renewed.LeaseID, "fences": renewed.Fences})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "exclusive", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: aliceToken,
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "docs"}}})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "docs/guide.md"}}})
+}
+
+func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) {
+	t.Helper()
+	result, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list coordination tools: %v", err)
+	}
+	tools := make(map[string]sdkmcp.Tool, len(result.Tools))
+	for _, tool := range result.Tools {
+		tools[tool.Name] = *tool
+	}
+	expectedDefaults := map[string]map[string]any{
+		ToolMessageSend:        {"acknowledgement_required": false},
+		ToolMessageReply:       {"acknowledgement_required": false},
+		ToolInboxFetch:         {"unread_only": false, "after": float64(0), "limit": float64(50)},
+		ToolThreadFetch:        {"after": float64(0), "limit": float64(50)},
+		ToolReservationAcquire: {"mode": "exclusive", "ttl_seconds": float64(3600)},
+		ToolReservationRenew:   {"ttl_seconds": float64(3600)},
+	}
+	for toolName, defaults := range expectedDefaults {
+		tool, ok := tools[toolName]
+		if !ok {
+			t.Fatalf("coordination tool %q was not discovered", toolName)
+		}
+		encoded, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshal %s schema: %v", toolName, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Default any `json:"default"`
+			} `json:"properties"`
+			Required []string `json:"required"`
+		}
+		if err := json.Unmarshal(encoded, &schema); err != nil {
+			t.Fatalf("decode %s schema: %v", toolName, err)
+		}
+		for field, want := range defaults {
+			if slicesContains(schema.Required, field) {
+				t.Errorf("%s schema requires optional field %q", toolName, field)
+			}
+			if got := schema.Properties[field].Default; !reflect.DeepEqual(got, want) {
+				t.Errorf("%s.%s default = %#v, want %#v", toolName, field, got, want)
+			}
+		}
+	}
+
+	release := tools[ToolReservationRelease]
+	encoded, err := json.Marshal(release.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal release schema: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`"ttl_seconds"`)) {
+		t.Fatalf("release schema includes ttl_seconds: %s", encoded)
+	}
+}
+
+func slicesContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertCoordinationInputRejected(t *testing.T, session *sdkmcp.ClientSession, tool string, input any) {
+	t.Helper()
+	result, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: tool, Arguments: input})
+	if err != nil {
+		t.Fatalf("%s invalid call: %v", tool, err)
+	}
+	if !result.IsError {
+		t.Fatalf("%s accepted invalid input: %#v", tool, input)
+	}
 }
 
 func callCoord[Output any](t *testing.T, session *sdkmcp.ClientSession, tool string, input any) Output {
