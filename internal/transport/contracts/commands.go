@@ -3,6 +3,7 @@ package contracts
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
@@ -59,7 +60,11 @@ func (handler *ApplicationHandler) commandContext(
 	if err != nil {
 		return commandRequestContext{}, err
 	}
-	audit, err := handler.assembler.AuditRequestContext(requestID, requestID, handler.serverReceived())
+	audit, err := handler.assembler.AuditRequestContext(
+		requestID,
+		requestID,
+		handler.serverReceived().UTC().Truncate(time.Microsecond),
+	)
 	if err != nil {
 		return commandRequestContext{}, err
 	}

@@ -738,7 +738,8 @@ func securityAudit(t *testing.T, spec application.SecuritySpec, reason string) a
 func bindSecurityAudit(t *testing.T, spec application.SecuritySpec) application.SecuritySpec {
 	t.Helper()
 	request, err := application.NewAuditRequestContext(
-		"01b8e094-9888-7000-8000-000000000201", "01b8e094-9888-7000-8000-000000000202", time.Now().UTC(), nil,
+		"01b8e094-9888-7000-8000-000000000201", "01b8e094-9888-7000-8000-000000000202",
+		time.Now().UTC().Truncate(time.Microsecond), nil,
 	)
 	if err != nil {
 		t.Fatal(err)

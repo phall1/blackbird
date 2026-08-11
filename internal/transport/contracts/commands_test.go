@@ -144,7 +144,7 @@ func workspaceCreateTestDTO(t *testing.T, fixture authenticationFixture) Workspa
 			Schema: SchemaWorkspaceCreateCommand, RequestID: "req_workspace_create",
 			CommandID: commandID, Operation: OperationWorkspaceCreate,
 			IdempotencyKey: "workspace-create-test-key", AuthorityID: fixture.authority,
-			AuthorityEpoch: fixture.epoch, Deadline: time.Now().UTC().Add(time.Hour),
+			AuthorityEpoch: fixture.epoch, Deadline: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond),
 			CorrelationID: correlation,
 		},
 		ClientInstanceID: clientInstance,
@@ -422,7 +422,7 @@ func objectiveActivateTestDTO(t *testing.T, fixture authenticationFixture) Objec
 			Schema: SchemaObjectiveActivateCommand, RequestID: "req_objective_activate",
 			CommandID: commandID, Operation: OperationObjectiveActivate,
 			IdempotencyKey: "objective-activate-test-key", AuthorityID: fixture.authority,
-			AuthorityEpoch: fixture.epoch, Deadline: time.Now().UTC().Add(time.Hour), CorrelationID: correlationID,
+			AuthorityEpoch: fixture.epoch, Deadline: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond), CorrelationID: correlationID,
 		},
 		ClientInstanceID: clientID,
 		ExpectedVersions: ObjectiveActivateExpectedVersionsDTO{
