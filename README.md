@@ -42,3 +42,33 @@ go build ./...
 Build metadata can be supplied with linker flags targeting `main.version`,
 `main.commit`, and `main.builtAt`. Unset fields use explicit development
 values.
+
+## Local Product Management
+
+The released `blackbird` binary manages its per-user service without requiring
+root access:
+
+```sh
+blackbird install
+blackbird status
+blackbird update
+blackbird uninstall
+```
+
+`install` creates XDG config, data, and state directories, writes an atomic
+launchd agent on macOS or systemd user unit on Linux, and safely restarts the
+service. It also installs an unattended Homebrew updater that runs every six
+hours: a non-`KeepAlive` launchd job on macOS, or a systemd user timer and
+oneshot service on Linux. Updater failures are retained in Blackbird's state
+logs on macOS and the user journal on Linux. The updater never restarts itself;
+the daemon restarts only after the installed formula version changes.
+
+Installation also adds one `blackbird` HTTP MCP entry to detected OpenCode,
+Claude Code, and Codex configurations while preserving unrelated settings.
+Repeated installs converge the daemon, updater, and client definitions.
+
+`update` runs `brew update` followed by
+`brew upgrade phall1/tap/blackbird`; the service is restarted only when the
+installed formula version changes. `status` reports both the daemon and updater.
+`uninstall` stops the daemon and updater and removes only their definitions. The
+database, logs, XDG directories, and MCP client settings are retained.

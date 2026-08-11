@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+      built_at: ${{ steps.release.outputs.built_at }}
+      source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve immutable release identity
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "::error::release tags must have the form vX.Y.Z"
+            exit 1
+          fi
+          commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          source_date_epoch="$(git show -s --format=%ct "$commit")"
+          built_at="$(date --utc --date="@${source_date_epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
+          {
+            echo "tag=${RELEASE_TAG}"
+            echo "version=${RELEASE_TAG#v}"
+            echo "commit=${commit}"
+            echo "built_at=${built_at}"
+            echo "source_date_epoch=${source_date_epoch}"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test release source
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+
+      - name: Verify and test module
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go mod verify
+          go test ./...
+          go vet ./...
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            host_os: Darwin
+            host_arch: arm64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            host_os: Linux
+            host_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            goos: linux
+            goarch: arm64
+            host_os: Linux
+            host_arch: aarch64
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Go 1.26.5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: go.sum
+
+      - name: Assert native host and immutable source
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.prepare.outputs.commit }}
+          HOST_OS: ${{ matrix.host_os }}
+          HOST_ARCH: ${{ matrix.host_arch }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "$HOST_OS"
+          test "$(uname -m)" = "$HOST_ARCH"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          go mod verify
+
+      - name: Build reproducible native binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          BUILT_AT: ${{ needs.prepare.outputs.built_at }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ldflags="-buildid= -s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.builtAt=${BUILT_AT}"
+          go build -trimpath -buildvcs=false -tags='netgo osusergo' \
+            -ldflags="$ldflags" -o "dist/blackbird-${TARGET}" ./cmd/blackbird
+          go build -trimpath -buildvcs=false -tags='netgo osusergo' \
+            -ldflags="$ldflags" -o "dist/blackbird-${TARGET}.rebuild" ./cmd/blackbird
+          cmp "dist/blackbird-${TARGET}" "dist/blackbird-${TARGET}.rebuild"
+          expected="blackbird version=${VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
+          test "$("dist/blackbird-${TARGET}" --version)" = "$expected"
+          go version -m "dist/blackbird-${TARGET}" > "dist/BUILD-INFO-${TARGET}.txt"
+
+      - name: Upload native build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blackbird-build-${{ matrix.target }}
+          path: |
+            dist/blackbird-${{ matrix.target }}
+            dist/BUILD-INFO-${{ matrix.target }}.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package release assets
+    needs: [prepare, test, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download native builds
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          pattern: blackbird-build-*
+          path: native
+          merge-multiple: true
+
+      - name: Assemble normalized archives and checksums
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            base="blackbird-${TAG}-${target}"
+            mkdir "$base"
+            install -m 0755 "native/blackbird-${target}" "${base}/blackbird"
+            install -m 0644 LICENSE "${base}/LICENSE"
+            install -m 0644 "native/BUILD-INFO-${target}.txt" "${base}/BUILD-INFO.txt"
+            tar --sort=name --format=ustar --mtime="@${SOURCE_DATE_EPOCH}" \
+              --owner=0 --group=0 --numeric-owner -cf - "$base" \
+              | gzip -n -9 > "release/${base}.tar.gz"
+            (cd release && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256")
+            tar -tzf "release/${base}.tar.gz" | grep -Fxq "${base}/blackbird"
+            (cd release && sha256sum --check "${base}.tar.gz.sha256")
+          done
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 6
+
+      - name: Upload complete release asset set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blackbird-release-${{ needs.prepare.outputs.tag }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish release
+    needs: [prepare, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download complete release asset set
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: blackbird-release-${{ needs.prepare.outputs.tag }}
+          path: release
+
+      - name: Validate local asset set
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            base="blackbird-${TAG}-${target}.tar.gz"
+            test -f "release/$base"
+            test -f "release/${base}.sha256"
+            (cd release && sha256sum --check "${base}.sha256")
+          done
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 6
+
+      - name: Upload, verify, and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --generate-notes --verify-tag \
+              --title "Blackbird ${VERSION}"
+          fi
+          gh release upload "$TAG" release/* --clobber
+
+          expected=()
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            base="blackbird-${TAG}-${target}.tar.gz"
+            expected+=("$base" "${base}.sha256")
+          done
+          mapfile -t expected < <(printf '%s\n' "${expected[@]}" | sort)
+          mapfile -t actual < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
+          gh release edit "$TAG" --draft=false
+
+  tap-release:
+    name: Dispatch optional tap update
+    needs: [prepare, release]
+    runs-on: ubuntu-24.04
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+    steps:
+      - name: Dispatch release to Homebrew tap
+        if: ${{ env.TAP_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ env.TAP_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          jq -cn \
+            --arg tag "$TAG" \
+            --arg version "$VERSION" \
+            '{event_type:"tap-release",client_payload:{tool:"blackbird",tag:$tag,version:$version}}' \
+            | gh api --method POST repos/phall1/homebrew-tap/dispatches --input -

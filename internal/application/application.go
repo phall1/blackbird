@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phall1/blackbird/internal/domain"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -62,6 +64,8 @@ var (
 	ErrInvalidSecurityExecution   = errors.New("invalid security execution")
 	ErrApplicationLimitExceeded   = errors.New("application contract limit exceeded")
 	ErrInvalidQuery               = errors.New("invalid application query")
+	ErrInvalidCoordination        = errors.New("invalid coordination contract")
+	ErrCoordinationUnsupported    = errors.New("coordination storage is unsupported")
 )
 
 type QueryOperation string
@@ -6814,4 +6818,445 @@ type CanonicalCodec[Value any] interface {
 type EventAuditVerifier interface {
 	domain.EventDigestVerifier
 	VerifyAuditEntry(previous Digest, canonicalEntry []byte, expected Digest) error
+}
+
+// W2 durable coordination contracts.
+const (
+	MaxMessageRecipients   = 256
+	MaxMessageSubjectBytes = 512
+	MaxMessageBodyBytes    = 256 * 1024
+	MaxLeaseSelectors      = 256
+	MaxLeaseSelectorBytes  = 4096
+	MaxLeaseTTL            = 24 * time.Hour
+	MaxLeaseLifetime       = 7 * 24 * time.Hour
+)
+
+type RecipientKind string
+
+const (
+	RecipientTo  RecipientKind = "to"
+	RecipientCc  RecipientKind = "cc"
+	RecipientBcc RecipientKind = "bcc"
+)
+
+type Recipient struct {
+	actor domain.ActorID
+	kind  RecipientKind
+}
+
+func NewRecipient(actor domain.ActorID, kind RecipientKind) (Recipient, error) {
+	if actor.IsZero() || kind != RecipientTo && kind != RecipientCc && kind != RecipientBcc {
+		return Recipient{}, ErrInvalidCoordination
+	}
+	return Recipient{actor: actor, kind: kind}, nil
+}
+
+func (recipient Recipient) ActorID() domain.ActorID { return recipient.actor }
+func (recipient Recipient) Kind() RecipientKind     { return recipient.kind }
+
+type OpenConversationParams struct {
+	ConversationID  domain.ConversationID
+	WorkspaceID     domain.WorkspaceID
+	RunID           domain.RunID
+	OpenedBy        domain.ActorID
+	OpenedBySession domain.ActorSessionID
+	Topic           string
+}
+
+type Conversation struct {
+	id        domain.ConversationID
+	workspace domain.WorkspaceID
+	run       domain.RunID
+	openedBy  domain.ActorID
+	topic     string
+	openedAt  time.Time
+}
+
+func NewConversation(params OpenConversationParams, openedAt time.Time) (Conversation, error) {
+	if params.ConversationID.IsZero() || params.WorkspaceID.IsZero() || params.RunID.IsZero() ||
+		params.OpenedBy.IsZero() || params.OpenedBySession.IsZero() || !validOpaqueText(params.Topic, 512) || openedAt.IsZero() {
+		return Conversation{}, ErrInvalidCoordination
+	}
+	return Conversation{id: params.ConversationID, workspace: params.WorkspaceID, run: params.RunID,
+		openedBy: params.OpenedBy, topic: params.Topic, openedAt: openedAt.UTC()}, nil
+}
+
+func (conversation Conversation) ID() domain.ConversationID       { return conversation.id }
+func (conversation Conversation) WorkspaceID() domain.WorkspaceID { return conversation.workspace }
+func (conversation Conversation) RunID() domain.RunID             { return conversation.run }
+func (conversation Conversation) OpenedBy() domain.ActorID        { return conversation.openedBy }
+func (conversation Conversation) Topic() string                   { return conversation.topic }
+func (conversation Conversation) OpenedAt() time.Time             { return conversation.openedAt }
+
+type SendMessageParams struct {
+	MessageID               domain.MessageID
+	ConversationID          domain.ConversationID
+	WorkspaceID             domain.WorkspaceID
+	Author                  domain.ActorID
+	AuthorSession           domain.ActorSessionID
+	Subject                 string
+	Body                    string
+	Recipients              []Recipient
+	ReplyTo                 *domain.MessageID
+	AcknowledgementRequired bool
+}
+
+type Delivery struct {
+	recipient               Recipient
+	acknowledgementRequired bool
+	availableAt             *time.Time
+	readAt                  *time.Time
+	acknowledgedAt          *time.Time
+}
+
+func NewDeliveryView(recipient Recipient, acknowledgementRequired bool, availableAt, readAt, acknowledgedAt *time.Time) (Delivery, error) {
+	if recipient.actor.IsZero() || recipient.kind != RecipientTo && recipient.kind != RecipientCc && recipient.kind != RecipientBcc {
+		return Delivery{}, ErrInvalidCoordination
+	}
+	return Delivery{recipient: recipient, acknowledgementRequired: acknowledgementRequired,
+		availableAt: cloneOptional(availableAt), readAt: cloneOptional(readAt), acknowledgedAt: cloneOptional(acknowledgedAt)}, nil
+}
+
+func (delivery Delivery) Recipient() Recipient           { return delivery.recipient }
+func (delivery Delivery) AcknowledgementRequired() bool  { return delivery.acknowledgementRequired }
+func (delivery Delivery) AvailableAt() (time.Time, bool) { return optionalTime(delivery.availableAt) }
+func (delivery Delivery) ReadAt() (time.Time, bool)      { return optionalTime(delivery.readAt) }
+func (delivery Delivery) AcknowledgedAt() (time.Time, bool) {
+	return optionalTime(delivery.acknowledgedAt)
+}
+
+func optionalTime(value *time.Time) (time.Time, bool) {
+	if value == nil {
+		return time.Time{}, false
+	}
+	return *value, true
+}
+
+type Message struct {
+	id           domain.MessageID
+	conversation domain.ConversationID
+	workspace    domain.WorkspaceID
+	author       domain.ActorID
+	subject      string
+	body         string
+	digest       Digest
+	replyTo      *domain.MessageID
+	sentAt       time.Time
+	position     uint64
+	deliveries   []Delivery
+}
+
+type MessageViewParams struct {
+	MessageID      domain.MessageID
+	ConversationID domain.ConversationID
+	WorkspaceID    domain.WorkspaceID
+	Author         domain.ActorID
+	Subject        string
+	Body           string
+	ReplyTo        *domain.MessageID
+	SentAt         time.Time
+	Position       uint64
+	Deliveries     []Delivery
+}
+
+func NewMessageView(params MessageViewParams) (Message, error) {
+	if params.MessageID.IsZero() || params.ConversationID.IsZero() || params.WorkspaceID.IsZero() || params.Author.IsZero() ||
+		len(params.Subject) == 0 || len(params.Subject) > MaxMessageSubjectBytes || !utf8.ValidString(params.Subject) ||
+		len(params.Body) == 0 || len(params.Body) > MaxMessageBodyBytes || !utf8.ValidString(params.Body) ||
+		params.SentAt.IsZero() || params.Position == 0 || len(params.Deliveries) == 0 || len(params.Deliveries) > MaxMessageRecipients {
+		return Message{}, ErrInvalidCoordination
+	}
+	if params.ReplyTo != nil && params.ReplyTo.IsZero() {
+		return Message{}, ErrInvalidCoordination
+	}
+	deliveries := append([]Delivery(nil), params.Deliveries...)
+	return Message{id: params.MessageID, conversation: params.ConversationID, workspace: params.WorkspaceID,
+		author: params.Author, subject: params.Subject, body: params.Body, digest: DigestBytes([]byte(params.Body)),
+		replyTo: cloneOptional(params.ReplyTo), sentAt: params.SentAt.UTC(), position: params.Position, deliveries: deliveries}, nil
+}
+
+func ValidateSendMessage(params SendMessageParams) error {
+	if params.MessageID.IsZero() || params.ConversationID.IsZero() || params.WorkspaceID.IsZero() || params.Author.IsZero() ||
+		params.AuthorSession.IsZero() || len(params.Subject) == 0 || len(params.Subject) > MaxMessageSubjectBytes ||
+		!utf8.ValidString(params.Subject) || len(params.Body) == 0 || len(params.Body) > MaxMessageBodyBytes ||
+		!utf8.ValidString(params.Body) || len(params.Recipients) == 0 || len(params.Recipients) > MaxMessageRecipients ||
+		params.ReplyTo != nil && params.ReplyTo.IsZero() {
+		return ErrInvalidCoordination
+	}
+	seen := make(map[domain.ActorID]struct{}, len(params.Recipients))
+	for _, recipient := range params.Recipients {
+		if recipient.actor.IsZero() || recipient.kind != RecipientTo && recipient.kind != RecipientCc && recipient.kind != RecipientBcc {
+			return ErrInvalidCoordination
+		}
+		if _, duplicate := seen[recipient.actor]; duplicate {
+			return ErrInvalidCoordination
+		}
+		seen[recipient.actor] = struct{}{}
+	}
+	return nil
+}
+
+func (message Message) ID() domain.MessageID                  { return message.id }
+func (message Message) ConversationID() domain.ConversationID { return message.conversation }
+func (message Message) WorkspaceID() domain.WorkspaceID       { return message.workspace }
+func (message Message) Author() domain.ActorID                { return message.author }
+func (message Message) Subject() string                       { return message.subject }
+func (message Message) Body() string                          { return message.body }
+func (message Message) Digest() Digest                        { return message.digest }
+func (message Message) ReplyTo() *domain.MessageID            { return cloneOptional(message.replyTo) }
+func (message Message) SentAt() time.Time                     { return message.sentAt }
+func (message Message) Position() uint64                      { return message.position }
+func (message Message) Deliveries() []Delivery                { return append([]Delivery(nil), message.deliveries...) }
+
+type CoordinationPage struct {
+	messages []Message
+	next     uint64
+	hasMore  bool
+}
+
+func NewCoordinationPage(messages []Message, next uint64, hasMore bool) (CoordinationPage, error) {
+	if len(messages) > MaxQueryPageSize {
+		return CoordinationPage{}, ErrInvalidCoordination
+	}
+	return CoordinationPage{messages: append([]Message(nil), messages...), next: next, hasMore: hasMore}, nil
+}
+func (page CoordinationPage) Messages() []Message { return append([]Message(nil), page.messages...) }
+func (page CoordinationPage) NextCursor() uint64  { return page.next }
+func (page CoordinationPage) HasMore() bool       { return page.hasMore }
+
+type InboxQuery struct {
+	WorkspaceID domain.WorkspaceID
+	Recipient   domain.ActorID
+	After       uint64
+	Limit       uint16
+	UnreadOnly  bool
+}
+type ThreadQuery struct {
+	WorkspaceID    domain.WorkspaceID
+	ConversationID domain.ConversationID
+	Viewer         domain.ActorID
+	After          uint64
+	Limit          uint16
+}
+
+type DeliveryFactKind string
+
+const (
+	DeliveryAvailable    DeliveryFactKind = "available"
+	DeliveryRead         DeliveryFactKind = "read"
+	DeliveryAcknowledged DeliveryFactKind = "acknowledged"
+)
+
+type RecordDeliveryFactParams struct {
+	WorkspaceID    domain.WorkspaceID
+	MessageID      domain.MessageID
+	Recipient      domain.ActorID
+	ActorSessionID *domain.ActorSessionID
+	Kind           DeliveryFactKind
+	MessageDigest  Digest
+}
+
+type LeaseSelectorKind string
+
+const (
+	LeaseSelectorExact   LeaseSelectorKind = "exact"
+	LeaseSelectorSubtree LeaseSelectorKind = "subtree"
+)
+
+type LeaseSelector struct {
+	kind  LeaseSelectorKind
+	value string
+}
+
+func NewLeaseSelector(kind LeaseSelectorKind, value string) (LeaseSelector, error) {
+	if kind != LeaseSelectorExact && kind != LeaseSelectorSubtree || value == "" || len(value) > MaxLeaseSelectorBytes ||
+		!utf8.ValidString(value) || strings.Contains(value, "\\") || path.IsAbs(value) || !norm.NFC.IsNormalString(value) {
+		return LeaseSelector{}, ErrInvalidCoordination
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." || strings.ContainsRune(segment, 0) {
+			return LeaseSelector{}, ErrInvalidCoordination
+		}
+	}
+	if path.Clean(value) != value {
+		return LeaseSelector{}, ErrInvalidCoordination
+	}
+	return LeaseSelector{kind: kind, value: value}, nil
+}
+func (selector LeaseSelector) Kind() LeaseSelectorKind { return selector.kind }
+func (selector LeaseSelector) Path() string            { return selector.value }
+func (selector LeaseSelector) Key() string             { return string(selector.kind) + ":" + selector.value }
+func LeaseSelectorsOverlap(left, right LeaseSelector) bool {
+	if left.value == right.value {
+		return true
+	}
+	return left.kind == LeaseSelectorSubtree && strings.HasPrefix(right.value, left.value+"/") ||
+		right.kind == LeaseSelectorSubtree && strings.HasPrefix(left.value, right.value+"/")
+}
+
+type LeaseMode string
+
+const (
+	LeaseShared    LeaseMode = "shared"
+	LeaseExclusive LeaseMode = "exclusive"
+)
+
+type Fence struct {
+	conflictKey string
+	counter     uint64
+}
+
+func NewFence(key string, counter uint64) (Fence, error) {
+	if !validOpaqueText(key, MaxLeaseSelectorBytes+16) || counter == 0 || counter > MaxCanonicalInteger {
+		return Fence{}, ErrInvalidCoordination
+	}
+	return Fence{conflictKey: key, counter: counter}, nil
+}
+func (fence Fence) ConflictKey() string { return fence.conflictKey }
+func (fence Fence) Counter() uint64     { return fence.counter }
+
+type AcquireLeaseParams struct {
+	LeaseID        domain.LeaseID
+	WorkspaceID    domain.WorkspaceID
+	Holder         domain.ActorID
+	HolderSession  domain.ActorSessionID
+	AuthorityEpoch domain.AuthorityEpoch
+	Mode           LeaseMode
+	Selectors      []LeaseSelector
+	TTL            time.Duration
+}
+type Lease struct {
+	id            domain.LeaseID
+	workspace     domain.WorkspaceID
+	holder        domain.ActorID
+	holderSession domain.ActorSessionID
+	epoch         domain.AuthorityEpoch
+	mode          LeaseMode
+	selectors     []LeaseSelector
+	fences        []Fence
+	acquiredAt    time.Time
+	expiresAt     time.Time
+	releasedAt    *time.Time
+}
+type LeaseViewParams struct {
+	LeaseID        domain.LeaseID
+	WorkspaceID    domain.WorkspaceID
+	Holder         domain.ActorID
+	HolderSession  domain.ActorSessionID
+	AuthorityEpoch domain.AuthorityEpoch
+	Mode           LeaseMode
+	Selectors      []LeaseSelector
+	Fences         []Fence
+	AcquiredAt     time.Time
+	ExpiresAt      time.Time
+	ReleasedAt     *time.Time
+}
+
+func NewLeaseView(params LeaseViewParams) (Lease, error) {
+	if params.LeaseID.IsZero() || params.WorkspaceID.IsZero() || params.Holder.IsZero() || params.HolderSession.IsZero() ||
+		params.AuthorityEpoch.IsZero() || params.Mode != LeaseShared && params.Mode != LeaseExclusive ||
+		len(params.Selectors) == 0 || len(params.Selectors) > MaxLeaseSelectors || params.AcquiredAt.IsZero() ||
+		!params.ExpiresAt.After(params.AcquiredAt) {
+		return Lease{}, ErrInvalidCoordination
+	}
+	return Lease{id: params.LeaseID, workspace: params.WorkspaceID, holder: params.Holder, holderSession: params.HolderSession,
+		epoch: params.AuthorityEpoch, mode: params.Mode, selectors: append([]LeaseSelector(nil), params.Selectors...),
+		fences: append([]Fence(nil), params.Fences...), acquiredAt: params.AcquiredAt.UTC(), expiresAt: params.ExpiresAt.UTC(),
+		releasedAt: cloneOptional(params.ReleasedAt)}, nil
+}
+func ValidateAcquireLease(params AcquireLeaseParams) error {
+	if params.LeaseID.IsZero() || params.WorkspaceID.IsZero() || params.Holder.IsZero() || params.HolderSession.IsZero() ||
+		params.AuthorityEpoch.IsZero() || params.Mode != LeaseShared && params.Mode != LeaseExclusive ||
+		params.TTL <= 0 || params.TTL > MaxLeaseTTL || len(params.Selectors) == 0 || len(params.Selectors) > MaxLeaseSelectors {
+		return ErrInvalidCoordination
+	}
+	total := 0
+	seen := make(map[string]struct{}, len(params.Selectors))
+	for index, selector := range params.Selectors {
+		if selector.value == "" || selector.kind != LeaseSelectorExact && selector.kind != LeaseSelectorSubtree {
+			return ErrInvalidCoordination
+		}
+		total += len(selector.Key())
+		if _, duplicate := seen[selector.Key()]; duplicate {
+			return ErrInvalidCoordination
+		}
+		seen[selector.Key()] = struct{}{}
+		for prior := 0; prior < index; prior++ {
+			if LeaseSelectorsOverlap(params.Selectors[prior], selector) {
+				return ErrInvalidCoordination
+			}
+		}
+	}
+	if total > MaxLeaseSelectorBytes {
+		return ErrInvalidCoordination
+	}
+	return nil
+}
+func (lease Lease) ID() domain.LeaseID                    { return lease.id }
+func (lease Lease) WorkspaceID() domain.WorkspaceID       { return lease.workspace }
+func (lease Lease) Holder() domain.ActorID                { return lease.holder }
+func (lease Lease) HolderSession() domain.ActorSessionID  { return lease.holderSession }
+func (lease Lease) AuthorityEpoch() domain.AuthorityEpoch { return lease.epoch }
+func (lease Lease) Mode() LeaseMode                       { return lease.mode }
+func (lease Lease) Selectors() []LeaseSelector {
+	return append([]LeaseSelector(nil), lease.selectors...)
+}
+func (lease Lease) Fences() []Fence               { return append([]Fence(nil), lease.fences...) }
+func (lease Lease) AcquiredAt() time.Time         { return lease.acquiredAt }
+func (lease Lease) ExpiresAt() time.Time          { return lease.expiresAt }
+func (lease Lease) ReleasedAt() (time.Time, bool) { return optionalTime(lease.releasedAt) }
+
+type ChangeLeaseParams struct {
+	LeaseID        domain.LeaseID
+	HolderSession  domain.ActorSessionID
+	AuthorityEpoch domain.AuthorityEpoch
+	Fences         []Fence
+	TTL            time.Duration
+}
+
+type CoordinationStore interface {
+	OpenConversation(context.Context, OpenConversationParams) (Conversation, error)
+	SendMessage(context.Context, SendMessageParams) (Message, error)
+	Inbox(context.Context, InboxQuery) (CoordinationPage, error)
+	Thread(context.Context, ThreadQuery) (CoordinationPage, error)
+	RecordDeliveryFact(context.Context, RecordDeliveryFactParams) (Delivery, error)
+	AcquireLease(context.Context, AcquireLeaseParams) (Lease, error)
+	RenewLease(context.Context, ChangeLeaseParams) (Lease, error)
+	ReleaseLease(context.Context, ChangeLeaseParams) (Lease, error)
+	ValidateFence(context.Context, domain.LeaseID, domain.AuthorityEpoch, []Fence) error
+}
+
+const (
+	MaxCoordinationKeyBytes  = 4096
+	MaxCoordinationNameBytes = 128
+)
+
+type LocalAgentSession struct {
+	ProjectKey     string
+	AgentName      string
+	WorkspaceID    domain.WorkspaceID
+	RunID          domain.RunID
+	ActorID        domain.ActorID
+	ActorSessionID domain.ActorSessionID
+	AuthorityEpoch domain.AuthorityEpoch
+	StartedAt      time.Time
+	LastSeenAt     time.Time
+}
+
+type ActiveAgent struct {
+	Name       string
+	ActorID    domain.ActorID
+	SessionID  domain.ActorSessionID
+	StartedAt  time.Time
+	LastSeenAt time.Time
+}
+
+// LocalCoordinationStore resolves ergonomic local names and bearer tokens to
+// the UUID-level durable coordination contracts above.
+type LocalCoordinationStore interface {
+	CoordinationStore
+	RegisterLocalAgent(context.Context, string, string, string) (LocalAgentSession, string, error)
+	AuthenticateLocalAgent(context.Context, string) (LocalAgentSession, error)
+	ListActiveLocalAgents(context.Context, LocalAgentSession) ([]ActiveAgent, error)
+	ResolveLocalAgentNames(context.Context, LocalAgentSession, []string) ([]domain.ActorID, error)
 }

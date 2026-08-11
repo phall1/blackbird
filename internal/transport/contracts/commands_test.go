@@ -16,9 +16,10 @@ import (
 // configured execution so the handler's full assembly surface is observable
 // without the application OrchestrationService.
 type workspaceCreateDispatcherStub struct {
-	request *application.CreateWorkspaceRequest
-	exec    application.CommandExecution
-	err     error
+	request           *application.CreateWorkspaceRequest
+	objectiveActivate *application.ActivateObjectiveRequest
+	exec              application.CommandExecution
+	err               error
 }
 
 func (stub *workspaceCreateDispatcherStub) CreateWorkspace(_ context.Context, request application.CreateWorkspaceRequest) (application.CommandExecution, error) {
@@ -55,6 +56,26 @@ func (stub *workspaceCreateDispatcherStub) PairDevice(context.Context, applicati
 	panic("unexpected command dispatch")
 }
 func (stub *workspaceCreateDispatcherStub) StartActorSession(context.Context, application.StartActorSessionRequest) (application.CommandExecution, error) {
+	panic("unexpected command dispatch")
+}
+func (stub *workspaceCreateDispatcherStub) ObserveWorkRef(context.Context, application.ObserveWorkRefRequest) (application.CommandExecution, error) {
+	panic("unexpected command dispatch")
+}
+func (stub *workspaceCreateDispatcherStub) CreateObjectiveAndWork(context.Context, application.CreateObjectiveAndWorkRequest) (application.CommandExecution, error) {
+	panic("unexpected command dispatch")
+}
+func (stub *workspaceCreateDispatcherStub) ActivateObjective(_ context.Context, request application.ActivateObjectiveRequest) (application.CommandExecution, error) {
+	copyOfRequest := request
+	stub.objectiveActivate = &copyOfRequest
+	return stub.exec, stub.err
+}
+func (stub *workspaceCreateDispatcherStub) PlanRunWithBindings(context.Context, application.PlanRunWithBindingsRequest) (application.CommandExecution, error) {
+	panic("unexpected command dispatch")
+}
+func (stub *workspaceCreateDispatcherStub) JoinRun(context.Context, application.JoinRunRequest) (application.CommandExecution, error) {
+	panic("unexpected command dispatch")
+}
+func (stub *workspaceCreateDispatcherStub) StartRun(context.Context, application.StartRunRequest) (application.CommandExecution, error) {
 	panic("unexpected command dispatch")
 }
 
@@ -375,5 +396,112 @@ func TestHandleWorkspaceCreateFailsClosedWithoutDependencies(t *testing.T) {
 	empty := &ApplicationHandler{}
 	if _, failure, err := empty.HandleWorkspaceCreate(context.Background(), evidence, dto); !errors.Is(err, application.ErrInvalidApplicationContract) || failure != nil {
 		t.Fatalf("empty handler err=%v failure=%v, want invalid contract", err, failure)
+	}
+}
+
+func objectiveActivateTestDTO(t *testing.T, fixture authenticationFixture) ObjectiveActivateRequestDTO {
+	t.Helper()
+	commandID, err := domain.NewCommandID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	correlationID, err := domain.NewCorrelationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID, err := domain.NewClientInstanceID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectiveID, err := domain.NewObjectiveID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ObjectiveActivateRequestDTO{
+		CommandMetadataDTO: CommandMetadataDTO{
+			Schema: SchemaObjectiveActivateCommand, RequestID: "req_objective_activate",
+			CommandID: commandID, Operation: OperationObjectiveActivate,
+			IdempotencyKey: "objective-activate-test-key", AuthorityID: fixture.authority,
+			AuthorityEpoch: fixture.epoch, Deadline: time.Now().UTC().Add(time.Hour), CorrelationID: correlationID,
+		},
+		ClientInstanceID: clientID,
+		ExpectedVersions: ObjectiveActivateExpectedVersionsDTO{
+			Actor: domain.InitialVersion(), ActorSession: fixture.session.Version(), Objective: domain.InitialVersion(),
+		},
+		Body: ObjectiveActivateBodyDTO{
+			WorkspaceID: fixture.workspace, ActorID: fixture.session.Binding().ActorID(),
+			ActorSessionID: fixture.session.ID(), ObjectiveID: objectiveID,
+		},
+	}
+}
+
+func TestHandleObjectiveActivateAssemblesEvidenceBoundCommand(t *testing.T) {
+	fixture := newAuthenticationFixture(t)
+	evidence := assemblerEvidence(t, fixture)
+	dispatcher := &workspaceCreateDispatcherStub{}
+	handler, _ := newWorkspaceCreateTestHandler(t, fixture, dispatcher)
+	dto := objectiveActivateTestDTO(t, fixture)
+	rejection, err := domain.NewCommandError(domain.ErrorCodeForbidden, "objective activation forbidden", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher.exec, err = application.RejectedCommandExecution(rejection)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, failure, err := handler.HandleObjectiveActivate(context.Background(), evidence, dto)
+	if err != nil {
+		t.Fatalf("HandleObjectiveActivate error=%v", err)
+	}
+	if result.Schema != "" || failure == nil || failure.Code != domain.ErrorCodeForbidden {
+		t.Fatalf("result=%+v failure=%+v, want typed forbidden rejection", result, failure)
+	}
+	if failure.Details.DeniedCapability != "objective:activate" || failure.Details.ResourceScope == nil ||
+		failure.Details.ResourceScope.Type != domain.AggregateKindWorkspace || failure.Details.ResourceScope.ID != dto.Body.WorkspaceID.String() {
+		t.Fatalf("failure evidence=%+v", failure.Details)
+	}
+	dispatched := dispatcher.objectiveActivate
+	if dispatched == nil {
+		t.Fatal("objective activation was not dispatched")
+	}
+	if dispatched.SessionID != dto.Body.ActorSessionID || dispatched.ObjectiveID != dto.Body.ObjectiveID {
+		t.Fatalf("dispatched identity=%+v", dispatched)
+	}
+	if dispatched.Spec.CommandOperation() != application.CommandActivateObjective ||
+		dispatched.Spec.Authorship().PrincipalID() != evidence.PrincipalID() {
+		t.Fatalf("spec operation/authorship=%s/%s", dispatched.Spec.CommandOperation(), dispatched.Spec.Authorship().PrincipalID())
+	}
+	attribution, present := dispatched.Spec.Authorship().ActorAttribution()
+	if !present || attribution.ActorID() != dto.Body.ActorID || attribution.ActorSessionID() != dto.Body.ActorSessionID {
+		t.Fatalf("actor attribution=%+v present=%v", attribution, present)
+	}
+	fingerprint, hashErr := application.NewProductionCanonicalCodec().HashCommand(dispatched.HashView)
+	if hashErr != nil || fingerprint != dispatched.Spec.RequestFingerprint() {
+		t.Fatalf("hash fingerprint=%x err=%v spec=%x", fingerprint, hashErr, dispatched.Spec.RequestFingerprint())
+	}
+}
+
+func TestHandleObjectiveActivateRejectsMismatchedSessionEvidence(t *testing.T) {
+	fixture := newAuthenticationFixture(t)
+	evidence := assemblerEvidence(t, fixture)
+	dispatcher := &workspaceCreateDispatcherStub{}
+	handler, _ := newWorkspaceCreateTestHandler(t, fixture, dispatcher)
+	dto := objectiveActivateTestDTO(t, fixture)
+	dto.ExpectedVersions.ActorSession = domain.InitialVersion()
+	if dto.ExpectedVersions.ActorSession == fixture.session.Version() {
+		next, err := dto.ExpectedVersions.ActorSession.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		dto.ExpectedVersions.ActorSession = next
+	}
+
+	_, failure, err := handler.HandleObjectiveActivate(context.Background(), evidence, dto)
+	if !errors.Is(err, application.ErrInvalidApplicationContract) || failure != nil {
+		t.Fatalf("mismatched session evidence failure=%v err=%v", failure, err)
+	}
+	if dispatcher.objectiveActivate != nil {
+		t.Fatal("mismatched evidence must not dispatch")
 	}
 }

@@ -27,16 +27,17 @@ import (
 
 const (
 	ApplicationID       = 0x42424d4c
-	SchemaVersion       = 1
+	SchemaVersion       = 3
 	DriverVersion       = "v1.56.0"
 	SQLiteVersion       = "3.53.3"
 	SQLiteSourceID      = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
 	defaultBusyTimeout  = 5 * time.Second
 	maximumBusyTimeout  = 30 * time.Second
-	initialMigrationID  = "0001_w0.sql"
 	maximumReadPoolSize = 5
-	schemaChecksumHex   = "1585df708230d0cade52205ee76479d822e83df0106782e5a10ceaf4a6aab1f0"
+	schemaChecksumHex   = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
 )
+
+var migrationIDs = [...]string{"0001_w0.sql", "0002_w2_coordination.sql", "0003_local_coordination.sql"}
 
 var (
 	ErrInvalidConfiguration = errors.New("invalid SQLite configuration")
@@ -89,6 +90,9 @@ type Store struct {
 	closeErr     error
 	releasePath  func()
 }
+
+var _ application.CoordinationStore = (*Store)(nil)
+var _ application.LocalCoordinationStore = (*Store)(nil)
 
 type writeArbiter struct {
 	sync.Mutex
@@ -291,13 +295,17 @@ func (store *Store) initializeOrVerify(ctx context.Context) error {
 }
 
 func (store *Store) applyInitialMigration(ctx context.Context) error {
-	body, checksum, err := initialMigration()
-	if err != nil {
-		return err
-	}
 	return store.withImmediate(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			return fmt.Errorf("apply SQLite migration %s: %w", initialMigrationID, err)
+		checksums := make(map[string][sha256.Size]byte, len(migrationIDs))
+		for _, migrationID := range migrationIDs {
+			body, checksum, err := migration(migrationID)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+				return fmt.Errorf("apply SQLite migration %s: %w", migrationID, err)
+			}
+			checksums[migrationID] = checksum
 		}
 		liveChecksum, err := schemaChecksum(ctx, tx)
 		if err != nil {
@@ -312,11 +320,14 @@ func (store *Store) applyInitialMigration(ctx context.Context) error {
 		); err != nil {
 			return fmt.Errorf("record SQLite schema manifest: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state) VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')",
-			initialMigrationID, checksum[:],
-		); err != nil {
-			return fmt.Errorf("record SQLite migration %s: %w", initialMigrationID, err)
+		for _, migrationID := range migrationIDs {
+			checksum := checksums[migrationID]
+			if _, err := tx.ExecContext(ctx,
+				"INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state) VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')",
+				migrationID, checksum[:],
+			); err != nil {
+				return fmt.Errorf("record SQLite migration %s: %w", migrationID, err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA application_id = "+strconv.Itoa(ApplicationID)); err != nil {
 			return fmt.Errorf("set SQLite application id: %w", err)
@@ -328,8 +339,8 @@ func (store *Store) applyInitialMigration(ctx context.Context) error {
 	})
 }
 
-func initialMigration() ([]byte, [sha256.Size]byte, error) {
-	body, err := migrations.ReadFile("migrations/" + initialMigrationID)
+func migration(migrationID string) ([]byte, [sha256.Size]byte, error) {
+	body, err := migrations.ReadFile("migrations/" + migrationID)
 	if err != nil {
 		return nil, [sha256.Size]byte{}, fmt.Errorf("read embedded SQLite migration: %w", err)
 	}
@@ -337,22 +348,24 @@ func initialMigration() ([]byte, [sha256.Size]byte, error) {
 }
 
 func (store *Store) verifyMigrationLedger(ctx context.Context) error {
-	_, expected, err := initialMigration()
-	if err != nil {
-		return err
-	}
-	var checksum []byte
-	var state string
-	if err := store.db.QueryRowContext(ctx,
-		"SELECT checksum, state FROM schema_migrations WHERE migration_id = ?", initialMigrationID,
-	).Scan(&checksum, &state); err != nil {
-		return fmt.Errorf("%w: migration ledger: %v", ErrSchemaMismatch, err)
-	}
-	if !bytes.Equal(checksum, expected[:]) || state != "applied" {
-		return fmt.Errorf("%w: migration %s checksum or state", ErrSchemaMismatch, initialMigrationID)
+	for _, migrationID := range migrationIDs {
+		_, expected, err := migration(migrationID)
+		if err != nil {
+			return err
+		}
+		var checksum []byte
+		var state string
+		if err := store.db.QueryRowContext(ctx,
+			"SELECT checksum, state FROM schema_migrations WHERE migration_id = ?", migrationID,
+		).Scan(&checksum, &state); err != nil {
+			return fmt.Errorf("%w: migration ledger: %v", ErrSchemaMismatch, err)
+		}
+		if !bytes.Equal(checksum, expected[:]) || state != "applied" {
+			return fmt.Errorf("%w: migration %s checksum or state", ErrSchemaMismatch, migrationID)
+		}
 	}
 	var migrationCount int
-	if err := store.db.QueryRowContext(ctx, "SELECT count(*) FROM schema_migrations").Scan(&migrationCount); err != nil || migrationCount != 1 {
+	if err := store.db.QueryRowContext(ctx, "SELECT count(*) FROM schema_migrations").Scan(&migrationCount); err != nil || migrationCount != len(migrationIDs) {
 		return fmt.Errorf("%w: migration ledger count=%d error=%v", ErrSchemaMismatch, migrationCount, err)
 	}
 	expectedSchema := expectedSchemaChecksum()

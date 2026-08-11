@@ -3,7 +3,9 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -18,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
@@ -987,4 +990,854 @@ func unsupportedFilesystem(filesystemType uint64, filesystemName string) bool {
 	default:
 		return false
 	}
+}
+
+func (store *Store) OpenConversation(ctx context.Context, params application.OpenConversationParams) (application.Conversation, error) {
+	var result application.Conversation
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		result, err = application.NewConversation(params, now)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO conversations(conversation_id, workspace_id, run_id,
+			opened_by_actor_id, opened_by_session_id, topic, opened_at_us) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			params.ConversationID.String(), params.WorkspaceID.String(), params.RunID.String(), params.OpenedBy.String(),
+			params.OpenedBySession.String(), params.Topic, timeMicros(now))
+		if err != nil {
+			return fmt.Errorf("insert SQLite conversation: %w", err)
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (store *Store) SendMessage(ctx context.Context, params application.SendMessageParams) (application.Message, error) {
+	if err := application.ValidateSendMessage(params); err != nil {
+		return application.Message{}, err
+	}
+	var result application.Message
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		var status, workspace string
+		if err := tx.QueryRowContext(ctx, `SELECT status, workspace_id FROM conversations WHERE conversation_id = ?`,
+			params.ConversationID.String()).Scan(&status, &workspace); errors.Is(err, sql.ErrNoRows) {
+			return coordinationError(domain.ErrorCodeNotFound, "conversation was not found")
+		} else if err != nil {
+			return err
+		}
+		if workspace != params.WorkspaceID.String() {
+			return coordinationError(domain.ErrorCodeForbidden, "conversation belongs to another workspace")
+		}
+		if status != "open" {
+			return coordinationConflict(domain.ErrorCodeStateConflict, domain.ConflictConversationClosed, "conversation is closed")
+		}
+		if params.ReplyTo != nil {
+			var parentConversation string
+			if err := tx.QueryRowContext(ctx, `SELECT conversation_id FROM messages WHERE message_id = ?`, params.ReplyTo.String()).Scan(&parentConversation); err != nil || parentConversation != params.ConversationID.String() {
+				return application.ErrInvalidCoordination
+			}
+		}
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		digest := application.DigestBytes([]byte(params.Body))
+		var reply any
+		if params.ReplyTo != nil {
+			reply = params.ReplyTo.String()
+		}
+		insert, err := tx.ExecContext(ctx, `INSERT INTO messages(message_id, conversation_id, workspace_id,
+			author_actor_id, author_session_id, subject, body, body_digest, reply_to_message_id, sent_at_us)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, params.MessageID.String(), params.ConversationID.String(),
+			params.WorkspaceID.String(), params.Author.String(), params.AuthorSession.String(), params.Subject, params.Body,
+			digest[:], reply, timeMicros(now))
+		if err != nil {
+			return fmt.Errorf("insert SQLite message: %w", err)
+		}
+		position, err := insert.LastInsertId()
+		if err != nil || position <= 0 {
+			return application.ErrInvalidCoordination
+		}
+		deliveries := make([]application.Delivery, 0, len(params.Recipients))
+		for _, recipient := range params.Recipients {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO message_deliveries(message_id, recipient_actor_id,
+				recipient_kind, acknowledgement_required) VALUES (?, ?, ?, ?)`, params.MessageID.String(),
+				recipient.ActorID().String(), string(recipient.Kind()), params.AcknowledgementRequired); err != nil {
+				return fmt.Errorf("insert SQLite message delivery: %w", err)
+			}
+			delivery, _ := application.NewDeliveryView(recipient, params.AcknowledgementRequired, nil, nil, nil)
+			deliveries = append(deliveries, delivery)
+		}
+		result, err = application.NewMessageView(application.MessageViewParams{MessageID: params.MessageID,
+			ConversationID: params.ConversationID, WorkspaceID: params.WorkspaceID, Author: params.Author,
+			Subject: params.Subject, Body: params.Body, ReplyTo: params.ReplyTo, SentAt: now,
+			Position: uint64(position), Deliveries: deliveries})
+		return err
+	})
+	return result, err
+}
+
+func (store *Store) Inbox(ctx context.Context, query application.InboxQuery) (application.CoordinationPage, error) {
+	if query.WorkspaceID.IsZero() || query.Recipient.IsZero() || query.Limit == 0 || query.Limit > application.MaxQueryPageSize {
+		return application.CoordinationPage{}, application.ErrInvalidCoordination
+	}
+	return store.loadMessages(ctx, query.WorkspaceID, domain.ConversationID{}, query.Recipient, query.After, query.Limit, true, query.UnreadOnly)
+}
+
+func (store *Store) Thread(ctx context.Context, query application.ThreadQuery) (application.CoordinationPage, error) {
+	if query.WorkspaceID.IsZero() || query.ConversationID.IsZero() || query.Viewer.IsZero() || query.Limit == 0 || query.Limit > application.MaxQueryPageSize {
+		return application.CoordinationPage{}, application.ErrInvalidCoordination
+	}
+	return store.loadMessages(ctx, query.WorkspaceID, query.ConversationID, query.Viewer, query.After, query.Limit, false, false)
+}
+
+func (store *Store) loadMessages(ctx context.Context, workspace domain.WorkspaceID, conversation domain.ConversationID,
+	viewer domain.ActorID, after uint64, limit uint16, inbox, unreadOnly bool) (application.CoordinationPage, error) {
+	base := `SELECT DISTINCT message.message_id, message.conversation_id, message.author_actor_id, message.subject,
+		message.body, message.reply_to_message_id, message.sent_at_us, message.position FROM messages AS message
+		LEFT JOIN message_deliveries AS own ON own.message_id = message.message_id AND own.recipient_actor_id = ?
+		WHERE message.workspace_id = ? AND message.position > ? AND (message.author_actor_id = ? OR own.message_id IS NOT NULL)`
+	args := []any{viewer.String(), workspace.String(), after, viewer.String()}
+	if inbox {
+		base += ` AND own.message_id IS NOT NULL`
+		if unreadOnly {
+			base += ` AND own.read_at_us IS NULL`
+		}
+	} else {
+		base += ` AND message.conversation_id = ?`
+		args = append(args, conversation.String())
+	}
+	base += ` ORDER BY message.position LIMIT ?`
+	args = append(args, int(limit)+1)
+	rows, err := store.db.QueryContext(ctx, base, args...)
+	if err != nil {
+		return application.CoordinationPage{}, fmt.Errorf("query SQLite coordination messages: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	type row struct {
+		message, conversation, author, subject, body string
+		reply                                        sql.NullString
+		sent                                         int64
+		position                                     uint64
+	}
+	values := make([]row, 0, limit)
+	hasMore := false
+	for rows.Next() {
+		var value row
+		if err := rows.Scan(&value.message, &value.conversation, &value.author, &value.subject, &value.body,
+			&value.reply, &value.sent, &value.position); err != nil {
+			return application.CoordinationPage{}, err
+		}
+		if len(values) == int(limit) {
+			hasMore = true
+			break
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return application.CoordinationPage{}, err
+	}
+	result := make([]application.Message, 0, len(values))
+	for _, value := range values {
+		messageID, e1 := domain.ParseMessageID(value.message)
+		conversationID, e2 := domain.ParseConversationID(value.conversation)
+		author, e3 := domain.ParseActorID(value.author)
+		if e1 != nil || e2 != nil || e3 != nil {
+			return application.CoordinationPage{}, application.ErrInvalidCoordination
+		}
+		deliveries, err := store.loadVisibleDeliveries(ctx, messageID, author, viewer)
+		if err != nil {
+			return application.CoordinationPage{}, err
+		}
+		params := application.MessageViewParams{MessageID: messageID, ConversationID: conversationID, WorkspaceID: workspace,
+			Author: author, Subject: value.subject, Body: value.body, SentAt: microsTime(value.sent), Position: value.position,
+			Deliveries: deliveries}
+		if value.reply.Valid {
+			id, parseErr := domain.ParseMessageID(value.reply.String)
+			if parseErr != nil {
+				return application.CoordinationPage{}, parseErr
+			}
+			params.ReplyTo = &id
+		}
+		message, err := application.NewMessageView(params)
+		if err != nil {
+			return application.CoordinationPage{}, err
+		}
+		result = append(result, message)
+	}
+	next := after
+	if len(result) != 0 {
+		next = result[len(result)-1].Position()
+	}
+	return application.NewCoordinationPage(result, next, hasMore)
+}
+
+func (store *Store) loadVisibleDeliveries(ctx context.Context, message domain.MessageID, author, viewer domain.ActorID) ([]application.Delivery, error) {
+	rows, err := store.db.QueryContext(ctx, `SELECT recipient_actor_id, recipient_kind, acknowledgement_required,
+		available_at_us, read_at_us, acknowledged_at_us FROM message_deliveries WHERE message_id = ?
+		AND (? = ? OR recipient_kind <> 'bcc' OR recipient_actor_id = ?) ORDER BY recipient_kind, recipient_actor_id`,
+		message.String(), viewer.String(), author.String(), viewer.String())
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []application.Delivery
+	for rows.Next() {
+		var actorText, kind string
+		var required bool
+		var available, read, acknowledged sql.NullInt64
+		if err := rows.Scan(&actorText, &kind, &required, &available, &read, &acknowledged); err != nil {
+			return nil, err
+		}
+		actor, err := domain.ParseActorID(actorText)
+		if err != nil {
+			return nil, err
+		}
+		recipient, err := application.NewRecipient(actor, application.RecipientKind(kind))
+		if err != nil {
+			return nil, err
+		}
+		delivery, err := application.NewDeliveryView(recipient, required, nullableTime(available), nullableTime(read), nullableTime(acknowledged))
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, delivery)
+	}
+	return result, rows.Err()
+}
+
+func nullableTime(value sql.NullInt64) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	result := microsTime(value.Int64)
+	return &result
+}
+
+func (store *Store) RecordDeliveryFact(ctx context.Context, params application.RecordDeliveryFactParams) (application.Delivery, error) {
+	if params.WorkspaceID.IsZero() || params.MessageID.IsZero() || params.Recipient.IsZero() ||
+		params.Kind != application.DeliveryAvailable && params.Kind != application.DeliveryRead && params.Kind != application.DeliveryAcknowledged {
+		return application.Delivery{}, application.ErrInvalidCoordination
+	}
+	if params.Kind != application.DeliveryAvailable && (params.ActorSessionID == nil || params.ActorSessionID.IsZero()) {
+		return application.Delivery{}, application.ErrInvalidCoordination
+	}
+	if params.Kind == application.DeliveryAcknowledged && params.MessageDigest.IsZero() {
+		return application.Delivery{}, application.ErrInvalidCoordination
+	}
+	var result application.Delivery
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		var kind string
+		var required bool
+		var digest []byte
+		var acknowledgedSession sql.NullString
+		var acknowledgedDigest []byte
+		var workspace string
+		var available, read, acknowledged sql.NullInt64
+		err := tx.QueryRowContext(ctx, `SELECT delivery.recipient_kind, delivery.acknowledgement_required,
+			delivery.available_at_us, delivery.read_at_us, delivery.acknowledged_at_us,
+			delivery.acknowledged_by_session_id, delivery.acknowledged_message_digest, message.body_digest, message.workspace_id
+			FROM message_deliveries AS delivery JOIN messages AS message USING(message_id)
+			WHERE delivery.message_id = ? AND delivery.recipient_actor_id = ?`, params.MessageID.String(), params.Recipient.String()).Scan(
+			&kind, &required, &available, &read, &acknowledged, &acknowledgedSession, &acknowledgedDigest, &digest, &workspace)
+		if errors.Is(err, sql.ErrNoRows) {
+			return coordinationError(domain.ErrorCodeForbidden, "message delivery belongs to another recipient")
+		}
+		if err != nil {
+			return err
+		}
+		if workspace != params.WorkspaceID.String() {
+			return coordinationError(domain.ErrorCodeForbidden, "message belongs to another workspace")
+		}
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		switch params.Kind {
+		case application.DeliveryAvailable:
+			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET available_at_us = COALESCE(available_at_us, ?) WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.MessageID.String(), params.Recipient.String())
+		case application.DeliveryRead:
+			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET read_at_us = COALESCE(read_at_us, ?) WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.MessageID.String(), params.Recipient.String())
+		case application.DeliveryAcknowledged:
+			if !bytes.Equal(digest, params.MessageDigest[:]) {
+				return coordinationConflict(domain.ErrorCodeStateConflict, domain.ConflictDeliveryFact, "message digest does not match")
+			}
+			if acknowledged.Valid && (acknowledgedSession.String != params.ActorSessionID.String() ||
+				!bytes.Equal(acknowledgedDigest, params.MessageDigest[:])) {
+				return coordinationConflict(domain.ErrorCodeStateConflict, domain.ConflictDeliveryFact, "acknowledgement fact already differs")
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET acknowledged_at_us = COALESCE(acknowledged_at_us, ?),
+				acknowledged_by_session_id = COALESCE(acknowledged_by_session_id, ?), acknowledged_message_digest = COALESCE(acknowledged_message_digest, ?)
+				WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.ActorSessionID.String(), digest,
+				params.MessageID.String(), params.Recipient.String())
+		}
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT available_at_us, read_at_us, acknowledged_at_us FROM message_deliveries
+			WHERE message_id = ? AND recipient_actor_id = ?`, params.MessageID.String(), params.Recipient.String()).Scan(&available, &read, &acknowledged); err != nil {
+			return err
+		}
+		actorRecipient, _ := application.NewRecipient(params.Recipient, application.RecipientKind(kind))
+		result, err = application.NewDeliveryView(actorRecipient, required, nullableTime(available), nullableTime(read), nullableTime(acknowledged))
+		return err
+	})
+	return result, err
+}
+
+func (store *Store) AcquireLease(ctx context.Context, params application.AcquireLeaseParams) (application.Lease, error) {
+	if err := application.ValidateAcquireLease(params); err != nil {
+		return application.Lease{}, err
+	}
+	var result application.Lease
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if err := requireCurrentLeaseEpoch(ctx, tx, params.WorkspaceID, params.AuthorityEpoch); err != nil {
+			return err
+		}
+		type existingSelector struct {
+			lease, mode, kind, value string
+			expires                  int64
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT lease.lease_id, lease.mode, selector.selector_kind, selector.selector_path, lease.expires_at_us
+			FROM leases AS lease JOIN lease_selectors AS selector USING(lease_id)
+			WHERE lease.workspace_id = ? AND lease.authority_epoch = ? AND lease.status = 'active'`,
+			params.WorkspaceID.String(), params.AuthorityEpoch.String())
+		if err != nil {
+			return err
+		}
+		var existing []existingSelector
+		for rows.Next() {
+			var value existingSelector
+			if err := rows.Scan(&value.lease, &value.mode, &value.kind, &value.value, &value.expires); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			existing = append(existing, value)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		keys := make(map[string]struct{}, len(params.Selectors))
+		for _, requested := range params.Selectors {
+			keys[requested.Key()] = struct{}{}
+			for _, prior := range existing {
+				selector, parseErr := application.NewLeaseSelector(application.LeaseSelectorKind(prior.kind), prior.value)
+				if parseErr != nil {
+					return parseErr
+				}
+				if !application.LeaseSelectorsOverlap(requested, selector) {
+					continue
+				}
+				keys[selector.Key()] = struct{}{}
+				if prior.expires > timeMicros(now) && (params.Mode == application.LeaseExclusive || application.LeaseMode(prior.mode) == application.LeaseExclusive) {
+					return coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictLease, "an active overlapping lease exists")
+				}
+			}
+		}
+		expires := now.Add(params.TTL)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO leases(lease_id, workspace_id, holder_actor_id, holder_session_id,
+			authority_epoch, mode, status, acquired_at_us, expires_at_us) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+			params.LeaseID.String(), params.WorkspaceID.String(), params.Holder.String(), params.HolderSession.String(),
+			params.AuthorityEpoch.String(), string(params.Mode), timeMicros(now), timeMicros(expires)); err != nil {
+			return fmt.Errorf("insert SQLite lease: %w", err)
+		}
+		selectors := append([]application.LeaseSelector(nil), params.Selectors...)
+		sort.Slice(selectors, func(i, j int) bool { return selectors[i].Key() < selectors[j].Key() })
+		for index, selector := range selectors {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO lease_selectors(lease_id, selector_ordinal, selector_kind, selector_path) VALUES (?, ?, ?, ?)`,
+				params.LeaseID.String(), index, string(selector.Kind()), selector.Path()); err != nil {
+				return err
+			}
+		}
+		var fences []application.Fence
+		if params.Mode == application.LeaseExclusive {
+			ordered := make([]string, 0, len(keys))
+			for key := range keys {
+				ordered = append(ordered, key)
+			}
+			sort.Strings(ordered)
+			for _, key := range ordered {
+				_, err := tx.ExecContext(ctx, `INSERT INTO lease_fence_counters(workspace_id, authority_epoch, conflict_key, counter)
+					VALUES (?, ?, ?, 1) ON CONFLICT(workspace_id, authority_epoch, conflict_key) DO UPDATE SET counter = counter + 1`,
+					params.WorkspaceID.String(), params.AuthorityEpoch.String(), key)
+				if err != nil {
+					return err
+				}
+				var counter uint64
+				if err := tx.QueryRowContext(ctx, `SELECT counter FROM lease_fence_counters WHERE workspace_id = ? AND authority_epoch = ? AND conflict_key = ?`,
+					params.WorkspaceID.String(), params.AuthorityEpoch.String(), key).Scan(&counter); err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx, `INSERT INTO lease_fences(lease_id, conflict_key, counter) VALUES (?, ?, ?)`, params.LeaseID.String(), key, counter); err != nil {
+					return err
+				}
+				fence, _ := application.NewFence(key, counter)
+				fences = append(fences, fence)
+			}
+		}
+		result, err = application.NewLeaseView(application.LeaseViewParams{LeaseID: params.LeaseID, WorkspaceID: params.WorkspaceID,
+			Holder: params.Holder, HolderSession: params.HolderSession, AuthorityEpoch: params.AuthorityEpoch, Mode: params.Mode,
+			Selectors: selectors, Fences: fences, AcquiredAt: now, ExpiresAt: expires})
+		return err
+	})
+	return result, err
+}
+
+func (store *Store) RenewLease(ctx context.Context, params application.ChangeLeaseParams) (application.Lease, error) {
+	if params.TTL <= 0 || params.TTL > application.MaxLeaseTTL {
+		return application.Lease{}, application.ErrInvalidCoordination
+	}
+	return store.changeLease(ctx, params, false)
+}
+
+func (store *Store) ReleaseLease(ctx context.Context, params application.ChangeLeaseParams) (application.Lease, error) {
+	if params.TTL != 0 {
+		return application.Lease{}, application.ErrInvalidCoordination
+	}
+	return store.changeLease(ctx, params, true)
+}
+
+func (store *Store) changeLease(ctx context.Context, params application.ChangeLeaseParams, release bool) (application.Lease, error) {
+	if params.LeaseID.IsZero() || params.HolderSession.IsZero() || params.AuthorityEpoch.IsZero() {
+		return application.Lease{}, application.ErrInvalidCoordination
+	}
+	var result application.Lease
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		lease, err := loadLease(ctx, tx, params.LeaseID)
+		if err != nil {
+			return err
+		}
+		if lease.HolderSession() != params.HolderSession {
+			return coordinationError(domain.ErrorCodeForbidden, "lease belongs to another holder")
+		}
+		if lease.AuthorityEpoch() != params.AuthorityEpoch {
+			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease authority epoch is stale")
+		}
+		if err := requireCurrentLeaseEpoch(ctx, tx, lease.WorkspaceID(), params.AuthorityEpoch); err != nil {
+			return err
+		}
+		if !equalFences(lease.Fences(), params.Fences) {
+			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease fence is stale")
+		}
+		if _, released := lease.ReleasedAt(); released {
+			result = lease
+			return nil
+		}
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !now.Before(lease.ExpiresAt()) {
+			return coordinationConflict(domain.ErrorCodeLeaseExpired, domain.ConflictLeaseTerminal, "lease has expired")
+		}
+		if release {
+			if _, err := tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ? WHERE lease_id = ? AND status = 'active'`, timeMicros(now), params.LeaseID.String()); err != nil {
+				return err
+			}
+		} else {
+			expires := now.Add(params.TTL)
+			maximum := lease.AcquiredAt().Add(application.MaxLeaseLifetime)
+			if expires.After(maximum) {
+				return application.ErrInvalidCoordination
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE leases SET expires_at_us = ? WHERE lease_id = ? AND status = 'active'`, timeMicros(expires), params.LeaseID.String()); err != nil {
+				return err
+			}
+		}
+		result, err = loadLease(ctx, tx, params.LeaseID)
+		return err
+	})
+	return result, err
+}
+
+func (store *Store) ValidateFence(ctx context.Context, leaseID domain.LeaseID, epoch domain.AuthorityEpoch, fences []application.Fence) error {
+	if leaseID.IsZero() || epoch.IsZero() {
+		return application.ErrInvalidCoordination
+	}
+	lease, err := loadLease(ctx, store.db, leaseID)
+	if err != nil {
+		return err
+	}
+	if lease.AuthorityEpoch() != epoch || !equalFences(lease.Fences(), fences) {
+		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease fence is stale")
+	}
+	if err := requireCurrentLeaseEpoch(ctx, store.db, lease.WorkspaceID(), epoch); err != nil {
+		return err
+	}
+	now, err := sqliteNow(ctx, store.db)
+	if err != nil {
+		return err
+	}
+	if _, released := lease.ReleasedAt(); released || !now.Before(lease.ExpiresAt()) {
+		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease is not active")
+	}
+	for _, fence := range fences {
+		var current uint64
+		if err := store.db.QueryRowContext(ctx, `SELECT counter FROM lease_fence_counters WHERE workspace_id = ? AND authority_epoch = ? AND conflict_key = ?`,
+			lease.WorkspaceID().String(), epoch.String(), fence.ConflictKey()).Scan(&current); err != nil || current != fence.Counter() {
+			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease fence has been superseded")
+		}
+	}
+	return nil
+}
+
+type leaseQuery interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func loadLease(ctx context.Context, query leaseQuery, id domain.LeaseID) (application.Lease, error) {
+	var workspaceText, holderText, sessionText, epochText, mode, status string
+	var acquired, expires int64
+	var released sql.NullInt64
+	err := query.QueryRowContext(ctx, `SELECT workspace_id, holder_actor_id, holder_session_id, authority_epoch, mode,
+		status, acquired_at_us, expires_at_us, released_at_us FROM leases WHERE lease_id = ?`, id.String()).Scan(
+		&workspaceText, &holderText, &sessionText, &epochText, &mode, &status, &acquired, &expires, &released)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Lease{}, coordinationError(domain.ErrorCodeNotFound, "lease was not found")
+	}
+	if err != nil {
+		return application.Lease{}, err
+	}
+	workspace, e1 := domain.ParseWorkspaceID(workspaceText)
+	holder, e2 := domain.ParseActorID(holderText)
+	session, e3 := domain.ParseActorSessionID(sessionText)
+	epoch, e4 := domain.ParseAuthorityEpoch(epochText)
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+		return application.Lease{}, application.ErrInvalidCoordination
+	}
+	selectorRows, err := query.QueryContext(ctx, `SELECT selector_kind, selector_path FROM lease_selectors WHERE lease_id = ? ORDER BY selector_ordinal`, id.String())
+	if err != nil {
+		return application.Lease{}, err
+	}
+	defer func() { _ = selectorRows.Close() }()
+	var selectors []application.LeaseSelector
+	for selectorRows.Next() {
+		var kind, value string
+		if err := selectorRows.Scan(&kind, &value); err != nil {
+			return application.Lease{}, err
+		}
+		selector, err := application.NewLeaseSelector(application.LeaseSelectorKind(kind), value)
+		if err != nil {
+			return application.Lease{}, err
+		}
+		selectors = append(selectors, selector)
+	}
+	if err := selectorRows.Close(); err != nil {
+		return application.Lease{}, err
+	}
+	fenceRows, err := query.QueryContext(ctx, `SELECT conflict_key, counter FROM lease_fences WHERE lease_id = ? ORDER BY conflict_key`, id.String())
+	if err != nil {
+		return application.Lease{}, err
+	}
+	defer func() { _ = fenceRows.Close() }()
+	var fences []application.Fence
+	for fenceRows.Next() {
+		var key string
+		var counter uint64
+		if err := fenceRows.Scan(&key, &counter); err != nil {
+			return application.Lease{}, err
+		}
+		fence, err := application.NewFence(key, counter)
+		if err != nil {
+			return application.Lease{}, err
+		}
+		fences = append(fences, fence)
+	}
+	params := application.LeaseViewParams{LeaseID: id, WorkspaceID: workspace, Holder: holder, HolderSession: session,
+		AuthorityEpoch: epoch, Mode: application.LeaseMode(mode), Selectors: selectors, Fences: fences,
+		AcquiredAt: microsTime(acquired), ExpiresAt: microsTime(expires), ReleasedAt: nullableTime(released)}
+	return application.NewLeaseView(params)
+}
+
+func equalFences(left, right []application.Fence) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	left = append([]application.Fence(nil), left...)
+	right = append([]application.Fence(nil), right...)
+	sort.Slice(left, func(i, j int) bool { return left[i].ConflictKey() < left[j].ConflictKey() })
+	sort.Slice(right, func(i, j int) bool { return right[i].ConflictKey() < right[j].ConflictKey() })
+	for index := range left {
+		if left[index].ConflictKey() != right[index].ConflictKey() || left[index].Counter() != right[index].Counter() {
+			return false
+		}
+	}
+	return true
+}
+
+func sqliteNow(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (time.Time, error) {
+	var micros int64
+	if err := query.QueryRowContext(ctx, `SELECT CAST(unixepoch('subsec') * 1000000 AS INTEGER)`).Scan(&micros); err != nil {
+		return time.Time{}, err
+	}
+	return microsTime(micros), nil
+}
+
+func requireCurrentLeaseEpoch(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, workspace domain.WorkspaceID, epoch domain.AuthorityEpoch) error {
+	var current string
+	err := query.QueryRowContext(ctx, `SELECT authority_epoch FROM scope_guards WHERE scope_kind = 'workspace' AND scope_id = ?`, workspace.String()).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return coordinationError(domain.ErrorCodeNotFound, "workspace lease authority was not found")
+	}
+	if err != nil {
+		return err
+	}
+	if current != epoch.String() {
+		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "workspace authority epoch is stale")
+	}
+	return nil
+}
+
+func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentName, registrationToken string) (application.LocalAgentSession, string, error) {
+	if !validLocalCoordinationText(projectKey, application.MaxCoordinationKeyBytes) ||
+		!validLocalCoordinationText(agentName, application.MaxCoordinationNameBytes) {
+		return application.LocalAgentSession{}, "", application.ErrInvalidCoordination
+	}
+	actorID, err := domain.NewActorID()
+	if err != nil {
+		return application.LocalAgentSession{}, "", err
+	}
+	sessionID, err := domain.NewActorSessionID()
+	if err != nil {
+		return application.LocalAgentSession{}, "", err
+	}
+	workspaceID, err := domain.NewWorkspaceID()
+	if err != nil {
+		return application.LocalAgentSession{}, "", err
+	}
+	runID, err := domain.NewRunID()
+	if err != nil {
+		return application.LocalAgentSession{}, "", err
+	}
+	authorityID, err := domain.NewAuthorityID()
+	if err != nil {
+		return application.LocalAgentSession{}, "", err
+	}
+	epoch, err := domain.ParseAuthorityEpoch(authorityID.String())
+	if err != nil {
+		return application.LocalAgentSession{}, "", err
+	}
+	issuedToken := ""
+	var result application.LocalAgentSession
+	err = store.withImmediate(ctx, func(tx *sql.Tx) error {
+		now, nowErr := sqliteNow(ctx, tx)
+		if nowErr != nil {
+			return nowErr
+		}
+		var workspaceText, runText, authorityText, epochText string
+		projectErr := tx.QueryRowContext(ctx, `SELECT workspace_id, run_id, authority_id, authority_epoch
+			FROM coordination_projects WHERE project_key = ?`, projectKey).Scan(&workspaceText, &runText, &authorityText, &epochText)
+		if errors.Is(projectErr, sql.ErrNoRows) {
+			workspaceText, runText, authorityText, epochText = workspaceID.String(), runID.String(), authorityID.String(), epoch.String()
+			if _, insertErr := tx.ExecContext(ctx, `INSERT INTO coordination_projects(project_key, workspace_id, run_id,
+				authority_id, authority_epoch, created_at_us) VALUES (?, ?, ?, ?, ?, ?)`, projectKey, workspaceText,
+				runText, authorityText, epochText, timeMicros(now)); insertErr != nil {
+				return fmt.Errorf("insert SQLite coordination project: %w", insertErr)
+			}
+			if _, insertErr := tx.ExecContext(ctx, `INSERT INTO scope_guards(scope_kind, scope_id, authority_id,
+				authority_epoch, write_status, guard_generation, updated_at_us) VALUES ('workspace', ?, ?, ?, 'open', 1, ?)`,
+				workspaceText, authorityText, epochText, timeMicros(now)); insertErr != nil {
+				return fmt.Errorf("insert SQLite coordination authority: %w", insertErr)
+			}
+		} else if projectErr != nil {
+			return projectErr
+		}
+
+		var actorText string
+		var storedDigest []byte
+		agentErr := tx.QueryRowContext(ctx, `SELECT actor_id, registration_token_digest FROM coordination_agents
+			WHERE project_key = ? AND agent_name = ?`, projectKey, agentName).Scan(&actorText, &storedDigest)
+		if errors.Is(agentErr, sql.ErrNoRows) {
+			if registrationToken != "" {
+				return coordinationError(domain.ErrorCodeUnauthenticated, "registration token is not valid")
+			}
+			issuedToken, err = newLocalCoordinationToken()
+			if err != nil {
+				return err
+			}
+			digest := sha256.Sum256([]byte(issuedToken))
+			actorText = actorID.String()
+			if _, insertErr := tx.ExecContext(ctx, `INSERT INTO coordination_agents(actor_id, project_key, agent_name,
+				registration_token_digest, created_at_us) VALUES (?, ?, ?, ?, ?)`, actorText, projectKey, agentName,
+				digest[:], timeMicros(now)); insertErr != nil {
+				return fmt.Errorf("insert SQLite coordination agent: %w", insertErr)
+			}
+		} else if agentErr != nil {
+			return agentErr
+		} else {
+			provided := sha256.Sum256([]byte(registrationToken))
+			if registrationToken == "" || len(storedDigest) != sha256.Size || subtle.ConstantTimeCompare(provided[:], storedDigest) != 1 {
+				return coordinationError(domain.ErrorCodeUnauthenticated, "registration token is not valid")
+			}
+		}
+		if _, updateErr := tx.ExecContext(ctx, `UPDATE coordination_agent_sessions SET ended_at_us = ?
+			WHERE actor_id = ? AND ended_at_us IS NULL`, timeMicros(now), actorText); updateErr != nil {
+			return updateErr
+		}
+		if _, updateErr := tx.ExecContext(ctx, `UPDATE leases SET holder_session_id = ?
+			WHERE holder_actor_id = ? AND workspace_id = ? AND status = 'active' AND expires_at_us > ?`,
+			sessionID.String(), actorText, workspaceText, timeMicros(now)); updateErr != nil {
+			return updateErr
+		}
+		if _, insertErr := tx.ExecContext(ctx, `INSERT INTO coordination_agent_sessions(session_id, actor_id,
+			started_at_us, last_seen_at_us) VALUES (?, ?, ?, ?)`, sessionID.String(), actorText, timeMicros(now),
+			timeMicros(now)); insertErr != nil {
+			return fmt.Errorf("insert SQLite coordination session: %w", insertErr)
+		}
+		result, err = localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionID.String(), epochText,
+			timeMicros(now), timeMicros(now))
+		return err
+	})
+	return result, issuedToken, err
+}
+
+func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (application.LocalAgentSession, error) {
+	if token == "" || len(token) > 256 {
+		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated, "agent token is not valid")
+	}
+	digest := sha256.Sum256([]byte(token))
+	var result application.LocalAgentSession
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		var projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string
+		var started, lastSeen int64
+		err = tx.QueryRowContext(ctx, `SELECT project.project_key, agent.agent_name, project.workspace_id, project.run_id,
+			agent.actor_id, session.session_id, project.authority_epoch, session.started_at_us, session.last_seen_at_us
+			FROM coordination_agents AS agent JOIN coordination_projects AS project USING(project_key)
+			JOIN coordination_agent_sessions AS session USING(actor_id)
+			WHERE agent.registration_token_digest = ? AND session.ended_at_us IS NULL
+			ORDER BY session.started_at_us DESC LIMIT 1`, digest[:]).Scan(&projectKey, &agentName, &workspaceText, &runText,
+			&actorText, &sessionText, &epochText, &started, &lastSeen)
+		if errors.Is(err, sql.ErrNoRows) {
+			return coordinationError(domain.ErrorCodeUnauthenticated, "agent token is not valid")
+		}
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE coordination_agent_sessions SET last_seen_at_us = ? WHERE session_id = ?`,
+			timeMicros(now), sessionText); err != nil {
+			return err
+		}
+		result, err = localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText,
+			started, timeMicros(now))
+		return err
+	})
+	return result, err
+}
+
+func (store *Store) ListActiveLocalAgents(ctx context.Context, session application.LocalAgentSession) ([]application.ActiveAgent, error) {
+	if session.WorkspaceID.IsZero() || session.ProjectKey == "" {
+		return nil, application.ErrInvalidCoordination
+	}
+	cutoff := time.Now().UTC().Add(-5 * time.Minute)
+	rows, err := store.db.QueryContext(ctx, `SELECT agent.agent_name, agent.actor_id, session.session_id,
+		session.started_at_us, session.last_seen_at_us FROM coordination_agents AS agent
+		JOIN coordination_agent_sessions AS session USING(actor_id)
+		WHERE agent.project_key = ? AND session.ended_at_us IS NULL AND session.last_seen_at_us >= ?
+		ORDER BY agent.agent_name`, session.ProjectKey, timeMicros(cutoff))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []application.ActiveAgent
+	for rows.Next() {
+		var value application.ActiveAgent
+		var actorText, sessionText string
+		var started, seen int64
+		if err := rows.Scan(&value.Name, &actorText, &sessionText, &started, &seen); err != nil {
+			return nil, err
+		}
+		value.ActorID, err = domain.ParseActorID(actorText)
+		if err != nil {
+			return nil, err
+		}
+		value.SessionID, err = domain.ParseActorSessionID(sessionText)
+		if err != nil {
+			return nil, err
+		}
+		value.StartedAt, value.LastSeenAt = microsTime(started), microsTime(seen)
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (store *Store) ResolveLocalAgentNames(ctx context.Context, session application.LocalAgentSession, names []string) ([]domain.ActorID, error) {
+	if session.ProjectKey == "" || len(names) == 0 || len(names) > application.MaxMessageRecipients {
+		return nil, application.ErrInvalidCoordination
+	}
+	result := make([]domain.ActorID, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if !validLocalCoordinationText(name, application.MaxCoordinationNameBytes) {
+			return nil, application.ErrInvalidCoordination
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, application.ErrInvalidCoordination
+		}
+		seen[name] = struct{}{}
+		var actorText string
+		if err := store.db.QueryRowContext(ctx, `SELECT actor_id FROM coordination_agents WHERE project_key = ? AND agent_name = ?`,
+			session.ProjectKey, name).Scan(&actorText); errors.Is(err, sql.ErrNoRows) {
+			return nil, coordinationError(domain.ErrorCodeNotFound, "agent was not found")
+		} else if err != nil {
+			return nil, err
+		}
+		actor, err := domain.ParseActorID(actorText)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, actor)
+	}
+	return result, nil
+}
+
+func validLocalCoordinationText(value string, maximum int) bool {
+	return value != "" && value == strings.TrimSpace(value) && len(value) <= maximum && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+}
+
+func newLocalCoordinationToken() (string, error) {
+	var value [32]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return "bbm_" + hex.EncodeToString(value[:]), nil
+}
+
+func localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string,
+	started, lastSeen int64) (application.LocalAgentSession, error) {
+	workspace, e1 := domain.ParseWorkspaceID(workspaceText)
+	run, e2 := domain.ParseRunID(runText)
+	actor, e3 := domain.ParseActorID(actorText)
+	session, e4 := domain.ParseActorSessionID(sessionText)
+	epoch, e5 := domain.ParseAuthorityEpoch(epochText)
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil {
+		return application.LocalAgentSession{}, application.ErrInvalidCoordination
+	}
+	return application.LocalAgentSession{ProjectKey: projectKey, AgentName: agentName, WorkspaceID: workspace, RunID: run,
+		ActorID: actor, ActorSessionID: session, AuthorityEpoch: epoch, StartedAt: microsTime(started),
+		LastSeenAt: microsTime(lastSeen)}, nil
+}
+
+func coordinationError(code domain.ErrorCode, message string) error {
+	result, _ := domain.NewCommandError(code, message, nil)
+	return result
+}
+func coordinationConflict(code domain.ErrorCode, kind domain.ConflictKind, message string) error {
+	result, _ := domain.NewConflictError(code, kind, message, nil)
+	return result
 }

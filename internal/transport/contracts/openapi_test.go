@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-const productOpenAPIGoldenSHA256 = "9462dfdca70a65be856f83f38e150c5acb3455bc255432a5f8adc4822f7bdd12"
+const productOpenAPIGoldenSHA256 = "38acbcfd29d0dbd0981e5e064f6605299d2f80254ceb2151ab90b467323513f0"
 
 func TestProductOpenAPI31IsDeterministicAndComplete(t *testing.T) {
 	t.Parallel()
@@ -43,8 +43,8 @@ func TestProductOpenAPI31IsDeterministicAndComplete(t *testing.T) {
 		t.Fatalf("error status matrix = %#v", got)
 	}
 	paths := document["paths"].(map[string]any)
-	if len(paths) != 13 {
-		t.Fatalf("path count = %d, want 13", len(paths))
+	if len(paths) != 19 {
+		t.Fatalf("path count = %d, want 19", len(paths))
 	}
 	for _, operation := range productAPIOperations {
 		post := paths[operation.Path].(map[string]any)["post"].(map[string]any)

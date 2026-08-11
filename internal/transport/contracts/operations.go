@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -307,6 +308,24 @@ type ActorDelegationActivateHandler interface {
 type SessionStartHandler interface {
 	HandleSessionStart(context.Context, AuthenticationEvidence, SessionStartRequestDTO) (SessionStartResultDTO, *ErrorDTO, error)
 }
+type WorkRefObserveHandler interface {
+	HandleWorkRefObserve(context.Context, AuthenticationEvidence, WorkRefObserveRequestDTO) (WorkRefObserveResultDTO, *ErrorDTO, error)
+}
+type ObjectiveAndWorkCreateHandler interface {
+	HandleObjectiveAndWorkCreate(context.Context, AuthenticationEvidence, ObjectiveAndWorkCreateRequestDTO) (ObjectiveAndWorkCreateResultDTO, *ErrorDTO, error)
+}
+type ObjectiveActivateHandler interface {
+	HandleObjectiveActivate(context.Context, AuthenticationEvidence, ObjectiveActivateRequestDTO) (ObjectiveActivateResultDTO, *ErrorDTO, error)
+}
+type RunPlanWithBindingsHandler interface {
+	HandleRunPlanWithBindings(context.Context, AuthenticationEvidence, RunPlanWithBindingsRequestDTO) (RunPlanWithBindingsResultDTO, *ErrorDTO, error)
+}
+type RunJoinHandler interface {
+	HandleRunJoin(context.Context, AuthenticationEvidence, RunJoinRequestDTO) (RunJoinResultDTO, *ErrorDTO, error)
+}
+type RunStartHandler interface {
+	HandleRunStart(context.Context, AuthenticationEvidence, RunStartRequestDTO) (RunStartResultDTO, *ErrorDTO, error)
+}
 type ContextGetHandler interface {
 	HandleContextGet(context.Context, AuthenticationEvidence, ContextGetRequestDTO) (ContextPageDTO, *ErrorDTO, error)
 }
@@ -327,6 +346,13 @@ const (
 	OperationActorDelegationActivate   = "actor_delegation.activate.v1"
 	OperationSessionStart              = "session.start.v1"
 
+	OperationWorkRefObserve         = "work_ref.observe.v1"
+	OperationObjectiveAndWorkCreate = "objective_and_work.create.v1"
+	OperationObjectiveActivate      = "objective.activate.v1"
+	OperationRunPlanWithBindings    = "run.plan_with_bindings.v1"
+	OperationRunJoin                = "run_participation.join.v1"
+	OperationRunStart               = "run.start.v1"
+
 	SchemaInstallationBootstrapCommand     = "blackbird.command.installation_bootstrap/1"
 	SchemaPrincipalRegisterCommand         = "blackbird.command.principal_register/1"
 	SchemaDevicePairingBeginCommand        = "blackbird.command.device_pairing_begin/1"
@@ -338,6 +364,12 @@ const (
 	SchemaActorDelegationProposeCommand    = "blackbird.command.actor_delegation_propose/1"
 	SchemaActorDelegationActivateCommand   = "blackbird.command.actor_delegation_activate/1"
 	SchemaSessionStartCommand              = "blackbird.command.session_start/1"
+	SchemaWorkRefObserveCommand            = "blackbird.command.work_ref_observe/1"
+	SchemaObjectiveAndWorkCreateCommand    = "blackbird.command.objective_and_work_create/1"
+	SchemaObjectiveActivateCommand         = "blackbird.command.objective_activate/1"
+	SchemaRunPlanWithBindingsCommand       = "blackbird.command.run_plan_with_bindings/1"
+	SchemaRunJoinCommand                   = "blackbird.command.run_join/1"
+	SchemaRunStartCommand                  = "blackbird.command.run_start/1"
 
 	PairingProtocolV1     = "blackbird.pair/v1"
 	PrincipalKindHuman    = "human"
@@ -366,6 +398,18 @@ var w0OperationInventory = []string{
 
 // W0OperationInventory returns the closed public command catalog in stable order.
 func W0OperationInventory() []string { return append([]string(nil), w0OperationInventory...) }
+
+var w1OperationInventory = []string{
+	OperationWorkRefObserve,
+	OperationObjectiveAndWorkCreate,
+	OperationObjectiveActivate,
+	OperationRunPlanWithBindings,
+	OperationRunJoin,
+	OperationRunStart,
+}
+
+// W1OperationInventory returns the W1 command catalog in stable order.
+func W1OperationInventory() []string { return append([]string(nil), w1OperationInventory...) }
 
 // CommandMetadataDTO is common retry, attribution, authority, and deadline
 // metadata for the three pre-session W0.2 commands. Authentication still comes
@@ -1301,6 +1345,685 @@ func (request ActorDelegationActivateRequestDTO) Validate() error {
 		return err
 	}
 	return request.Body.SessionStartChallenge.validate("body.session_start_challenge")
+}
+
+type WorkRefObserveRequestDTO struct {
+	CommandMetadataDTO
+	ClientInstanceID domain.ClientInstanceID           `json:"client_instance_id"`
+	ExpectedVersions WorkRefObserveExpectedVersionsDTO `json:"expected_versions"`
+	Body             WorkRefObserveBodyDTO             `json:"body"`
+}
+type WorkRefObserveExpectedVersionsDTO struct {
+	Adapter       domain.Version `json:"adapter"`
+	Workspace     domain.Version `json:"workspace"`
+	WorkReference domain.Version `json:"work_reference"`
+}
+type WorkRefObserveBodyDTO struct {
+	AdapterID               domain.PrincipalID     `json:"adapter_id"`
+	WorkspaceID             domain.WorkspaceID     `json:"workspace_id"`
+	WorkReferenceID         domain.WorkReferenceID `json:"work_reference_id"`
+	ProviderNamespace       string                 `json:"provider_namespace"`
+	ProviderObjectID        string                 `json:"provider_object_id"`
+	ProviderLocator         string                 `json:"provider_locator"`
+	ProviderVersion         string                 `json:"provider_version"`
+	SelectedFields          json.RawMessage        `json:"selected_fields"`
+	AdapterPrincipalID      domain.PrincipalID     `json:"adapter_principal_id"`
+	ObservedAt              time.Time              `json:"observed_at"`
+	PreviousProviderVersion string                 `json:"previous_provider_version,omitempty"`
+}
+
+type WorkRefObserveValues struct {
+	Metadata                     CommandMetadataDTO
+	ClientInstanceID             domain.ClientInstanceID
+	AdapterID                    domain.PrincipalID
+	AdapterVersion               domain.Version
+	WorkspaceID                  domain.WorkspaceID
+	WorkspaceVersion             domain.Version
+	WorkReferenceID              domain.WorkReferenceID
+	ExpectedWorkReferenceVersion domain.Version
+	Observation                  domain.ProviderObservation
+	PreviousProviderVersion      domain.OpaqueProviderValue
+}
+
+func DecodeWorkRefObserveRequest(data []byte) (WorkRefObserveRequestDTO, error) {
+	var request WorkRefObserveRequestDTO
+	if err := decodeCommandInput(data, &request); err != nil {
+		return WorkRefObserveRequestDTO{}, err
+	}
+	if _, err := request.Values(); err != nil {
+		return WorkRefObserveRequestDTO{}, err
+	}
+	return request, nil
+}
+
+func (request WorkRefObserveRequestDTO) Values() (WorkRefObserveValues, error) {
+	if err := request.validate(SchemaWorkRefObserveCommand, OperationWorkRefObserve); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if err := validateRequiredID("client_instance_id", request.ClientInstanceID); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if err := validateVersion("expected_versions.adapter", request.ExpectedVersions.Adapter); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if err := validateVersion("expected_versions.workspace", request.ExpectedVersions.Workspace); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if err := validateRequiredID("body.adapter_id", request.Body.AdapterID); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if err := validateRequiredID("body.workspace_id", request.Body.WorkspaceID); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if err := validateRequiredID("body.work_reference_id", request.Body.WorkReferenceID); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if request.Body.AdapterID != request.Body.AdapterPrincipalID {
+		return WorkRefObserveValues{}, invalid("body.adapter_principal_id", "must equal body.adapter_id for provider authority")
+	}
+	if err := validateUTCInstant("body.observed_at", request.Body.ObservedAt); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	for field, value := range map[string]string{
+		"body.provider_namespace": request.Body.ProviderNamespace,
+		"body.provider_object_id": request.Body.ProviderObjectID,
+		"body.provider_locator":   request.Body.ProviderLocator,
+		"body.provider_version":   request.Body.ProviderVersion,
+	} {
+		if err := validateText(field, value, maxOpaqueProviderValueBytes, true); err != nil {
+			return WorkRefObserveValues{}, err
+		}
+	}
+	if err := validateRawJSONObject("body.selected_fields", request.Body.SelectedFields); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	create := request.ExpectedVersions.WorkReference.IsZero()
+	if err := validateText("body.previous_provider_version", request.Body.PreviousProviderVersion, maxOpaqueProviderValueBytes, !create); err != nil {
+		return WorkRefObserveValues{}, err
+	}
+	if create && request.Body.PreviousProviderVersion != "" {
+		return WorkRefObserveValues{}, invalid("body.previous_provider_version", "must be absent when creating a new work reference")
+	}
+	if !create {
+		if err := validateVersion("expected_versions.work_reference", request.ExpectedVersions.WorkReference); err != nil {
+			return WorkRefObserveValues{}, err
+		}
+	}
+	namespace, err := domain.NewOpaqueProviderValue(request.Body.ProviderNamespace)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body.provider_namespace", err.Error())
+	}
+	objectID, err := domain.NewOpaqueProviderValue(request.Body.ProviderObjectID)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body.provider_object_id", err.Error())
+	}
+	locator, err := domain.NewOpaqueProviderValue(request.Body.ProviderLocator)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body.provider_locator", err.Error())
+	}
+	providerVersion, err := domain.NewOpaqueProviderValue(request.Body.ProviderVersion)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body.provider_version", err.Error())
+	}
+	fields, err := domain.NewEventPayload(request.Body.SelectedFields)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body.selected_fields", err.Error())
+	}
+	observation, err := domain.NewProviderObservation(
+		namespace, objectID, locator, providerVersion, fields, request.Body.AdapterID, request.Body.ObservedAt,
+	)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body", err.Error())
+	}
+	previous, err := domain.NewOpaqueProviderValue(request.Body.PreviousProviderVersion)
+	if err != nil {
+		return WorkRefObserveValues{}, invalid("body.previous_provider_version", err.Error())
+	}
+	return WorkRefObserveValues{
+		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
+		AdapterID: request.Body.AdapterID, AdapterVersion: request.ExpectedVersions.Adapter,
+		WorkspaceID: request.Body.WorkspaceID, WorkspaceVersion: request.ExpectedVersions.Workspace,
+		WorkReferenceID:              request.Body.WorkReferenceID,
+		ExpectedWorkReferenceVersion: request.ExpectedVersions.WorkReference,
+		Observation:                  observation, PreviousProviderVersion: previous,
+	}, nil
+}
+
+type ObjectiveAndWorkCreateRequestDTO struct {
+	CommandMetadataDTO
+	ClientInstanceID domain.ClientInstanceID                   `json:"client_instance_id"`
+	ExpectedVersions ObjectiveAndWorkCreateExpectedVersionsDTO `json:"expected_versions"`
+	Body             ObjectiveAndWorkCreateBodyDTO             `json:"body"`
+}
+type ObjectiveAndWorkCreateExpectedVersionsDTO struct {
+	Actor         domain.Version `json:"actor"`
+	ActorSession  domain.Version `json:"actor_session"`
+	WorkReference domain.Version `json:"work_reference"`
+}
+type ObjectiveAndWorkCreateBodyDTO struct {
+	WorkspaceID        domain.WorkspaceID     `json:"workspace_id"`
+	ActorID            domain.ActorID         `json:"actor_id"`
+	ActorSessionID     domain.ActorSessionID  `json:"actor_session_id"`
+	ObjectiveID        domain.ObjectiveID     `json:"objective_id"`
+	ObjectiveTitle     string                 `json:"objective_title"`
+	AcceptanceCriteria string                 `json:"acceptance_criteria"`
+	WorkUnitID         domain.WorkUnitID      `json:"work_unit_id"`
+	WorkUnitTitle      string                 `json:"work_unit_title"`
+	WorkReferenceID    domain.WorkReferenceID `json:"work_reference_id"`
+}
+
+type ObjectiveAndWorkCreateValues struct {
+	Metadata                     CommandMetadataDTO
+	ClientInstanceID             domain.ClientInstanceID
+	WorkspaceID                  domain.WorkspaceID
+	ActorID                      domain.ActorID
+	ExpectedActorVersion         domain.Version
+	ActorSessionID               domain.ActorSessionID
+	ExpectedSessionVersion       domain.Version
+	ObjectiveID                  domain.ObjectiveID
+	ObjectiveTitle               string
+	AcceptanceCriteria           string
+	WorkUnitID                   domain.WorkUnitID
+	WorkUnitTitle                string
+	WorkReferenceID              domain.WorkReferenceID
+	ExpectedWorkReferenceVersion domain.Version
+}
+
+func DecodeObjectiveAndWorkCreateRequest(data []byte) (ObjectiveAndWorkCreateRequestDTO, error) {
+	var request ObjectiveAndWorkCreateRequestDTO
+	if err := decodeCommandInput(data, &request); err != nil {
+		return ObjectiveAndWorkCreateRequestDTO{}, err
+	}
+	if _, err := request.Values(); err != nil {
+		return ObjectiveAndWorkCreateRequestDTO{}, err
+	}
+	return request, nil
+}
+
+func (request ObjectiveAndWorkCreateRequestDTO) Values() (ObjectiveAndWorkCreateValues, error) {
+	if err := request.validate(SchemaObjectiveAndWorkCreateCommand, OperationObjectiveAndWorkCreate); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateOrdinaryWorkRequest(request.CommandMetadataDTO, request.ClientInstanceID, request.ExpectedVersions.Actor,
+		request.ExpectedVersions.ActorSession, request.Body.WorkspaceID, request.Body.ActorID, request.Body.ActorSessionID); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateRequiredID("body.objective_id", request.Body.ObjectiveID); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateRequiredID("body.work_unit_id", request.Body.WorkUnitID); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateRequiredID("body.work_reference_id", request.Body.WorkReferenceID); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateVersion("expected_versions.work_reference", request.ExpectedVersions.WorkReference); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateText("body.objective_title", request.Body.ObjectiveTitle, maxObjectiveTitleBytes, true); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateText("body.acceptance_criteria", request.Body.AcceptanceCriteria, maxAcceptanceCriteriaBytes, true); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	if err := validateText("body.work_unit_title", request.Body.WorkUnitTitle, maxObjectiveTitleBytes, true); err != nil {
+		return ObjectiveAndWorkCreateValues{}, err
+	}
+	return ObjectiveAndWorkCreateValues{
+		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
+		WorkspaceID: request.Body.WorkspaceID, ActorID: request.Body.ActorID,
+		ExpectedActorVersion: request.ExpectedVersions.Actor, ActorSessionID: request.Body.ActorSessionID,
+		ExpectedSessionVersion: request.ExpectedVersions.ActorSession,
+		ObjectiveID:            request.Body.ObjectiveID, ObjectiveTitle: request.Body.ObjectiveTitle,
+		AcceptanceCriteria: request.Body.AcceptanceCriteria, WorkUnitID: request.Body.WorkUnitID,
+		WorkUnitTitle: request.Body.WorkUnitTitle, WorkReferenceID: request.Body.WorkReferenceID,
+		ExpectedWorkReferenceVersion: request.ExpectedVersions.WorkReference,
+	}, nil
+}
+
+type ObjectiveActivateRequestDTO struct {
+	CommandMetadataDTO
+	ClientInstanceID domain.ClientInstanceID              `json:"client_instance_id"`
+	ExpectedVersions ObjectiveActivateExpectedVersionsDTO `json:"expected_versions"`
+	Body             ObjectiveActivateBodyDTO             `json:"body"`
+}
+type ObjectiveActivateExpectedVersionsDTO struct {
+	Actor        domain.Version `json:"actor"`
+	ActorSession domain.Version `json:"actor_session"`
+	Objective    domain.Version `json:"objective"`
+}
+type ObjectiveActivateBodyDTO struct {
+	WorkspaceID    domain.WorkspaceID    `json:"workspace_id"`
+	ActorID        domain.ActorID        `json:"actor_id"`
+	ActorSessionID domain.ActorSessionID `json:"actor_session_id"`
+	ObjectiveID    domain.ObjectiveID    `json:"objective_id"`
+}
+
+type ObjectiveActivateValues struct {
+	Metadata                 CommandMetadataDTO
+	ClientInstanceID         domain.ClientInstanceID
+	WorkspaceID              domain.WorkspaceID
+	ActorID                  domain.ActorID
+	ExpectedActorVersion     domain.Version
+	ActorSessionID           domain.ActorSessionID
+	ExpectedSessionVersion   domain.Version
+	ObjectiveID              domain.ObjectiveID
+	ExpectedObjectiveVersion domain.Version
+}
+
+func DecodeObjectiveActivateRequest(data []byte) (ObjectiveActivateRequestDTO, error) {
+	var request ObjectiveActivateRequestDTO
+	if err := decodeCommandInput(data, &request); err != nil {
+		return ObjectiveActivateRequestDTO{}, err
+	}
+	if _, err := request.Values(); err != nil {
+		return ObjectiveActivateRequestDTO{}, err
+	}
+	return request, nil
+}
+
+func (request ObjectiveActivateRequestDTO) Values() (ObjectiveActivateValues, error) {
+	if err := request.validate(SchemaObjectiveActivateCommand, OperationObjectiveActivate); err != nil {
+		return ObjectiveActivateValues{}, err
+	}
+	if err := validateOrdinaryWorkRequest(request.CommandMetadataDTO, request.ClientInstanceID, request.ExpectedVersions.Actor,
+		request.ExpectedVersions.ActorSession, request.Body.WorkspaceID, request.Body.ActorID, request.Body.ActorSessionID); err != nil {
+		return ObjectiveActivateValues{}, err
+	}
+	if err := validateRequiredID("body.objective_id", request.Body.ObjectiveID); err != nil {
+		return ObjectiveActivateValues{}, err
+	}
+	if err := validateVersion("expected_versions.objective", request.ExpectedVersions.Objective); err != nil {
+		return ObjectiveActivateValues{}, err
+	}
+	return ObjectiveActivateValues{
+		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
+		WorkspaceID: request.Body.WorkspaceID, ActorID: request.Body.ActorID,
+		ExpectedActorVersion: request.ExpectedVersions.Actor, ActorSessionID: request.Body.ActorSessionID,
+		ExpectedSessionVersion: request.ExpectedVersions.ActorSession,
+		ObjectiveID:            request.Body.ObjectiveID, ExpectedObjectiveVersion: request.ExpectedVersions.Objective,
+	}, nil
+}
+
+type RunParticipantPlanDTO struct {
+	ParticipationID        domain.RunParticipationID `json:"participation_id"`
+	ActorID                domain.ActorID            `json:"actor_id"`
+	ExpectedActorVersion   domain.Version            `json:"expected_actor_version"`
+	SessionID              domain.ActorSessionID     `json:"session_id"`
+	ExpectedSessionVersion domain.Version            `json:"expected_session_version"`
+	Role                   string                    `json:"role"`
+}
+type RuntimeBindingPlanDTO struct {
+	BindingID                      domain.RuntimeBindingID   `json:"binding_id"`
+	ParticipationID                domain.RunParticipationID `json:"participation_id"`
+	SessionID                      domain.ActorSessionID     `json:"session_id"`
+	RuntimeEndpointID              domain.RuntimeEndpointID  `json:"runtime_endpoint_id"`
+	ExpectedRuntimeEndpointVersion domain.Version            `json:"expected_runtime_endpoint_version"`
+}
+
+type RunPlanWithBindingsRequestDTO struct {
+	CommandMetadataDTO
+	ClientInstanceID domain.ClientInstanceID                `json:"client_instance_id"`
+	ExpectedVersions RunPlanWithBindingsExpectedVersionsDTO `json:"expected_versions"`
+	Body             RunPlanWithBindingsBodyDTO             `json:"body"`
+}
+type RunPlanWithBindingsExpectedVersionsDTO struct {
+	Actor        domain.Version `json:"actor"`
+	ActorSession domain.Version `json:"actor_session"`
+	Objective    domain.Version `json:"objective"`
+	WorkUnit     domain.Version `json:"work_unit"`
+}
+type RunPlanWithBindingsBodyDTO struct {
+	WorkspaceID    domain.WorkspaceID      `json:"workspace_id"`
+	ActorID        domain.ActorID          `json:"actor_id"`
+	ActorSessionID domain.ActorSessionID   `json:"actor_session_id"`
+	RunID          domain.RunID            `json:"run_id"`
+	ObjectiveID    domain.ObjectiveID      `json:"objective_id"`
+	WorkUnitID     domain.WorkUnitID       `json:"work_unit_id"`
+	Participants   []RunParticipantPlanDTO `json:"participants"`
+	Bindings       []RuntimeBindingPlanDTO `json:"bindings"`
+}
+
+type RunParticipantValues struct {
+	ParticipationID        domain.RunParticipationID
+	ActorID                domain.ActorID
+	ExpectedActorVersion   domain.Version
+	SessionID              domain.ActorSessionID
+	ExpectedSessionVersion domain.Version
+	Role                   string
+}
+type RuntimeBindingValues struct {
+	BindingID                      domain.RuntimeBindingID
+	ParticipationID                domain.RunParticipationID
+	SessionID                      domain.ActorSessionID
+	RuntimeEndpointID              domain.RuntimeEndpointID
+	ExpectedRuntimeEndpointVersion domain.Version
+}
+
+type RunPlanWithBindingsValues struct {
+	Metadata                 CommandMetadataDTO
+	ClientInstanceID         domain.ClientInstanceID
+	WorkspaceID              domain.WorkspaceID
+	ActorID                  domain.ActorID
+	ExpectedActorVersion     domain.Version
+	ActorSessionID           domain.ActorSessionID
+	ExpectedSessionVersion   domain.Version
+	RunID                    domain.RunID
+	ObjectiveID              domain.ObjectiveID
+	ExpectedObjectiveVersion domain.Version
+	WorkUnitID               domain.WorkUnitID
+	ExpectedWorkUnitVersion  domain.Version
+	Participants             []RunParticipantValues
+	Bindings                 []RuntimeBindingValues
+}
+
+func DecodeRunPlanWithBindingsRequest(data []byte) (RunPlanWithBindingsRequestDTO, error) {
+	var request RunPlanWithBindingsRequestDTO
+	if err := decodeCommandInput(data, &request); err != nil {
+		return RunPlanWithBindingsRequestDTO{}, err
+	}
+	if _, err := request.Values(); err != nil {
+		return RunPlanWithBindingsRequestDTO{}, err
+	}
+	return request, nil
+}
+
+func (request RunPlanWithBindingsRequestDTO) Values() (RunPlanWithBindingsValues, error) {
+	if err := request.validate(SchemaRunPlanWithBindingsCommand, OperationRunPlanWithBindings); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if err := validateOrdinaryWorkRequest(request.CommandMetadataDTO, request.ClientInstanceID, request.ExpectedVersions.Actor,
+		request.ExpectedVersions.ActorSession, request.Body.WorkspaceID, request.Body.ActorID, request.Body.ActorSessionID); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if err := validateRequiredID("body.run_id", request.Body.RunID); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if err := validateRequiredID("body.objective_id", request.Body.ObjectiveID); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if err := validateRequiredID("body.work_unit_id", request.Body.WorkUnitID); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if err := validateVersion("expected_versions.objective", request.ExpectedVersions.Objective); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if err := validateVersion("expected_versions.work_unit", request.ExpectedVersions.WorkUnit); err != nil {
+		return RunPlanWithBindingsValues{}, err
+	}
+	if len(request.Body.Participants) == 0 || len(request.Body.Participants) > domain.MaxRunParticipants {
+		return RunPlanWithBindingsValues{}, invalid("body.participants", fmt.Sprintf("must contain between 1 and %d entries", domain.MaxRunParticipants))
+	}
+	if len(request.Body.Bindings) == 0 || len(request.Body.Bindings) > domain.MaxRunBindings {
+		return RunPlanWithBindingsValues{}, invalid("body.bindings", fmt.Sprintf("must contain between 1 and %d entries", domain.MaxRunBindings))
+	}
+	seenParticipation := make(map[string]struct{}, len(request.Body.Participants))
+	participants := make([]RunParticipantValues, len(request.Body.Participants))
+	for index, plan := range request.Body.Participants {
+		prefix := fmt.Sprintf("body.participants[%d]", index)
+		if err := validateRequiredID(prefix+".participation_id", plan.ParticipationID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateRequiredID(prefix+".actor_id", plan.ActorID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateVersion(prefix+".expected_actor_version", plan.ExpectedActorVersion); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateRequiredID(prefix+".session_id", plan.SessionID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateVersion(prefix+".expected_session_version", plan.ExpectedSessionVersion); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateText(prefix+".role", plan.Role, maxRunRoleBytes, true); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		key := plan.ParticipationID.String()
+		if _, duplicate := seenParticipation[key]; duplicate {
+			return RunPlanWithBindingsValues{}, invalid(prefix+".participation_id", "must not duplicate an earlier participation")
+		}
+		seenParticipation[key] = struct{}{}
+		participants[index] = RunParticipantValues{
+			ParticipationID: plan.ParticipationID, ActorID: plan.ActorID,
+			ExpectedActorVersion: plan.ExpectedActorVersion, SessionID: plan.SessionID,
+			ExpectedSessionVersion: plan.ExpectedSessionVersion, Role: plan.Role,
+		}
+	}
+	seenBinding := make(map[string]struct{}, len(request.Body.Bindings))
+	bindings := make([]RuntimeBindingValues, len(request.Body.Bindings))
+	for index, plan := range request.Body.Bindings {
+		prefix := fmt.Sprintf("body.bindings[%d]", index)
+		if err := validateRequiredID(prefix+".binding_id", plan.BindingID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateRequiredID(prefix+".participation_id", plan.ParticipationID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateRequiredID(prefix+".session_id", plan.SessionID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateRequiredID(prefix+".runtime_endpoint_id", plan.RuntimeEndpointID); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		if err := validateVersion(prefix+".expected_runtime_endpoint_version", plan.ExpectedRuntimeEndpointVersion); err != nil {
+			return RunPlanWithBindingsValues{}, err
+		}
+		key := plan.BindingID.String()
+		if _, duplicate := seenBinding[key]; duplicate {
+			return RunPlanWithBindingsValues{}, invalid(prefix+".binding_id", "must not duplicate an earlier binding")
+		}
+		seenBinding[key] = struct{}{}
+		bindings[index] = RuntimeBindingValues{
+			BindingID: plan.BindingID, ParticipationID: plan.ParticipationID, SessionID: plan.SessionID,
+			RuntimeEndpointID: plan.RuntimeEndpointID, ExpectedRuntimeEndpointVersion: plan.ExpectedRuntimeEndpointVersion,
+		}
+	}
+	return RunPlanWithBindingsValues{
+		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
+		WorkspaceID: request.Body.WorkspaceID, ActorID: request.Body.ActorID,
+		ExpectedActorVersion: request.ExpectedVersions.Actor, ActorSessionID: request.Body.ActorSessionID,
+		ExpectedSessionVersion: request.ExpectedVersions.ActorSession, RunID: request.Body.RunID,
+		ObjectiveID: request.Body.ObjectiveID, ExpectedObjectiveVersion: request.ExpectedVersions.Objective,
+		WorkUnitID: request.Body.WorkUnitID, ExpectedWorkUnitVersion: request.ExpectedVersions.WorkUnit,
+		Participants: participants, Bindings: bindings,
+	}, nil
+}
+
+type RunJoinRequestDTO struct {
+	CommandMetadataDTO
+	ClientInstanceID domain.ClientInstanceID    `json:"client_instance_id"`
+	ExpectedVersions RunJoinExpectedVersionsDTO `json:"expected_versions"`
+	Body             RunJoinBodyDTO             `json:"body"`
+}
+type RunJoinExpectedVersionsDTO struct {
+	Actor         domain.Version `json:"actor"`
+	ActorSession  domain.Version `json:"actor_session"`
+	Run           domain.Version `json:"run"`
+	Participation domain.Version `json:"participation"`
+}
+type RunJoinBodyDTO struct {
+	WorkspaceID     domain.WorkspaceID        `json:"workspace_id"`
+	ActorID         domain.ActorID            `json:"actor_id"`
+	ActorSessionID  domain.ActorSessionID     `json:"actor_session_id"`
+	RunID           domain.RunID              `json:"run_id"`
+	ParticipationID domain.RunParticipationID `json:"participation_id"`
+}
+
+type RunJoinValues struct {
+	Metadata                     CommandMetadataDTO
+	ClientInstanceID             domain.ClientInstanceID
+	WorkspaceID                  domain.WorkspaceID
+	ActorID                      domain.ActorID
+	ExpectedActorVersion         domain.Version
+	ActorSessionID               domain.ActorSessionID
+	ExpectedSessionVersion       domain.Version
+	RunID                        domain.RunID
+	ExpectedRunVersion           domain.Version
+	ParticipationID              domain.RunParticipationID
+	ExpectedParticipationVersion domain.Version
+}
+
+func DecodeRunJoinRequest(data []byte) (RunJoinRequestDTO, error) {
+	var request RunJoinRequestDTO
+	if err := decodeCommandInput(data, &request); err != nil {
+		return RunJoinRequestDTO{}, err
+	}
+	if _, err := request.Values(); err != nil {
+		return RunJoinRequestDTO{}, err
+	}
+	return request, nil
+}
+
+func (request RunJoinRequestDTO) Values() (RunJoinValues, error) {
+	if err := request.validate(SchemaRunJoinCommand, OperationRunJoin); err != nil {
+		return RunJoinValues{}, err
+	}
+	if err := validateOrdinaryWorkRequest(request.CommandMetadataDTO, request.ClientInstanceID, request.ExpectedVersions.Actor,
+		request.ExpectedVersions.ActorSession, request.Body.WorkspaceID, request.Body.ActorID, request.Body.ActorSessionID); err != nil {
+		return RunJoinValues{}, err
+	}
+	if err := validateRequiredID("body.run_id", request.Body.RunID); err != nil {
+		return RunJoinValues{}, err
+	}
+	if err := validateRequiredID("body.participation_id", request.Body.ParticipationID); err != nil {
+		return RunJoinValues{}, err
+	}
+	if err := validateVersion("expected_versions.run", request.ExpectedVersions.Run); err != nil {
+		return RunJoinValues{}, err
+	}
+	if err := validateVersion("expected_versions.participation", request.ExpectedVersions.Participation); err != nil {
+		return RunJoinValues{}, err
+	}
+	return RunJoinValues{
+		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
+		WorkspaceID: request.Body.WorkspaceID, ActorID: request.Body.ActorID,
+		ExpectedActorVersion: request.ExpectedVersions.Actor, ActorSessionID: request.Body.ActorSessionID,
+		ExpectedSessionVersion: request.ExpectedVersions.ActorSession, RunID: request.Body.RunID,
+		ExpectedRunVersion: request.ExpectedVersions.Run, ParticipationID: request.Body.ParticipationID,
+		ExpectedParticipationVersion: request.ExpectedVersions.Participation,
+	}, nil
+}
+
+type RunStartParticipationDTO struct {
+	ParticipationID domain.RunParticipationID `json:"participation_id"`
+	ExpectedVersion domain.Version            `json:"expected_version"`
+}
+
+type RunStartRequestDTO struct {
+	CommandMetadataDTO
+	ClientInstanceID domain.ClientInstanceID     `json:"client_instance_id"`
+	ExpectedVersions RunStartExpectedVersionsDTO `json:"expected_versions"`
+	Body             RunStartBodyDTO             `json:"body"`
+}
+type RunStartExpectedVersionsDTO struct {
+	Actor        domain.Version `json:"actor"`
+	ActorSession domain.Version `json:"actor_session"`
+	Run          domain.Version `json:"run"`
+}
+type RunStartBodyDTO struct {
+	WorkspaceID    domain.WorkspaceID         `json:"workspace_id"`
+	ActorID        domain.ActorID             `json:"actor_id"`
+	ActorSessionID domain.ActorSessionID      `json:"actor_session_id"`
+	RunID          domain.RunID               `json:"run_id"`
+	Participations []RunStartParticipationDTO `json:"participations"`
+}
+
+type RunStartParticipationValues struct {
+	ParticipationID domain.RunParticipationID
+	ExpectedVersion domain.Version
+}
+
+type RunStartValues struct {
+	Metadata               CommandMetadataDTO
+	ClientInstanceID       domain.ClientInstanceID
+	WorkspaceID            domain.WorkspaceID
+	ActorID                domain.ActorID
+	ExpectedActorVersion   domain.Version
+	ActorSessionID         domain.ActorSessionID
+	ExpectedSessionVersion domain.Version
+	RunID                  domain.RunID
+	ExpectedRunVersion     domain.Version
+	Participations         []RunStartParticipationValues
+}
+
+func DecodeRunStartRequest(data []byte) (RunStartRequestDTO, error) {
+	var request RunStartRequestDTO
+	if err := decodeCommandInput(data, &request); err != nil {
+		return RunStartRequestDTO{}, err
+	}
+	if _, err := request.Values(); err != nil {
+		return RunStartRequestDTO{}, err
+	}
+	return request, nil
+}
+
+func (request RunStartRequestDTO) Values() (RunStartValues, error) {
+	if err := request.validate(SchemaRunStartCommand, OperationRunStart); err != nil {
+		return RunStartValues{}, err
+	}
+	if err := validateOrdinaryWorkRequest(request.CommandMetadataDTO, request.ClientInstanceID, request.ExpectedVersions.Actor,
+		request.ExpectedVersions.ActorSession, request.Body.WorkspaceID, request.Body.ActorID, request.Body.ActorSessionID); err != nil {
+		return RunStartValues{}, err
+	}
+	if err := validateRequiredID("body.run_id", request.Body.RunID); err != nil {
+		return RunStartValues{}, err
+	}
+	if err := validateVersion("expected_versions.run", request.ExpectedVersions.Run); err != nil {
+		return RunStartValues{}, err
+	}
+	if len(request.Body.Participations) == 0 || len(request.Body.Participations) > domain.MaxRunParticipants {
+		return RunStartValues{}, invalid("body.participations", fmt.Sprintf("must contain between 1 and %d entries", domain.MaxRunParticipants))
+	}
+	seen := make(map[string]struct{}, len(request.Body.Participations))
+	participations := make([]RunStartParticipationValues, len(request.Body.Participations))
+	for index, participation := range request.Body.Participations {
+		prefix := fmt.Sprintf("body.participations[%d]", index)
+		if err := validateRequiredID(prefix+".participation_id", participation.ParticipationID); err != nil {
+			return RunStartValues{}, err
+		}
+		if err := validateVersion(prefix+".expected_version", participation.ExpectedVersion); err != nil {
+			return RunStartValues{}, err
+		}
+		key := participation.ParticipationID.String()
+		if _, duplicate := seen[key]; duplicate {
+			return RunStartValues{}, invalid(prefix+".participation_id", "must not duplicate an earlier participation")
+		}
+		seen[key] = struct{}{}
+		participations[index] = RunStartParticipationValues{
+			ParticipationID: participation.ParticipationID, ExpectedVersion: participation.ExpectedVersion,
+		}
+	}
+	return RunStartValues{
+		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
+		WorkspaceID: request.Body.WorkspaceID, ActorID: request.Body.ActorID,
+		ExpectedActorVersion: request.ExpectedVersions.Actor, ActorSessionID: request.Body.ActorSessionID,
+		ExpectedSessionVersion: request.ExpectedVersions.ActorSession, RunID: request.Body.RunID,
+		ExpectedRunVersion: request.ExpectedVersions.Run, Participations: participations,
+	}, nil
+}
+
+func validateOrdinaryWorkRequest(metadata CommandMetadataDTO, client domain.ClientInstanceID, actorVersion, sessionVersion domain.Version,
+	workspace domain.WorkspaceID, actor domain.ActorID, session domain.ActorSessionID) error {
+	if err := validateRequiredID("client_instance_id", client); err != nil {
+		return err
+	}
+	if err := validateVersion("expected_versions.actor", actorVersion); err != nil {
+		return err
+	}
+	if err := validateVersion("expected_versions.actor_session", sessionVersion); err != nil {
+		return err
+	}
+	if err := validateRequiredID("body.workspace_id", workspace); err != nil {
+		return err
+	}
+	if err := validateRequiredID("body.actor_id", actor); err != nil {
+		return err
+	}
+	if err := validateRequiredID("body.actor_session_id", session); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateGrantRevisionSet(field string, grants []GrantRevisionDTO) error {

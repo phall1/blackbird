@@ -99,6 +99,8 @@ type Store struct {
 	closeOnce   sync.Once
 }
 
+var _ application.CoordinationStore = (*Store)(nil)
+
 type eventCursorWire struct {
 	Workspace string `json:"workspace"`
 	Epoch     string `json:"epoch"`
@@ -1093,4 +1095,32 @@ func (store *Store) Diagnostics() Diagnostics { return store.diagnostics }
 func (store *Store) Close() error {
 	store.closeOnce.Do(func() { store.pool.Close() })
 	return nil
+}
+
+func (store *Store) OpenConversation(context.Context, application.OpenConversationParams) (application.Conversation, error) {
+	return application.Conversation{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) SendMessage(context.Context, application.SendMessageParams) (application.Message, error) {
+	return application.Message{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) Inbox(context.Context, application.InboxQuery) (application.CoordinationPage, error) {
+	return application.CoordinationPage{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) Thread(context.Context, application.ThreadQuery) (application.CoordinationPage, error) {
+	return application.CoordinationPage{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) RecordDeliveryFact(context.Context, application.RecordDeliveryFactParams) (application.Delivery, error) {
+	return application.Delivery{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) AcquireLease(context.Context, application.AcquireLeaseParams) (application.Lease, error) {
+	return application.Lease{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) RenewLease(context.Context, application.ChangeLeaseParams) (application.Lease, error) {
+	return application.Lease{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) ReleaseLease(context.Context, application.ChangeLeaseParams) (application.Lease, error) {
+	return application.Lease{}, application.ErrCoordinationUnsupported
+}
+func (store *Store) ValidateFence(context.Context, domain.LeaseID, domain.AuthorityEpoch, []application.Fence) error {
+	return application.ErrCoordinationUnsupported
 }

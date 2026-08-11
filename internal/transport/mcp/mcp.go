@@ -1,4 +1,4 @@
-// Package mcp exposes the strict W0 transport contracts through the official MCP Go SDK.
+// Package mcp exposes the strict transport contracts through the official MCP Go SDK.
 package mcp
 
 import (
@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/transport/contracts"
 )
@@ -32,8 +33,26 @@ const (
 	ToolActorDelegationPropose    = "blackbird_propose_actor_delegation"
 	ToolActorDelegationActivate   = "blackbird_activate_actor_delegation"
 	ToolSessionStart              = "blackbird_start_session"
+	ToolWorkRefObserve            = "blackbird_observe_work_ref"
+	ToolObjectiveAndWorkCreate    = "blackbird_create_objective_and_work"
+	ToolObjectiveActivate         = "blackbird_activate_objective"
+	ToolRunPlanWithBindings       = "blackbird_plan_run_with_bindings"
+	ToolRunJoin                   = "blackbird_join_run"
+	ToolRunStart                  = "blackbird_start_run"
 	ToolContextGet                = "blackbird_get_context"
 	ToolEventsSync                = "blackbird_sync_events"
+	ToolAgentRegister             = "blackbird_agent_register"
+	ToolAgentsList                = "blackbird_agents_list"
+	ToolConversationOpen          = "blackbird_conversation_open"
+	ToolMessageSend               = "blackbird_message_send"
+	ToolMessageReply              = "blackbird_message_reply"
+	ToolInboxFetch                = "blackbird_inbox_fetch"
+	ToolThreadFetch               = "blackbird_thread_fetch"
+	ToolMessageMarkRead           = "blackbird_message_mark_read"
+	ToolMessageAcknowledge        = "blackbird_message_acknowledge"
+	ToolReservationAcquire        = "blackbird_reservation_acquire"
+	ToolReservationRenew          = "blackbird_reservation_renew"
+	ToolReservationRelease        = "blackbird_reservation_release"
 
 	ResourceCurrentContext = "blackbird://session/current/context"
 	ResourceContextDeltas  = "blackbird://session/current/context-deltas{?cursor,limit}"
@@ -67,8 +86,15 @@ type Dependencies struct {
 	ActorDelegationPropose    contracts.ActorDelegationProposeHandler
 	ActorDelegationActivate   contracts.ActorDelegationActivateHandler
 	SessionStart              contracts.SessionStartHandler
+	WorkRefObserve            contracts.WorkRefObserveHandler
+	ObjectiveAndWorkCreate    contracts.ObjectiveAndWorkCreateHandler
+	ObjectiveActivate         contracts.ObjectiveActivateHandler
+	RunPlanWithBindings       contracts.RunPlanWithBindingsHandler
+	RunJoin                   contracts.RunJoinHandler
+	RunStart                  contracts.RunStartHandler
 	ContextGet                contracts.ContextGetHandler
 	EventsSync                contracts.EventsSyncHandler
+	Coordination              application.LocalCoordinationStore
 }
 
 // Server embeds the SDK server and adds Blackbird's context-head wake-up API.
@@ -81,8 +107,11 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 		isNil(dependencies.WorkspaceCreate) || isNil(dependencies.WorkspaceMemberInvite) ||
 		isNil(dependencies.WorkspaceMembershipAccept) || isNil(dependencies.ActorCreate) ||
 		isNil(dependencies.ActorDelegationPropose) || isNil(dependencies.ActorDelegationActivate) ||
-		isNil(dependencies.SessionStart) || isNil(dependencies.ContextGet) || isNil(dependencies.EventsSync) {
-		return nil, errors.New("mcp transport requires every W0 handler, authenticator, and current-session binder")
+		isNil(dependencies.SessionStart) || isNil(dependencies.WorkRefObserve) ||
+		isNil(dependencies.ObjectiveAndWorkCreate) || isNil(dependencies.ObjectiveActivate) ||
+		isNil(dependencies.RunPlanWithBindings) || isNil(dependencies.RunJoin) || isNil(dependencies.RunStart) ||
+		isNil(dependencies.ContextGet) || isNil(dependencies.EventsSync) {
+		return nil, errors.New("mcp transport requires every W0/W1 handler, authenticator, and current-session binder")
 	}
 
 	sdk := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "blackbird", Version: "v1"}, &sdkmcp.ServerOptions{
@@ -123,12 +152,461 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	registerCommand(sdk, ToolSessionStart, contracts.OperationSessionStart, dependencies.Authenticator,
 		contracts.DecodeSessionStartRequest, func(value contracts.SessionStartRequestDTO) time.Time { return value.Deadline },
 		dependencies.SessionStart.HandleSessionStart, func(value contracts.SessionStartResultDTO) error { return value.Validate() })
+	registerCommand(sdk, ToolWorkRefObserve, contracts.OperationWorkRefObserve, dependencies.Authenticator,
+		contracts.DecodeWorkRefObserveRequest, func(value contracts.WorkRefObserveRequestDTO) time.Time { return value.Deadline },
+		dependencies.WorkRefObserve.HandleWorkRefObserve, func(value contracts.WorkRefObserveResultDTO) error { return value.Validate() })
+	registerCommand(sdk, ToolObjectiveAndWorkCreate, contracts.OperationObjectiveAndWorkCreate, dependencies.Authenticator,
+		contracts.DecodeObjectiveAndWorkCreateRequest, func(value contracts.ObjectiveAndWorkCreateRequestDTO) time.Time { return value.Deadline },
+		dependencies.ObjectiveAndWorkCreate.HandleObjectiveAndWorkCreate, func(value contracts.ObjectiveAndWorkCreateResultDTO) error { return value.Validate() })
+	registerCommand(sdk, ToolObjectiveActivate, contracts.OperationObjectiveActivate, dependencies.Authenticator,
+		contracts.DecodeObjectiveActivateRequest, func(value contracts.ObjectiveActivateRequestDTO) time.Time { return value.Deadline },
+		dependencies.ObjectiveActivate.HandleObjectiveActivate, func(value contracts.ObjectiveActivateResultDTO) error { return value.Validate() })
+	registerCommand(sdk, ToolRunPlanWithBindings, contracts.OperationRunPlanWithBindings, dependencies.Authenticator,
+		contracts.DecodeRunPlanWithBindingsRequest, func(value contracts.RunPlanWithBindingsRequestDTO) time.Time { return value.Deadline },
+		dependencies.RunPlanWithBindings.HandleRunPlanWithBindings, func(value contracts.RunPlanWithBindingsResultDTO) error { return value.Validate() })
+	registerCommand(sdk, ToolRunJoin, contracts.OperationRunJoin, dependencies.Authenticator,
+		contracts.DecodeRunJoinRequest, func(value contracts.RunJoinRequestDTO) time.Time { return value.Deadline },
+		dependencies.RunJoin.HandleRunJoin, func(value contracts.RunJoinResultDTO) error { return value.Validate() })
+	registerCommand(sdk, ToolRunStart, contracts.OperationRunStart, dependencies.Authenticator,
+		contracts.DecodeRunStartRequest, func(value contracts.RunStartRequestDTO) time.Time { return value.Deadline },
+		dependencies.RunStart.HandleRunStart, func(value contracts.RunStartResultDTO) error { return value.Validate() })
 	registerQuery(sdk, ToolContextGet, contracts.OperationContextGet, dependencies.Authenticator,
 		contracts.DecodeContextGetRequest, dependencies.ContextGet.HandleContextGet, func(value contracts.ContextPageDTO) error { return value.Validate() })
 	registerQuery(sdk, ToolEventsSync, contracts.OperationEventsSync, dependencies.Authenticator,
 		contracts.DecodeEventsSyncRequest, dependencies.EventsSync.HandleEventsSync, func(value contracts.EventPageDTO) error { return value.Validate() })
 	registerResources(sdk, dependencies)
+	if !isNil(dependencies.Coordination) {
+		registerCoordinationTools(sdk, dependencies.Coordination)
+	}
 	return server, nil
+}
+
+type registerAgentInput struct {
+	ProjectKey        string  `json:"project_key" jsonschema:"Repository or workspace key, preferably its absolute path."`
+	AgentName         string  `json:"agent_name"`
+	RegistrationToken *string `json:"registration_token,omitempty" jsonschema:"Existing token required when restarting a registered name."`
+}
+type agentSessionOutput struct {
+	ProjectKey        string `json:"project_key"`
+	AgentName         string `json:"agent_name"`
+	WorkspaceID       string `json:"workspace_id"`
+	ActorID           string `json:"actor_id"`
+	SessionID         string `json:"session_id"`
+	RegistrationToken string `json:"registration_token,omitempty"`
+}
+type tokenInput struct {
+	AgentToken string `json:"agent_token"`
+}
+type activeAgentOutput struct {
+	Name       string `json:"name"`
+	ActorID    string `json:"actor_id"`
+	SessionID  string `json:"session_id"`
+	LastSeenAt string `json:"last_seen_at"`
+}
+type activeAgentsOutput struct {
+	Agents []activeAgentOutput `json:"agents"`
+}
+type openConversationInput struct {
+	AgentToken string `json:"agent_token"`
+	Topic      string `json:"topic"`
+}
+type conversationOutput struct {
+	ConversationID string `json:"conversation_id"`
+	Topic          string `json:"topic"`
+	OpenedAt       string `json:"opened_at"`
+}
+type sendMessageInput struct {
+	AgentToken              string   `json:"agent_token"`
+	ConversationID          string   `json:"conversation_id"`
+	To                      []string `json:"to"`
+	Subject                 string   `json:"subject"`
+	Body                    string   `json:"body"`
+	AcknowledgementRequired bool     `json:"acknowledgement_required"`
+}
+type replyMessageInput struct {
+	sendMessageInput
+	ReplyToMessageID string `json:"reply_to_message_id"`
+}
+type deliveryOutput struct {
+	RecipientActorID string `json:"recipient_actor_id"`
+	Kind             string `json:"kind"`
+	Read             bool   `json:"read"`
+	Acknowledged     bool   `json:"acknowledged"`
+}
+type messageOutput struct {
+	MessageID      string           `json:"message_id"`
+	ConversationID string           `json:"conversation_id"`
+	AuthorActorID  string           `json:"author_actor_id"`
+	Subject        string           `json:"subject"`
+	Body           string           `json:"body"`
+	BodyDigest     string           `json:"body_digest"`
+	ReplyTo        string           `json:"reply_to,omitempty"`
+	SentAt         string           `json:"sent_at"`
+	Position       uint64           `json:"position"`
+	Deliveries     []deliveryOutput `json:"deliveries"`
+}
+type fetchInboxInput struct {
+	AgentToken string `json:"agent_token"`
+	UnreadOnly bool   `json:"unread_only"`
+	After      uint64 `json:"after"`
+	Limit      uint16 `json:"limit"`
+}
+type fetchThreadInput struct {
+	AgentToken     string `json:"agent_token"`
+	ConversationID string `json:"conversation_id"`
+	After          uint64 `json:"after"`
+	Limit          uint16 `json:"limit"`
+}
+type messagePageOutput struct {
+	Messages []messageOutput `json:"messages"`
+	Next     uint64          `json:"next"`
+	HasMore  bool            `json:"has_more"`
+}
+type messageFactInput struct {
+	AgentToken string `json:"agent_token"`
+	MessageID  string `json:"message_id"`
+}
+type deliveryFactOutput struct {
+	MessageID    string `json:"message_id"`
+	Read         bool   `json:"read"`
+	Acknowledged bool   `json:"acknowledged"`
+}
+type reservationSelectorInput struct {
+	Kind string `json:"kind" jsonschema:"exact or subtree"`
+	Path string `json:"path"`
+}
+type reservationAcquireInput struct {
+	AgentToken string                     `json:"agent_token"`
+	Mode       string                     `json:"mode" jsonschema:"shared or exclusive"`
+	Selectors  []reservationSelectorInput `json:"selectors"`
+	TTLSeconds uint32                     `json:"ttl_seconds"`
+}
+type fenceOutput struct {
+	ConflictKey string `json:"conflict_key"`
+	Counter     uint64 `json:"counter"`
+}
+type reservationChangeInput struct {
+	AgentToken string        `json:"agent_token"`
+	LeaseID    string        `json:"lease_id"`
+	Fences     []fenceOutput `json:"fences"`
+	TTLSeconds uint32        `json:"ttl_seconds"`
+}
+type reservationOutput struct {
+	LeaseID    string                     `json:"lease_id"`
+	Mode       string                     `json:"mode"`
+	Selectors  []reservationSelectorInput `json:"selectors"`
+	Fences     []fenceOutput              `json:"fences"`
+	ExpiresAt  string                     `json:"expires_at"`
+	ReleasedAt string                     `json:"released_at,omitempty"`
+}
+
+func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoordinationStore) {
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentRegister, Description: "Start or resume a durable local agent session for a repository key and agent name."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input registerAgentInput) (*sdkmcp.CallToolResult, agentSessionOutput, error) {
+			token := ""
+			if input.RegistrationToken != nil {
+				token = *input.RegistrationToken
+			}
+			session, issued, err := store.RegisterLocalAgent(ctx, input.ProjectKey, input.AgentName, token)
+			if err != nil {
+				return nil, agentSessionOutput{}, err
+			}
+			return nil, agentSessionOutput{ProjectKey: session.ProjectKey, AgentName: session.AgentName,
+				WorkspaceID: session.WorkspaceID.String(), ActorID: session.ActorID.String(), SessionID: session.ActorSessionID.String(),
+				RegistrationToken: issued}, nil
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentsList, Description: "List agent sessions active in the caller's repository."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input tokenInput) (*sdkmcp.CallToolResult, activeAgentsOutput, error) {
+			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+			if err != nil {
+				return nil, activeAgentsOutput{}, err
+			}
+			agents, err := store.ListActiveLocalAgents(ctx, session)
+			if err != nil {
+				return nil, activeAgentsOutput{}, err
+			}
+			output := activeAgentsOutput{Agents: make([]activeAgentOutput, 0, len(agents))}
+			for _, agent := range agents {
+				output.Agents = append(output.Agents, activeAgentOutput{Name: agent.Name, ActorID: agent.ActorID.String(),
+					SessionID: agent.SessionID.String(), LastSeenAt: agent.LastSeenAt.Format(time.RFC3339Nano)})
+			}
+			return nil, output, nil
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolConversationOpen, Description: "Open a durable conversation in the caller's repository."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input openConversationInput) (*sdkmcp.CallToolResult, conversationOutput, error) {
+			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+			if err != nil {
+				return nil, conversationOutput{}, err
+			}
+			id, err := domain.NewConversationID()
+			if err != nil {
+				return nil, conversationOutput{}, err
+			}
+			value, err := store.OpenConversation(ctx, application.OpenConversationParams{ConversationID: id,
+				WorkspaceID: session.WorkspaceID, RunID: session.RunID, OpenedBy: session.ActorID,
+				OpenedBySession: session.ActorSessionID, Topic: input.Topic})
+			if err != nil {
+				return nil, conversationOutput{}, err
+			}
+			return nil, conversationOutput{ConversationID: value.ID().String(), Topic: value.Topic(), OpenedAt: value.OpenedAt().Format(time.RFC3339Nano)}, nil
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolMessageSend, Description: "Send a durable message to named agents."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input sendMessageInput) (*sdkmcp.CallToolResult, messageOutput, error) {
+			value, err := sendLocalMessage(ctx, store, input, "")
+			return nil, value, err
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolMessageReply, Description: "Reply to a durable message in its conversation."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input replyMessageInput) (*sdkmcp.CallToolResult, messageOutput, error) {
+			value, err := sendLocalMessage(ctx, store, input.sendMessageInput, input.ReplyToMessageID)
+			return nil, value, err
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolInboxFetch, Description: "Fetch the caller's unread or complete inbox."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input fetchInboxInput) (*sdkmcp.CallToolResult, messagePageOutput, error) {
+			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+			if err != nil {
+				return nil, messagePageOutput{}, err
+			}
+			page, err := store.Inbox(ctx, application.InboxQuery{WorkspaceID: session.WorkspaceID, Recipient: session.ActorID,
+				After: input.After, Limit: input.Limit, UnreadOnly: input.UnreadOnly})
+			if err != nil {
+				return nil, messagePageOutput{}, err
+			}
+			return nil, coordinationPageOutput(page), nil
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolThreadFetch, Description: "Fetch visible messages in a conversation."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input fetchThreadInput) (*sdkmcp.CallToolResult, messagePageOutput, error) {
+			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+			if err != nil {
+				return nil, messagePageOutput{}, err
+			}
+			conversation, err := domain.ParseConversationID(input.ConversationID)
+			if err != nil {
+				return nil, messagePageOutput{}, application.ErrInvalidCoordination
+			}
+			page, err := store.Thread(ctx, application.ThreadQuery{WorkspaceID: session.WorkspaceID, ConversationID: conversation,
+				Viewer: session.ActorID, After: input.After, Limit: input.Limit})
+			if err != nil {
+				return nil, messagePageOutput{}, err
+			}
+			return nil, coordinationPageOutput(page), nil
+		})
+	registerDeliveryFactTool(server, ToolMessageMarkRead, application.DeliveryRead, store)
+	registerDeliveryFactTool(server, ToolMessageAcknowledge, application.DeliveryAcknowledged, store)
+	registerReservationTools(server, store)
+}
+
+func sendLocalMessage(ctx context.Context, store application.LocalCoordinationStore, input sendMessageInput, replyText string) (messageOutput, error) {
+	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+	if err != nil {
+		return messageOutput{}, err
+	}
+	conversation, err := domain.ParseConversationID(input.ConversationID)
+	if err != nil {
+		return messageOutput{}, application.ErrInvalidCoordination
+	}
+	actors, err := store.ResolveLocalAgentNames(ctx, session, input.To)
+	if err != nil {
+		return messageOutput{}, err
+	}
+	recipients := make([]application.Recipient, 0, len(actors))
+	for _, actor := range actors {
+		recipient, recipientErr := application.NewRecipient(actor, application.RecipientTo)
+		if recipientErr != nil {
+			return messageOutput{}, recipientErr
+		}
+		recipients = append(recipients, recipient)
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		return messageOutput{}, err
+	}
+	params := application.SendMessageParams{MessageID: messageID, ConversationID: conversation,
+		WorkspaceID: session.WorkspaceID, Author: session.ActorID, AuthorSession: session.ActorSessionID,
+		Subject: input.Subject, Body: input.Body, Recipients: recipients,
+		AcknowledgementRequired: input.AcknowledgementRequired}
+	if replyText != "" {
+		reply, parseErr := domain.ParseMessageID(replyText)
+		if parseErr != nil {
+			return messageOutput{}, application.ErrInvalidCoordination
+		}
+		params.ReplyTo = &reply
+	}
+	message, err := store.SendMessage(ctx, params)
+	if err != nil {
+		return messageOutput{}, err
+	}
+	return localMessageOutput(message), nil
+}
+
+func coordinationPageOutput(page application.CoordinationPage) messagePageOutput {
+	messages := page.Messages()
+	result := messagePageOutput{Messages: make([]messageOutput, 0, len(messages)), Next: page.NextCursor(), HasMore: page.HasMore()}
+	for _, message := range messages {
+		result.Messages = append(result.Messages, localMessageOutput(message))
+	}
+	return result
+}
+
+func localMessageOutput(message application.Message) messageOutput {
+	digest := message.Digest()
+	result := messageOutput{MessageID: message.ID().String(), ConversationID: message.ConversationID().String(),
+		AuthorActorID: message.Author().String(), Subject: message.Subject(), Body: message.Body(), BodyDigest: hex.EncodeToString(digest[:]),
+		SentAt: message.SentAt().Format(time.RFC3339Nano), Position: message.Position(), Deliveries: []deliveryOutput{}}
+	if reply := message.ReplyTo(); reply != nil {
+		result.ReplyTo = reply.String()
+	}
+	for _, delivery := range message.Deliveries() {
+		_, read := delivery.ReadAt()
+		_, acknowledged := delivery.AcknowledgedAt()
+		result.Deliveries = append(result.Deliveries, deliveryOutput{RecipientActorID: delivery.Recipient().ActorID().String(),
+			Kind: string(delivery.Recipient().Kind()), Read: read, Acknowledged: acknowledged})
+	}
+	return result
+}
+
+func registerDeliveryFactTool(server *sdkmcp.Server, name string, kind application.DeliveryFactKind, store application.LocalCoordinationStore) {
+	description := "Mark a message read without acknowledging it."
+	if kind == application.DeliveryAcknowledged {
+		description = "Acknowledge the exact durable message body."
+	}
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: name, Description: description},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input messageFactInput) (*sdkmcp.CallToolResult, deliveryFactOutput, error) {
+			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+			if err != nil {
+				return nil, deliveryFactOutput{}, err
+			}
+			messageID, err := domain.ParseMessageID(input.MessageID)
+			if err != nil {
+				return nil, deliveryFactOutput{}, application.ErrInvalidCoordination
+			}
+			params := application.RecordDeliveryFactParams{WorkspaceID: session.WorkspaceID, MessageID: messageID,
+				Recipient: session.ActorID, ActorSessionID: &session.ActorSessionID, Kind: kind}
+			if kind == application.DeliveryAcknowledged {
+				digest, findErr := findInboxMessageDigest(ctx, store, session, messageID)
+				if findErr != nil {
+					return nil, deliveryFactOutput{}, findErr
+				}
+				params.MessageDigest = digest
+			}
+			delivery, err := store.RecordDeliveryFact(ctx, params)
+			if err != nil {
+				return nil, deliveryFactOutput{}, err
+			}
+			_, read := delivery.ReadAt()
+			_, acknowledged := delivery.AcknowledgedAt()
+			return nil, deliveryFactOutput{MessageID: input.MessageID, Read: read, Acknowledged: acknowledged}, nil
+		})
+}
+
+func findInboxMessageDigest(ctx context.Context, store application.LocalCoordinationStore, session application.LocalAgentSession,
+	want domain.MessageID) (application.Digest, error) {
+	var after uint64
+	for {
+		page, err := store.Inbox(ctx, application.InboxQuery{WorkspaceID: session.WorkspaceID, Recipient: session.ActorID,
+			After: after, Limit: 256})
+		if err != nil {
+			return application.Digest{}, err
+		}
+		for _, message := range page.Messages() {
+			if message.ID() == want {
+				return message.Digest(), nil
+			}
+		}
+		if !page.HasMore() {
+			return application.Digest{}, errors.New("message is not visible in the agent inbox")
+		}
+		after = page.NextCursor()
+	}
+}
+
+func registerReservationTools(server *sdkmcp.Server, store application.LocalCoordinationStore) {
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationAcquire, Description: "Acquire shared or exclusive exact/subtree file reservations."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationAcquireInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
+			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+			if err != nil {
+				return nil, reservationOutput{}, err
+			}
+			selectors := make([]application.LeaseSelector, 0, len(input.Selectors))
+			for _, raw := range input.Selectors {
+				selector, selectorErr := application.NewLeaseSelector(application.LeaseSelectorKind(raw.Kind), raw.Path)
+				if selectorErr != nil {
+					return nil, reservationOutput{}, selectorErr
+				}
+				selectors = append(selectors, selector)
+			}
+			leaseID, err := domain.NewLeaseID()
+			if err != nil {
+				return nil, reservationOutput{}, err
+			}
+			lease, err := store.AcquireLease(ctx, application.AcquireLeaseParams{LeaseID: leaseID,
+				WorkspaceID: session.WorkspaceID, Holder: session.ActorID, HolderSession: session.ActorSessionID,
+				AuthorityEpoch: session.AuthorityEpoch, Mode: application.LeaseMode(input.Mode), Selectors: selectors,
+				TTL: time.Duration(input.TTLSeconds) * time.Second})
+			if err != nil {
+				return nil, reservationOutput{}, err
+			}
+			return nil, localReservationOutput(lease), nil
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRenew, Description: "Renew a held file reservation using its current fences."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationChangeInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
+			lease, err := changeLocalReservation(ctx, store, input, false)
+			return nil, lease, err
+		})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRelease, Description: "Release a held file reservation using its current fences."},
+		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationChangeInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
+			if input.TTLSeconds != 0 {
+				return nil, reservationOutput{}, application.ErrInvalidCoordination
+			}
+			lease, err := changeLocalReservation(ctx, store, input, true)
+			return nil, lease, err
+		})
+}
+
+func changeLocalReservation(ctx context.Context, store application.LocalCoordinationStore, input reservationChangeInput,
+	release bool) (reservationOutput, error) {
+	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+	if err != nil {
+		return reservationOutput{}, err
+	}
+	leaseID, err := domain.ParseLeaseID(input.LeaseID)
+	if err != nil {
+		return reservationOutput{}, application.ErrInvalidCoordination
+	}
+	fences := make([]application.Fence, 0, len(input.Fences))
+	for _, raw := range input.Fences {
+		fence, fenceErr := application.NewFence(raw.ConflictKey, raw.Counter)
+		if fenceErr != nil {
+			return reservationOutput{}, fenceErr
+		}
+		fences = append(fences, fence)
+	}
+	params := application.ChangeLeaseParams{LeaseID: leaseID, HolderSession: session.ActorSessionID,
+		AuthorityEpoch: session.AuthorityEpoch, Fences: fences, TTL: time.Duration(input.TTLSeconds) * time.Second}
+	var lease application.Lease
+	if release {
+		lease, err = store.ReleaseLease(ctx, params)
+	} else {
+		lease, err = store.RenewLease(ctx, params)
+	}
+	if err != nil {
+		return reservationOutput{}, err
+	}
+	return localReservationOutput(lease), nil
+}
+
+func localReservationOutput(lease application.Lease) reservationOutput {
+	result := reservationOutput{LeaseID: lease.ID().String(), Mode: string(lease.Mode()), ExpiresAt: lease.ExpiresAt().Format(time.RFC3339Nano),
+		Selectors: []reservationSelectorInput{}, Fences: []fenceOutput{}}
+	for _, selector := range lease.Selectors() {
+		result.Selectors = append(result.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path()})
+	}
+	for _, fence := range lease.Fences() {
+		result.Fences = append(result.Fences, fenceOutput{ConflictKey: fence.ConflictKey(), Counter: fence.Counter()})
+	}
+	if released, ok := lease.ReleasedAt(); ok {
+		result.ReleasedAt = released.Format(time.RFC3339Nano)
+	}
+	return result
 }
 
 func (server *Server) NotifyContextChanged(ctx context.Context) error {
@@ -311,6 +789,13 @@ func contractSchemaOptions() *jsonschema.ForOptions {
 		reflect.TypeFor[domain.EventID]():               identifier,
 		reflect.TypeFor[domain.CorrelationID]():         identifier,
 		reflect.TypeFor[domain.ClientInstanceID]():      identifier,
+		reflect.TypeFor[domain.WorkReferenceID]():       identifier,
+		reflect.TypeFor[domain.ObjectiveID]():           identifier,
+		reflect.TypeFor[domain.WorkUnitID]():            identifier,
+		reflect.TypeFor[domain.RunID]():                 identifier,
+		reflect.TypeFor[domain.RunParticipationID]():    identifier,
+		reflect.TypeFor[domain.RuntimeBindingID]():      identifier,
+		reflect.TypeFor[domain.RuntimeEndpointID]():     identifier,
 		reflect.TypeFor[domain.AuthorityEpoch]():        identifier,
 		reflect.TypeFor[domain.Version]():               integer,
 		reflect.TypeFor[domain.StreamPosition]():        integer,
@@ -361,6 +846,18 @@ func requestIDOf(value any, fallback string) string {
 		return request.RequestID
 	case contracts.SessionStartRequestDTO:
 		return request.RequestID
+	case contracts.WorkRefObserveRequestDTO:
+		return request.RequestID
+	case contracts.ObjectiveAndWorkCreateRequestDTO:
+		return request.RequestID
+	case contracts.ObjectiveActivateRequestDTO:
+		return request.RequestID
+	case contracts.RunPlanWithBindingsRequestDTO:
+		return request.RequestID
+	case contracts.RunJoinRequestDTO:
+		return request.RequestID
+	case contracts.RunStartRequestDTO:
+		return request.RequestID
 	case contracts.ContextGetRequestDTO:
 		return request.RequestID
 	case contracts.EventsSyncRequestDTO:
@@ -393,6 +890,18 @@ func responseRequestID(value any) string {
 	case contracts.ActorDelegationActivateResultDTO:
 		return response.RequestID
 	case contracts.SessionStartResultDTO:
+		return response.RequestID
+	case contracts.WorkRefObserveResultDTO:
+		return response.RequestID
+	case contracts.ObjectiveAndWorkCreateResultDTO:
+		return response.RequestID
+	case contracts.ObjectiveActivateResultDTO:
+		return response.RequestID
+	case contracts.RunPlanWithBindingsResultDTO:
+		return response.RequestID
+	case contracts.RunJoinResultDTO:
+		return response.RequestID
+	case contracts.RunStartResultDTO:
 		return response.RequestID
 	case contracts.ContextPageDTO:
 		return response.RequestID

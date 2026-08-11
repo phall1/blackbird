@@ -86,6 +86,12 @@ type testHandlers struct {
 	ActorDelegationProposeHandler
 	ActorDelegationActivateHandler
 	SessionStartHandler
+	WorkRefObserveHandler
+	ObjectiveAndWorkCreateHandler
+	ObjectiveActivateHandler
+	RunPlanWithBindingsHandler
+	RunJoinHandler
+	RunStartHandler
 	ContextGetHandler
 	events func(context.Context, AuthenticationEvidence, contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error)
 }
@@ -112,6 +118,12 @@ func testDependencies(authenticator Authenticator, handlers *testHandlers) Depen
 		ActorDelegationPropose:    handlers,
 		ActorDelegationActivate:   handlers,
 		SessionStart:              handlers,
+		WorkRefObserve:            handlers,
+		ObjectiveAndWorkCreate:    handlers,
+		ObjectiveActivate:         handlers,
+		RunPlanWithBindings:       handlers,
+		RunJoin:                   handlers,
+		RunStart:                  handlers,
 		ContextGet:                handlers,
 		EventsSync:                handlers,
 	}
@@ -133,23 +145,45 @@ func TestNewHandlerRequiresCompleteComposition(t *testing.T) {
 	}
 }
 
-func TestAllW0RoutesAreLiteralPOSTRoutes(t *testing.T) {
+func TestAllRoutesAreLiteralPOSTRoutes(t *testing.T) {
 	t.Parallel()
 	authenticator := &testAuthenticator{}
 	handlers := &testHandlers{events: successfulEvents}
 	handler := newTestHandler(t, authenticator, handlers)
-	routes := []string{
-		PathInstallationBootstrap, PathPrincipalRegister, PathDevicePairingBegin, PathDevicePair,
-		PathWorkspaceCreate, PathWorkspaceMemberInvite, PathWorkspaceMembershipAccept, PathActorCreate,
-		PathActorDelegationPropose, PathActorDelegationActivate, PathSessionStart, PathContextGet, PathEventsSync,
+	routes := []struct {
+		path      string
+		operation string
+	}{
+		{PathInstallationBootstrap, contracts.OperationInstallationBootstrap},
+		{PathPrincipalRegister, contracts.OperationPrincipalRegister},
+		{PathDevicePairingBegin, contracts.OperationDevicePairingBegin},
+		{PathDevicePair, contracts.OperationDevicePair},
+		{PathWorkspaceCreate, contracts.OperationWorkspaceCreate},
+		{PathWorkspaceMemberInvite, contracts.OperationWorkspaceMemberInvite},
+		{PathWorkspaceMembershipAccept, contracts.OperationWorkspaceMembershipAccept},
+		{PathActorCreate, contracts.OperationActorCreate},
+		{PathActorDelegationPropose, contracts.OperationActorDelegationPropose},
+		{PathActorDelegationActivate, contracts.OperationActorDelegationActivate},
+		{PathSessionStart, contracts.OperationSessionStart},
+		{PathWorkRefObserve, contracts.OperationWorkRefObserve},
+		{PathObjectiveAndWorkCreate, contracts.OperationObjectiveAndWorkCreate},
+		{PathObjectiveActivate, contracts.OperationObjectiveActivate},
+		{PathRunPlanWithBindings, contracts.OperationRunPlanWithBindings},
+		{PathRunJoin, contracts.OperationRunJoin},
+		{PathRunStart, contracts.OperationRunStart},
+		{PathContextGet, contracts.OperationContextGet},
+		{PathEventsSync, contracts.OperationEventsSync},
 	}
 	for _, route := range routes {
-		request := httptest.NewRequest(http.MethodPost, route, strings.NewReader(`{}`))
+		request := httptest.NewRequest(http.MethodPost, route.path, strings.NewReader(`{}`))
 		request.Header.Set("Content-Type", mediaTypeJSON)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusUnprocessableEntity {
-			t.Errorf("POST %s status = %d, want %d", route, response.Code, http.StatusUnprocessableEntity)
+			t.Errorf("POST %s status = %d, want %d", route.path, response.Code, http.StatusUnprocessableEntity)
+		}
+		if authenticator.operation != route.operation {
+			t.Errorf("POST %s authenticated operation = %q, want %q", route.path, authenticator.operation, route.operation)
 		}
 	}
 

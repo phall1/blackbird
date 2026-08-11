@@ -47,6 +47,9 @@ const (
 	IdentifierKindRunParticipation    IdentifierKind = "run_participation"
 	IdentifierKindRuntimeBinding      IdentifierKind = "runtime_binding"
 	IdentifierKindRuntimeEndpoint     IdentifierKind = "runtime_endpoint"
+	IdentifierKindConversation        IdentifierKind = "conversation"
+	IdentifierKindMessage             IdentifierKind = "message"
+	IdentifierKindLease               IdentifierKind = "lease"
 )
 
 // IdentifierError reports a failed typed-ID boundary without weakening the
@@ -249,6 +252,9 @@ type runIDMarker struct{}
 type runParticipationIDMarker struct{}
 type runtimeBindingIDMarker struct{}
 type runtimeEndpointIDMarker struct{}
+type conversationIDMarker struct{}
+type messageIDMarker struct{}
+type leaseIDMarker struct{}
 
 func (installationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindInstallation }
 func (authorityIDMarker) identifierKind() IdentifierKind       { return IdentifierKindAuthority }
@@ -279,6 +285,9 @@ func (runParticipationIDMarker) identifierKind() IdentifierKind {
 }
 func (runtimeBindingIDMarker) identifierKind() IdentifierKind  { return IdentifierKindRuntimeBinding }
 func (runtimeEndpointIDMarker) identifierKind() IdentifierKind { return IdentifierKindRuntimeEndpoint }
+func (conversationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindConversation }
+func (messageIDMarker) identifierKind() IdentifierKind         { return IdentifierKindMessage }
+func (leaseIDMarker) identifierKind() IdentifierKind           { return IdentifierKindLease }
 
 // The unique marker embedded in every wrapper makes both implicit assignment
 // and explicit cross-kind conversion fail at compile time.
@@ -319,6 +328,9 @@ type RuntimeBindingID struct {
 type RuntimeEndpointID struct {
 	typedID[runtimeEndpointIDMarker]
 }
+type ConversationID struct{ typedID[conversationIDMarker] }
+type MessageID struct{ typedID[messageIDMarker] }
+type LeaseID struct{ typedID[leaseIDMarker] }
 
 func ParseInstallationID(text string) (InstallationID, error) {
 	id, err := parseTypedID[installationIDMarker](text)
@@ -420,6 +432,18 @@ func ParseRuntimeEndpointID(text string) (RuntimeEndpointID, error) {
 	id, err := parseTypedID[runtimeEndpointIDMarker](text)
 	return RuntimeEndpointID{typedID: id}, err
 }
+func ParseConversationID(text string) (ConversationID, error) {
+	id, err := parseTypedID[conversationIDMarker](text)
+	return ConversationID{typedID: id}, err
+}
+func ParseMessageID(text string) (MessageID, error) {
+	id, err := parseTypedID[messageIDMarker](text)
+	return MessageID{typedID: id}, err
+}
+func ParseLeaseID(text string) (LeaseID, error) {
+	id, err := parseTypedID[leaseIDMarker](text)
+	return LeaseID{typedID: id}, err
+}
 
 func NewInstallationID() (InstallationID, error) {
 	id, err := newTypedID[installationIDMarker]()
@@ -520,4 +544,16 @@ func NewRuntimeBindingID() (RuntimeBindingID, error) {
 func NewRuntimeEndpointID() (RuntimeEndpointID, error) {
 	id, err := newTypedID[runtimeEndpointIDMarker]()
 	return RuntimeEndpointID{typedID: id}, err
+}
+func NewConversationID() (ConversationID, error) {
+	id, err := newTypedID[conversationIDMarker]()
+	return ConversationID{typedID: id}, err
+}
+func NewMessageID() (MessageID, error) {
+	id, err := newTypedID[messageIDMarker]()
+	return MessageID{typedID: id}, err
+}
+func NewLeaseID() (LeaseID, error) {
+	id, err := newTypedID[leaseIDMarker]()
+	return LeaseID{typedID: id}, err
 }

@@ -1,4 +1,4 @@
-// Package http exposes the strict W0 product-API contracts over net/http.
+// Package http exposes the strict product-API contracts over net/http.
 package http
 
 import (
@@ -30,6 +30,12 @@ const (
 	PathActorDelegationPropose    = "/api/v1/commands/actor_delegation.propose"
 	PathActorDelegationActivate   = "/api/v1/commands/actor_delegation.activate"
 	PathSessionStart              = "/api/v1/commands/session.start"
+	PathWorkRefObserve            = "/api/v1/commands/work_ref.observe"
+	PathObjectiveAndWorkCreate    = "/api/v1/commands/objective_and_work.create"
+	PathObjectiveActivate         = "/api/v1/commands/objective.activate"
+	PathRunPlanWithBindings       = "/api/v1/commands/run.plan_with_bindings"
+	PathRunJoin                   = "/api/v1/commands/run_participation.join"
+	PathRunStart                  = "/api/v1/commands/run.start"
 	PathContextGet                = "/api/v1/queries/context.get"
 	PathEventsSync                = "/api/v1/queries/events.sync"
 
@@ -57,6 +63,12 @@ type ActorCreateHandler = contracts.ActorCreateHandler
 type ActorDelegationProposeHandler = contracts.ActorDelegationProposeHandler
 type ActorDelegationActivateHandler = contracts.ActorDelegationActivateHandler
 type SessionStartHandler = contracts.SessionStartHandler
+type WorkRefObserveHandler = contracts.WorkRefObserveHandler
+type ObjectiveAndWorkCreateHandler = contracts.ObjectiveAndWorkCreateHandler
+type ObjectiveActivateHandler = contracts.ObjectiveActivateHandler
+type RunPlanWithBindingsHandler = contracts.RunPlanWithBindingsHandler
+type RunJoinHandler = contracts.RunJoinHandler
+type RunStartHandler = contracts.RunStartHandler
 type ContextGetHandler = contracts.ContextGetHandler
 type EventsSyncHandler = contracts.EventsSyncHandler
 
@@ -73,11 +85,17 @@ type Dependencies struct {
 	ActorDelegationPropose    ActorDelegationProposeHandler
 	ActorDelegationActivate   ActorDelegationActivateHandler
 	SessionStart              SessionStartHandler
+	WorkRefObserve            WorkRefObserveHandler
+	ObjectiveAndWorkCreate    ObjectiveAndWorkCreateHandler
+	ObjectiveActivate         ObjectiveActivateHandler
+	RunPlanWithBindings       RunPlanWithBindingsHandler
+	RunJoin                   RunJoinHandler
+	RunStart                  RunStartHandler
 	ContextGet                ContextGetHandler
 	EventsSync                EventsSyncHandler
 }
 
-// NewHandler constructs the complete W0 HTTP route set. Dependencies are
+// NewHandler constructs the complete HTTP route set. Dependencies are
 // intentionally explicit so a partially composed product API cannot start.
 func NewHandler(dependencies Dependencies) (stdhttp.Handler, error) {
 	if isNil(dependencies.Authenticator) || isNil(dependencies.InstallationBootstrap) ||
@@ -86,8 +104,11 @@ func NewHandler(dependencies Dependencies) (stdhttp.Handler, error) {
 		isNil(dependencies.WorkspaceMemberInvite) || isNil(dependencies.WorkspaceMembershipAccept) ||
 		isNil(dependencies.ActorCreate) || isNil(dependencies.ActorDelegationPropose) ||
 		isNil(dependencies.ActorDelegationActivate) || isNil(dependencies.SessionStart) ||
+		isNil(dependencies.WorkRefObserve) || isNil(dependencies.ObjectiveAndWorkCreate) ||
+		isNil(dependencies.ObjectiveActivate) || isNil(dependencies.RunPlanWithBindings) ||
+		isNil(dependencies.RunJoin) || isNil(dependencies.RunStart) ||
 		isNil(dependencies.ContextGet) || isNil(dependencies.EventsSync) {
-		return nil, errors.New("http transport requires every W0 handler and authenticator")
+		return nil, errors.New("http transport requires every W0/W1 handler and authenticator")
 	}
 
 	mux := stdhttp.NewServeMux()
@@ -124,6 +145,24 @@ func NewHandler(dependencies Dependencies) (stdhttp.Handler, error) {
 	commandRoute(mux, PathSessionStart, contracts.OperationSessionStart, dependencies.Authenticator,
 		contracts.DecodeSessionStartRequest, func(request contracts.SessionStartRequestDTO) time.Time { return request.Deadline },
 		dependencies.SessionStart.HandleSessionStart, func(result contracts.SessionStartResultDTO) error { return result.Validate() })
+	commandRoute(mux, PathWorkRefObserve, contracts.OperationWorkRefObserve, dependencies.Authenticator,
+		contracts.DecodeWorkRefObserveRequest, func(request contracts.WorkRefObserveRequestDTO) time.Time { return request.Deadline },
+		dependencies.WorkRefObserve.HandleWorkRefObserve, func(result contracts.WorkRefObserveResultDTO) error { return result.Validate() })
+	commandRoute(mux, PathObjectiveAndWorkCreate, contracts.OperationObjectiveAndWorkCreate, dependencies.Authenticator,
+		contracts.DecodeObjectiveAndWorkCreateRequest, func(request contracts.ObjectiveAndWorkCreateRequestDTO) time.Time { return request.Deadline },
+		dependencies.ObjectiveAndWorkCreate.HandleObjectiveAndWorkCreate, func(result contracts.ObjectiveAndWorkCreateResultDTO) error { return result.Validate() })
+	commandRoute(mux, PathObjectiveActivate, contracts.OperationObjectiveActivate, dependencies.Authenticator,
+		contracts.DecodeObjectiveActivateRequest, func(request contracts.ObjectiveActivateRequestDTO) time.Time { return request.Deadline },
+		dependencies.ObjectiveActivate.HandleObjectiveActivate, func(result contracts.ObjectiveActivateResultDTO) error { return result.Validate() })
+	commandRoute(mux, PathRunPlanWithBindings, contracts.OperationRunPlanWithBindings, dependencies.Authenticator,
+		contracts.DecodeRunPlanWithBindingsRequest, func(request contracts.RunPlanWithBindingsRequestDTO) time.Time { return request.Deadline },
+		dependencies.RunPlanWithBindings.HandleRunPlanWithBindings, func(result contracts.RunPlanWithBindingsResultDTO) error { return result.Validate() })
+	commandRoute(mux, PathRunJoin, contracts.OperationRunJoin, dependencies.Authenticator,
+		contracts.DecodeRunJoinRequest, func(request contracts.RunJoinRequestDTO) time.Time { return request.Deadline },
+		dependencies.RunJoin.HandleRunJoin, func(result contracts.RunJoinResultDTO) error { return result.Validate() })
+	commandRoute(mux, PathRunStart, contracts.OperationRunStart, dependencies.Authenticator,
+		contracts.DecodeRunStartRequest, func(request contracts.RunStartRequestDTO) time.Time { return request.Deadline },
+		dependencies.RunStart.HandleRunStart, func(result contracts.RunStartResultDTO) error { return result.Validate() })
 	queryRoute(mux, PathContextGet, contracts.OperationContextGet, dependencies.Authenticator,
 		contracts.DecodeContextGetRequest, dependencies.ContextGet.HandleContextGet, func(result contracts.ContextPageDTO) error { return result.Validate() })
 	queryRoute(mux, PathEventsSync, contracts.OperationEventsSync, dependencies.Authenticator,
@@ -274,6 +313,18 @@ func requestIDOf(value any, fallback string) string {
 		return request.RequestID
 	case contracts.SessionStartRequestDTO:
 		return request.RequestID
+	case contracts.WorkRefObserveRequestDTO:
+		return request.RequestID
+	case contracts.ObjectiveAndWorkCreateRequestDTO:
+		return request.RequestID
+	case contracts.ObjectiveActivateRequestDTO:
+		return request.RequestID
+	case contracts.RunPlanWithBindingsRequestDTO:
+		return request.RequestID
+	case contracts.RunJoinRequestDTO:
+		return request.RequestID
+	case contracts.RunStartRequestDTO:
+		return request.RequestID
 	case contracts.ContextGetRequestDTO:
 		return request.RequestID
 	case contracts.EventsSyncRequestDTO:
@@ -306,6 +357,18 @@ func responseRequestID(value any) string {
 	case contracts.ActorDelegationActivateResultDTO:
 		return response.RequestID
 	case contracts.SessionStartResultDTO:
+		return response.RequestID
+	case contracts.WorkRefObserveResultDTO:
+		return response.RequestID
+	case contracts.ObjectiveAndWorkCreateResultDTO:
+		return response.RequestID
+	case contracts.ObjectiveActivateResultDTO:
+		return response.RequestID
+	case contracts.RunPlanWithBindingsResultDTO:
+		return response.RequestID
+	case contracts.RunJoinResultDTO:
+		return response.RequestID
+	case contracts.RunStartResultDTO:
 		return response.RequestID
 	case contracts.ContextPageDTO:
 		return response.RequestID

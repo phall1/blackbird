@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/phall1/blackbird/internal/install"
 	blackbirdruntime "github.com/phall1/blackbird/internal/runtime"
 )
 
@@ -29,6 +30,13 @@ type daemonRunner interface {
 }
 
 type daemonFactory func(blackbirdruntime.BuildInfo, blackbirdruntime.Config) (daemonRunner, error)
+
+type productManager interface {
+	Install(context.Context) (install.Result, error)
+	Status(context.Context) (string, error)
+	Update(context.Context) (install.UpdateResult, error)
+	Uninstall(context.Context) (install.Result, error)
+}
 
 func main() {
 	os.Exit(runMain(os.Args[1:], os.Stdout, os.Stderr))
@@ -53,6 +61,38 @@ func executeConfigured(
 	injected *blackbirdruntime.Config,
 	factory daemonFactory,
 ) int {
+	return executeWithManager(ctx, args, stdout, stderr, injected, factory, nil)
+}
+
+func executeWithManager(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	injected *blackbirdruntime.Config,
+	factory daemonFactory,
+	manager productManager,
+) int {
+	if len(args) > 0 && isProductCommand(args[0]) {
+		if len(args) != 1 {
+			if err := writef(stderr, "blackbird: %s does not accept arguments\n", args[0]); err != nil {
+				return exitError
+			}
+			return exitUsage
+		}
+		if manager == nil {
+			var err error
+			manager, err = install.New()
+			if err != nil {
+				if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
+					return exitError
+				}
+				return exitError
+			}
+		}
+		return executeProductCommand(ctx, args[0], manager, stdout, stderr)
+	}
+
 	flags := flag.NewFlagSet("blackbird", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	showVersion := flags.Bool("version", false, "print build identity and exit")
@@ -97,7 +137,7 @@ func executeConfigured(
 	config.Storage = blackbirdruntime.StorageBackend(*storage)
 	if factory == nil {
 		factory = func(build blackbirdruntime.BuildInfo, config blackbirdruntime.Config) (daemonRunner, error) {
-			return blackbirdruntime.NewDaemon(build, config, blackbirdruntime.Dependencies{})
+			return blackbirdruntime.NewProductionDaemon(build, config)
 		}
 	}
 	daemon, err := factory(build, config)
@@ -116,6 +156,63 @@ func executeConfigured(
 	}
 
 	return exitOK
+}
+
+func isProductCommand(argument string) bool {
+	switch argument {
+	case "install", "status", "update", "uninstall":
+		return true
+	default:
+		return false
+	}
+}
+
+func executeProductCommand(ctx context.Context, command string, manager productManager, stdout, stderr io.Writer) int {
+	var err error
+	switch command {
+	case "install":
+		var result install.Result
+		result, err = manager.Install(ctx)
+		if err == nil {
+			err = writef(stdout, "installed service=%s updater=%s clients=%s\n", result.ServicePath, stringsOrNone(result.UpdaterPaths), stringsOrNone(result.Clients))
+		}
+	case "status":
+		var status string
+		status, err = manager.Status(ctx)
+		if err == nil {
+			err = writef(stdout, "%s\n", status)
+		}
+	case "update":
+		var result install.UpdateResult
+		result, err = manager.Update(ctx)
+		if err == nil {
+			err = writef(stdout, "updated changed=%t before=%q after=%q\n", result.Changed, result.Before, result.After)
+		}
+	case "uninstall":
+		var result install.Result
+		result, err = manager.Uninstall(ctx)
+		if err == nil {
+			err = writef(stdout, "uninstalled service=%s updater=%s data=retained\n", result.ServicePath, stringsOrNone(result.UpdaterPaths))
+		}
+	}
+	if err != nil {
+		if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
+			return exitError
+		}
+		return exitError
+	}
+	return exitOK
+}
+
+func stringsOrNone(values []string) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	result := values[0]
+	for _, value := range values[1:] {
+		result += "," + value
+	}
+	return result
 }
 
 func writef(output io.Writer, format string, args ...any) error {

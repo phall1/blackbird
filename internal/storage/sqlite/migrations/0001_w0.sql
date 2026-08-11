@@ -6,7 +6,7 @@ CREATE TABLE schema_migrations (
 ) STRICT;
 
 CREATE TABLE schema_manifest (
-    schema_version INTEGER PRIMARY KEY CHECK (schema_version = 1),
+    schema_version INTEGER PRIMARY KEY CHECK (schema_version BETWEEN 1 AND 3),
     checksum BLOB NOT NULL CHECK (length(checksum) = 32)
 ) STRICT;
 

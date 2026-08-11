@@ -29,20 +29,24 @@ const (
 	MaxCommandJSONBytes = 64 * 1024
 	MaxOutcomeJSONBytes = 1024 * 1024
 
-	maxRequestIDBytes        = 128
-	maxDisplayNameBytes      = 256
-	maxClientNameBytes       = 128
-	maxClientVersionBytes    = 128
-	maxDiscoveryLocatorBytes = 4096
-	maxCursorBytes           = 4096
-	maxCapabilityCount       = 64
-	maxCapabilityBytes       = 128
-	maxGrantReferenceCount   = 64
-	maxEventIDCount          = 16
-	maxFieldViolationCount   = 64
-	maxSyncPageCount         = 256
-	maxContextDeltaCount     = 256
-	maxJSONNestingDepth      = 64
+	maxRequestIDBytes           = 128
+	maxDisplayNameBytes         = 256
+	maxClientNameBytes          = 128
+	maxClientVersionBytes       = 128
+	maxDiscoveryLocatorBytes    = 4096
+	maxCursorBytes              = 4096
+	maxOpaqueProviderValueBytes = 4096
+	maxObjectiveTitleBytes      = 512
+	maxAcceptanceCriteriaBytes  = 8192
+	maxRunRoleBytes             = 128
+	maxCapabilityCount          = 64
+	maxCapabilityBytes          = 128
+	maxGrantReferenceCount      = 64
+	maxEventIDCount             = 1 + domain.MaxRunParticipants + domain.MaxRunBindings
+	maxFieldViolationCount      = 64
+	maxSyncPageCount            = 256
+	maxContextDeltaCount        = 256
+	maxJSONNestingDepth         = 64
 )
 
 var (
@@ -396,6 +400,20 @@ func validateText(field, value string, maximum int, required bool) error {
 		if character < 0x20 || character == 0x7f {
 			return invalid(field, "must not contain control characters")
 		}
+	}
+	return nil
+}
+
+func validateRawJSONObject(field string, data json.RawMessage) error {
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		return invalid(field, "is required")
+	}
+	if err := validateNoDuplicateJSONKeys(data); err != nil {
+		return invalid(field, err.Error())
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil || members == nil {
+		return invalid(field, "must be a JSON object")
 	}
 	return nil
 }

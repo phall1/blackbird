@@ -3,13 +3,27 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/phall1/blackbird/internal/application"
 )
+
+func TestCoordinationSurfaceFailsExplicitlyUntilPostgresIsImplemented(t *testing.T) {
+	t.Parallel()
+	store := &Store{}
+	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{}); !errors.Is(err, application.ErrCoordinationUnsupported) {
+		t.Fatalf("OpenConversation error=%v", err)
+	}
+	if _, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{}); !errors.Is(err, application.ErrCoordinationUnsupported) {
+		t.Fatalf("AcquireLease error=%v", err)
+	}
+}
 
 func TestSchemaStaticallyMatchesSQLiteLogicalTablesAndNativeTypes(t *testing.T) {
 	t.Parallel()

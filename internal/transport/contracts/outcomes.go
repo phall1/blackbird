@@ -23,6 +23,15 @@ const (
 	EventTypeActorDelegationProposed     = "blackbird.actor_delegation.proposed"
 	EventTypeActorDelegationActivated    = "blackbird.actor_delegation.activated"
 	EventTypeActorSessionStarted         = "blackbird.actor_session.started"
+	EventTypeWorkRefObserved             = "blackbird.work_ref.observed"
+	EventTypeObjectiveCreated            = "blackbird.objective.created"
+	EventTypeWorkUnitCreated             = "blackbird.work_unit.created"
+	EventTypeObjectiveActivated          = "blackbird.objective.activated"
+	EventTypeRunPlanned                  = "blackbird.run.planned"
+	EventTypeRunParticipantInvited       = "blackbird.run_participant.invited"
+	EventTypeRuntimeBindingRequested     = "blackbird.runtime_binding.requested"
+	EventTypeRunParticipantJoined        = "blackbird.run_participant.joined"
+	EventTypeRunStarted                  = "blackbird.run.started"
 
 	StateActive   = "active"
 	StateTrusted  = "trusted"
@@ -472,6 +481,334 @@ func DecodeSessionStartResult(data []byte) (SessionStartResultDTO, error) {
 	var value SessionStartResultDTO
 	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
 	return value, err
+}
+
+type WorkRefObserveResultDTO struct {
+	CommandResultMetadataDTO
+	Resource WorkRefObserveResourceDTO `json:"resource"`
+}
+type WorkRefObserveResourceDTO struct {
+	WorkspaceID        domain.WorkspaceID     `json:"workspace_id"`
+	WorkReferenceID    domain.WorkReferenceID `json:"work_reference_id"`
+	ResourceVersion    domain.Version         `json:"resource_version"`
+	AdapterPrincipalID domain.PrincipalID     `json:"adapter_principal_id"`
+	ProviderNamespace  string                 `json:"provider_namespace"`
+	ProviderObjectID   string                 `json:"provider_object_id"`
+	ProviderLocator    string                 `json:"provider_locator"`
+	ProviderVersion    string                 `json:"provider_version"`
+	ObservedAt         time.Time              `json:"observed_at"`
+}
+
+func DecodeWorkRefObserveResult(data []byte) (WorkRefObserveResultDTO, error) {
+	var value WorkRefObserveResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
+func (result WorkRefObserveResultDTO) Validate() error {
+	if err := result.validate(OperationWorkRefObserve, 1); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"resource.workspace_id":         result.Resource.WorkspaceID,
+		"resource.work_reference_id":    result.Resource.WorkReferenceID,
+		"resource.adapter_principal_id": result.Resource.AdapterPrincipalID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	for field, value := range map[string]string{
+		"resource.provider_namespace": result.Resource.ProviderNamespace,
+		"resource.provider_object_id": result.Resource.ProviderObjectID,
+		"resource.provider_locator":   result.Resource.ProviderLocator,
+		"resource.provider_version":   result.Resource.ProviderVersion,
+	} {
+		if err := validateText(field, value, maxOpaqueProviderValueBytes, true); err != nil {
+			return err
+		}
+	}
+	if err := validateVersion("resource.resource_version", result.Resource.ResourceVersion); err != nil {
+		return err
+	}
+	return validateUTCInstant("resource.observed_at", result.Resource.ObservedAt)
+}
+
+type ObjectiveAndWorkCreateResultDTO struct {
+	CommandResultMetadataDTO
+	Resource ObjectiveAndWorkCreateResourceDTO `json:"resource"`
+}
+type ObjectiveAndWorkCreateResourceDTO struct {
+	WorkspaceID      domain.WorkspaceID     `json:"workspace_id"`
+	ObjectiveID      domain.ObjectiveID     `json:"objective_id"`
+	ObjectiveState   string                 `json:"objective_state"`
+	ObjectiveVersion domain.Version         `json:"objective_version"`
+	WorkUnitID       domain.WorkUnitID      `json:"work_unit_id"`
+	WorkUnitState    string                 `json:"work_unit_state"`
+	WorkUnitVersion  domain.Version         `json:"work_unit_version"`
+	WorkReferenceID  domain.WorkReferenceID `json:"work_reference_id"`
+}
+
+func DecodeObjectiveAndWorkCreateResult(data []byte) (ObjectiveAndWorkCreateResultDTO, error) {
+	var value ObjectiveAndWorkCreateResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
+func (result ObjectiveAndWorkCreateResultDTO) Validate() error {
+	if err := result.validate(OperationObjectiveAndWorkCreate, 2); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"resource.workspace_id":      result.Resource.WorkspaceID,
+		"resource.objective_id":      result.Resource.ObjectiveID,
+		"resource.work_unit_id":      result.Resource.WorkUnitID,
+		"resource.work_reference_id": result.Resource.WorkReferenceID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	if err := validateLiteral("resource.objective_state", result.Resource.ObjectiveState, string(domain.ObjectiveDraft)); err != nil {
+		return err
+	}
+	if err := validateLiteral("resource.work_unit_state", result.Resource.WorkUnitState, string(domain.WorkUnitProposed)); err != nil {
+		return err
+	}
+	if err := validateInitialVersion("resource.objective_version", result.Resource.ObjectiveVersion); err != nil {
+		return err
+	}
+	return validateInitialVersion("resource.work_unit_version", result.Resource.WorkUnitVersion)
+}
+
+type ObjectiveActivateResultDTO struct {
+	CommandResultMetadataDTO
+	Resource ObjectiveActivateResourceDTO `json:"resource"`
+}
+type ObjectiveActivateResourceDTO struct {
+	WorkspaceID     domain.WorkspaceID `json:"workspace_id"`
+	ObjectiveID     domain.ObjectiveID `json:"objective_id"`
+	ObjectiveState  string             `json:"objective_state"`
+	ResourceVersion domain.Version     `json:"resource_version"`
+}
+
+func DecodeObjectiveActivateResult(data []byte) (ObjectiveActivateResultDTO, error) {
+	var value ObjectiveActivateResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
+func (result ObjectiveActivateResultDTO) Validate() error {
+	if err := result.validate(OperationObjectiveActivate, 1); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"resource.workspace_id": result.Resource.WorkspaceID,
+		"resource.objective_id": result.Resource.ObjectiveID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	if err := validateLiteral("resource.objective_state", result.Resource.ObjectiveState, string(domain.ObjectiveActive)); err != nil {
+		return err
+	}
+	return validateAdvancedVersion("resource.resource_version", result.Resource.ResourceVersion)
+}
+
+type RunPlanWithBindingsResultDTO struct {
+	CommandResultMetadataDTO
+	Resource RunPlanWithBindingsResourceDTO `json:"resource"`
+}
+type RunPlanWithBindingsResourceDTO struct {
+	WorkspaceID    domain.WorkspaceID            `json:"workspace_id"`
+	RunID          domain.RunID                  `json:"run_id"`
+	RunState       string                        `json:"run_state"`
+	RunVersion     domain.Version                `json:"run_version"`
+	ObjectiveID    domain.ObjectiveID            `json:"objective_id"`
+	WorkUnitID     domain.WorkUnitID             `json:"work_unit_id"`
+	OperatorID     domain.ActorID                `json:"operator_id"`
+	Participations []RunParticipationResourceDTO `json:"participations"`
+	Bindings       []RuntimeBindingResourceDTO   `json:"bindings"`
+}
+type RunParticipationResourceDTO struct {
+	ParticipationID    domain.RunParticipationID `json:"participation_id"`
+	ActorID            domain.ActorID            `json:"actor_id"`
+	Role               string                    `json:"role"`
+	ParticipationState string                    `json:"participation_state"`
+	ResourceVersion    domain.Version            `json:"resource_version"`
+}
+type RuntimeBindingResourceDTO struct {
+	BindingID         domain.RuntimeBindingID   `json:"binding_id"`
+	ParticipationID   domain.RunParticipationID `json:"participation_id"`
+	SessionID         domain.ActorSessionID     `json:"session_id"`
+	RuntimeEndpointID domain.RuntimeEndpointID  `json:"runtime_endpoint_id"`
+	BindingState      string                    `json:"binding_state"`
+	ResourceVersion   domain.Version            `json:"resource_version"`
+}
+
+func DecodeRunPlanWithBindingsResult(data []byte) (RunPlanWithBindingsResultDTO, error) {
+	var value RunPlanWithBindingsResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
+func (result RunPlanWithBindingsResultDTO) Validate() error {
+	expectedEvents := 1 + len(result.Resource.Participations) + len(result.Resource.Bindings)
+	if err := result.validate(OperationRunPlanWithBindings, expectedEvents); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"resource.workspace_id": result.Resource.WorkspaceID,
+		"resource.run_id":       result.Resource.RunID,
+		"resource.objective_id": result.Resource.ObjectiveID,
+		"resource.work_unit_id": result.Resource.WorkUnitID,
+		"resource.operator_id":  result.Resource.OperatorID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	if err := validateLiteral("resource.run_state", result.Resource.RunState, string(domain.RunPlanned)); err != nil {
+		return err
+	}
+	if err := validateInitialVersion("resource.run_version", result.Resource.RunVersion); err != nil {
+		return err
+	}
+	if len(result.Resource.Participations) == 0 || len(result.Resource.Participations) > domain.MaxRunParticipants {
+		return invalid("resource.participations", fmt.Sprintf("must contain between 1 and %d entries", domain.MaxRunParticipants))
+	}
+	seenParticipation := make(map[domain.RunParticipationID]struct{}, len(result.Resource.Participations))
+	for index, participation := range result.Resource.Participations {
+		prefix := fmt.Sprintf("resource.participations[%d]", index)
+		if err := validateRequiredID(prefix+".participation_id", participation.ParticipationID); err != nil {
+			return err
+		}
+		if err := validateRequiredID(prefix+".actor_id", participation.ActorID); err != nil {
+			return err
+		}
+		if err := validateText(prefix+".role", participation.Role, maxRunRoleBytes, true); err != nil {
+			return err
+		}
+		if err := validateLiteral(prefix+".participation_state", participation.ParticipationState, string(domain.RunParticipationInvited)); err != nil {
+			return err
+		}
+		if err := validateInitialVersion(prefix+".resource_version", participation.ResourceVersion); err != nil {
+			return err
+		}
+		if _, duplicate := seenParticipation[participation.ParticipationID]; duplicate {
+			return invalid(prefix+".participation_id", "must not duplicate an earlier participation")
+		}
+		seenParticipation[participation.ParticipationID] = struct{}{}
+	}
+	if len(result.Resource.Bindings) == 0 || len(result.Resource.Bindings) > domain.MaxRunBindings {
+		return invalid("resource.bindings", fmt.Sprintf("must contain between 1 and %d entries", domain.MaxRunBindings))
+	}
+	seenBinding := make(map[domain.RuntimeBindingID]struct{}, len(result.Resource.Bindings))
+	for index, binding := range result.Resource.Bindings {
+		prefix := fmt.Sprintf("resource.bindings[%d]", index)
+		if err := validateRequiredID(prefix+".binding_id", binding.BindingID); err != nil {
+			return err
+		}
+		if err := validateRequiredID(prefix+".participation_id", binding.ParticipationID); err != nil {
+			return err
+		}
+		if err := validateRequiredID(prefix+".session_id", binding.SessionID); err != nil {
+			return err
+		}
+		if err := validateRequiredID(prefix+".runtime_endpoint_id", binding.RuntimeEndpointID); err != nil {
+			return err
+		}
+		if err := validateLiteral(prefix+".binding_state", binding.BindingState, string(domain.RuntimeBindingRequested)); err != nil {
+			return err
+		}
+		if err := validateInitialVersion(prefix+".resource_version", binding.ResourceVersion); err != nil {
+			return err
+		}
+		if _, duplicate := seenBinding[binding.BindingID]; duplicate {
+			return invalid(prefix+".binding_id", "must not duplicate an earlier binding")
+		}
+		seenBinding[binding.BindingID] = struct{}{}
+	}
+	return nil
+}
+
+type RunJoinResultDTO struct {
+	CommandResultMetadataDTO
+	Resource RunJoinResourceDTO `json:"resource"`
+}
+type RunJoinResourceDTO struct {
+	WorkspaceID        domain.WorkspaceID        `json:"workspace_id"`
+	RunID              domain.RunID              `json:"run_id"`
+	ParticipationID    domain.RunParticipationID `json:"participation_id"`
+	ActorID            domain.ActorID            `json:"actor_id"`
+	SessionID          domain.ActorSessionID     `json:"session_id"`
+	ParticipationState string                    `json:"participation_state"`
+	ResourceVersion    domain.Version            `json:"resource_version"`
+}
+
+func DecodeRunJoinResult(data []byte) (RunJoinResultDTO, error) {
+	var value RunJoinResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
+func (result RunJoinResultDTO) Validate() error {
+	if err := result.validate(OperationRunJoin, 1); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"resource.workspace_id":     result.Resource.WorkspaceID,
+		"resource.run_id":           result.Resource.RunID,
+		"resource.participation_id": result.Resource.ParticipationID,
+		"resource.actor_id":         result.Resource.ActorID,
+		"resource.session_id":       result.Resource.SessionID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	if err := validateLiteral("resource.participation_state", result.Resource.ParticipationState, string(domain.RunParticipationActive)); err != nil {
+		return err
+	}
+	return validateAdvancedVersion("resource.resource_version", result.Resource.ResourceVersion)
+}
+
+type RunStartResultDTO struct {
+	CommandResultMetadataDTO
+	Resource RunStartResourceDTO `json:"resource"`
+}
+type RunStartResourceDTO struct {
+	WorkspaceID domain.WorkspaceID `json:"workspace_id"`
+	RunID       domain.RunID       `json:"run_id"`
+	RunState    string             `json:"run_state"`
+	RunVersion  domain.Version     `json:"run_version"`
+	OperatorID  domain.ActorID     `json:"operator_id"`
+}
+
+func DecodeRunStartResult(data []byte) (RunStartResultDTO, error) {
+	var value RunStartResultDTO
+	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
+	return value, err
+}
+
+func (result RunStartResultDTO) Validate() error {
+	if err := result.validate(OperationRunStart, 1); err != nil {
+		return err
+	}
+	for field, id := range map[string]interface{ IsZero() bool }{
+		"resource.workspace_id": result.Resource.WorkspaceID,
+		"resource.run_id":       result.Resource.RunID,
+		"resource.operator_id":  result.Resource.OperatorID,
+	} {
+		if err := validateRequiredID(field, id); err != nil {
+			return err
+		}
+	}
+	if err := validateLiteral("resource.run_state", result.Resource.RunState, string(domain.RunStarting)); err != nil {
+		return err
+	}
+	return validateAdvancedVersion("resource.run_version", result.Resource.RunVersion)
 }
 
 func validateUTCInstant(field string, instant time.Time) error {

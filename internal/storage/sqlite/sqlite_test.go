@@ -55,8 +55,8 @@ func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 34 {
-		t.Fatalf("tables=%d, want 34", tables)
+	if tables != 44 {
+		t.Fatalf("tables=%d, want 44", tables)
 	}
 	if err := reopened.IntegrityCheck(context.Background()); err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestOpenRejectsIdentityChecksumAndConfigurationDrift(t *testing.T) {
 		mutate func(*testing.T, string)
 	}{
 		{"application id", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA application_id = 1") }},
-		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 2") }},
+		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 4") }},
 		{"migration checksum", func(t *testing.T, path string) {
 			execRaw(t, path, "DROP TRIGGER schema_migrations_no_update")
 			execRaw(t, path, "UPDATE schema_migrations SET checksum = zeroblob(32)")

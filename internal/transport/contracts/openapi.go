@@ -39,6 +39,12 @@ var productAPIOperations = []apiOperation{
 	{"/api/v1/commands/actor_delegation.propose", OperationActorDelegationPropose, "ActorDelegationProposeRequest", "ActorDelegationProposeResult", reflect.TypeFor[ActorDelegationProposeRequestDTO](), reflect.TypeFor[ActorDelegationProposeResultDTO]()},
 	{"/api/v1/commands/actor_delegation.activate", OperationActorDelegationActivate, "ActorDelegationActivateRequest", "ActorDelegationActivateResult", reflect.TypeFor[ActorDelegationActivateRequestDTO](), reflect.TypeFor[ActorDelegationActivateResultDTO]()},
 	{"/api/v1/commands/session.start", OperationSessionStart, "SessionStartRequest", "SessionStartResult", reflect.TypeFor[SessionStartRequestDTO](), reflect.TypeFor[SessionStartResultDTO]()},
+	{"/api/v1/commands/work_ref.observe", OperationWorkRefObserve, "WorkRefObserveRequest", "WorkRefObserveResult", reflect.TypeFor[WorkRefObserveRequestDTO](), reflect.TypeFor[WorkRefObserveResultDTO]()},
+	{"/api/v1/commands/objective_and_work.create", OperationObjectiveAndWorkCreate, "ObjectiveAndWorkCreateRequest", "ObjectiveAndWorkCreateResult", reflect.TypeFor[ObjectiveAndWorkCreateRequestDTO](), reflect.TypeFor[ObjectiveAndWorkCreateResultDTO]()},
+	{"/api/v1/commands/objective.activate", OperationObjectiveActivate, "ObjectiveActivateRequest", "ObjectiveActivateResult", reflect.TypeFor[ObjectiveActivateRequestDTO](), reflect.TypeFor[ObjectiveActivateResultDTO]()},
+	{"/api/v1/commands/run.plan_with_bindings", OperationRunPlanWithBindings, "RunPlanWithBindingsRequest", "RunPlanWithBindingsResult", reflect.TypeFor[RunPlanWithBindingsRequestDTO](), reflect.TypeFor[RunPlanWithBindingsResultDTO]()},
+	{"/api/v1/commands/run_participation.join", OperationRunJoin, "RunJoinRequest", "RunJoinResult", reflect.TypeFor[RunJoinRequestDTO](), reflect.TypeFor[RunJoinResultDTO]()},
+	{"/api/v1/commands/run.start", OperationRunStart, "RunStartRequest", "RunStartResult", reflect.TypeFor[RunStartRequestDTO](), reflect.TypeFor[RunStartResultDTO]()},
 	{"/api/v1/queries/context.get", OperationContextGet, "ContextGetRequest", "ContextPage", reflect.TypeFor[ContextGetRequestDTO](), reflect.TypeFor[ContextPageDTO]()},
 	{"/api/v1/queries/events.sync", OperationEventsSync, "EventsSyncRequest", "EventPage", reflect.TypeFor[EventsSyncRequestDTO](), reflect.TypeFor[EventPageDTO]()},
 }
@@ -347,6 +353,21 @@ func applyNamedProperty(name string, property schema) {
 		stringBounds(target, 1, maxCursorBytes)
 	case "display_name", "alias":
 		stringBounds(target, 1, maxDisplayNameBytes)
+	case "objective_title", "work_unit_title":
+		stringBounds(target, 1, maxObjectiveTitleBytes)
+	case "acceptance_criteria":
+		stringBounds(target, 1, maxAcceptanceCriteriaBytes)
+	case "provider_namespace", "provider_object_id", "provider_locator", "provider_version":
+		stringBounds(target, 1, maxOpaqueProviderValueBytes)
+	case "previous_provider_version":
+		stringBounds(target, 0, maxOpaqueProviderValueBytes)
+	case "role":
+		stringBounds(target, 1, maxRunRoleBytes)
+	case "participants", "bindings", "participations":
+		target["minItems"], target["maxItems"] = 1, domain.MaxRunParticipants
+	case "selected_fields":
+		target["type"] = "object"
+		target["additionalProperties"] = true
 	case "discovery_locator":
 		stringBounds(target, 0, maxDiscoveryLocatorBytes)
 	case "public_key_reference":
@@ -422,8 +443,8 @@ func applyRootContract(object schema, valueType reflect.Type, operation string) 
 		setConst(properties, "schema", schemaValue)
 	}
 	if emitted, present := properties["emitted_event_ids"]; present {
-		count := expectedEventCount(operation)
-		emitted.(schema)["minItems"], emitted.(schema)["maxItems"] = count, count
+		minimum, maximum := expectedEventCountRange(operation)
+		emitted.(schema)["minItems"], emitted.(schema)["maxItems"] = minimum, maximum
 	}
 }
 
@@ -451,6 +472,18 @@ func schemaLiteral(valueType reflect.Type) string {
 		return SchemaActorDelegationActivateCommand
 	case reflect.TypeFor[SessionStartRequestDTO]():
 		return SchemaSessionStartCommand
+	case reflect.TypeFor[WorkRefObserveRequestDTO]():
+		return SchemaWorkRefObserveCommand
+	case reflect.TypeFor[ObjectiveAndWorkCreateRequestDTO]():
+		return SchemaObjectiveAndWorkCreateCommand
+	case reflect.TypeFor[ObjectiveActivateRequestDTO]():
+		return SchemaObjectiveActivateCommand
+	case reflect.TypeFor[RunPlanWithBindingsRequestDTO]():
+		return SchemaRunPlanWithBindingsCommand
+	case reflect.TypeFor[RunJoinRequestDTO]():
+		return SchemaRunJoinCommand
+	case reflect.TypeFor[RunStartRequestDTO]():
+		return SchemaRunStartCommand
 	case reflect.TypeFor[ContextGetRequestDTO]():
 		return SchemaContextGetRequest
 	case reflect.TypeFor[EventsSyncRequestDTO]():
@@ -467,11 +500,17 @@ func schemaLiteral(valueType reflect.Type) string {
 	}
 }
 
-func expectedEventCount(operation string) int {
-	if operation == OperationInstallationBootstrap || operation == OperationWorkspaceCreate {
-		return 3
+func expectedEventCountRange(operation string) (int, int) {
+	switch operation {
+	case OperationInstallationBootstrap, OperationWorkspaceCreate:
+		return 3, 3
+	case OperationObjectiveAndWorkCreate:
+		return 2, 2
+	case OperationRunPlanWithBindings:
+		return 1, maxEventIDCount
+	default:
+		return 1, 1
 	}
-	return 1
 }
 
 func applyErrorContract(object schema) {

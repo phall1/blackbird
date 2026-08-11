@@ -17,6 +17,57 @@ func applicationUUID(index int) string {
 	return fmt.Sprintf("01b8e094-9888-7000-8000-%012x", index)
 }
 
+func FuzzLeaseSelectorOverlapIsSymmetric(f *testing.F) {
+	for _, seed := range [][4]string{{"exact", "src/a.go", "subtree", "src"}, {"exact", "a/b", "exact", "a/c"}, {"subtree", "a", "subtree", "a/b"}} {
+		f.Add(seed[0], seed[1], seed[2], seed[3])
+	}
+	f.Fuzz(func(t *testing.T, leftKind, leftPath, rightKind, rightPath string) {
+		left, leftErr := NewLeaseSelector(LeaseSelectorKind(leftKind), leftPath)
+		right, rightErr := NewLeaseSelector(LeaseSelectorKind(rightKind), rightPath)
+		if leftErr != nil || rightErr != nil {
+			return
+		}
+		if LeaseSelectorsOverlap(left, right) != LeaseSelectorsOverlap(right, left) {
+			t.Fatalf("overlap is asymmetric: %s %s", left.Key(), right.Key())
+		}
+		if left.Key() == right.Key() && !LeaseSelectorsOverlap(left, right) {
+			t.Fatal("equal selectors do not overlap")
+		}
+	})
+}
+
+func TestLeaseSelectorCanonicalizationRejectsAmbiguousPaths(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"", "/absolute", "a//b", "a/./b", "a/../b", "a\\b", "e\u0301/file"} {
+		if _, err := NewLeaseSelector(LeaseSelectorExact, value); !errors.Is(err, ErrInvalidCoordination) {
+			t.Fatalf("selector %q error=%v", value, err)
+		}
+	}
+	for _, test := range []struct {
+		left    LeaseSelector
+		right   LeaseSelector
+		overlap bool
+	}{
+		{mustLeaseSelector(t, LeaseSelectorSubtree, "src"), mustLeaseSelector(t, LeaseSelectorExact, "src/a.go"), true},
+		{mustLeaseSelector(t, LeaseSelectorExact, "src/a.go"), mustLeaseSelector(t, LeaseSelectorExact, "src/a.go"), true},
+		{mustLeaseSelector(t, LeaseSelectorExact, "src/a.go"), mustLeaseSelector(t, LeaseSelectorExact, "src/b.go"), false},
+		{mustLeaseSelector(t, LeaseSelectorSubtree, "src/a"), mustLeaseSelector(t, LeaseSelectorExact, "src/ab"), false},
+	} {
+		if got := LeaseSelectorsOverlap(test.left, test.right); got != test.overlap {
+			t.Fatalf("%s / %s overlap=%v", test.left.Key(), test.right.Key(), got)
+		}
+	}
+}
+
+func mustLeaseSelector(t *testing.T, kind LeaseSelectorKind, value string) LeaseSelector {
+	t.Helper()
+	selector, err := NewLeaseSelector(kind, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return selector
+}
+
 type bootstrapFixture struct {
 	now           time.Time
 	scope         domain.AuthorityScope

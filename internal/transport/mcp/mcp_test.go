@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	stdhttp "net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
+	"github.com/phall1/blackbird/internal/storage/sqlite"
 	"github.com/phall1/blackbird/internal/transport/contracts"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 )
@@ -85,6 +88,12 @@ type testHandlers struct {
 	contracts.ActorDelegationProposeHandler
 	contracts.ActorDelegationActivateHandler
 	contracts.SessionStartHandler
+	contracts.WorkRefObserveHandler
+	contracts.ObjectiveAndWorkCreateHandler
+	contracts.ObjectiveActivateHandler
+	contracts.RunPlanWithBindingsHandler
+	contracts.RunJoinHandler
+	contracts.RunStartHandler
 	events  func(context.Context, contracts.AuthenticationEvidence, contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error)
 	context func(context.Context, contracts.AuthenticationEvidence, contracts.ContextGetRequestDTO) (contracts.ContextPageDTO, *contracts.ErrorDTO, error)
 }
@@ -182,16 +191,32 @@ func TestMCPDiscoveryStrictnessResourcesAndCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(tools.Tools) != 13 {
-		t.Fatalf("tool count = %d, want 13", len(tools.Tools))
+	if len(tools.Tools) != 19 {
+		t.Fatalf("tool count = %d, want 19", len(tools.Tools))
+	}
+	w1Tools := map[string]bool{
+		ToolWorkRefObserve:         false,
+		ToolObjectiveAndWorkCreate: false,
+		ToolObjectiveActivate:      false,
+		ToolRunPlanWithBindings:    false,
+		ToolRunJoin:                false,
+		ToolRunStart:               false,
 	}
 	for _, tool := range tools.Tools {
+		if _, ok := w1Tools[tool.Name]; ok {
+			w1Tools[tool.Name] = true
+		}
 		encoded, err := json.Marshal(tool.InputSchema)
 		if err != nil {
 			t.Fatalf("marshal schema for %s: %v", tool.Name, err)
 		}
 		if !bytes.Contains(encoded, []byte(`"additionalProperties":false`)) {
 			t.Fatalf("tool %s has permissive input schema: %s", tool.Name, encoded)
+		}
+	}
+	for name, found := range w1Tools {
+		if !found {
+			t.Errorf("W1 tool %q was not discovered", name)
 		}
 	}
 
@@ -263,8 +288,8 @@ func TestStreamableHTTPHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tools over Streamable HTTP: %v", err)
 	}
-	if len(tools.Tools) != 13 {
-		t.Fatalf("Streamable HTTP tool count = %d, want 13", len(tools.Tools))
+	if len(tools.Tools) != 19 {
+		t.Fatalf("Streamable HTTP tool count = %d, want 19", len(tools.Tools))
 	}
 }
 
@@ -275,6 +300,130 @@ func TestNewServerRequiresCompleteComposition(t *testing.T) {
 	}
 }
 
+func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "coordination.db")
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
+		&testSessionBinder{session: parseSession(t)}, store)
+	client, closeMCP := connect(t, server)
+
+	alice := callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
+	bob := callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob"})
+	if alice.RegistrationToken == "" || bob.RegistrationToken == "" {
+		t.Fatal("new registrations did not issue bearer tokens")
+	}
+	agents := callCoord[activeAgentsOutput](t, client, ToolAgentsList, tokenInput{AgentToken: alice.RegistrationToken})
+	if len(agents.Agents) != 2 || agents.Agents[0].Name != "alice" || agents.Agents[1].Name != "bob" {
+		t.Fatalf("active agents = %+v", agents.Agents)
+	}
+	conversation := callCoord[conversationOutput](t, client, ToolConversationOpen,
+		openConversationInput{AgentToken: alice.RegistrationToken, Topic: "restart handoff"})
+	message := callCoord[messageOutput](t, client, ToolMessageSend, sendMessageInput{AgentToken: alice.RegistrationToken,
+		ConversationID: conversation.ConversationID, To: []string{"bob"}, Subject: "handoff", Body: "durable payload",
+		AcknowledgementRequired: true})
+	inbox := callCoord[messagePageOutput](t, client, ToolInboxFetch,
+		fetchInboxInput{AgentToken: bob.RegistrationToken, UnreadOnly: true, Limit: 32})
+	if len(inbox.Messages) != 1 || inbox.Messages[0].MessageID != message.MessageID {
+		t.Fatalf("bob inbox = %+v", inbox)
+	}
+	read := callCoord[deliveryFactOutput](t, client, ToolMessageMarkRead,
+		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID})
+	ack := callCoord[deliveryFactOutput](t, client, ToolMessageAcknowledge,
+		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID})
+	if !read.Read || !ack.Read || !ack.Acknowledged {
+		t.Fatalf("read/ack = %+v / %+v", read, ack)
+	}
+	if unread := callCoord[messagePageOutput](t, client, ToolInboxFetch,
+		fetchInboxInput{AgentToken: bob.RegistrationToken, UnreadOnly: true, Limit: 32}); len(unread.Messages) != 0 {
+		t.Fatalf("read message remained unread: %+v", unread)
+	}
+	if all := callCoord[messagePageOutput](t, client, ToolInboxFetch,
+		fetchInboxInput{AgentToken: bob.RegistrationToken, Limit: 32}); len(all.Messages) != 1 {
+		t.Fatalf("all inbox omitted read message: %+v", all)
+	}
+	reply := callCoord[messageOutput](t, client, ToolMessageReply, replyMessageInput{sendMessageInput: sendMessageInput{
+		AgentToken: bob.RegistrationToken, ConversationID: conversation.ConversationID, To: []string{"alice"},
+		Subject: "re: handoff", Body: "received", AcknowledgementRequired: false}, ReplyToMessageID: message.MessageID})
+	if reply.ReplyTo != message.MessageID {
+		t.Fatalf("reply = %+v", reply)
+	}
+	lease := callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: alice.RegistrationToken, Mode: "exclusive", TTLSeconds: 3600,
+		Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "src"}},
+	})
+	if lease.LeaseID == "" || len(lease.Fences) == 0 {
+		t.Fatalf("lease = %+v", lease)
+	}
+
+	closeMCP()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = sqlite.Open(context.Background(), sqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	server = newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
+		&testSessionBinder{session: parseSession(t)}, store)
+	client, closeMCP = connect(t, server)
+	defer closeMCP()
+	aliceToken, bobToken := alice.RegistrationToken, bob.RegistrationToken
+	callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice", RegistrationToken: &aliceToken})
+	callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob", RegistrationToken: &bobToken})
+	renewed := callCoord[reservationOutput](t, client, ToolReservationRenew, reservationChangeInput{AgentToken: aliceToken,
+		LeaseID: lease.LeaseID, Fences: lease.Fences, TTLSeconds: 3600})
+	if renewed.LeaseID != lease.LeaseID {
+		t.Fatalf("renewed lease = %+v", renewed)
+	}
+	thread := callCoord[messagePageOutput](t, client, ToolThreadFetch, fetchThreadInput{AgentToken: aliceToken,
+		ConversationID: conversation.ConversationID, Limit: 32})
+	if len(thread.Messages) != 2 || thread.Messages[0].Body != "durable payload" || !thread.Messages[0].Deliveries[0].Acknowledged ||
+		thread.Messages[1].ReplyTo != message.MessageID {
+		t.Fatalf("durable thread = %+v", thread)
+	}
+	conflict, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolReservationAcquire,
+		Arguments: reservationAcquireInput{AgentToken: bobToken, Mode: "exclusive", TTLSeconds: 3600,
+			Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}}})
+	if err != nil {
+		t.Fatalf("reservation conflict call: %v", err)
+	}
+	if !conflict.IsError || !strings.Contains(strings.ToLower(conflict.Content[0].(*sdkmcp.TextContent).Text), "lease") {
+		t.Fatalf("overlapping reservation did not conflict: %+v", conflict)
+	}
+	callCoord[reservationOutput](t, client, ToolReservationRelease, reservationChangeInput{AgentToken: aliceToken,
+		LeaseID: renewed.LeaseID, Fences: renewed.Fences})
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
+		Mode: "exclusive", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: aliceToken,
+		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "docs"}}})
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
+		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "docs/guide.md"}}})
+}
+
+func callCoord[Output any](t *testing.T, session *sdkmcp.ClientSession, tool string, input any) Output {
+	t.Helper()
+	result, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: tool, Arguments: input})
+	if err != nil {
+		t.Fatalf("%s: %v", tool, err)
+	}
+	if result.IsError {
+		t.Fatalf("%s tool error: %+v", tool, result.Content)
+	}
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal %s output: %v", tool, err)
+	}
+	var output Output
+	if err := json.Unmarshal(encoded, &output); err != nil {
+		t.Fatalf("decode %s output: %v", tool, err)
+	}
+	return output
+}
+
 func callHTTP(t *testing.T, handlers *testHandlers, request contracts.EventsSyncRequestDTO) ([]byte, int) {
 	t.Helper()
 	handler, err := httptransport.NewHandler(httptransport.Dependencies{
@@ -282,6 +431,8 @@ func callHTTP(t *testing.T, handlers *testHandlers, request contracts.EventsSync
 		DevicePairingBegin: handlers, DevicePair: handlers, WorkspaceCreate: handlers, WorkspaceMemberInvite: handlers,
 		WorkspaceMembershipAccept: handlers, ActorCreate: handlers, ActorDelegationPropose: handlers,
 		ActorDelegationActivate: handlers, SessionStart: handlers, ContextGet: handlers, EventsSync: handlers,
+		WorkRefObserve: handlers, ObjectiveAndWorkCreate: handlers, ObjectiveActivate: handlers,
+		RunPlanWithBindings: handlers, RunJoin: handlers, RunStart: handlers,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -309,13 +460,20 @@ func callMCP(t *testing.T, handlers *testHandlers, request contracts.EventsSyncR
 	return result
 }
 
-func newTestServer(t *testing.T, handlers *testHandlers, binder CurrentSessionBinder) *Server {
+func newTestServer(t *testing.T, handlers *testHandlers, binder CurrentSessionBinder, coordination ...application.LocalCoordinationStore) *Server {
 	t.Helper()
+	var coordinationStore application.LocalCoordinationStore
+	if len(coordination) != 0 {
+		coordinationStore = coordination[0]
+	}
 	server, err := NewServer(Dependencies{
 		Authenticator: testMCPAuthenticator{}, CurrentSession: binder, InstallationBootstrap: handlers,
+		Coordination:      coordinationStore,
 		PrincipalRegister: handlers, DevicePairingBegin: handlers, DevicePair: handlers, WorkspaceCreate: handlers,
 		WorkspaceMemberInvite: handlers, WorkspaceMembershipAccept: handlers, ActorCreate: handlers,
 		ActorDelegationPropose: handlers, ActorDelegationActivate: handlers, SessionStart: handlers,
+		WorkRefObserve: handlers, ObjectiveAndWorkCreate: handlers, ObjectiveActivate: handlers,
+		RunPlanWithBindings: handlers, RunJoin: handlers, RunStart: handlers,
 		ContextGet: handlers, EventsSync: handlers,
 	})
 	if err != nil {
