@@ -1784,11 +1784,7 @@ func (request RunPlanWithBindingsRequestDTO) Values() (RunPlanWithBindingsValues
 			return RunPlanWithBindingsValues{}, invalid(prefix+".participation_id", "must not duplicate an earlier participation")
 		}
 		seenParticipation[key] = struct{}{}
-		participants[index] = RunParticipantValues{
-			ParticipationID: plan.ParticipationID, ActorID: plan.ActorID,
-			ExpectedActorVersion: plan.ExpectedActorVersion, SessionID: plan.SessionID,
-			ExpectedSessionVersion: plan.ExpectedSessionVersion, Role: plan.Role,
-		}
+		participants[index] = RunParticipantValues(plan)
 	}
 	seenBinding := make(map[string]struct{}, len(request.Body.Bindings))
 	bindings := make([]RuntimeBindingValues, len(request.Body.Bindings))
@@ -1814,10 +1810,7 @@ func (request RunPlanWithBindingsRequestDTO) Values() (RunPlanWithBindingsValues
 			return RunPlanWithBindingsValues{}, invalid(prefix+".binding_id", "must not duplicate an earlier binding")
 		}
 		seenBinding[key] = struct{}{}
-		bindings[index] = RuntimeBindingValues{
-			BindingID: plan.BindingID, ParticipationID: plan.ParticipationID, SessionID: plan.SessionID,
-			RuntimeEndpointID: plan.RuntimeEndpointID, ExpectedRuntimeEndpointVersion: plan.ExpectedRuntimeEndpointVersion,
-		}
+		bindings[index] = RuntimeBindingValues(plan)
 	}
 	return RunPlanWithBindingsValues{
 		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
@@ -1990,9 +1983,7 @@ func (request RunStartRequestDTO) Values() (RunStartValues, error) {
 			return RunStartValues{}, invalid(prefix+".participation_id", "must not duplicate an earlier participation")
 		}
 		seen[key] = struct{}{}
-		participations[index] = RunStartParticipationValues{
-			ParticipationID: participation.ParticipationID, ExpectedVersion: participation.ExpectedVersion,
-		}
+		participations[index] = RunStartParticipationValues(participation)
 	}
 	return RunStartValues{
 		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,

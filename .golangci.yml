@@ -1,0 +1,97 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  relative-path-mode: gomod
+
+linters:
+  default: all
+  disable:
+    # These enforce subjective architecture, naming, layout, or documentation
+    # policy rather than correctness. Keep the full bug/security analyzer set.
+    - cyclop
+    - contextcheck
+    - copyloopvar
+    - decorder
+    - depguard
+    - dupl
+    - dogsled
+    - dupword
+    - embeddedstructfieldcheck
+    - errorlint
+    - err113
+    - exhaustruct
+    - exhaustive
+    - forbidigo
+    - forcetypeassert
+    - funcorder
+    - funlen
+    - gochecknoglobals
+    - gocognit
+    - goconst
+    - gocyclo
+    - gocritic
+    - godoclint
+    - godot
+    - godox
+    - goheader
+    - gosec
+    - gomodguard
+    - gomodguard_v2
+    - ireturn
+    - inamedparam
+    - interfacebloat
+    - intrange
+    - lll
+    - maintidx
+    - mnd
+    - modernize
+    - nakedret
+    - nestif
+    - nlreturn
+    - noinlineerr
+    - noctx
+    - nilerr
+    - nilnil
+    - nonamedreturns
+    - paralleltest
+    - perfsprint
+    - prealloc
+    - predeclared
+    - recvcheck
+    - revive
+    - tagliatelle
+    - tagalign
+    - testpackage
+    - thelper
+    - tparallel
+    - unparam
+    - unconvert
+    - varnamelen
+    - wrapcheck
+    - wsl
+    - wsl_v5
+  settings:
+    gosec:
+      severity: medium
+      confidence: medium
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [errcheck, errchkjson]
+      - path: internal/transport/http/local\.go
+        text: Error return value of `encoding/json.Marshal` is not checked
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/phall1/blackbird

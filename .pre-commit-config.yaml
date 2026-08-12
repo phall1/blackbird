@@ -1,0 +1,30 @@
+minimum_prek_version: "0.2.0"
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+fail_fast: true
+
+repos:
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt (autofix)
+        entry: gofmt -w
+        language: system
+        types: [go]
+      - id: go-vet
+        name: go vet
+        entry: go vet ./...
+        language: system
+        pass_filenames: false
+      - id: golangci-fast
+        name: golangci-lint (fast)
+        entry: golangci-lint run --fix --fast-only
+        language: system
+        pass_filenames: false
+      - id: quality-gate
+        name: full quality gate
+        entry: make check
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        always_run: true

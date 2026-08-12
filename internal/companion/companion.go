@@ -240,16 +240,16 @@ func (companion *Companion) processReady(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = rows.Close() }()
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
 			return err
 		}
 		ids = append(ids, id)
 	}
-	if err := rows.Close(); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 	for _, id := range ids {
@@ -302,9 +302,12 @@ func (companion *Companion) deliver(ctx context.Context, messageID string) error
 	}
 	runErr := command.Wait()
 	output := outputBuffer.Bytes()
-	evidence, _ := json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "arguments": args[:len(args)-1], "output": json.RawMessage(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
+	evidence, err := json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "arguments": args[:len(args)-1], "output": json.RawMessage(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
 	if !json.Valid(output) {
-		evidence, _ = json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "output_text": string(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
+		evidence, err = json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "output_text": string(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
+	}
+	if err != nil {
+		return companion.retry(messageID, fmt.Errorf("marshal transcript evidence: %w", err))
 	}
 	if writeErr := os.WriteFile(transcript, evidence, 0o600); writeErr != nil {
 		_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "Claude completed but transcript evidence could not be written: "+writeErr.Error(), messageID)

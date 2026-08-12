@@ -2237,27 +2237,25 @@ func loadActorSessionState(ctx context.Context, tx *sql.Tx, id string) (domain.A
 	if err != nil {
 		return domain.ActorSessionState{}, err
 	}
+	defer func() { _ = grantRows.Close() }()
 	var grants []domain.AggregateRef
 	for grantRows.Next() {
 		var grantID string
 		var grantVersion uint64
 		if err := grantRows.Scan(&grantID, &grantVersion); err != nil {
-			_ = grantRows.Close()
 			return domain.ActorSessionState{}, err
 		}
 		gid, e := domain.ParseGrantID(grantID)
 		if e != nil {
-			_ = grantRows.Close()
 			return domain.ActorSessionState{}, e
 		}
 		ref, e := domain.NewAggregateRef(gid, mustVersion(grantVersion))
 		if e != nil {
-			_ = grantRows.Close()
 			return domain.ActorSessionState{}, e
 		}
 		grants = append(grants, ref)
 	}
-	if err := grantRows.Close(); err != nil {
+	if err := grantRows.Err(); err != nil {
 		return domain.ActorSessionState{}, err
 	}
 	policy, err := domain.NewPolicyRevision(policyText)

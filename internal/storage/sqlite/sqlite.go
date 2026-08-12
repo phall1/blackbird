@@ -21,9 +21,10 @@ import (
 	"sync"
 	"time"
 
+	sqlitedriver "modernc.org/sqlite"
+
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
-	sqlitedriver "modernc.org/sqlite"
 )
 
 const (

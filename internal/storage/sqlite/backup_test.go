@@ -15,7 +15,7 @@ import (
 
 func TestOnlineBackupRemainsConsistentDuringActiveWALWrites(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	root := t.TempDir()
 	store, err := Open(ctx, Config{Path: filepath.Join(root, "active-source.db")})

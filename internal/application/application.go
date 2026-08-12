@@ -23,8 +23,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/phall1/blackbird/internal/domain"
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/phall1/blackbird/internal/domain"
 )
 
 const (

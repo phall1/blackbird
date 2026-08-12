@@ -246,6 +246,9 @@ func TestStaticBoundaryHasNoShellOrProviderStorageKnowledge(t *testing.T) {
 }
 
 func TestRealSupportedInterface(t *testing.T) {
+	if os.Getenv("BLACKBIRD_RUN_EXTERNAL_TESTS") != "1" {
+		t.Skip("set BLACKBIRD_RUN_EXTERNAL_TESTS=1 to probe the installed bd and live issue store")
+	}
 	const executable = "/opt/homebrew/bin/bd"
 	if _, err := os.Stat(executable); err != nil {
 		t.Skip("supported bd fixture is not installed")

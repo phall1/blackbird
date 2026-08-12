@@ -90,12 +90,15 @@ with private directory and file permissions.
 ## Development
 
 ```sh
-go test ./...
-go test -race ./...
-go vet ./...
-golangci-lint run ./...
-go build ./...
+make lint       # all enabled static analyzers and formatting checks
+make test-race  # shuffled tests under the race detector
+make check      # the complete pre-push/CI quality gate
+make hooks      # install fast pre-commit and exhaustive pre-push hooks with prek
 ```
+
+The live `bd` compatibility probe is intentionally excluded from hermetic test
+runs. Set `BLACKBIRD_RUN_EXTERNAL_TESTS=1` to exercise it against the installed
+binary and local issue store.
 
 Build metadata can be supplied with linker flags targeting `main.version`,
 `main.commit`, and `main.builtAt`. Unset fields use explicit development
