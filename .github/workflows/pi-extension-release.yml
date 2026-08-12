@@ -30,6 +30,7 @@ jobs:
           TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
           DRY_RUN: ${{ github.event_name == 'push' && 'false' || inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           npm install --global npm@11.5.1
