@@ -464,21 +464,47 @@ function isAborted(signal: AbortSignal): boolean {
   return signal.aborted
 }
 
+interface SharedSupervisor {
+  references: number
+  readonly controller: AbortController
+  readonly task: Promise<void>
+}
+
+const supervisors = new Map<string, SharedSupervisor>()
+
+export function acquireSupervisor(key: string, start: (signal: AbortSignal) => Promise<void>): () => Promise<void> {
+  const existing = supervisors.get(key)
+  if (existing) {
+    existing.references += 1
+    return releaseSupervisor(key, existing)
+  }
+  const controller = new AbortController()
+  const supervisor: SharedSupervisor = { references: 1, controller, task: start(controller.signal) }
+  supervisors.set(key, supervisor)
+  return releaseSupervisor(key, supervisor)
+}
+
+function releaseSupervisor(key: string, supervisor: SharedSupervisor): () => Promise<void> {
+  return async () => {
+    supervisor.references -= 1
+    if (supervisor.references !== 0 || supervisors.get(key) !== supervisor) return
+    supervisors.delete(key)
+    supervisor.controller.abort()
+    await supervisor.task
+  }
+}
+
 export default Plugin.define({
   id: "phall1.blackbird",
   setup: (ctx) => {
-    resolveOptions(ctx.options)
-    const controller = new AbortController()
+    const options = resolveOptions(ctx.options)
     const session: SessionClient = {
       create: async (input) => ctx.session.create(input),
       prompt: async (input) => ctx.session.prompt(input),
     }
-    const task = runSupervisor(session, ctx.options, controller.signal).catch((error: unknown) => {
-      if (!controller.signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
-    })
-    return async () => {
-      controller.abort()
-      await task
-    }
+    const key = `${options.baseUrl.toString()}\0${options.projectKey}\0${options.agentName}\0${options.stateDir}`
+    return acquireSupervisor(key, (signal) => runSupervisor(session, ctx.options, signal).catch((error: unknown) => {
+      if (!signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
+    }))
   },
 })

@@ -11,9 +11,9 @@ it.
 {
   "plugins": [
     {
-      "package": "blackbird-opencode@0.1.1",
+      "package": "blackbird-opencode@0.1.2",
       "options": {
-        "baseUrl": "http://127.0.0.1:8081",
+        "baseUrl": "http://127.0.0.1:8080",
         "projectKey": "~/workspace/project",
         "agentName": "OpenCode",
         "routing": { "mode": "conversation" }

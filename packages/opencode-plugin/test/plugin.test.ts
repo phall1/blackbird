@@ -2,7 +2,7 @@ import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { deterministicMessageID, resolveOptions, runSupervisor, type SessionClient } from "../src/index.js"
+import { acquireSupervisor, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient } from "../src/index.js"
 
 const controllers: AbortController[] = []
 afterEach(() => { for (const controller of controllers) controller.abort() })
@@ -32,6 +32,23 @@ describe("configuration and IDs", () => {
 })
 
 describe("supervisor", () => {
+  it("shares one supervisor across repeated OpenCode project activations", async () => {
+    let starts = 0
+    let stopped = false
+    const start = async (signal: AbortSignal) => {
+      starts += 1
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))
+      stopped = true
+    }
+    const releaseFirst = acquireSupervisor("identity", start)
+    const releaseSecond = acquireSupervisor("identity", start)
+    expect(starts).toBe(1)
+    await releaseFirst()
+    expect(stopped).toBe(false)
+    await releaseSecond()
+    expect(stopped).toBe(true)
+  })
+
   it("registers, catches up opaque events, fetches exact messages, and treats SSE as wake-only", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "blackbird-plugin-"))
     const controller = new AbortController()
