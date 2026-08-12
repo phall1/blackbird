@@ -193,6 +193,9 @@ func TestStatusReportsDormantLaunchdUpdaterAsScheduled(t *testing.T) {
 	if !strings.Contains(status, "daemon=running") || !strings.Contains(status, "companion=running") || !strings.Contains(status, "updater=scheduled") {
 		t.Fatalf("status = %q", status)
 	}
+	if strings.Contains(status, "state = exited") {
+		t.Fatalf("status leaked launchctl output: %q", status)
+	}
 }
 
 func TestInstallRejectsUpdateIntervalOutsideBounds(t *testing.T) {
