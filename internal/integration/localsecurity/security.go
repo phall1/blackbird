@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/lexfrei/keychain"
+
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 )

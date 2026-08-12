@@ -1342,9 +1342,10 @@ func (store *Store) RecordDeliveryFact(ctx context.Context, params application.R
 		}
 		if changed {
 			eventType := application.CoordinationEventMessageAvailable
-			if params.Kind == application.DeliveryRead {
+			switch params.Kind {
+			case application.DeliveryRead:
 				eventType = application.CoordinationEventMessageRead
-			} else if params.Kind == application.DeliveryAcknowledged {
+			case application.DeliveryAcknowledged:
 				eventType = application.CoordinationEventMessageAcknowledged
 			}
 			payload, payloadErr := coordinationPayload(map[string]any{"message_id": params.MessageID.String()})
@@ -1391,16 +1392,16 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		if err != nil {
 			return err
 		}
+		defer func() { _ = rows.Close() }()
 		var existing []existingSelector
 		for rows.Next() {
 			var value existingSelector
 			if err := rows.Scan(&value.lease, &value.mode, &value.kind, &value.value, &value.expires); err != nil {
-				_ = rows.Close()
 				return err
 			}
 			existing = append(existing, value)
 		}
-		if err := rows.Close(); err != nil {
+		if err := rows.Err(); err != nil {
 			return err
 		}
 		keys := make(map[string]struct{}, len(params.Selectors))
@@ -1629,6 +1630,9 @@ func loadLease(ctx context.Context, query leaseQuery, id domain.LeaseID) (applic
 		}
 		selectors = append(selectors, selector)
 	}
+	if err := selectorRows.Err(); err != nil {
+		return application.Lease{}, err
+	}
 	if err := selectorRows.Close(); err != nil {
 		return application.Lease{}, err
 	}
@@ -1649,6 +1653,9 @@ func loadLease(ctx context.Context, query leaseQuery, id domain.LeaseID) (applic
 			return application.Lease{}, err
 		}
 		fences = append(fences, fence)
+	}
+	if err := fenceRows.Err(); err != nil {
+		return application.Lease{}, err
 	}
 	params := application.LeaseViewParams{LeaseID: id, WorkspaceID: workspace, Holder: holder, HolderSession: session,
 		AuthorityEpoch: epoch, Mode: application.LeaseMode(mode), Selectors: selectors, Fences: fences,

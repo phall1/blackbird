@@ -299,7 +299,7 @@ func deviceIngress(t *testing.T, fixture authenticationFixture) VerifiedIngress 
 	ingress, err := NewVerifiedIngress(VerifiedIngressParams{
 		PrincipalID: fixture.principal.ID(), DeviceID: &deviceID,
 		CredentialFingerprint: fixture.spki,
-		AuthorityEpoch: fixture.epoch, ChannelBinding: fixture.channelBinding,
+		AuthorityEpoch:        fixture.epoch, ChannelBinding: fixture.channelBinding,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -434,10 +434,10 @@ func TestProductionAuthenticatorMapsSafeAuthenticationRejections(t *testing.T) {
 	sessionIngress := sessionIngress(t, fixture)
 
 	for _, test := range []struct {
-		name   string
-		code   domain.ErrorCode
+		name    string
+		code    domain.ErrorCode
 		ingress VerifiedIngress
-		verify func(*testing.T, *ErrorDTO)
+		verify  func(*testing.T, *ErrorDTO)
 	}{
 		{
 			name: "unauthenticated device credential", code: domain.ErrorCodeUnauthenticated, ingress: deviceIngress,

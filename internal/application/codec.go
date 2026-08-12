@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gowebpki/jcs"
+
 	"github.com/phall1/blackbird/internal/domain"
 )
 
