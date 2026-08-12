@@ -23,6 +23,9 @@ func TestCoordinationSurfaceFailsExplicitlyUntilPostgresIsImplemented(t *testing
 	if _, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{}); !errors.Is(err, application.ErrCoordinationUnsupported) {
 		t.Fatalf("AcquireLease error=%v", err)
 	}
+	if _, err := store.SyncCoordinationEvents(context.Background(), application.CoordinationEventsQuery{}); !errors.Is(err, application.ErrCoordinationUnsupported) {
+		t.Fatalf("SyncCoordinationEvents error=%v", err)
+	}
 }
 
 func TestSchemaStaticallyMatchesSQLiteLogicalTablesAndNativeTypes(t *testing.T) {

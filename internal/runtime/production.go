@@ -147,9 +147,17 @@ func composeProduction(_ context.Context, storage Storage) (HandlerBundle, error
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose HTTP transport: %w", err)
 	}
+	coordination := localCoordinationStore(storage)
+	localHTTPHandler, err := httptransport.NewLocalHandler(httptransport.LocalDependencies{Coordination: coordination})
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose local HTTP transport: %w", err)
+	}
+	httpMux := http.NewServeMux()
+	httpMux.Handle("/api/v1/local/", localHTTPHandler)
+	httpMux.Handle("/", httpHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Authenticator: mcpIngressAuthenticator{ingress}, CurrentSession: productionCurrentSession{},
-		Coordination:          localCoordinationStore(storage),
+		Coordination:          coordination,
 		InstallationBootstrap: handler, PrincipalRegister: handler,
 		DevicePairingBegin: handler, DevicePair: handler, WorkspaceCreate: handler,
 		WorkspaceMemberInvite: handler, WorkspaceMembershipAccept: handler,
@@ -161,7 +169,7 @@ func composeProduction(_ context.Context, storage Storage) (HandlerBundle, error
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose MCP transport: %w", err)
 	}
-	return HandlerBundle{HTTP: httpHandler, MCP: mcpServer.HTTPHandler(nil)}, nil
+	return HandlerBundle{HTTP: httpMux, MCP: mcpServer.HTTPHandler(nil)}, nil
 }
 
 func localCoordinationStore(storage Storage) application.LocalCoordinationStore {

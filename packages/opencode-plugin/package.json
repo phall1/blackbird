@@ -1,0 +1,60 @@
+{
+  "name": "blackbird-opencode",
+  "version": "0.1.0",
+  "description": "Deliver durable Blackbird messages into OpenCode V2 sessions.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit && eslint src test",
+    "test": "vitest run",
+    "test:pack": "npm run build && node scripts/pack-test.mjs",
+    "prepack": "npm run build",
+    "gates": "npm run check && npm test && npm run test:pack"
+  },
+  "keywords": [
+    "blackbird",
+    "opencode",
+    "plugin",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phall1/blackbird.git",
+    "directory": "packages/opencode-plugin"
+  },
+  "bugs": {
+    "url": "https://github.com/phall1/blackbird/issues"
+  },
+  "homepage": "https://github.com/phall1/blackbird/tree/main/packages/opencode-plugin#readme",
+  "dependencies": {
+    "@opencode-ai/plugin": "0.0.0-next-17307"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.33.0",
+    "@types/node": "24.2.1",
+    "eslint": "9.33.0",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.39.1",
+    "vitest": "3.2.7"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

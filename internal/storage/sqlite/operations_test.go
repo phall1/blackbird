@@ -146,12 +146,69 @@ func TestCoordinationMessagePrivacyAndIndependentFacts(t *testing.T) {
 	if _, ok := read.AcknowledgedAt(); !ok {
 		t.Fatal("read regressed acknowledgement")
 	}
-	if _, ok := read.AvailableAt(); ok {
-		t.Fatal("read implied availability")
+	readAt, _ := read.ReadAt()
+	if availableAt, ok := read.AvailableAt(); !ok || availableAt.After(readAt) {
+		t.Fatal("send-time availability was not retained")
 	}
 	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
 		MessageID: messageID, Recipient: outsider, ActorSessionID: &session, Kind: application.DeliveryRead}); !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("outsider read error=%v", err)
+	}
+}
+
+func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	workspace := coordinationWorkspace(t, 300)
+	author := coordinationActor(t, 301)
+	recipient := coordinationActor(t, 302)
+	other := coordinationActor(t, 303)
+	session, _ := domain.ParseActorSessionID(coordinationUUID(304))
+	run, _ := domain.ParseRunID(coordinationUUID(305))
+	conversationID, _ := domain.ParseConversationID(coordinationUUID(306))
+	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{ConversationID: conversationID,
+		WorkspaceID: workspace, RunID: run, OpenedBy: author, OpenedBySession: session, Topic: "journal"}); err != nil {
+		t.Fatal(err)
+	}
+	to, _ := application.NewRecipient(recipient, application.RecipientTo)
+	for index := 0; index < 2; index++ {
+		messageID, _ := domain.ParseMessageID(coordinationUUID(310 + index))
+		if _, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+			ConversationID: conversationID, WorkspaceID: workspace, Author: author, AuthorSession: session,
+			Subject: "event", Body: "body", Recipients: []application.Recipient{to}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	query, _ := application.NewCoordinationEventsQuery(workspace, recipient, application.CoordinationEventCursor{}, 1)
+	first, err := store.SyncCoordinationEvents(context.Background(), query)
+	if err != nil || len(first.Events()) != 1 || !first.HasMore() || first.NextCursor().IsZero() ||
+		first.Events()[0].EventType() != application.CoordinationEventMessageAvailable || first.Events()[0].ActorID() != recipient {
+		t.Fatalf("first coordination page=%+v error=%v", first, err)
+	}
+	continued, _ := application.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
+	second, err := store.SyncCoordinationEvents(context.Background(), continued)
+	if err != nil || len(second.Events()) != 1 || second.HasMore() || second.Events()[0].Position() <= first.Events()[0].Position() {
+		t.Fatalf("second coordination page=%+v error=%v", second, err)
+	}
+	otherQuery, _ := application.NewCoordinationEventsQuery(workspace, other, application.CoordinationEventCursor{}, 10)
+	private, err := store.SyncCoordinationEvents(context.Background(), otherQuery)
+	if err != nil || len(private.Events()) != 0 {
+		t.Fatalf("other actor events=%d error=%v", len(private.Events()), err)
+	}
+	scopeMismatch, _ := application.NewCoordinationEventsQuery(workspace, other, first.NextCursor(), 1)
+	if _, err := store.SyncCoordinationEvents(context.Background(), scopeMismatch); err == nil {
+		t.Fatal("actor-scoped cursor was accepted for another actor")
+	}
+	tampered, _ := application.NewCoordinationEventCursor(first.NextCursor().String() + "x")
+	tamperedQuery, _ := application.NewCoordinationEventsQuery(workspace, recipient, tampered, 1)
+	if _, err := store.SyncCoordinationEvents(context.Background(), tamperedQuery); err == nil {
+		t.Fatal("tampered coordination cursor was accepted")
+	}
+	if _, err := store.db.Exec(`UPDATE coordination_events SET event_type = 'message.read'`); err == nil {
+		t.Fatal("coordination event update was accepted")
+	}
+	if _, err := store.db.Exec(`DELETE FROM coordination_events`); err == nil {
+		t.Fatal("coordination event delete was accepted")
 	}
 }
 

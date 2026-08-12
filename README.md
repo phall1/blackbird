@@ -11,6 +11,8 @@ The released product includes:
   discovery;
 - conversations, immutable messages, replies, inboxes, threads, independent
   read and acknowledgement facts, and To/Cc/Bcc privacy;
+- a private, tamper-evident coordination event journal with authenticated
+  catch-up cursors and a wake-only SSE stream;
 - shared and exclusive exact/subtree file reservations with expiry, renewal,
   overlap detection, and fencing tokens;
 - strict W0 identity and W1 work/run contracts with idempotent orchestration;
@@ -53,6 +55,37 @@ All tools except initial registration authenticate with the returned
 `agent_token`. Reserve the narrowest relevant paths before editing, use one
 conversation per work item, acknowledge required handoffs, and release
 reservations when work completes.
+
+## OpenCode Push Delivery
+
+The `blackbird-opencode` package is an OpenCode V2 plugin that turns durable
+`message.available` events into queued, resumable OpenCode session prompts. It
+uses SSE only as a low-latency wake signal, catches up from the SQLite event
+journal after every reconnect, resolves each message through a privacy-checked
+endpoint, and does not mark or acknowledge mail on the agent's behalf.
+
+Add it to OpenCode's `plugins` configuration with an absolute repository path:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "blackbird-opencode@0.1.0",
+      "options": {
+        "baseUrl": "http://127.0.0.1:8081",
+        "projectKey": "/absolute/path/to/project",
+        "agentName": "OpenCode",
+        "routing": { "mode": "conversation" }
+      }
+    }
+  ]
+}
+```
+
+OpenCode installs the package and its production dependencies in its isolated
+plugin cache. Registration tokens, opaque cursors, deduplication facts, and
+conversation-to-session bindings are stored under `$XDG_STATE_HOME/blackbird`
+with private directory and file permissions.
 
 ## Development
 

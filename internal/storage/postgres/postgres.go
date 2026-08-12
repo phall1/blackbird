@@ -1103,6 +1103,9 @@ func (store *Store) OpenConversation(context.Context, application.OpenConversati
 func (store *Store) SendMessage(context.Context, application.SendMessageParams) (application.Message, error) {
 	return application.Message{}, application.ErrCoordinationUnsupported
 }
+func (store *Store) GetVisibleMessage(context.Context, domain.WorkspaceID, domain.ActorID, domain.MessageID) (application.Message, error) {
+	return application.Message{}, application.ErrCoordinationUnsupported
+}
 func (store *Store) Inbox(context.Context, application.InboxQuery) (application.CoordinationPage, error) {
 	return application.CoordinationPage{}, application.ErrCoordinationUnsupported
 }
@@ -1123,4 +1126,7 @@ func (store *Store) ReleaseLease(context.Context, application.ChangeLeaseParams)
 }
 func (store *Store) ValidateFence(context.Context, domain.LeaseID, domain.AuthorityEpoch, []application.Fence) error {
 	return application.ErrCoordinationUnsupported
+}
+func (store *Store) SyncCoordinationEvents(context.Context, application.CoordinationEventsQuery) (application.CoordinationEventsPage, error) {
+	return application.CoordinationEventsPage{}, application.ErrCoordinationUnsupported
 }

@@ -1,0 +1,246 @@
+name: Release OpenCode plugin
+
+on:
+  push:
+    tags:
+      - "opencode-plugin-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing opencode-plugin-vX.Y.Z tag to validate
+        required: true
+        type: string
+      dry_run:
+        description: Build and validate without publishing npm or GitHub releases
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-plugin-release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_DIRECTORY: packages/opencode-plugin
+
+jobs:
+  prepare:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      package_name: ${{ steps.release.outputs.package_name }}
+      dry_run: ${{ steps.release.outputs.dry_run }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+      - name: Validate tag and package version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="$PUSH_TAG"
+            dry_run=false
+          else
+            tag="$DISPATCH_TAG"
+            dry_run="$DISPATCH_DRY_RUN"
+          fi
+
+          if [[ ! "$tag" =~ ^opencode-plugin-v([0-9]+[.][0-9]+[.][0-9]+)$ ]]; then
+            echo "::error::release tags must have the form opencode-plugin-vX.Y.Z"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "refs/tags/${tag}")" || {
+            echo "::error::workflow source must be the commit referenced by ${tag}"
+            exit 1
+          }
+
+          package_version="$(node -p "require('./${PACKAGE_DIRECTORY}/package.json').version")"
+          package_name="$(node -p "require('./${PACKAGE_DIRECTORY}/package.json').name")"
+          test "$package_version" = "$version" || {
+            echo "::error::${PACKAGE_DIRECTORY}/package.json version ${package_version} does not match tag version ${version}"
+            exit 1
+          }
+          test -n "$package_name"
+          test "$dry_run" = true || test "$dry_run" = false
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "package_name=$package_name"
+            echo "dry_run=$dry_run"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Build and test exact package
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.PACKAGE_DIRECTORY }}/package-lock.json
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.5.1
+
+      - name: Install, test, and build
+        working-directory: ${{ env.PACKAGE_DIRECTORY }}
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Create the release tarball once
+        id: pack
+        working-directory: ${{ env.PACKAGE_DIRECTORY }}
+        env:
+          EXPECTED_NAME: ${{ needs.prepare.outputs.package_name }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          tarball="$(npm pack --json | node -e '
+            let input = "";
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename));
+          ')"
+          test -f "$tarball"
+          mv "$tarball" "release/$tarball"
+
+          packed_manifest="$(tar -xOf "release/$tarball" package/package.json)"
+          packed_name="$(node -p 'JSON.parse(process.argv[1]).name' "$packed_manifest")"
+          packed_version="$(node -p 'JSON.parse(process.argv[1]).version' "$packed_manifest")"
+          test "$packed_name" = "$EXPECTED_NAME"
+          test "$packed_version" = "$EXPECTED_VERSION"
+          (cd release && sha256sum "$tarball" > "${tarball}.sha256")
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Install and verify the exact release tarball
+        env:
+          EXPECTED_NAME: ${{ needs.prepare.outputs.package_name }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          tarball="$PWD/${PACKAGE_DIRECTORY}/release/${TARBALL}"
+          test_dir="$(mktemp -d)"
+          cd "$test_dir"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --package-lock=false "$tarball"
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const packageName = process.env.EXPECTED_NAME;
+            const manifest = JSON.parse(fs.readFileSync(path.join("node_modules", packageName, "package.json"), "utf8"));
+            if (manifest.name !== packageName || manifest.version !== process.env.EXPECTED_VERSION) process.exit(1);
+          '
+          npm ls --depth=0 "${EXPECTED_NAME}@${EXPECTED_VERSION}"
+
+      - name: Upload immutable npm package
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: opencode-plugin-${{ needs.prepare.outputs.tag }}
+          path: |
+            ${{ env.PACKAGE_DIRECTORY }}/release/*.tgz
+            ${{ env.PACKAGE_DIRECTORY }}/release/*.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish npm package and GitHub release
+    needs: [prepare, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download exact validated package
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: opencode-plugin-${{ needs.prepare.outputs.tag }}
+          path: release
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.5.1
+
+      - name: Verify downloaded package
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tarballs < <(find release -maxdepth 1 -type f -name '*.tgz' -print)
+          test "${#tarballs[@]}" -eq 1
+          (cd release && sha256sum --check "$(basename "${tarballs[0]}").sha256")
+          echo "tarball=${tarballs[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Exercise npm publish without changing the registry
+        if: ${{ needs.prepare.outputs.dry_run == 'true' }}
+        env:
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+        run: npm publish --dry-run "$TARBALL"
+
+      - name: Stage and verify draft GitHub release
+        if: ${{ needs.prepare.outputs.dry_run == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --generate-notes \
+              --title "Blackbird OpenCode plugin ${VERSION}"
+          fi
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$TAG" release/* --clobber
+          mapfile -t expected < <(find release -maxdepth 1 -type f -exec basename {} \; | sort)
+          mapfile -t actual < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
+
+      - name: Publish exact package with provenance
+        if: ${{ needs.prepare.outputs.dry_run == 'false' }}
+        env:
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+        run: npm publish --provenance --access public "$TARBALL"
+
+      - name: Publish verified GitHub release
+        if: ${{ needs.prepare.outputs.dry_run == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false

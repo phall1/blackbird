@@ -3,6 +3,7 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
@@ -27,17 +28,18 @@ import (
 
 const (
 	ApplicationID       = 0x42424d4c
-	SchemaVersion       = 3
+	SchemaVersion       = 4
 	DriverVersion       = "v1.56.0"
 	SQLiteVersion       = "3.53.3"
 	SQLiteSourceID      = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
 	defaultBusyTimeout  = 5 * time.Second
 	maximumBusyTimeout  = 30 * time.Second
 	maximumReadPoolSize = 5
-	schemaChecksumHex   = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
+	schemaChecksumHex   = "78700880f092ecb28b261bcab7fa71d2755062a047d3c4ad51f8c426253f3427"
+	schemaV3ChecksumHex = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
 )
 
-var migrationIDs = [...]string{"0001_w0.sql", "0002_w2_coordination.sql", "0003_local_coordination.sql"}
+var migrationIDs = [...]string{"0001_w0.sql", "0002_w2_coordination.sql", "0003_local_coordination.sql", "0004_coordination_event_journal.sql"}
 
 var (
 	ErrInvalidConfiguration = errors.New("invalid SQLite configuration")
@@ -288,10 +290,60 @@ func (store *Store) initializeOrVerify(ctx context.Context) error {
 	if applicationID == 0 && schemaVersion == 0 && objectCount == 0 {
 		return store.applyInitialMigration(ctx)
 	}
+	if applicationID == ApplicationID && schemaVersion == SchemaVersion-1 {
+		if err := store.applyIncrementalMigration(ctx); err != nil {
+			return err
+		}
+		return store.verifyMigrationLedger(ctx)
+	}
 	if applicationID != ApplicationID || schemaVersion != SchemaVersion {
 		return fmt.Errorf("%w: application_id=%d user_version=%d", ErrSchemaMismatch, applicationID, schemaVersion)
 	}
 	return store.verifyMigrationLedger(ctx)
+}
+
+func (store *Store) applyIncrementalMigration(ctx context.Context) error {
+	return store.withImmediate(ctx, func(tx *sql.Tx) error {
+		if err := verifyMigrationLedgerVersion(ctx, tx, migrationIDs[:len(migrationIDs)-1], SchemaVersion-1,
+			expectedSchemaChecksumHex(schemaV3ChecksumHex)); err != nil {
+			return err
+		}
+		migrationID := migrationIDs[len(migrationIDs)-1]
+		body, checksum, err := migration(migrationID)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+			return fmt.Errorf("apply SQLite migration %s: %w", migrationID, err)
+		}
+		key := make([]byte, sha256.Size)
+		if _, err := rand.Read(key); err != nil {
+			return fmt.Errorf("generate SQLite coordination cursor key: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_event_cursor_keys(singleton, key, created_at_us)
+			VALUES (1, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER))`, key); err != nil {
+			return fmt.Errorf("initialize SQLite coordination cursor key: %w", err)
+		}
+		liveChecksum, err := schemaChecksum(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if liveChecksum != expectedSchemaChecksum() {
+			return fmt.Errorf("%w: migrated schema checksum=%x want=%x", ErrSchemaMismatch, liveChecksum, expectedSchemaChecksum())
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_manifest(schema_version, checksum) VALUES (?, ?)`,
+			SchemaVersion, liveChecksum[:]); err != nil {
+			return fmt.Errorf("record SQLite schema manifest: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state)
+			VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')`, migrationID, checksum[:]); err != nil {
+			return fmt.Errorf("record SQLite migration %s: %w", migrationID, err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(SchemaVersion)); err != nil {
+			return fmt.Errorf("set SQLite schema version: %w", err)
+		}
+		return nil
+	})
 }
 
 func (store *Store) applyInitialMigration(ctx context.Context) error {
@@ -306,6 +358,14 @@ func (store *Store) applyInitialMigration(ctx context.Context) error {
 				return fmt.Errorf("apply SQLite migration %s: %w", migrationID, err)
 			}
 			checksums[migrationID] = checksum
+		}
+		key := make([]byte, sha256.Size)
+		if _, err := rand.Read(key); err != nil {
+			return fmt.Errorf("generate SQLite coordination cursor key: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_event_cursor_keys(singleton, key, created_at_us)
+			VALUES (1, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER))`, key); err != nil {
+			return fmt.Errorf("initialize SQLite coordination cursor key: %w", err)
 		}
 		liveChecksum, err := schemaChecksum(ctx, tx)
 		if err != nil {
@@ -386,13 +446,52 @@ func (store *Store) verifyMigrationLedger(ctx context.Context) error {
 }
 
 func expectedSchemaChecksum() [sha256.Size]byte {
-	decoded, err := hex.DecodeString(schemaChecksumHex)
+	return expectedSchemaChecksumHex(schemaChecksumHex)
+}
+
+func expectedSchemaChecksumHex(value string) [sha256.Size]byte {
+	decoded, err := hex.DecodeString(value)
 	if err != nil || len(decoded) != sha256.Size {
 		panic("invalid compiled SQLite schema checksum")
 	}
 	var result [sha256.Size]byte
 	copy(result[:], decoded)
 	return result
+}
+
+func verifyMigrationLedgerVersion(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, ids []string, version int, expectedSchema [sha256.Size]byte) error {
+	for _, migrationID := range ids {
+		_, expected, err := migration(migrationID)
+		if err != nil {
+			return err
+		}
+		var checksum []byte
+		var state string
+		if err := query.QueryRowContext(ctx, `SELECT checksum, state FROM schema_migrations WHERE migration_id = ?`,
+			migrationID).Scan(&checksum, &state); err != nil || !bytes.Equal(checksum, expected[:]) || state != "applied" {
+			return fmt.Errorf("%w: migration %s checksum, state, or presence", ErrSchemaMismatch, migrationID)
+		}
+	}
+	var count int
+	if err := query.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil || count != len(ids) {
+		return fmt.Errorf("%w: migration ledger count=%d error=%v", ErrSchemaMismatch, count, err)
+	}
+	var recorded []byte
+	if err := query.QueryRowContext(ctx, `SELECT checksum FROM schema_manifest WHERE schema_version = ?`, version).
+		Scan(&recorded); err != nil || !bytes.Equal(recorded, expectedSchema[:]) {
+		return fmt.Errorf("%w: prior schema manifest error=%v", ErrSchemaMismatch, err)
+	}
+	live, err := schemaChecksum(ctx, query)
+	if err != nil {
+		return err
+	}
+	if live != expectedSchema {
+		return fmt.Errorf("%w: prior live schema checksum=%x want=%x", ErrSchemaMismatch, live, expectedSchema)
+	}
+	return nil
 }
 
 func schemaChecksum(ctx context.Context, query interface {

@@ -55,11 +55,64 @@ func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 44 {
-		t.Fatalf("tables=%d, want 44", tables)
+	if tables != 46 {
+		t.Fatalf("tables=%d, want 46", tables)
 	}
 	if err := reopened.IntegrityCheck(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenIncrementallyMigratesInstalledSchemaThree(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "blackbird-v3.db")
+	db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, migrationID := range migrationIDs[:3] {
+		body, checksum, migrationErr := migration(migrationID)
+		if migrationErr != nil {
+			t.Fatal(migrationErr)
+		}
+		if _, migrationErr = db.Exec(string(body)); migrationErr != nil {
+			t.Fatal(migrationErr)
+		}
+		if _, migrationErr = db.Exec(`INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state)
+			VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')`, migrationID, checksum[:]); migrationErr != nil {
+			t.Fatal(migrationErr)
+		}
+	}
+	v3 := expectedSchemaChecksumHex(schemaV3ChecksumHex)
+	if _, err = db.Exec(`INSERT INTO schema_manifest(schema_version, checksum) VALUES (3, ?)`, v3[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA application_id = 1111641420`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(context.Background(), Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if store.Diagnostics().SchemaVersion != SchemaVersion {
+		t.Fatalf("schema version=%d", store.Diagnostics().SchemaVersion)
+	}
+	var migrations, keys int
+	if err := store.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&migrations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM coordination_event_cursor_keys`).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if migrations != 4 || keys != 1 {
+		t.Fatalf("migration rows=%d cursor keys=%d", migrations, keys)
 	}
 }
 
@@ -119,7 +172,7 @@ func TestOpenRejectsIdentityChecksumAndConfigurationDrift(t *testing.T) {
 		mutate func(*testing.T, string)
 	}{
 		{"application id", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA application_id = 1") }},
-		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 4") }},
+		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 5") }},
 		{"migration checksum", func(t *testing.T, path string) {
 			execRaw(t, path, "DROP TRIGGER schema_migrations_no_update")
 			execRaw(t, path, "UPDATE schema_migrations SET checksum = zeroblob(32)")

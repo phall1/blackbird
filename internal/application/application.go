@@ -7024,6 +7024,132 @@ func (page CoordinationPage) Messages() []Message { return append([]Message(nil)
 func (page CoordinationPage) NextCursor() uint64  { return page.next }
 func (page CoordinationPage) HasMore() bool       { return page.hasMore }
 
+// CoordinationEventCursor is an opaque, authenticated continuation token.
+// Callers may persist and return it but must not interpret its contents.
+type CoordinationEventCursor struct{ value string }
+
+func NewCoordinationEventCursor(value string) (CoordinationEventCursor, error) {
+	if !validOpaqueText(value, 1024) {
+		return CoordinationEventCursor{}, ErrInvalidCoordination
+	}
+	return CoordinationEventCursor{value: value}, nil
+}
+
+func (cursor CoordinationEventCursor) String() string { return cursor.value }
+func (cursor CoordinationEventCursor) IsZero() bool   { return cursor.value == "" }
+
+type CoordinationEventType string
+
+const (
+	CoordinationEventMessageAvailable    CoordinationEventType = "message.available"
+	CoordinationEventMessageRead         CoordinationEventType = "message.read"
+	CoordinationEventMessageAcknowledged CoordinationEventType = "message.acknowledged"
+	CoordinationEventLeaseAcquired       CoordinationEventType = "lease.acquired"
+	CoordinationEventLeaseRenewed        CoordinationEventType = "lease.renewed"
+	CoordinationEventLeaseReleased       CoordinationEventType = "lease.released"
+)
+
+func (kind CoordinationEventType) Valid() bool {
+	switch kind {
+	case CoordinationEventMessageAvailable, CoordinationEventMessageRead,
+		CoordinationEventMessageAcknowledged, CoordinationEventLeaseAcquired,
+		CoordinationEventLeaseRenewed, CoordinationEventLeaseReleased:
+		return true
+	default:
+		return false
+	}
+}
+
+type CoordinationEvent struct {
+	position   uint64
+	workspace  domain.WorkspaceID
+	actor      domain.ActorID
+	eventType  CoordinationEventType
+	subjectID  string
+	occurredAt time.Time
+	payload    []byte
+}
+
+type CoordinationEventParams struct {
+	Position   uint64
+	Workspace  domain.WorkspaceID
+	Actor      domain.ActorID
+	EventType  CoordinationEventType
+	SubjectID  string
+	OccurredAt time.Time
+	Payload    []byte
+}
+
+func NewCoordinationEvent(params CoordinationEventParams) (CoordinationEvent, error) {
+	if params.Position == 0 || params.Position > MaxCanonicalInteger || params.Workspace.IsZero() ||
+		params.Actor.IsZero() || !params.EventType.Valid() || !validOpaqueText(params.SubjectID, 256) ||
+		params.OccurredAt.IsZero() || !validQueryJSONObject(params.Payload) {
+		return CoordinationEvent{}, ErrInvalidCoordination
+	}
+	return CoordinationEvent{position: params.Position, workspace: params.Workspace, actor: params.Actor,
+		eventType: params.EventType, subjectID: params.SubjectID, occurredAt: params.OccurredAt.UTC(),
+		payload: append([]byte(nil), params.Payload...)}, nil
+}
+
+func (event CoordinationEvent) Position() uint64                 { return event.position }
+func (event CoordinationEvent) WorkspaceID() domain.WorkspaceID  { return event.workspace }
+func (event CoordinationEvent) ActorID() domain.ActorID          { return event.actor }
+func (event CoordinationEvent) EventType() CoordinationEventType { return event.eventType }
+func (event CoordinationEvent) SubjectID() string                { return event.subjectID }
+func (event CoordinationEvent) OccurredAt() time.Time            { return event.occurredAt }
+func (event CoordinationEvent) Payload() []byte                  { return append([]byte(nil), event.payload...) }
+
+type CoordinationEventsQuery struct {
+	workspace domain.WorkspaceID
+	actor     domain.ActorID
+	after     CoordinationEventCursor
+	limit     uint16
+}
+
+func NewCoordinationEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
+	after CoordinationEventCursor, limit uint16) (CoordinationEventsQuery, error) {
+	if workspace.IsZero() || actor.IsZero() || limit == 0 || limit > MaxQueryPageSize {
+		return CoordinationEventsQuery{}, ErrInvalidCoordination
+	}
+	return CoordinationEventsQuery{workspace: workspace, actor: actor, after: after, limit: limit}, nil
+}
+
+func (query CoordinationEventsQuery) WorkspaceID() domain.WorkspaceID      { return query.workspace }
+func (query CoordinationEventsQuery) ActorID() domain.ActorID              { return query.actor }
+func (query CoordinationEventsQuery) AfterCursor() CoordinationEventCursor { return query.after }
+func (query CoordinationEventsQuery) Limit() uint16                        { return query.limit }
+
+type CoordinationEventsPage struct {
+	events  []CoordinationEvent
+	next    CoordinationEventCursor
+	hasMore bool
+}
+
+func NewCoordinationEventsPage(events []CoordinationEvent, next CoordinationEventCursor,
+	hasMore bool) (CoordinationEventsPage, error) {
+	if next.IsZero() || len(events) > MaxQueryPageSize {
+		return CoordinationEventsPage{}, ErrInvalidCoordination
+	}
+	cloned := append([]CoordinationEvent(nil), events...)
+	for index := range cloned {
+		if cloned[index].position == 0 || index > 0 && cloned[index-1].position >= cloned[index].position {
+			return CoordinationEventsPage{}, ErrInvalidCoordination
+		}
+		cloned[index].payload = append([]byte(nil), cloned[index].payload...)
+	}
+	return CoordinationEventsPage{events: cloned, next: next, hasMore: hasMore}, nil
+}
+
+func (page CoordinationEventsPage) Events() []CoordinationEvent {
+	result := append([]CoordinationEvent(nil), page.events...)
+	for index := range result {
+		result[index].payload = append([]byte(nil), result[index].payload...)
+	}
+	return result
+}
+func (page CoordinationEventsPage) NextCursor() CoordinationEventCursor { return page.next }
+func (page CoordinationEventsPage) HasMore() bool                       { return page.hasMore }
+
 type InboxQuery struct {
 	WorkspaceID domain.WorkspaceID
 	Recipient   domain.ActorID
@@ -7224,6 +7350,7 @@ type CoordinationStore interface {
 	RenewLease(context.Context, ChangeLeaseParams) (Lease, error)
 	ReleaseLease(context.Context, ChangeLeaseParams) (Lease, error)
 	ValidateFence(context.Context, domain.LeaseID, domain.AuthorityEpoch, []Fence) error
+	SyncCoordinationEvents(context.Context, CoordinationEventsQuery) (CoordinationEventsPage, error)
 }
 
 const (
@@ -7255,6 +7382,7 @@ type ActiveAgent struct {
 // the UUID-level durable coordination contracts above.
 type LocalCoordinationStore interface {
 	CoordinationStore
+	GetVisibleMessage(context.Context, domain.WorkspaceID, domain.ActorID, domain.MessageID) (Message, error)
 	RegisterLocalAgent(context.Context, string, string, string) (LocalAgentSession, string, error)
 	AuthenticateLocalAgent(context.Context, string) (LocalAgentSession, error)
 	ListActiveLocalAgents(context.Context, LocalAgentSession) ([]ActiveAgent, error)
