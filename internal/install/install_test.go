@@ -177,6 +177,24 @@ func TestNativeStateReportsStoppedLaunchdJob(t *testing.T) {
 	}
 }
 
+func TestStatusReportsDormantLaunchdUpdaterAsScheduled(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	runner := &recordingRunner{outputs: []string{"state = running", "state = running", "state = exited"}}
+	manager := testManager(home, "darwin", runner)
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runner.outputs = []string{"state = running", "state = running", "state = exited"}
+	status, err := manager.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "daemon=running") || !strings.Contains(status, "companion=running") || !strings.Contains(status, "updater=scheduled") {
+		t.Fatalf("status = %q", status)
+	}
+}
+
 func TestInstallRejectsUpdateIntervalOutsideBounds(t *testing.T) {
 	t.Parallel()
 	for _, interval := range []time.Duration{time.Minute, 25 * time.Hour} {

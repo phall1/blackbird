@@ -240,7 +240,7 @@ func (manager *Manager) Status(ctx context.Context) (string, error) {
 	}
 	serviceState := nativeState(manager.config.GOOS, serviceOutput, serviceErr, "running", "stopped")
 	companionState := nativeState(manager.config.GOOS, companionOutput, companionErr, "running", "stopped")
-	updaterState := nativeState(manager.config.GOOS, updaterOutput, updaterErr, "scheduled", "stopped")
+	updaterState := nativeState("linux", updaterOutput, updaterErr, "scheduled", "stopped")
 	return fmt.Sprintf(
 		"daemon=%s installed=%t path=%s companion=%s installed=%t path=%s project=%s agent=ClaudeCode updater=%s installed=%t paths=%s interval=%s",
 		serviceState, serviceInstalled, manager.servicePath(), companionState, companionInstalled, manager.companionPath(), manager.config.WorkingDir, updaterState, updaterInstalled,
