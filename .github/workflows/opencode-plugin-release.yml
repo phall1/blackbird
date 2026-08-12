@@ -233,7 +233,18 @@ jobs:
         if: ${{ needs.prepare.outputs.dry_run == 'false' }}
         env:
           TARBALL: ${{ steps.artifact.outputs.tarball }}
-        run: npm publish --provenance --access public "$TARBALL"
+          PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tarball="${GITHUB_WORKSPACE}/${TARBALL}"
+          local_shasum="$(sha1sum "$tarball" | cut -d' ' -f1)"
+          published_shasum="$(npm view "${PACKAGE_NAME}@${VERSION}" dist.shasum 2>/dev/null || true)"
+          if [[ -n "$published_shasum" ]]; then
+            test "$published_shasum" = "$local_shasum"
+            exit 0
+          fi
+          npm publish --provenance --access public "$tarball"
 
       - name: Publish verified GitHub release
         if: ${{ needs.prepare.outputs.dry_run == 'false' }}
