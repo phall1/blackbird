@@ -33,6 +33,7 @@ var allowedInternalLayers = map[string]bool{
 	"transport":        true,
 	"runtime":          true,
 	"install":          true,
+	"companion":        true,
 	"architecturetest": true,
 }
 

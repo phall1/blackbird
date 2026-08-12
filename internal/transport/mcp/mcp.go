@@ -702,7 +702,7 @@ func registerTool[Request, Result any](server *sdkmcp.Server, name, operation st
 	if err != nil {
 		panic(fmt.Sprintf("infer MCP error schema for %s: %v", operation, err))
 	}
-	semanticOutputSchema := &jsonschema.Schema{OneOf: []*jsonschema.Schema{outputSchema, errorSchema}}
+	semanticOutputSchema := &jsonschema.Schema{Type: "object", OneOf: []*jsonschema.Schema{outputSchema, errorSchema}}
 	server.AddTool(&sdkmcp.Tool{
 		Name: name, Description: operation + "; authorized, bounded, idempotent command/query with strict versioned input.",
 		InputSchema: inputSchema, OutputSchema: semanticOutputSchema,

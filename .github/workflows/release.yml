@@ -145,6 +145,8 @@ jobs:
           go build -trimpath -buildvcs=false -tags='netgo osusergo' \
             -ldflags="$ldflags" -o "dist/blackbird-${TARGET}" ./cmd/blackbird
           go build -trimpath -buildvcs=false -tags='netgo osusergo' \
+            -ldflags="$ldflags" -o "dist/blackbird-claude-${TARGET}" ./cmd/blackbird-claude
+          go build -trimpath -buildvcs=false -tags='netgo osusergo' \
             -ldflags="$ldflags" -o "dist/blackbird-${TARGET}.rebuild" ./cmd/blackbird
           cmp "dist/blackbird-${TARGET}" "dist/blackbird-${TARGET}.rebuild"
           expected="blackbird version=${VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
@@ -157,6 +159,7 @@ jobs:
           name: blackbird-build-${{ matrix.target }}
           path: |
             dist/blackbird-${{ matrix.target }}
+            dist/blackbird-claude-${{ matrix.target }}
             dist/BUILD-INFO-${{ matrix.target }}.txt
           if-no-files-found: error
           retention-days: 7
@@ -190,6 +193,7 @@ jobs:
             base="blackbird-${TAG}-${target}"
             mkdir "$base"
             install -m 0755 "native/blackbird-${target}" "${base}/blackbird"
+            install -m 0755 "native/blackbird-claude-${target}" "${base}/blackbird-claude"
             install -m 0644 LICENSE "${base}/LICENSE"
             install -m 0644 "native/BUILD-INFO-${target}.txt" "${base}/BUILD-INFO.txt"
             tar --sort=name --format=ustar --mtime="@${SOURCE_DATE_EPOCH}" \
@@ -197,6 +201,7 @@ jobs:
               | gzip -n -9 > "release/${base}.tar.gz"
             (cd release && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256")
             tar -tzf "release/${base}.tar.gz" | grep -Fxq "${base}/blackbird"
+            tar -tzf "release/${base}.tar.gz" | grep -Fxq "${base}/blackbird-claude"
             (cd release && sha256sum --check "${base}.tar.gz.sha256")
           done
           test "$(find release -maxdepth 1 -type f | wc -l)" -eq 6

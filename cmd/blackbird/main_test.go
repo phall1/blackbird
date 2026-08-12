@@ -105,10 +105,10 @@ func TestExecuteDispatchesProductCommands(t *testing.T) {
 		command string
 		want    string
 	}{
-		{command: "install", want: "installed service=/service updater=/updater clients=opencode,codex\n"},
-		{command: "status", want: "daemon=running installed=true path=/service updater=scheduled installed=true paths=/updater interval=6h0m0s\n"},
+		{command: "install", want: "installed service=/service companion=/companion updater=/updater clients=opencode,codex\n"},
+		{command: "status", want: "daemon=running installed=true path=/service companion=running installed=true path=/companion updater=scheduled installed=true paths=/updater interval=6h0m0s\n"},
 		{command: "update", want: "updated changed=true before=\"blackbird 1.0.0\" after=\"blackbird 1.1.0\"\n"},
-		{command: "uninstall", want: "uninstalled service=/service updater=/updater data=retained\n"},
+		{command: "uninstall", want: "uninstalled service=/service companion=/companion updater=/updater data=retained\n"},
 	}
 	for _, test := range tests {
 		t.Run(test.command, func(t *testing.T) {
@@ -167,7 +167,7 @@ func TestSourceBuiltDaemonStartsSQLiteAndServesW0Surfaces(t *testing.T) {
 		}
 		return request, err
 	})
-	defer httpResponse.Body.Close()
+	defer func() { _ = httpResponse.Body.Close() }()
 	if httpResponse.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("W0 HTTP status = %d, want %d", httpResponse.StatusCode, http.StatusUnauthorized)
 	}
@@ -181,7 +181,7 @@ func TestSourceBuiltDaemonStartsSQLiteAndServesW0Surfaces(t *testing.T) {
 		}
 		return request, err
 	})
-	defer mcpResponse.Body.Close()
+	defer func() { _ = mcpResponse.Body.Close() }()
 	if mcpResponse.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(mcpResponse.Body)
 		t.Fatalf("MCP initialize status = %d, want %d; body=%s", mcpResponse.StatusCode, http.StatusOK, body)
@@ -274,12 +274,12 @@ type fakeProductManager struct {
 
 func (manager *fakeProductManager) Install(context.Context) (install.Result, error) {
 	manager.called = "install"
-	return install.Result{ServicePath: "/service", UpdaterPaths: []string{"/updater"}, Clients: []string{"opencode", "codex"}}, nil
+	return install.Result{ServicePath: "/service", CompanionPath: "/companion", UpdaterPaths: []string{"/updater"}, Clients: []string{"opencode", "codex"}}, nil
 }
 
 func (manager *fakeProductManager) Status(context.Context) (string, error) {
 	manager.called = "status"
-	return "daemon=running installed=true path=/service updater=scheduled installed=true paths=/updater interval=6h0m0s", nil
+	return "daemon=running installed=true path=/service companion=running installed=true path=/companion updater=scheduled installed=true paths=/updater interval=6h0m0s", nil
 }
 
 func (manager *fakeProductManager) Update(context.Context) (install.UpdateResult, error) {
@@ -289,5 +289,5 @@ func (manager *fakeProductManager) Update(context.Context) (install.UpdateResult
 
 func (manager *fakeProductManager) Uninstall(context.Context) (install.Result, error) {
 	manager.called = "uninstall"
-	return install.Result{ServicePath: "/service", UpdaterPaths: []string{"/updater"}}, nil
+	return install.Result{ServicePath: "/service", CompanionPath: "/companion", UpdaterPaths: []string{"/updater"}}, nil
 }

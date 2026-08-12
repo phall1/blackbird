@@ -213,6 +213,13 @@ func TestMCPDiscoveryStrictnessResourcesAndCancellation(t *testing.T) {
 		if !bytes.Contains(encoded, []byte(`"additionalProperties":false`)) {
 			t.Fatalf("tool %s has permissive input schema: %s", tool.Name, encoded)
 		}
+		output, err := json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatalf("marshal output schema for %s: %v", tool.Name, err)
+		}
+		if !bytes.Contains(output, []byte(`"type":"object"`)) {
+			t.Fatalf("tool %s output schema lacks Claude-compatible root object type: %s", tool.Name, output)
+		}
 	}
 	for name, found := range w1Tools {
 		if !found {
