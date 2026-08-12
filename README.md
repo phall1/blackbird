@@ -70,10 +70,10 @@ Add it to OpenCode's `plugins` configuration with an absolute repository path:
 {
   "plugins": [
     {
-      "package": "blackbird-opencode@0.1.0",
+      "package": "blackbird-opencode@0.1.1",
       "options": {
         "baseUrl": "http://127.0.0.1:8081",
-        "projectKey": "/absolute/path/to/project",
+        "projectKey": "~/workspace/project",
         "agentName": "OpenCode",
         "routing": { "mode": "conversation" }
       }

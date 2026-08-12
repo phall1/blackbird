@@ -11,10 +11,10 @@ it.
 {
   "plugins": [
     {
-      "package": "blackbird-opencode@0.1.0",
+      "package": "blackbird-opencode@0.1.1",
       "options": {
         "baseUrl": "http://127.0.0.1:8081",
-        "projectKey": "/absolute/path/to/project",
+        "projectKey": "~/workspace/project",
         "agentName": "OpenCode",
         "routing": { "mode": "conversation" }
       }
@@ -23,7 +23,8 @@ it.
 }
 ```
 
-`baseUrl`, `projectKey`, and `agentName` are required. Routing is either:
+`baseUrl`, `projectKey`, and `agentName` are required. A `projectKey` beginning
+with `~/` is expanded to the current user's home directory. Routing is either:
 
 - `{ "mode": "fixed", "sessionID": "ses_..." }` for one existing session.
 - `{ "mode": "conversation", "agent": "build" }` (the default) for one

@@ -1,5 +1,5 @@
 import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { deterministicMessageID, resolveOptions, runSupervisor, type SessionClient } from "../src/index.js"
@@ -16,6 +16,11 @@ describe("configuration and IDs", () => {
     expect(options.catchUpPath).toBe("/api/v1/local/coordination/events")
     expect(options.streamPath).toBe("/api/v1/local/coordination/events/stream")
     expect(options.messagePath).toBe("/api/v1/local/messages")
+  })
+
+  it("expands a portable home-relative project key", () => {
+    const options = resolveOptions({ baseUrl: "http://127.0.0.1:8081", projectKey: "~/workspace/project", agentName: "agent" })
+    expect(options.projectKey).toBe(join(homedir(), "workspace/project"))
   })
 
   it("rejects insecure or ambiguous configuration", () => {

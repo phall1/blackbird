@@ -142,7 +142,7 @@ export function resolveOptions(raw: PluginOptions | BlackbirdOptions, environmen
     throw new Error("blackbird: plaintext http is allowed only for a loopback Blackbird server")
   }
   baseUrl.pathname = baseUrl.pathname.replace(/\/$/, "") + "/"
-  const projectKey = requiredString(source, "projectKey")
+  const projectKey = expandHome(requiredString(source, "projectKey"))
   const agentName = requiredString(source, "agentName")
   const routingValue = record(source["routing"])
   let routing: RoutingFixed | RoutingConversation
@@ -172,6 +172,12 @@ export function resolveOptions(raw: PluginOptions | BlackbirdOptions, environmen
     maximumMs: optionalNumber(backoff?.["maximumMs"], 30_000, 10, 300_000, "backoff.maximumMs"),
     jitter: optionalNumber(backoff?.["jitter"], 0.2, 0, 1, "backoff.jitter"),
   }
+}
+
+function expandHome(value: string): string {
+  if (value === "~") return homedir()
+  if (value.startsWith("~/")) return join(homedir(), value.slice(2))
+  return value
 }
 
 function isLoopbackHostname(hostname: string): boolean {
