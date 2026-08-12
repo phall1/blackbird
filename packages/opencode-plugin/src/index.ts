@@ -55,7 +55,7 @@ export interface BlackbirdOptions {
 }
 
 export interface SessionClient {
-  create(input: { title: string; agent?: string }): Promise<{ id: string }>
+  create(input: { title: string; agent?: string; location: { directory: string } }): Promise<{ id: string }>
   prompt(input: {
     sessionID: string
     id: string
@@ -161,7 +161,7 @@ export function resolveOptions(raw: PluginOptions | BlackbirdOptions, environmen
     projectKey,
     agentName,
     ...(typeof source["token"] === "string" ? { token: source["token"] } : {}),
-    stateDir: typeof source["stateDir"] === "string" ? source["stateDir"] : join(stateRoot, "blackbird", "opencode", projectHash, safeSegment(agentName)),
+    stateDir: typeof source["stateDir"] === "string" ? expandHome(source["stateDir"]) : join(stateRoot, "blackbird", "opencode", projectHash, safeSegment(agentName)),
     routing,
     registerPath: typeof paths?.["register"] === "string" ? paths["register"] : "/api/v1/local/agents/register",
     catchUpPath: typeof paths?.["catchUp"] === "string" ? paths["catchUp"] : "/api/v1/local/coordination/events",
@@ -376,6 +376,7 @@ export async function runSupervisor(
     if (existing !== undefined) return existing
     const created = await session.create({
       title: `Blackbird: ${message.subject}`.slice(0, 120),
+      location: { directory: options.projectKey },
       ...(options.routing.agent === undefined ? {} : { agent: options.routing.agent }),
     })
     state.sessions[message.conversation_id] = created.id
@@ -467,7 +468,7 @@ function isAborted(signal: AbortSignal): boolean {
 interface SharedSupervisor {
   references: number
   readonly controller: AbortController
-  readonly task: Promise<void>
+  task: Promise<void>
 }
 
 const supervisors = new Map<string, SharedSupervisor>()
@@ -479,7 +480,10 @@ export function acquireSupervisor(key: string, start: (signal: AbortSignal) => P
     return releaseSupervisor(key, existing)
   }
   const controller = new AbortController()
-  const supervisor: SharedSupervisor = { references: 1, controller, task: start(controller.signal) }
+  const supervisor: SharedSupervisor = { references: 1, controller, task: Promise.resolve() }
+  supervisor.task = start(controller.signal).finally(() => {
+    if (supervisors.get(key) === supervisor) supervisors.delete(key)
+  })
   supervisors.set(key, supervisor)
   return releaseSupervisor(key, supervisor)
 }

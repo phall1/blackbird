@@ -598,7 +598,6 @@ func TestExecuteSecurityDenialSaturationAndReservedAdmission(t *testing.T) {
 }
 
 func TestExecuteSecurityScopeDenialSaturationSummaryIsUnique(t *testing.T) {
-	t.Parallel()
 	store := openSecurityStore(t)
 	fixture := newSecurityFixture(t)
 	initializeSecurityFixture(t, store, fixture)

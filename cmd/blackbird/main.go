@@ -174,7 +174,7 @@ func executeProductCommand(ctx context.Context, command string, manager productM
 		var result install.Result
 		result, err = manager.Install(ctx)
 		if err == nil {
-			err = writef(stdout, "installed service=%s claude=%s pi=%s updater=%s clients=%s\n", result.ServicePath, result.CompanionPath, result.PiCompanionPath, stringsOrNone(result.UpdaterPaths), stringsOrNone(result.Clients))
+			err = writef(stdout, "installed service=%s updater=%s clients=%s\n", result.ServicePath, stringsOrNone(result.UpdaterPaths), stringsOrNone(result.Clients))
 		}
 	case "status":
 		var status string
@@ -192,7 +192,7 @@ func executeProductCommand(ctx context.Context, command string, manager productM
 		var result install.Result
 		result, err = manager.Uninstall(ctx)
 		if err == nil {
-			err = writef(stdout, "uninstalled service=%s claude=%s pi=%s updater=%s data=retained\n", result.ServicePath, result.CompanionPath, result.PiCompanionPath, stringsOrNone(result.UpdaterPaths))
+			err = writef(stdout, "uninstalled service=%s updater=%s data=retained\n", result.ServicePath, stringsOrNone(result.UpdaterPaths))
 		}
 	}
 	if err != nil {

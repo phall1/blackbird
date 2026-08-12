@@ -1,0 +1,12 @@
+{
+  "name": "blackbird",
+  "owner": { "name": "phall" },
+  "plugins": [
+    {
+      "name": "blackbird",
+      "description": "Deliver durable Blackbird messages into active Claude Code sessions.",
+      "version": "0.1.0",
+      "source": "./packages/claude-plugin"
+    }
+  ]
+}

@@ -49,6 +49,16 @@ describe("supervisor", () => {
     expect(stopped).toBe(true)
   })
 
+  it("starts a replacement after a supervisor exits", async () => {
+    let starts = 0
+    const release = acquireSupervisor("restart", async () => { starts += 1 })
+    await vi.waitFor(() => expect(starts).toBe(1))
+    const releaseReplacement = acquireSupervisor("restart", async () => { starts += 1 })
+    await vi.waitFor(() => expect(starts).toBe(2))
+    await release()
+    await releaseReplacement()
+  })
+
   it("registers, catches up opaque events, fetches exact messages, and treats SSE as wake-only", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "blackbird-plugin-"))
     const controller = new AbortController()
@@ -158,13 +168,15 @@ describe("supervisor", () => {
       if (id === undefined) throw new Error("message URL omitted its ID")
       return Response.json({ message_id: id, conversation_id: "conversation", subject: id, body: `body ${id}`, position: id === "m1" ? 1 : 2 })
     })
-    await runSupervisor({ create: vi.fn(async () => ({ id: "session" })), prompt }, {
+    const create = vi.fn<SessionClient["create"]>(async () => ({ id: "session" }))
+    await runSupervisor({ create, prompt }, {
       baseUrl: "https://blackbird.test", projectKey: "/repo", agentName: "agent", stateDir,
       paths: { register: "/register", catchUp: "/events", stream: "/stream", message: "/messages" },
       backoff: { minimumMs: 10, maximumMs: 10, jitter: 0 },
     }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => { controller.abort() } })
     const state = JSON.parse(await readFile(join(stateDir, "cursor.json"), "utf8")) as unknown
     expect(state).toMatchObject({ cursor: "" })
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ location: { directory: "/repo" } }))
     expect(prompt.mock.calls.map(([call]) => call.metadata["blackbird_message_id"])).toEqual(["m1", "m2"])
   })
 })

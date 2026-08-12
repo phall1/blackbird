@@ -16,7 +16,7 @@ The released product includes:
 - shared and exclusive exact/subtree file reservations with expiry, renewal,
   overlap detection, and fencing tokens;
 - strict W0 identity and W1 work/run contracts with idempotent orchestration;
-- per-user launchd and systemd services, unattended Homebrew updates, and
+- one per-user launchd or systemd daemon, unattended Homebrew updates, and
   idempotent MCP client configuration; and
 - reproducible native releases for Apple Silicon macOS and amd64/arm64 Linux.
 
@@ -87,6 +87,28 @@ plugin cache. Registration tokens, opaque cursors, deduplication facts, and
 conversation-to-session bindings are stored under `$XDG_STATE_HOME/blackbird`
 with private directory and file permissions.
 
+## Pi Delivery
+
+`blackbird-pi` is a Pi-native extension. It runs only inside an active Pi
+session and injects durable messages as ordered follow-ups:
+
+```sh
+pi install npm:blackbird-pi@0.1.0
+```
+
+## Claude Code Delivery
+
+The `blackbird` Claude Code plugin uses MCP Channels. Claude owns its stdio
+channel server for the active session; there is no Blackbird adapter service.
+
+```sh
+claude plugin marketplace add phall1/blackbird
+claude plugin install blackbird@blackbird
+claude --channels plugin:blackbird@blackbird
+```
+
+Adapter delivery never marks a Blackbird message read or acknowledged.
+
 ## Development
 
 ```sh
@@ -116,28 +138,11 @@ blackbird update
 blackbird uninstall
 ```
 
-`install` creates XDG config, data, and state directories, writes atomic
-launchd agents on macOS or systemd user units on Linux for the daemon and the
-first-class `blackbird-claude` and `blackbird-pi` companions, and safely
-restarts them. Each companion binds the project directory in which `blackbird
-install` first runs to its stable `ClaudeCode` or `Pi` identity; repeated
-installs preserve that configured working directory. They consume only the
-loopback API at `127.0.0.1:8080`, store independent registration tokens,
-delivery state, conversation-to-session UUID bindings, and transcript evidence
-under `$XDG_STATE_HOME/blackbird/claude` or `$XDG_STATE_HOME/blackbird/pi` with
-private permissions, and invoke the same-user agent CLI in the project
-directory. Neither companion marks messages read or acknowledges them
-automatically.
-Messages are processed serially per companion in journal order. Transient failures retry with
-bounded exponential backoff; if a companion stops after its agent starts but
-before success is durably recorded, that delivery is quarantined as ambiguous
-instead of being replayed automatically.
-
-Pi turns use `pi -p --approve --mode json --session-id <uuid>` with an
-adapter-owned private session directory. Reusing the exact UUID resumes the
-same Pi project session without an interactive selector. The supervised service
-pins both Pi's JavaScript entrypoint and its Node executable so it does not
-depend on shell initialization or fnm's transient multishell paths.
+`install` creates XDG config, data, and state directories and one launchd agent
+or systemd user unit for the daemon. During upgrades it stops and removes
+definitions left by the retired `blackbird-claude` and `blackbird-pi` services
+while retaining their private databases and transcripts for migration.
+OpenCode, Pi, and Claude Code delivery is owned by their native plugin systems.
 
 Installation also installs an unattended Homebrew updater that runs every six
 hours: a non-`KeepAlive` launchd job on macOS, or a systemd user timer and
@@ -147,11 +152,12 @@ the daemon restarts only after the installed formula version changes.
 
 Installation also adds one `blackbird` HTTP MCP entry to detected OpenCode,
 Claude Code, and Codex configurations while preserving unrelated settings.
-Repeated installs converge the daemon, updater, and client definitions.
+When user-managed OpenCode JSONC exists, Blackbird leaves it untouched rather
+than creating a competing JSON file. Repeated installs converge the remaining
+daemon, updater, and client definitions.
 
 `update` runs `brew update` followed by
 `brew upgrade phall1/tap/blackbird`; the service is restarted only when the
 installed formula version changes. `status` reports both the daemon and updater.
-`uninstall` stops the daemon, both companions, and updater and removes only their
-service definitions. Both databases, transcripts, logs, XDG directories, and
-MCP client settings are retained.
+`uninstall` stops the daemon and updater, cleans legacy adapter definitions, and
+retains databases, transcripts, logs, XDG directories, and MCP client settings.

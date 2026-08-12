@@ -1,0 +1,11 @@
+{
+  "name": "blackbird",
+  "displayName": "Blackbird",
+  "version": "0.1.0",
+  "description": "Deliver durable Blackbird messages into active Claude Code sessions.",
+  "author": { "name": "phall" },
+  "homepage": "https://github.com/phall1/blackbird/tree/main/packages/claude-plugin",
+  "repository": "https://github.com/phall1/blackbird",
+  "license": "MIT",
+  "keywords": ["blackbird", "channel", "coordination", "mcp"]
+}

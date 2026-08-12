@@ -11,7 +11,7 @@ it.
 {
   "plugins": [
     {
-      "package": "blackbird-opencode@0.1.2",
+        "package": "blackbird-opencode@0.1.3",
       "options": {
         "baseUrl": "http://127.0.0.1:8080",
         "projectKey": "~/workspace/project",

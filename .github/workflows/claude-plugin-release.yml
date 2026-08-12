@@ -1,0 +1,43 @@
+name: Release Claude plugin
+
+on:
+  push:
+    tags: ["claude-plugin-v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag: { description: "Existing claude-plugin-vX.Y.Z tag", required: true, type: string }
+      dry_run: { description: "Validate without releasing", required: true, default: true, type: boolean }
+
+permissions: { contents: read }
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/claude-plugin/package-lock.json
+      - name: Validate plugin release
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          DRY_RUN: ${{ github.event_name == 'push' && 'false' || inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^claude-plugin-v([0-9]+[.][0-9]+[.][0-9]+)$ ]]
+          version="${BASH_REMATCH[1]}"
+          test "$(node -p 'require("./packages/claude-plugin/.claude-plugin/plugin.json").version')" = "$version"
+          cd packages/claude-plugin
+          npm ci
+          npm run gates
+          cd ../..
+          npx --yes @anthropic-ai/claude-code@2.1.229 plugin validate packages/claude-plugin --strict
+          if [[ "$DRY_RUN" == false ]]; then
+            gh release create "$TAG" --verify-tag --generate-notes --title "Blackbird Claude plugin $version"
+          fi

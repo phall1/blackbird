@@ -30,8 +30,6 @@ func TestInstallConvergesServiceAndDetectedClientConfigs(t *testing.T) {
 	}
 	paths := []string{
 		first.ServicePath,
-		first.CompanionPath,
-		first.PiCompanionPath,
 		first.UpdaterPaths[0],
 		first.UpdaterPaths[1],
 		filepath.Join(configHome, "opencode", "opencode.json"),
@@ -46,20 +44,20 @@ func TestInstallConvergesServiceAndDetectedClientConfigs(t *testing.T) {
 		t.Fatalf("second install changed converged files\nfirst=%q\nsecond=%q", firstContent, secondContent)
 	}
 
-	if got := firstContent[paths[3]]; !strings.Contains(got, "ExecStart=") || !strings.Contains(got, " update") ||
+	if got := firstContent[paths[1]]; !strings.Contains(got, "ExecStart=") || !strings.Contains(got, " update") ||
 		!strings.Contains(got, "/home/linuxbrew/.linuxbrew/bin") || strings.Contains(got, "Restart=") {
 		t.Fatalf("systemd updater service = %s", got)
 	}
-	if got := firstContent[paths[4]]; !strings.Contains(got, "OnStartupSec=21600") || !strings.Contains(got, "OnUnitActiveSec=21600") || !strings.Contains(got, "Persistent=true") {
+	if got := firstContent[paths[2]]; !strings.Contains(got, "OnStartupSec=21600") || !strings.Contains(got, "OnUnitActiveSec=21600") || !strings.Contains(got, "Persistent=true") {
 		t.Fatalf("systemd updater timer = %s", got)
 	}
-	if got := firstContent[paths[5]]; !strings.Contains(got, `"theme": "existing"`) || strings.Count(got, `"blackbird"`) != 1 || !strings.Contains(got, `"other"`) {
+	if got := firstContent[paths[3]]; !strings.Contains(got, `"theme": "existing"`) || strings.Count(got, `"blackbird"`) != 1 || !strings.Contains(got, `"other"`) {
 		t.Fatalf("OpenCode config did not preserve and merge settings: %s", got)
 	}
-	if got := firstContent[paths[6]]; !strings.Contains(got, `"projects"`) || strings.Count(got, `"blackbird"`) != 1 || !strings.Contains(got, `"other"`) {
+	if got := firstContent[paths[4]]; !strings.Contains(got, `"projects"`) || strings.Count(got, `"blackbird"`) != 1 || !strings.Contains(got, `"other"`) {
 		t.Fatalf("Claude config did not preserve and merge settings: %s", got)
 	}
-	if got := firstContent[paths[7]]; !strings.Contains(got, `model = "gpt-5"`) || !strings.Contains(got, "[features]\nsearch = true") || strings.Contains(got, "old.test") || strings.Count(got, codexStart) != 1 || strings.Count(got, `[mcp_servers.blackbird]`) != 1 {
+	if got := firstContent[paths[5]]; !strings.Contains(got, `model = "gpt-5"`) || !strings.Contains(got, "[features]\nsearch = true") || strings.Contains(got, "old.test") || strings.Count(got, codexStart) != 1 || strings.Count(got, `[mcp_servers.blackbird]`) != 1 {
 		t.Fatalf("Codex config did not converge: %s", got)
 	}
 	if got := firstContent[first.ServicePath]; strings.Count(got, "ExecStart=") != 1 || !strings.Contains(got, filepath.Join(home, "data", "blackbird", "blackbird.db")) {
@@ -71,26 +69,24 @@ func TestInstallConvergesServiceAndDetectedClientConfigs(t *testing.T) {
 	}
 }
 
-func TestInstallPreservesCompanionIdentityAcrossWorkingDirectories(t *testing.T) {
+func TestInstallLeavesUserManagedOpenCodeJSONCAlone(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
+	path := filepath.Join(home, "config", "opencode", "opencode.jsonc")
+	mustWrite(t, path, "{\n  // user managed\n  \"plugins\": []\n}\n")
 	manager := testManager(home, "linux", &recordingRunner{})
-	manager.config.WorkingDir = filepath.Join(home, "first-project")
-	if _, err := manager.Install(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	manager = testManager(home, "linux", &recordingRunner{})
-	manager.config.WorkingDir = filepath.Join(home, "other-project")
 	result, err := manager.Install(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	definition, err := os.ReadFile(result.CompanionPath)
-	if err != nil {
-		t.Fatal(err)
+	if content, err := os.ReadFile(path); err != nil || string(content) != "{\n  // user managed\n  \"plugins\": []\n}\n" {
+		t.Fatalf("JSONC changed: %q, %v", content, err)
 	}
-	if !strings.Contains(string(definition), filepath.Join(home, "first-project")) || strings.Contains(string(definition), filepath.Join(home, "other-project")) {
-		t.Fatalf("companion definition did not preserve identity: %s", definition)
+	if _, err := os.Stat(filepath.Join(home, "config", "opencode", "opencode.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("competing JSON config created: %v", err)
+	}
+	if !reflect.DeepEqual(result.Clients, []string{"opencode", "claude"}) {
+		t.Fatalf("clients = %v", result.Clients)
 	}
 }
 
@@ -121,15 +117,11 @@ func TestInstallWritesAtomicLaunchAgentAndRestartsIt(t *testing.T) {
 		t.Fatalf("updater launch agent = %s", got)
 	}
 	want := []string{
+		"launchctl bootout gui/501 " + manager.companionPath(),
+		"launchctl bootout gui/501 " + manager.piCompanionPath(),
 		"launchctl bootout gui/501 " + result.ServicePath,
 		"launchctl bootstrap gui/501 " + result.ServicePath,
 		"launchctl kickstart -k gui/501/" + serviceLabel,
-		"launchctl bootout gui/501 " + result.CompanionPath,
-		"launchctl bootstrap gui/501 " + result.CompanionPath,
-		"launchctl kickstart -k gui/501/" + companionLabel,
-		"launchctl bootout gui/501 " + result.PiCompanionPath,
-		"launchctl bootstrap gui/501 " + result.PiCompanionPath,
-		"launchctl kickstart -k gui/501/" + piLabel,
 		"launchctl bootout gui/501 " + result.UpdaterPaths[0],
 		"launchctl bootstrap gui/501 " + result.UpdaterPaths[0],
 	}
@@ -144,26 +136,24 @@ func TestInstallWritesAtomicLaunchAgentAndRestartsIt(t *testing.T) {
 func TestStatusReportsDaemonAndUpdater(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
-	runner := &recordingRunner{outputs: []string{"active", "active", "active", "active"}}
+	runner := &recordingRunner{outputs: []string{"active", "active"}}
 	manager := testManager(home, "linux", runner)
 	if _, err := manager.Install(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	runner.commands = nil
-	runner.outputs = []string{"active", "active", "active", "active"}
+	runner.outputs = []string{"active", "active"}
 
 	status, err := manager.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(status, "daemon=running (active) installed=true") ||
-		!strings.Contains(status, "claude=running (active) installed=true") || !strings.Contains(status, "pi=running (active) installed=true") || !strings.Contains(status, "updater=scheduled (active) installed=true") || !strings.Contains(status, "interval=6h0m0s") {
+		!strings.Contains(status, "updater=scheduled (active) installed=true") || !strings.Contains(status, "interval=6h0m0s") {
 		t.Fatalf("status = %q", status)
 	}
 	want := []string{
 		"systemctl --user is-active blackbird.service",
-		"systemctl --user is-active blackbird-claude.service",
-		"systemctl --user is-active blackbird-pi.service",
 		"systemctl --user is-active blackbird-update.timer",
 	}
 	if !reflect.DeepEqual(runner.commands, want) {
@@ -185,17 +175,17 @@ func TestNativeStateReportsStoppedLaunchdJob(t *testing.T) {
 func TestStatusReportsDormantLaunchdUpdaterAsScheduled(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
-	runner := &recordingRunner{outputs: []string{"state = running", "state = running", "state = running", "state = exited"}}
+	runner := &recordingRunner{outputs: []string{"state = running", "state = exited"}}
 	manager := testManager(home, "darwin", runner)
 	if _, err := manager.Install(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	runner.outputs = []string{"state = running", "state = running", "state = running", "state = exited"}
+	runner.outputs = []string{"state = running", "state = exited"}
 	status, err := manager.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(status, "daemon=running") || !strings.Contains(status, "claude=running") || !strings.Contains(status, "pi=running") || !strings.Contains(status, "updater=scheduled") {
+	if !strings.Contains(status, "daemon=running") || !strings.Contains(status, "updater=scheduled") {
 		t.Fatalf("status = %q", status)
 	}
 	if strings.Contains(status, "state = exited") {
@@ -260,10 +250,8 @@ func TestUpdateRestartsOnlyWhenBrewVersionChanges(t *testing.T) {
 	if !result.Changed {
 		t.Fatal("changed update was not reported")
 	}
-	if got := runner.commands; !reflect.DeepEqual(got[len(got)-9:], []string{
+	if got := runner.commands; !reflect.DeepEqual(got[len(got)-3:], []string{
 		"systemctl --user daemon-reload", "systemctl --user enable blackbird.service", "systemctl --user restart blackbird.service",
-		"systemctl --user daemon-reload", "systemctl --user enable blackbird-claude.service", "systemctl --user restart blackbird-claude.service",
-		"systemctl --user daemon-reload", "systemctl --user enable blackbird-pi.service", "systemctl --user restart blackbird-pi.service",
 	}) {
 		t.Fatalf("restart commands = %v", got)
 	}
@@ -298,8 +286,6 @@ func TestUninstallRemovesOnlyServiceDefinition(t *testing.T) {
 	}
 	want := []string{
 		"systemctl --user disable --now blackbird.service",
-		"systemctl --user disable --now blackbird-claude.service",
-		"systemctl --user disable --now blackbird-pi.service",
 		"systemctl --user disable --now blackbird-update.timer",
 		"systemctl --user daemon-reload",
 	}

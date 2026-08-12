@@ -1,0 +1,17 @@
+{
+  "name": "blackbird-claude-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "check": "node --check server.mjs && npx --yes @anthropic-ai/claude-code@2.1.229 plugin validate . --strict",
+    "test": "node --test test/*.test.mjs",
+    "gates": "npm run check && npm test && npm audit --audit-level=high"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": { "@anthropic-ai/claude-code": "2.1.229" }
+}
