@@ -200,8 +200,9 @@ jobs:
               --owner=0 --group=0 --numeric-owner -cf - "$base" \
               | gzip -n -9 > "release/${base}.tar.gz"
             (cd release && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256")
-            tar -tzf "release/${base}.tar.gz" | grep -Fxq "${base}/blackbird"
-            tar -tzf "release/${base}.tar.gz" | grep -Fxq "${base}/blackbird-claude"
+            tar -tzf "release/${base}.tar.gz" > "${base}.contents"
+            grep -Fxq "${base}/blackbird" "${base}.contents"
+            grep -Fxq "${base}/blackbird-claude" "${base}.contents"
             (cd release && sha256sum --check "${base}.tar.gz.sha256")
           done
           test "$(find release -maxdepth 1 -type f | wc -l)" -eq 6
