@@ -4,7 +4,7 @@ GO ?= go
 GOLANGCI_LINT ?= golangci-lint
 PREK ?= uvx prek
 GOVULNCHECK_VERSION ?= v1.6.0
-COVERAGE_FLOOR ?= 59.0
+COVERAGE_FLOOR ?= 59.2
 
 format:
 	$(GOLANGCI_LINT) fmt
