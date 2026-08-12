@@ -237,19 +237,15 @@ jobs:
           done
           test "$(find release -maxdepth 1 -type f | wc -l)" -eq 6
 
-      - name: Upload, verify, and publish release
+      - name: Upload and verify release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
-          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --generate-notes --verify-tag \
-              --title "Blackbird ${VERSION}"
-          fi
+          gh release view "$TAG" >/dev/null
           gh release upload "$TAG" release/* --clobber
 
           expected=()
@@ -260,7 +256,6 @@ jobs:
           mapfile -t expected < <(printf '%s\n' "${expected[@]}" | sort)
           mapfile -t actual < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
           diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
-          gh release edit "$TAG" --draft=false
 
   tap-release:
     name: Dispatch optional tap update

@@ -40,8 +40,15 @@ jobs:
           npm run gates
           tarball="$(npm pack --json --ignore-scripts | node -e 'let s="";process.stdin.on("data",c=>s+=c);process.stdin.on("end",()=>process.stdout.write(JSON.parse(s)[0].filename))')"
           if [[ "$DRY_RUN" == false ]]; then
-            npm publish --provenance --access public "$tarball"
-            gh release create "$TAG" "$tarball" --verify-tag --generate-notes --title "Blackbird Pi extension $version"
+            local_shasum="$(sha1sum "$tarball" | cut -d' ' -f1)"
+            published_shasum="$(npm view "blackbird-pi@${version}" dist.shasum 2>/dev/null || true)"
+            if [[ -n "$published_shasum" ]]; then
+              test "$published_shasum" = "$local_shasum"
+            else
+              npm publish --provenance --access public "$tarball"
+            fi
+            gh release view "$TAG" >/dev/null
+            gh release upload "$TAG" "$tarball" --clobber
           else
             npm publish --dry-run "$tarball"
           fi

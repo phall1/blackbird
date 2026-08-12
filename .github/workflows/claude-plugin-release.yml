@@ -38,6 +38,4 @@ jobs:
           npm run gates
           cd ../..
           npx --yes @anthropic-ai/claude-code@2.1.229 plugin validate packages/claude-plugin --strict
-          if [[ "$DRY_RUN" == false ]]; then
-            gh release create "$TAG" --verify-tag --generate-notes --title "Blackbird Claude plugin $version"
-          fi
+          if [[ "$DRY_RUN" == false ]]; then gh release view "$TAG" >/dev/null; fi
