@@ -346,7 +346,7 @@ func pathsExist(paths ...string) (bool, error) {
 
 func nativeState(goos, output string, err error, active, inactive string) string {
 	state := active
-	if err != nil {
+	if err != nil || goos == "darwin" && !strings.Contains(output, "state = running") {
 		state = inactive
 	}
 	if output != "" && goos == "linux" {

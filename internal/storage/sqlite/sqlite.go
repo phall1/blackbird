@@ -240,7 +240,14 @@ func verifyIntegrity(ctx context.Context, query interface {
 	}
 	defer func() { _ = rows.Close() }()
 	if rows.Next() {
-		return fmt.Errorf("%w: foreign-key check failed", ErrSchemaMismatch)
+		var table string
+		var rowID int64
+		var parent string
+		var constraint sql.NullInt64
+		if err := rows.Scan(&table, &rowID, &parent, &constraint); err != nil {
+			return fmt.Errorf("run SQLite foreign-key check: %w", err)
+		}
+		return fmt.Errorf("%w: foreign-key check failed table=%s rowid=%d parent=%s", ErrSchemaMismatch, table, rowID, parent)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("run SQLite foreign-key check: %w", err)

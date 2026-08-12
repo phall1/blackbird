@@ -166,6 +166,17 @@ func TestStatusReportsDaemonAndUpdater(t *testing.T) {
 	}
 }
 
+func TestNativeStateReportsStoppedLaunchdJob(t *testing.T) {
+	t.Parallel()
+	output := "state = spawn scheduled\nactive count = 0\nlast exit code = 1"
+	if got := nativeState("darwin", output, nil, "running", "stopped"); got != "stopped" {
+		t.Fatalf("nativeState() = %q", got)
+	}
+	if got := nativeState("darwin", "state = running\nactive count = 1", nil, "running", "stopped"); got != "running" {
+		t.Fatalf("nativeState() = %q", got)
+	}
+}
+
 func TestInstallRejectsUpdateIntervalOutsideBounds(t *testing.T) {
 	t.Parallel()
 	for _, interval := range []time.Duration{time.Minute, 25 * time.Hour} {
