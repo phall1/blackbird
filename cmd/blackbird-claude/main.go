@@ -31,7 +31,7 @@ func main() {
 		fmt.Printf("blackbird-claude version=%s\n", version)
 		return
 	}
-	worker, err := companion.New(companion.Config{ProjectPath: *project, AgentName: *agent, StateDir: *state, APIBaseURL: *api, ClaudePath: *claude})
+	worker, err := companion.New(companion.Config{ProjectPath: *project, AgentName: *agent, StateDir: *state, APIBaseURL: *api, Harness: companion.HarnessClaude, Executable: *claude})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "blackbird-claude: %v\n", err)
 		os.Exit(1)

@@ -117,19 +117,27 @@ blackbird uninstall
 ```
 
 `install` creates XDG config, data, and state directories, writes atomic
-launchd agents on macOS or systemd user units on Linux for both the daemon and
-the `blackbird-claude` companion, and safely restarts them. The companion binds
-the project directory in which `blackbird install` first runs to the stable
-agent name `ClaudeCode`; repeated installs preserve that configured working
-directory. It consumes only the loopback API at `127.0.0.1:8080`, stores its
-registration token, delivery state, conversation-to-Claude UUID bindings, and
-transcript evidence under `$XDG_STATE_HOME/blackbird/claude` with private
-permissions, and invokes the same-user `claude` executable in the project
-directory. It never marks messages read or acknowledges them automatically.
-Messages are processed serially in journal order. Transient failures retry with
-bounded exponential backoff; if the companion stops after Claude starts but
+launchd agents on macOS or systemd user units on Linux for the daemon and the
+first-class `blackbird-claude` and `blackbird-pi` companions, and safely
+restarts them. Each companion binds the project directory in which `blackbird
+install` first runs to its stable `ClaudeCode` or `Pi` identity; repeated
+installs preserve that configured working directory. They consume only the
+loopback API at `127.0.0.1:8080`, store independent registration tokens,
+delivery state, conversation-to-session UUID bindings, and transcript evidence
+under `$XDG_STATE_HOME/blackbird/claude` or `$XDG_STATE_HOME/blackbird/pi` with
+private permissions, and invoke the same-user agent CLI in the project
+directory. Neither companion marks messages read or acknowledges them
+automatically.
+Messages are processed serially per companion in journal order. Transient failures retry with
+bounded exponential backoff; if a companion stops after its agent starts but
 before success is durably recorded, that delivery is quarantined as ambiguous
 instead of being replayed automatically.
+
+Pi turns use `pi -p --approve --mode json --session-id <uuid>` with an
+adapter-owned private session directory. Reusing the exact UUID resumes the
+same Pi project session without an interactive selector. The supervised service
+pins both Pi's JavaScript entrypoint and its Node executable so it does not
+depend on shell initialization or fnm's transient multishell paths.
 
 Installation also installs an unattended Homebrew updater that runs every six
 hours: a non-`KeepAlive` launchd job on macOS, or a systemd user timer and
@@ -144,6 +152,6 @@ Repeated installs converge the daemon, updater, and client definitions.
 `update` runs `brew update` followed by
 `brew upgrade phall1/tap/blackbird`; the service is restarted only when the
 installed formula version changes. `status` reports both the daemon and updater.
-`uninstall` stops the daemon, companion, and updater and removes only their
+`uninstall` stops the daemon, both companions, and updater and removes only their
 service definitions. Both databases, transcripts, logs, XDG directories, and
 MCP client settings are retained.

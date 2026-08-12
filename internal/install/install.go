@@ -20,6 +20,7 @@ import (
 const (
 	serviceLabel          = "com.phall1.blackbird"
 	companionLabel        = "com.phall1.blackbird.claude"
+	piLabel               = "com.phall1.blackbird.pi"
 	updaterLabel          = "com.phall1.blackbird.update"
 	formula               = "phall1/tap/blackbird"
 	mcpURL                = "http://127.0.0.1:8081"
@@ -45,19 +46,22 @@ func (commandRunner) Run(ctx context.Context, name string, args ...string) (stri
 
 // Config supplies host details. Tests can override every machine-dependent input.
 type Config struct {
-	GOOS                string
-	HomeDir             string
-	ConfigHome          string
-	DataHome            string
-	StateHome           string
-	Executable          string
-	CompanionExecutable string
-	ClaudeExecutable    string
-	WorkingDir          string
-	UID                 int
-	UpdateInterval      time.Duration
-	Runner              Runner
-	LookPath            func(string) (string, error)
+	GOOS                  string
+	HomeDir               string
+	ConfigHome            string
+	DataHome              string
+	StateHome             string
+	Executable            string
+	CompanionExecutable   string
+	PiCompanionExecutable string
+	ClaudeExecutable      string
+	PiExecutable          string
+	PiNodeExecutable      string
+	WorkingDir            string
+	UID                   int
+	UpdateInterval        time.Duration
+	Runner                Runner
+	LookPath              func(string) (string, error)
 }
 
 // Manager manages the local Blackbird product installation.
@@ -67,10 +71,11 @@ type Manager struct {
 
 // Result describes files changed by an operation.
 type Result struct {
-	ServicePath   string
-	CompanionPath string
-	UpdaterPaths  []string
-	Clients       []string
+	ServicePath     string
+	CompanionPath   string
+	PiCompanionPath string
+	UpdaterPaths    []string
+	Clients         []string
 }
 
 type companionConfig struct {
@@ -111,7 +116,8 @@ func New() (*Manager, error) {
 	return NewManager(Config{
 		HomeDir: home, ConfigHome: os.Getenv("XDG_CONFIG_HOME"), DataHome: os.Getenv("XDG_DATA_HOME"),
 		StateHome: os.Getenv("XDG_STATE_HOME"), Executable: executable,
-		CompanionExecutable: filepath.Join(filepath.Dir(executable), "blackbird-claude"), WorkingDir: workingDir,
+		CompanionExecutable:   filepath.Join(filepath.Dir(executable), "blackbird-claude"),
+		PiCompanionExecutable: filepath.Join(filepath.Dir(executable), "blackbird-pi"), WorkingDir: workingDir,
 	}), nil
 }
 
@@ -144,11 +150,36 @@ func NewManager(config Config) *Manager {
 	if config.CompanionExecutable == "" {
 		config.CompanionExecutable = filepath.Join(filepath.Dir(config.Executable), "blackbird-claude")
 	}
+	if config.PiCompanionExecutable == "" {
+		config.PiCompanionExecutable = filepath.Join(filepath.Dir(config.Executable), "blackbird-pi")
+	}
 	if config.ClaudeExecutable == "" {
 		if executable, err := config.LookPath("claude"); err == nil {
 			config.ClaudeExecutable = executable
 		} else {
 			config.ClaudeExecutable = "claude"
+		}
+	}
+	if config.PiExecutable == "" {
+		if executable, err := config.LookPath("pi"); err == nil {
+			if resolved, resolveErr := filepath.EvalSymlinks(executable); resolveErr == nil {
+				config.PiExecutable = resolved
+			} else {
+				config.PiExecutable = executable
+			}
+		} else {
+			config.PiExecutable = "pi"
+		}
+	}
+	if config.PiNodeExecutable == "" {
+		if executable, err := config.LookPath("node"); err == nil {
+			if resolved, resolveErr := filepath.EvalSymlinks(executable); resolveErr == nil {
+				config.PiNodeExecutable = resolved
+			} else {
+				config.PiNodeExecutable = executable
+			}
+		} else {
+			config.PiNodeExecutable = "node"
 		}
 	}
 	if config.WorkingDir == "" {
@@ -162,12 +193,15 @@ func (manager *Manager) Install(ctx context.Context) (Result, error) {
 	if err := manager.validatePlatform(); err != nil {
 		return Result{}, err
 	}
-	for _, directory := range []string{manager.blackbirdConfigDir(), manager.blackbirdDataDir(), manager.blackbirdStateDir(), filepath.Join(manager.blackbirdStateDir(), "claude")} {
+	for _, directory := range []string{manager.blackbirdConfigDir(), manager.blackbirdDataDir(), manager.blackbirdStateDir(), filepath.Join(manager.blackbirdStateDir(), "claude"), filepath.Join(manager.blackbirdStateDir(), "pi")} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			return Result{}, fmt.Errorf("create %s: %w", directory, err)
 		}
 	}
 	if err := manager.convergeCompanionConfig(); err != nil {
+		return Result{}, err
+	}
+	if err := manager.convergePiConfig(); err != nil {
 		return Result{}, err
 	}
 
@@ -186,6 +220,10 @@ func (manager *Manager) Install(ctx context.Context) (Result, error) {
 	if err := atomicWrite(companionPath, []byte(manager.companionDefinition()), 0o600); err != nil {
 		return Result{}, fmt.Errorf("write companion definition: %w", err)
 	}
+	piCompanionPath := manager.piCompanionPath()
+	if err := atomicWrite(piCompanionPath, []byte(manager.piCompanionDefinition()), 0o600); err != nil {
+		return Result{}, fmt.Errorf("write Pi companion definition: %w", err)
+	}
 	updaterPaths := manager.updaterPaths()
 	for index, path := range updaterPaths {
 		if err := atomicWrite(path, []byte(manager.updaterDefinitions()[index]), 0o600); err != nil {
@@ -198,10 +236,13 @@ func (manager *Manager) Install(ctx context.Context) (Result, error) {
 	if err := manager.restartCompanion(ctx); err != nil {
 		return Result{}, err
 	}
+	if err := manager.restartPiCompanion(ctx); err != nil {
+		return Result{}, err
+	}
 	if err := manager.restartUpdater(ctx); err != nil {
 		return Result{}, err
 	}
-	return Result{ServicePath: servicePath, CompanionPath: companionPath, UpdaterPaths: updaterPaths, Clients: clients}, nil
+	return Result{ServicePath: servicePath, CompanionPath: companionPath, PiCompanionPath: piCompanionPath, UpdaterPaths: updaterPaths, Clients: clients}, nil
 }
 
 // Status reports the daemon and periodic updater definitions and native states.
@@ -210,6 +251,11 @@ func (manager *Manager) Status(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if saved, found, err := manager.readCompanionConfig(); err != nil {
+		return "", err
+	} else if found {
+		manager.config.WorkingDir = saved.ProjectPath
+	}
+	if saved, found, err := manager.readPiConfig(); err != nil {
 		return "", err
 	} else if found {
 		manager.config.WorkingDir = saved.ProjectPath
@@ -227,26 +273,33 @@ func (manager *Manager) Status(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("inspect companion definition: %w", err)
 	}
-	var serviceOutput, companionOutput, updaterOutput string
-	var serviceErr, companionErr, updaterErr error
+	piInstalled, err := pathsExist(manager.piCompanionPath())
+	if err != nil {
+		return "", fmt.Errorf("inspect Pi companion definition: %w", err)
+	}
+	var serviceOutput, companionOutput, piOutput, updaterOutput string
+	var serviceErr, companionErr, piErr, updaterErr error
 	if manager.config.GOOS == "darwin" {
 		serviceOutput, serviceErr = manager.config.Runner.Run(ctx, "launchctl", "print", manager.launchDomain()+"/"+serviceLabel)
 		companionOutput, companionErr = manager.config.Runner.Run(ctx, "launchctl", "print", manager.launchDomain()+"/"+companionLabel)
+		piOutput, piErr = manager.config.Runner.Run(ctx, "launchctl", "print", manager.launchDomain()+"/"+piLabel)
 		updaterOutput, updaterErr = manager.config.Runner.Run(ctx, "launchctl", "print", manager.launchDomain()+"/"+updaterLabel)
 	} else {
 		serviceOutput, serviceErr = manager.config.Runner.Run(ctx, "systemctl", "--user", "is-active", "blackbird.service")
 		companionOutput, companionErr = manager.config.Runner.Run(ctx, "systemctl", "--user", "is-active", "blackbird-claude.service")
+		piOutput, piErr = manager.config.Runner.Run(ctx, "systemctl", "--user", "is-active", "blackbird-pi.service")
 		updaterOutput, updaterErr = manager.config.Runner.Run(ctx, "systemctl", "--user", "is-active", "blackbird-update.timer")
 	}
 	serviceState := nativeState(manager.config.GOOS, serviceOutput, serviceErr, "running", "stopped")
 	companionState := nativeState(manager.config.GOOS, companionOutput, companionErr, "running", "stopped")
+	piState := nativeState(manager.config.GOOS, piOutput, piErr, "running", "stopped")
 	updaterState := nativeState(manager.config.GOOS, updaterOutput, updaterErr, "scheduled", "stopped")
 	if manager.config.GOOS == "darwin" && updaterErr == nil {
 		updaterState = "scheduled"
 	}
 	return fmt.Sprintf(
-		"daemon=%s installed=%t path=%s companion=%s installed=%t path=%s project=%s agent=ClaudeCode updater=%s installed=%t paths=%s interval=%s",
-		serviceState, serviceInstalled, manager.servicePath(), companionState, companionInstalled, manager.companionPath(), manager.config.WorkingDir, updaterState, updaterInstalled,
+		"daemon=%s installed=%t path=%s claude=%s installed=%t path=%s pi=%s installed=%t path=%s project=%s updater=%s installed=%t paths=%s interval=%s",
+		serviceState, serviceInstalled, manager.servicePath(), companionState, companionInstalled, manager.companionPath(), piState, piInstalled, manager.piCompanionPath(), manager.config.WorkingDir, updaterState, updaterInstalled,
 		strings.Join(manager.updaterPaths(), ","), manager.config.UpdateInterval,
 	), nil
 }
@@ -275,6 +328,9 @@ func (manager *Manager) Update(ctx context.Context) (UpdateResult, error) {
 		if err := manager.restartCompanion(ctx); err != nil {
 			return UpdateResult{}, err
 		}
+		if err := manager.restartPiCompanion(ctx); err != nil {
+			return UpdateResult{}, err
+		}
 	}
 	return result, nil
 }
@@ -286,6 +342,7 @@ func (manager *Manager) Uninstall(ctx context.Context) (Result, error) {
 	}
 	path := manager.servicePath()
 	companionPath := manager.companionPath()
+	piCompanionPath := manager.piCompanionPath()
 	serviceExists, statErr := pathsExist(path)
 	if statErr != nil {
 		return Result{}, fmt.Errorf("inspect service definition: %w", statErr)
@@ -298,6 +355,7 @@ func (manager *Manager) Uninstall(ctx context.Context) (Result, error) {
 	if manager.config.GOOS == "darwin" {
 		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), path)
 		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), companionPath)
+		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), piCompanionPath)
 		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), updaterPaths[0])
 	} else if serviceExists {
 		if _, err := manager.runRequired(ctx, "systemctl", "--user", "disable", "--now", "blackbird.service"); err != nil {
@@ -307,6 +365,13 @@ func (manager *Manager) Uninstall(ctx context.Context) (Result, error) {
 	if manager.config.GOOS == "linux" {
 		if companionExists, _ := pathsExist(companionPath); companionExists {
 			if _, err := manager.runRequired(ctx, "systemctl", "--user", "disable", "--now", "blackbird-claude.service"); err != nil {
+				return Result{}, err
+			}
+		}
+	}
+	if manager.config.GOOS == "linux" {
+		if piExists, _ := pathsExist(piCompanionPath); piExists {
+			if _, err := manager.runRequired(ctx, "systemctl", "--user", "disable", "--now", "blackbird-pi.service"); err != nil {
 				return Result{}, err
 			}
 		}
@@ -322,6 +387,9 @@ func (manager *Manager) Uninstall(ctx context.Context) (Result, error) {
 	if err := os.Remove(companionPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return Result{}, fmt.Errorf("remove companion definition: %w", err)
 	}
+	if err := os.Remove(piCompanionPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return Result{}, fmt.Errorf("remove Pi companion definition: %w", err)
+	}
 	for _, updaterPath := range updaterPaths {
 		if err := os.Remove(updaterPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return Result{}, fmt.Errorf("remove updater definition: %w", err)
@@ -332,7 +400,7 @@ func (manager *Manager) Uninstall(ctx context.Context) (Result, error) {
 			return Result{}, err
 		}
 	}
-	return Result{ServicePath: path, CompanionPath: companionPath, UpdaterPaths: updaterPaths}, nil
+	return Result{ServicePath: path, CompanionPath: companionPath, PiCompanionPath: piCompanionPath, UpdaterPaths: updaterPaths}, nil
 }
 
 func pathsExist(paths ...string) (bool, error) {
@@ -418,6 +486,44 @@ func (manager *Manager) readCompanionConfig() (companionConfig, bool, error) {
 	}
 	if saved.ProjectPath == "" || saved.AgentName == "" {
 		return companionConfig{}, false, fmt.Errorf("parse companion config %s: project_path and agent_name are required", path)
+	}
+	return saved, true, nil
+}
+
+func (manager *Manager) convergePiConfig() error {
+	path := filepath.Join(manager.blackbirdConfigDir(), "pi.json")
+	saved, found, err := manager.readPiConfig()
+	if err != nil {
+		return err
+	}
+	if found {
+		manager.config.WorkingDir = saved.ProjectPath
+		return nil
+	}
+	encoded, err := json.MarshalIndent(companionConfig{ProjectPath: manager.config.WorkingDir, AgentName: "Pi"}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, append(encoded, '\n'), 0o600)
+}
+
+func (manager *Manager) readPiConfig() (companionConfig, bool, error) {
+	path := filepath.Join(manager.blackbirdConfigDir(), "pi.json")
+	content, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return companionConfig{}, false, nil
+	}
+	if err != nil {
+		return companionConfig{}, false, fmt.Errorf("read Pi companion config: %w", err)
+	}
+	var saved companionConfig
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&saved); err != nil {
+		return companionConfig{}, false, fmt.Errorf("parse Pi companion config %s: %w", path, err)
+	}
+	if saved.ProjectPath == "" || saved.AgentName == "" {
+		return companionConfig{}, false, fmt.Errorf("parse Pi companion config %s: project_path and agent_name are required", path)
 	}
 	return saved, true, nil
 }
@@ -589,6 +695,25 @@ func (manager *Manager) restartCompanion(ctx context.Context) error {
 	return err
 }
 
+func (manager *Manager) restartPiCompanion(ctx context.Context) error {
+	if manager.config.GOOS == "darwin" {
+		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), manager.piCompanionPath())
+		if _, err := manager.runRequired(ctx, "launchctl", "bootstrap", manager.launchDomain(), manager.piCompanionPath()); err != nil {
+			return err
+		}
+		_, err := manager.runRequired(ctx, "launchctl", "kickstart", "-k", manager.launchDomain()+"/"+piLabel)
+		return err
+	}
+	if _, err := manager.runRequired(ctx, "systemctl", "--user", "daemon-reload"); err != nil {
+		return err
+	}
+	if _, err := manager.runRequired(ctx, "systemctl", "--user", "enable", "blackbird-pi.service"); err != nil {
+		return err
+	}
+	_, err := manager.runRequired(ctx, "systemctl", "--user", "restart", "blackbird-pi.service")
+	return err
+}
+
 func (manager *Manager) runRequired(ctx context.Context, name string, args ...string) (string, error) {
 	output, err := manager.config.Runner.Run(ctx, name, args...)
 	if err != nil {
@@ -638,6 +763,13 @@ func (manager *Manager) companionPath() string {
 		return filepath.Join(manager.config.HomeDir, "Library", "LaunchAgents", companionLabel+".plist")
 	}
 	return filepath.Join(manager.config.ConfigHome, "systemd", "user", "blackbird-claude.service")
+}
+
+func (manager *Manager) piCompanionPath() string {
+	if manager.config.GOOS == "darwin" {
+		return filepath.Join(manager.config.HomeDir, "Library", "LaunchAgents", piLabel+".plist")
+	}
+	return filepath.Join(manager.config.ConfigHome, "systemd", "user", "blackbird-pi.service")
 }
 
 func (manager *Manager) updaterPaths() []string {
@@ -753,6 +885,37 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 `, systemdEscape("PATH="+updaterPath), systemdEscape(manager.config.CompanionExecutable), systemdEscape(manager.config.WorkingDir), systemdEscape(state), systemdEscape(manager.config.ClaudeExecutable))
+}
+
+func (manager *Manager) piCompanionDefinition() string {
+	state := filepath.Join(manager.blackbirdStateDir(), "pi")
+	if manager.config.GOOS == "darwin" {
+		return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key><array><string>%s</string><string>--project</string><string>%s</string><string>--agent</string><string>Pi</string><string>--state-dir</string><string>%s</string><string>--pi</string><string>%s</string><string>--node</string><string>%s</string></array>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>%s</string><key>PATH</key><string>%s</string></dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+`, piLabel, xmlEscape(manager.config.PiCompanionExecutable), xmlEscape(manager.config.WorkingDir), xmlEscape(state), xmlEscape(manager.config.PiExecutable), xmlEscape(manager.config.PiNodeExecutable), xmlEscape(manager.config.HomeDir), xmlEscape(updaterPath), xmlEscape(filepath.Join(state, "companion.log")), xmlEscape(filepath.Join(state, "companion.err.log")))
+	}
+	return fmt.Sprintf(`[Unit]
+Description=Blackbird Pi companion
+After=blackbird.service
+Requires=blackbird.service
+
+[Service]
+Type=simple
+Environment=%s
+ExecStart=%s --project %s --agent Pi --state-dir %s --pi %s --node %s
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`, systemdEscape("PATH="+updaterPath), systemdEscape(manager.config.PiCompanionExecutable), systemdEscape(manager.config.WorkingDir), systemdEscape(state), systemdEscape(manager.config.PiExecutable), systemdEscape(manager.config.PiNodeExecutable))
 }
 
 func xmlEscape(value string) string {

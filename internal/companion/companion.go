@@ -1,4 +1,4 @@
-// Package companion delivers Blackbird messages to durable Claude Code sessions.
+// Package companion delivers Blackbird messages to durable coding-agent sessions.
 package companion
 
 import (
@@ -31,18 +31,28 @@ const (
 	maxAttempts  = 5
 )
 
-// Config defines one stable Blackbird-to-Claude delivery session.
+// Harness identifies a supported coding-agent CLI.
+type Harness string
+
+const (
+	HarnessClaude Harness = "claude"
+	HarnessPi     Harness = "pi"
+)
+
+// Config defines one stable Blackbird-to-agent delivery session.
 type Config struct {
 	ProjectPath string
 	AgentName   string
 	StateDir    string
 	APIBaseURL  string
-	ClaudePath  string
+	Harness     Harness
+	Executable  string
+	PrefixArgs  []string
 	HTTPClient  *http.Client
 	Now         func() time.Time
 }
 
-// Companion consumes the local wake/catch-up API and serializes Claude invocations.
+// Companion consumes the local wake/catch-up API and serializes agent invocations.
 type Companion struct {
 	config Config
 	db     *sql.DB
@@ -91,8 +101,11 @@ func New(config Config) (*Companion, error) {
 	if config.APIBaseURL == "" {
 		config.APIBaseURL = "http://127.0.0.1:8080"
 	}
-	if config.ClaudePath == "" {
-		config.ClaudePath = "claude"
+	if config.Harness != HarnessClaude && config.Harness != HarnessPi {
+		return nil, fmt.Errorf("unsupported companion harness %q", config.Harness)
+	}
+	if config.Executable == "" {
+		config.Executable = string(config.Harness)
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -135,7 +148,7 @@ func (companion *Companion) initialize() error {
 			return fmt.Errorf("initialize delivery state: %w", err)
 		}
 	}
-	_, err := companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error='companion stopped while Claude execution outcome was unknown' WHERE status='running'`)
+	_, err := companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error='companion stopped while agent execution outcome was unknown' WHERE status='running'`)
 	return err
 }
 
@@ -278,50 +291,58 @@ func (companion *Companion) deliver(ctx context.Context, messageID string) error
 		return err
 	}
 	prompt := fmt.Sprintf("Blackbird durable message ID: %s\nConversation ID: %s\nAuthor actor ID: %s\nSent at: %s\nSubject: %s\nBody digest: %s\n\n%s", value.MessageID, value.ConversationID, value.AuthorActorID, value.SentAt, value.Subject, value.BodyDigest, value.Body)
+	args := append(append([]string{}, companion.config.PrefixArgs...), companion.arguments(sessionID, initialized, prompt)...)
+	command := exec.CommandContext(ctx, companion.config.Executable, args...)
+	command.Dir = companion.config.ProjectPath
+	var outputBuffer bytes.Buffer
+	command.Stdout = &outputBuffer
+	command.Stderr = &outputBuffer
+	if err := command.Start(); err != nil {
+		return companion.retry(messageID, fmt.Errorf("start %s invocation: %w", companion.config.Harness, err))
+	}
+	if !initialized {
+		if _, err := companion.db.Exec(`UPDATE sessions SET initialized=1 WHERE conversation_id=?`, value.ConversationID); err != nil {
+			_ = command.Process.Kill()
+			_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "agent started but session initialization could not be persisted: "+err.Error(), messageID)
+			return err
+		}
+	}
+	runErr := command.Wait()
+	output := outputBuffer.Bytes()
+	evidence, err := json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "harness": companion.config.Harness, "arguments": args[:len(args)-1], "output": json.RawMessage(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
+	if !json.Valid(output) {
+		evidence, err = json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "harness": companion.config.Harness, "arguments": args[:len(args)-1], "output_text": string(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
+	}
+	if err != nil {
+		return companion.retry(messageID, fmt.Errorf("marshal transcript evidence: %w", err))
+	}
+	if writeErr := os.WriteFile(transcript, evidence, 0o600); writeErr != nil {
+		_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "agent completed but transcript evidence could not be written: "+writeErr.Error(), messageID)
+		return writeErr
+	}
+	if runErr != nil {
+		if ctx.Err() != nil {
+			_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "agent was interrupted after starting; delivery outcome is unknown: "+runErr.Error(), messageID)
+			return ctx.Err()
+		}
+		return companion.retry(messageID, fmt.Errorf("%s invocation failed: %w", companion.config.Harness, runErr))
+	}
+	_, err = companion.db.Exec(`UPDATE deliveries SET status='delivered', completed_at=?, result_json=? WHERE message_id=?`, companion.config.Now().UTC().Format(time.RFC3339Nano), string(evidence), messageID)
+	return err
+}
+
+func (companion *Companion) arguments(sessionID string, initialized bool, prompt string) []string {
+	if companion.config.Harness == HarnessPi {
+		return []string{"-p", "--approve", "--mode", "json", "--session-id", sessionID,
+			"--session-dir", filepath.Join(companion.config.StateDir, "sessions"), prompt}
+	}
 	args := []string{"-p"}
 	if initialized {
 		args = append(args, "--resume", sessionID)
 	} else {
 		args = append(args, "--session-id", sessionID)
 	}
-	args = append(args, "--output-format", "json", prompt)
-	command := exec.CommandContext(ctx, companion.config.ClaudePath, args...)
-	command.Dir = companion.config.ProjectPath
-	var outputBuffer bytes.Buffer
-	command.Stdout = &outputBuffer
-	command.Stderr = &outputBuffer
-	if err := command.Start(); err != nil {
-		return companion.retry(messageID, fmt.Errorf("start Claude invocation: %w", err))
-	}
-	if !initialized {
-		if _, err := companion.db.Exec(`UPDATE sessions SET initialized=1 WHERE conversation_id=?`, value.ConversationID); err != nil {
-			_ = command.Process.Kill()
-			_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "Claude started but session initialization could not be persisted: "+err.Error(), messageID)
-			return err
-		}
-	}
-	runErr := command.Wait()
-	output := outputBuffer.Bytes()
-	evidence, err := json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "arguments": args[:len(args)-1], "output": json.RawMessage(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
-	if !json.Valid(output) {
-		evidence, err = json.Marshal(map[string]any{"message_id": messageID, "session_id": sessionID, "output_text": string(output), "completed_at": companion.config.Now().UTC().Format(time.RFC3339Nano)})
-	}
-	if err != nil {
-		return companion.retry(messageID, fmt.Errorf("marshal transcript evidence: %w", err))
-	}
-	if writeErr := os.WriteFile(transcript, evidence, 0o600); writeErr != nil {
-		_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "Claude completed but transcript evidence could not be written: "+writeErr.Error(), messageID)
-		return writeErr
-	}
-	if runErr != nil {
-		if ctx.Err() != nil {
-			_, _ = companion.db.Exec(`UPDATE deliveries SET status='ambiguous', last_error=? WHERE message_id=?`, "Claude was interrupted after starting; delivery outcome is unknown: "+runErr.Error(), messageID)
-			return ctx.Err()
-		}
-		return companion.retry(messageID, fmt.Errorf("claude invocation failed: %w", runErr))
-	}
-	_, err = companion.db.Exec(`UPDATE deliveries SET status='delivered', completed_at=?, result_json=? WHERE message_id=?`, companion.config.Now().UTC().Format(time.RFC3339Nano), string(evidence), messageID)
-	return err
+	return append(args, "--output-format", "json", prompt)
 }
 
 func (companion *Companion) session(conversationID string) (string, bool, error) {

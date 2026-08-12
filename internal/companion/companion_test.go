@@ -56,7 +56,7 @@ func TestDeliveryUsesSessionIDThenResumeAndPersistsEvidence(t *testing.T) {
 	}))
 	defer server.Close()
 	worker, err := New(Config{ProjectPath: project, AgentName: "ClaudeCode", StateDir: state,
-		APIBaseURL: server.URL, ClaudePath: claude, Now: func() time.Time { return time.Unix(100, 0) }})
+		APIBaseURL: server.URL, Harness: HarnessClaude, Executable: claude, Now: func() time.Time { return time.Unix(100, 0) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestDeliveryUsesSessionIDThenResumeAndPersistsEvidence(t *testing.T) {
 func TestNewQuarantinesCrashAmbiguityAndSecuresState(t *testing.T) {
 	project := t.TempDir()
 	state := filepath.Join(t.TempDir(), "state")
-	worker, err := New(Config{ProjectPath: project, AgentName: "ClaudeCode", StateDir: state})
+	worker, err := New(Config{ProjectPath: project, AgentName: "ClaudeCode", StateDir: state, Harness: HarnessClaude})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestNewQuarantinesCrashAmbiguityAndSecuresState(t *testing.T) {
 	if err := worker.Close(); err != nil {
 		t.Fatal(err)
 	}
-	worker, err = New(Config{ProjectPath: project, AgentName: "ClaudeCode", StateDir: state})
+	worker, err = New(Config{ProjectPath: project, AgentName: "ClaudeCode", StateDir: state, Harness: HarnessClaude})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestNewQuarantinesCrashAmbiguityAndSecuresState(t *testing.T) {
 }
 
 func TestSessionBindingIsDurable(t *testing.T) {
-	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state")})
+	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Harness: HarnessClaude})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestSessionBindingIsDurable(t *testing.T) {
 }
 
 func TestStartFailureRetriesWithSessionID(t *testing.T) {
-	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), ClaudePath: filepath.Join(t.TempDir(), "missing")})
+	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Harness: HarnessClaude, Executable: filepath.Join(t.TempDir(), "missing")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestStartFailureRetriesWithSessionID(t *testing.T) {
 }
 
 func TestProcessReadyStopsAfterFailureToPreserveOrder(t *testing.T) {
-	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), ClaudePath: filepath.Join(t.TempDir(), "missing")})
+	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Harness: HarnessClaude, Executable: filepath.Join(t.TempDir(), "missing")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestRegistrationTokenPersistsAndIsReusedAfterRestart(t *testing.T) {
 	defer server.Close()
 
 	for range 2 {
-		worker, err := New(Config{ProjectPath: project, AgentName: "agent", StateDir: state, APIBaseURL: server.URL})
+		worker, err := New(Config{ProjectPath: project, AgentName: "agent", StateDir: state, APIBaseURL: server.URL, Harness: HarnessClaude})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,7 +246,7 @@ func TestRegistrationTokenPersistsAndIsReusedAfterRestart(t *testing.T) {
 }
 
 func TestCatchUpPaginatesFiltersAndPersistsCursorAtomically(t *testing.T) {
-	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state")})
+	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Harness: HarnessClaude})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestCatchUpPaginatesFiltersAndPersistsCursorAtomically(t *testing.T) {
 
 func TestRetryBackoffTerminatesAfterMaximumAttempts(t *testing.T) {
 	now := time.Unix(1_000, 0).UTC()
-	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Now: func() time.Time { return now }})
+	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Harness: HarnessClaude, Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestWaitForWakeAuthenticatesAndHandlesStreamOutcomes(t *testing.T) {
 				_, _ = writer.Write([]byte(test.body))
 			}))
 			defer server.Close()
-			worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), APIBaseURL: server.URL})
+			worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), APIBaseURL: server.URL, Harness: HarnessClaude})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -382,7 +382,7 @@ func TestCanceledClaudeExecutionIsQuarantinedAsAmbiguous(t *testing.T) {
 		_ = json.NewEncoder(writer).Encode(message{MessageID: "message", ConversationID: "conversation", Body: "body"})
 	}))
 	defer server.Close()
-	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), ClaudePath: claude, APIBaseURL: server.URL})
+	worker, err := New(Config{ProjectPath: t.TempDir(), AgentName: "agent", StateDir: filepath.Join(t.TempDir(), "state"), Harness: HarnessClaude, Executable: claude, APIBaseURL: server.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,5 +402,48 @@ func TestCanceledClaudeExecutionIsQuarantinedAsAmbiguous(t *testing.T) {
 	}
 	if status != "ambiguous" || !strings.Contains(lastError, "outcome is unknown") {
 		t.Fatalf("status=%q last_error=%q", status, lastError)
+	}
+}
+
+func TestPiDeliveryUsesExactSessionIDForEveryTurn(t *testing.T) {
+	project := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	pi := filepath.Join(t.TempDir(), "pi")
+	logPath := filepath.Join(t.TempDir(), "pi.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PI_TEST_LOG\"\nprintf '{\"type\":\"agent_end\"}\\n'\n"
+	if err := os.WriteFile(pi, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PI_TEST_LOG", logPath)
+	messages := map[string]message{
+		"m1": {MessageID: "m1", ConversationID: "conversation", Body: "body one"},
+		"m2": {MessageID: "m2", ConversationID: "conversation", Body: "body two"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_ = json.NewEncoder(writer).Encode(messages[strings.TrimPrefix(request.URL.Path, messagesPath)])
+	}))
+	defer server.Close()
+	worker, err := New(Config{ProjectPath: project, AgentName: "Pi", StateDir: state, APIBaseURL: server.URL,
+		Harness: HarnessPi, Executable: pi, Now: func() time.Time { return time.Unix(100, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = worker.Close() })
+	worker.token = "token"
+	for _, id := range []string{"m1", "m2"} {
+		if _, err := worker.db.Exec(`INSERT INTO deliveries(message_id,conversation_id,status) VALUES(?, '', 'pending')`, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.deliver(context.Background(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(logged), "-p --approve") != 2 || strings.Contains(string(logged), "--resume") || strings.Count(string(logged), "--session-id") != 2 ||
+		strings.Count(string(logged), "--session-dir "+filepath.Join(state, "sessions")) != 2 || strings.Count(string(logged), "--approve") != 2 {
+		t.Fatalf("Pi invocations = %q", logged)
 	}
 }
