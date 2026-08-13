@@ -41,6 +41,7 @@ export interface SupervisorDependencies {
   fetch: typeof globalThis.fetch
   sleep(milliseconds: number, signal: AbortSignal): Promise<void>
   importLegacy(path: string): Promise<{ token?: string; cursor?: string; delivered: string[]; quarantined: string[] }>
+  connected(): void
 }
 
 const defaults: SupervisorDependencies = {
@@ -55,6 +56,7 @@ const defaults: SupervisorDependencies = {
     })
   },
   importLegacy: importLegacyState,
+  connected: () => {},
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -216,6 +218,7 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
     }
     await persist()
     const token = await register(options, join(options.stateDir, "token"), legacy.token, dependencies.fetch, signal)
+    dependencies.connected()
     const headers = { authorization: `Bearer ${token}`, accept: "application/json" }
     const admitted = new Map<string, { resolve(): void; reject(error: Error): void }>()
     const onMessageEnd = (event: { message: unknown }): void => {
@@ -310,7 +313,7 @@ export default function blackbirdPi(pi: ExtensionAPI): void {
     if (process.env["BLACKBIRD_PI_DISABLED"] === "1") { status = "disabled"; return }
     controller = new AbortController()
     status = "connecting"
-    task = runSupervisor(pi, ctx, resolveOptions(ctx.cwd), controller.signal).then(() => { status = "stopped" }).catch((error: unknown) => {
+    task = runSupervisor(pi, ctx, resolveOptions(ctx.cwd), controller.signal, { ...defaults, connected: () => { status = "connected" } }).then(() => { status = "stopped" }).catch((error: unknown) => {
       status = String(error)
       if (ctx.hasUI) ctx.ui.notify(status, "warning")
     })
