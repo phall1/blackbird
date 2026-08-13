@@ -27,10 +27,10 @@ function host(onSend?: (message: Record<string, unknown>) => void): ExtensionAPI
   } as unknown as ExtensionAPI
 }
 
-function dependencies(fetcher: typeof fetch, legacy: SupervisorDependencies["importLegacy"] = async () => ({ delivered: [], quarantined: [] })): SupervisorDependencies {
-  return { fetch: fetcher, importLegacy: legacy, sleep: async (_milliseconds, signal) => {
+function dependencies(fetcher: typeof fetch, legacy?: SupervisorDependencies["importLegacy"], connected = vi.fn()): SupervisorDependencies {
+  return { fetch: fetcher, importLegacy: legacy ?? (async () => ({ delivered: [], quarantined: [] })), sleep: async (_milliseconds, signal) => {
     if (signal.aborted) throw new DOMException("Aborted", "AbortError")
-  } }
+  }, connected }
 }
 
 describe("configuration", () => {
@@ -46,6 +46,7 @@ describe("supervisor", () => {
     const controller = new AbortController()
     controllers.push(controller)
     const sent: Record<string, unknown>[] = []
+    const connected = vi.fn()
     let catchUps = 0
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : input)
@@ -69,7 +70,8 @@ describe("supervisor", () => {
     })
     await runSupervisor(host((message) => sent.push(message)), context(), {
       ...resolveOptions("/repo", { XDG_STATE_HOME: "/unused" }), stateDir, legacyStateDir: join(stateDir, "legacy"),
-    }, controller.signal, dependencies(fetcher as typeof fetch))
+    }, controller.signal, dependencies(fetcher as typeof fetch, undefined, connected))
+    expect(connected).toHaveBeenCalledOnce()
     expect(sent).toEqual([expect.objectContaining({ customType: "blackbird-inbox", details: {
       blackbirdMessageId: "m1", blackbirdConversationId: "c1", blackbirdBodyDigest: "digest",
     } })])
