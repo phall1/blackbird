@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -536,8 +537,12 @@ func openBackupDatabase(path string, readOnly bool) (*sql.DB, error) {
 }
 
 func sqliteFileURI(path string, readOnly bool) string {
+	return sqliteFileURIWithTimeout(path, readOnly, defaultBusyTimeout)
+}
+
+func sqliteFileURIWithTimeout(path string, readOnly bool, busyTimeout time.Duration) string {
 	query := url.Values{}
-	query.Set("_busy_timeout", "5000")
+	query.Set("_busy_timeout", strconv.FormatInt(busyTimeout.Milliseconds(), 10))
 	query.Set("_foreign_keys", "on")
 	query.Set("_dqs", "false")
 	query.Add("_pragma", "trusted_schema(OFF)")

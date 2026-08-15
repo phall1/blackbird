@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +32,41 @@ const (
 	minimumUpdateInterval = time.Hour
 	maximumUpdateInterval = 24 * time.Hour
 	updaterPath           = "/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin"
+
+	// HandshakeFileName is the daemon discovery record the runtime writes into
+	// the state directory and the CLI reads back.
+	HandshakeFileName = "admin.json"
+
+	daemonCommand      = "daemon"
+	defaultHTTPAddress = "127.0.0.1:8080"
+	healthPath         = "/healthz"
+	daemonLogFileName  = "blackbird.log"
+	daemonErrFileName  = "blackbird.err.log"
+	probeTimeout       = 2 * time.Second
+	probeMaxBytes      = 8 << 10
+	crashWindow        = time.Minute
+	errorLogTailBytes  = 64 << 10
+	errorLevelMarker   = "level=ERROR"
+	logTimeField       = "time="
+	updaterScheduled   = "scheduled"
+	updaterStopped     = "stopped"
+)
+
+// Daemon states reported by Status. They combine three independent facts: the
+// unit file, the supervisor, and a real handshake against the daemon.
+const (
+	DaemonNotInstalled = "not-installed"
+	DaemonStopped      = "stopped"
+	DaemonRunning      = "running"
+	DaemonUnreachable  = "unreachable"
+	DaemonCrashLooping = "crash-looping"
+)
+
+// Service definition states reported by Status.
+const (
+	DefinitionAbsent  = "absent"
+	DefinitionCurrent = "current"
+	DefinitionStale   = "stale"
 )
 
 // Runner executes a host command and returns its combined output.
@@ -44,6 +81,38 @@ func (commandRunner) Run(ctx context.Context, name string, args ...string) (stri
 	return strings.TrimSpace(string(output)), err
 }
 
+// Prober performs a liveness handshake against a running daemon and reports the
+// version it answered with.
+type Prober interface {
+	Probe(context.Context, string) (string, error)
+}
+
+type httpProber struct{}
+
+func (httpProber) Probe(ctx context.Context, address string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+address+healthPath, nil)
+	if err != nil {
+		return "", fmt.Errorf("build health request: %w", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("probe %s: %w", address, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("probe %s: unexpected status %d", address, response.StatusCode)
+	}
+	var health struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, probeMaxBytes)).Decode(&health); err != nil {
+		return "", fmt.Errorf("decode health response: %w", err)
+	}
+	return health.Version, nil
+}
+
 // Config supplies host details. Tests can override every machine-dependent input.
 type Config struct {
 	GOOS           string
@@ -56,6 +125,7 @@ type Config struct {
 	UID            int
 	UpdateInterval time.Duration
 	Runner         Runner
+	Prober         Prober
 	LookPath       func(string) (string, error)
 }
 
@@ -72,10 +142,14 @@ type Result struct {
 }
 
 // UpdateResult reports whether Homebrew installed a different version.
+// DefinitionSkipped records that the service definition was left untouched
+// because the running binary is not the one the service invokes: repointing a
+// service at a build-tree path breaks it on the next boot.
 type UpdateResult struct {
-	Changed bool
-	Before  string
-	After   string
+	Changed           bool
+	Before            string
+	After             string
+	DefinitionSkipped bool
 }
 
 // New returns a manager configured from the current process environment.
@@ -118,11 +192,12 @@ func NewManager(config Config) *Manager {
 	if config.DataHome == "" {
 		config.DataHome = filepath.Join(config.HomeDir, ".local", "share")
 	}
-	if config.StateHome == "" {
-		config.StateHome = filepath.Join(config.HomeDir, ".local", "state")
-	}
+	config.StateHome = stateHome(config.StateHome, config.HomeDir)
 	if config.Runner == nil {
 		config.Runner = commandRunner{}
+	}
+	if config.Prober == nil {
+		config.Prober = httpProber{}
 	}
 	if config.LookPath == nil {
 		config.LookPath = exec.LookPath
@@ -137,6 +212,48 @@ func NewManager(config Config) *Manager {
 		config.WorkingDir = config.HomeDir
 	}
 	return &Manager{config: config}
+}
+
+func stateHome(configured, home string) string {
+	if configured != "" {
+		return configured
+	}
+	return filepath.Join(home, ".local", "state")
+}
+
+// DefaultStateDir resolves the Blackbird state directory from the process
+// environment, applying exactly the resolution NewManager applies to
+// Config.StateHome. Callers that already hold a Manager use Manager.StateDir.
+func DefaultStateDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(stateHome(os.Getenv("XDG_STATE_HOME"), home), "blackbird"), nil
+}
+
+// HandshakePath returns the daemon handshake record inside a state directory.
+func HandshakePath(stateDir string) string {
+	return filepath.Join(stateDir, HandshakeFileName)
+}
+
+// StateDir returns the Blackbird state directory this manager installs against.
+// The service definition passes it to the daemon explicitly because a launchd
+// agent and a systemd user unit do not inherit the login shell's XDG variables.
+func (manager *Manager) StateDir() string {
+	return manager.blackbirdStateDir()
+}
+
+// ServiceArgv returns the argv the service definition must invoke. The explicit
+// daemon subcommand replaces the pre-0.4 bare-flag form, which the CLI still
+// accepts so an upgraded binary survives an unrewritten unit file.
+func (manager *Manager) ServiceArgv() []string {
+	return []string{
+		manager.config.Executable,
+		daemonCommand,
+		"--sqlite-path=" + filepath.Join(manager.blackbirdDataDir(), "blackbird.db"),
+		"--state-dir=" + manager.blackbirdStateDir(),
+	}
 }
 
 // Install creates local directories, converges detected MCP clients, and restarts the service.
@@ -158,11 +275,8 @@ func (manager *Manager) Install(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	servicePath := manager.servicePath()
-	if err := os.MkdirAll(filepath.Dir(servicePath), 0o700); err != nil {
-		return Result{}, fmt.Errorf("create service directory: %w", err)
-	}
-	if err := atomicWrite(servicePath, []byte(manager.serviceDefinition()), 0o600); err != nil {
-		return Result{}, fmt.Errorf("write service definition: %w", err)
+	if _, err := manager.convergeServiceDefinition(); err != nil {
+		return Result{}, err
 	}
 	updaterPaths := manager.updaterPaths()
 	for index, path := range updaterPaths {
@@ -202,16 +316,201 @@ func (manager *Manager) Status(ctx context.Context) (string, error) {
 		serviceOutput, serviceErr = manager.config.Runner.Run(ctx, "systemctl", "--user", "is-active", "blackbird.service")
 		updaterOutput, updaterErr = manager.config.Runner.Run(ctx, "systemctl", "--user", "is-active", "blackbird-update.timer")
 	}
-	serviceState := nativeState(manager.config.GOOS, serviceOutput, serviceErr, "running", "stopped")
-	updaterState := nativeState(manager.config.GOOS, updaterOutput, updaterErr, "scheduled", "stopped")
-	if manager.config.GOOS == "darwin" && updaterErr == nil {
-		updaterState = "scheduled"
+	supervisor := supervisorReport{
+		goos:   manager.config.GOOS,
+		state:  nativeState(manager.config.GOOS, serviceOutput, serviceErr, DaemonRunning, DaemonStopped),
+		output: serviceOutput,
+		err:    serviceErr,
+	}
+	// A periodic job is idle between ticks, so neither supervisor reports it as
+	// running: a successful query is the whole signal. The state is reported
+	// bare on both platforms because consumers match this field exactly, and a
+	// healthy systemd timer would otherwise read as "scheduled (active)" and
+	// never satisfy them.
+	updaterState := nativeState(manager.config.GOOS, updaterOutput, updaterErr, updaterScheduled, updaterStopped)
+	if updaterErr == nil {
+		updaterState = updaterScheduled
+	}
+	definitionState, err := manager.definitionState()
+	if err != nil {
+		return "", err
 	}
 	return fmt.Sprintf(
-		"daemon=%s installed=%t path=%s updater=%s installed=%t paths=%s interval=%s",
-		serviceState, serviceInstalled, manager.servicePath(), updaterState, updaterInstalled,
+		"daemon=%s installed=%t path=%s definition=%s updater=%s installed=%t paths=%s interval=%s",
+		manager.daemonState(ctx, serviceInstalled, supervisor), serviceInstalled, manager.servicePath(),
+		definitionState, updaterState, updaterInstalled,
 		strings.Join(manager.updaterPaths(), ","), manager.config.UpdateInterval,
 	), nil
+}
+
+// supervisorReport is one sample of the platform supervisor's opinion: the
+// state nativeState derived, the raw output the failure signals are read out
+// of, and the error the query itself returned.
+type supervisorReport struct {
+	goos   string
+	state  string
+	output string
+	err    error
+}
+
+// daemonState resolves the supervisor's opinion against a real handshake. A
+// loaded launchd job says nothing about liveness: the recorded crash loop kept
+// the job loaded while every start aborted on a schema mismatch. The failure
+// signals are read whether or not the supervisor currently reports the job as
+// up, because a crash-looping daemon is dead at nearly every instant it can be
+// sampled: systemd holds it in activating (auto-restart) between attempts, and
+// launchd throttles it for the remainder of its ten-second minimum runtime.
+func (manager *Manager) daemonState(ctx context.Context, installed bool, supervisor supervisorReport) string {
+	if !installed {
+		return DaemonNotInstalled
+	}
+	detail := ""
+	if index := strings.Index(supervisor.state, " ("); index >= 0 {
+		detail = supervisor.state[index:]
+	}
+	if _, err := manager.config.Prober.Probe(ctx, manager.daemonAddress()); err == nil {
+		return DaemonRunning + detail
+	}
+	if manager.recentlyFailed(supervisor) {
+		return DaemonCrashLooping + detail
+	}
+	if !strings.HasPrefix(supervisor.state, DaemonRunning) {
+		return supervisor.state
+	}
+	return DaemonUnreachable + detail
+}
+
+func (manager *Manager) daemonAddress() string {
+	content, err := os.ReadFile(HandshakePath(manager.blackbirdStateDir()))
+	if err != nil {
+		return defaultHTTPAddress
+	}
+	var handshake struct {
+		HTTPAddress string `json:"http_address"`
+	}
+	if err := json.Unmarshal(content, &handshake); err != nil || handshake.HTTPAddress == "" {
+		return defaultHTTPAddress
+	}
+	return handshake.HTTPAddress
+}
+
+// recentlyFailed reports an actual failure signal, never mere log freshness:
+// the daemon routes all of its slog output to stderr at Info level, so its
+// error log carries an ordinary start as well as a failing one. A daemon that
+// is still binding its listener must read as unreachable, not as crash-looping,
+// and a daemon the supervisor is deliberately holding down is stopped even if
+// an earlier shutdown wrote to the error log.
+func (manager *Manager) recentlyFailed(supervisor supervisorReport) bool {
+	if supervisor.dormant() {
+		return false
+	}
+	return supervisor.failed() || manager.loggedFailure()
+}
+
+// dormant reports that the supervisor is not trying to run the daemon at all.
+// systemd only answers "inactive" for a unit it has stopped, never for one it
+// is restarting, and launchctl print fails outright once the job is booted out.
+func (supervisor supervisorReport) dormant() bool {
+	if supervisor.goos == "darwin" {
+		return supervisor.err != nil
+	}
+	state := strings.TrimSpace(supervisor.output)
+	return state == "inactive" || state == "unknown"
+}
+
+// failed reads the supervisor's own record of a failing job. systemctl
+// is-active exits non-zero for a restart loop and for an exhausted unit alike,
+// so the state text is the only thing separating them from a clean stop, and
+// launchd keeps both the last exit code and the throttling it applies to a job
+// that dies inside its minimum runtime.
+func (supervisor supervisorReport) failed() bool {
+	if supervisor.goos != "darwin" {
+		state := strings.TrimSpace(supervisor.output)
+		return state == "failed" || strings.HasPrefix(state, "activating") || strings.Contains(state, "auto-restart")
+	}
+	if strings.Contains(strings.ToLower(supervisor.output), "throttled") {
+		return true
+	}
+	for _, line := range strings.Split(supervisor.output, "\n") {
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key != "last exit code" && key != "last exit status" {
+			continue
+		}
+		code, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil && code != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// loggedFailure reports whether the tail of the daemon's error log carries an
+// Error record the daemon wrote inside the crash window. The supervisor opens
+// this file in append mode and never truncates it, so the file's modification
+// time belongs to its newest line only: an ordinary healthy start refreshes it
+// above failures left there by earlier versions. Every line is therefore dated
+// by its own timestamp, and the file time is kept only as a cheap way to skip
+// reading an idle log at all.
+func (manager *Manager) loggedFailure() bool {
+	path := manager.daemonErrorLogPath()
+	info, err := os.Stat(path)
+	if err != nil || info.Size() == 0 || time.Since(info.ModTime()) >= crashWindow {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = file.Close() }()
+	offset := int64(0)
+	if info.Size() > errorLogTailBytes {
+		offset = info.Size() - errorLogTailBytes
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return false
+	}
+	tail, err := io.ReadAll(io.LimitReader(file, errorLogTailBytes))
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(tail), "\n")
+	if offset > 0 && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	for _, line := range lines {
+		if freshFailureRecord(strings.TrimSpace(line)) {
+			return true
+		}
+	}
+	return false
+}
+
+// freshFailureRecord dates one slog text record and reports an Error written
+// inside the crash window. A line the slog handler never wrote - a panic, a
+// runtime fatal, the legacy-argv deprecation notice - carries no timestamp, so
+// it cannot be told apart from a pre-upgrade leftover and is left to the
+// supervisor's own exit-code and throttling signals. The window is applied in
+// both directions so a record stamped by a skewed clock ages out instead of
+// pinning the daemon to crash-looping forever.
+func freshFailureRecord(line string) bool {
+	if !strings.Contains(line, errorLevelMarker) {
+		return false
+	}
+	rest, found := strings.CutPrefix(line, logTimeField)
+	if !found {
+		return false
+	}
+	stamp, _, _ := strings.Cut(rest, " ")
+	written, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		return false
+	}
+	age := time.Since(written)
+	return age < crashWindow && age > -crashWindow
 }
 
 // Update refreshes Homebrew metadata, upgrades Blackbird, and restarts only after a version change.
@@ -234,7 +533,12 @@ func (manager *Manager) Update(ctx context.Context) (UpdateResult, error) {
 	if err := manager.cleanupLegacyAdapters(ctx); err != nil {
 		return UpdateResult{}, err
 	}
-	if result.Changed {
+	definitionChanged, skipped, err := manager.convergeInstalledServiceDefinition()
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	result.DefinitionSkipped = skipped
+	if result.Changed || definitionChanged {
 		if err := manager.restart(ctx); err != nil {
 			return UpdateResult{}, err
 		}
@@ -582,8 +886,33 @@ func (manager *Manager) updaterPaths() []string {
 	return []string{filepath.Join(unitDirectory, "blackbird-update.service"), filepath.Join(unitDirectory, "blackbird-update.timer")}
 }
 
+// updaterEnvironment is the environment the unattended updater must run with.
+// Neither a launchd agent nor a systemd user unit inherits the login shell, so
+// without these `blackbird update` resolves the XDG defaults instead of the
+// directories this installation actually uses, and converges a service
+// definition pointing at a different database and state directory than the one
+// it is repairing.
+func (manager *Manager) updaterEnvironment() []environmentEntry {
+	return []environmentEntry{
+		{name: "PATH", value: updaterPath},
+		{name: "XDG_CONFIG_HOME", value: manager.config.ConfigHome},
+		{name: "XDG_DATA_HOME", value: manager.config.DataHome},
+		{name: "XDG_STATE_HOME", value: manager.config.StateHome},
+	}
+}
+
+type environmentEntry struct {
+	name  string
+	value string
+}
+
 func (manager *Manager) updaterDefinitions() []string {
+	environment := manager.updaterEnvironment()
 	if manager.config.GOOS == "darwin" {
+		variables := make([]string, 0, len(environment))
+		for _, entry := range environment {
+			variables = append(variables, "<key>"+xmlEscape(entry.name)+"</key><string>"+xmlEscape(entry.value)+"</string>")
+		}
 		return []string{fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -592,13 +921,17 @@ func (manager *Manager) updaterDefinitions() []string {
   <key>ProgramArguments</key>
   <array><string>%s</string><string>update</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>%s</string></dict>
+  <dict>%s</dict>
   <key>StartInterval</key><integer>%d</integer>
   <key>StandardOutPath</key><string>%s</string>
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, updaterLabel, xmlEscape(manager.config.Executable), updaterPath, int(manager.config.UpdateInterval/time.Second), xmlEscape(filepath.Join(manager.blackbirdStateDir(), "update.log")), xmlEscape(filepath.Join(manager.blackbirdStateDir(), "update.err.log")))}
+`, updaterLabel, xmlEscape(manager.config.Executable), strings.Join(variables, ""), int(manager.config.UpdateInterval/time.Second), xmlEscape(filepath.Join(manager.blackbirdStateDir(), "update.log")), xmlEscape(filepath.Join(manager.blackbirdStateDir(), "update.err.log")))}
+	}
+	assignments := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		assignments = append(assignments, "Environment="+systemdEscape(entry.name+"="+entry.value))
 	}
 	service := fmt.Sprintf(`[Unit]
 Description=Update Blackbird through Homebrew
@@ -607,9 +940,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-Environment=%s
+%s
 ExecStart=%s update
-`, systemdEscape("PATH="+updaterPath), systemdEscape(manager.config.Executable))
+`, strings.Join(assignments, "\n"), systemdEscape(manager.config.Executable))
 	timer := fmt.Sprintf(`[Unit]
 Description=Periodically update Blackbird through Homebrew
 
@@ -626,22 +959,33 @@ WantedBy=timers.target
 }
 
 func (manager *Manager) serviceDefinition() string {
-	database := filepath.Join(manager.blackbirdDataDir(), "blackbird.db")
+	argv := manager.ServiceArgv()
 	if manager.config.GOOS == "darwin" {
+		arguments := make([]string, 0, len(argv))
+		for _, argument := range argv {
+			arguments = append(arguments, "<string>"+xmlEscape(argument)+"</string>")
+		}
 		return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>%s</string>
   <key>ProgramArguments</key>
-  <array><string>%s</string><string>--sqlite-path=%s</string></array>
+  <array>%s</array>
+  <key>EnvironmentVariables</key>
+  <dict><key>XDG_STATE_HOME</key><string>%s</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>%s</string>
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, serviceLabel, xmlEscape(manager.config.Executable), xmlEscape(database), xmlEscape(filepath.Join(manager.blackbirdStateDir(), "blackbird.log")), xmlEscape(filepath.Join(manager.blackbirdStateDir(), "blackbird.err.log")))
+`, serviceLabel, strings.Join(arguments, ""), xmlEscape(manager.config.StateHome),
+			xmlEscape(manager.daemonLogPath()), xmlEscape(manager.daemonErrorLogPath()))
+	}
+	arguments := make([]string, 0, len(argv))
+	for _, argument := range argv {
+		arguments = append(arguments, systemdEscape(argument))
 	}
 	return fmt.Sprintf(`[Unit]
 Description=Blackbird local coordination service
@@ -649,17 +993,163 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s --sqlite-path=%s
+Environment=%s
+ExecStart=%s
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=default.target
-`, systemdEscape(manager.config.Executable), systemdEscape(database))
+`, systemdEscape("XDG_STATE_HOME="+manager.config.StateHome), strings.Join(arguments, " "))
+}
+
+// convergeServiceDefinition rewrites the service definition only when the
+// on-disk bytes differ, and reports whether it changed. Every upgraded machine
+// repairs its own unit file on the next unattended updater tick.
+func (manager *Manager) convergeServiceDefinition() (bool, error) {
+	path := manager.servicePath()
+	wanted := []byte(manager.serviceDefinition())
+	current, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, fmt.Errorf("read service definition: %w", err)
+	}
+	if err == nil && bytes.Equal(current, wanted) {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, fmt.Errorf("create service directory: %w", err)
+	}
+	if err := atomicWrite(path, wanted, 0o600); err != nil {
+		return false, fmt.Errorf("write service definition: %w", err)
+	}
+	return true, nil
+}
+
+// convergeInstalledServiceDefinition repairs the unit file only when this
+// process is the binary the unit already invokes, and reports whether it was
+// skipped. An unattended `blackbird update` can run from a build tree or a
+// throwaway copy; writing ServiceArgv() then would repoint the supervisor at a
+// path that disappears, and the service would fail to start on the next boot.
+// Only `blackbird install` may name a new executable for the service.
+func (manager *Manager) convergeInstalledServiceDefinition() (changed, skipped bool, err error) {
+	recorded, err := manager.recordedServiceExecutable()
+	if err != nil {
+		return false, false, err
+	}
+	if !sameExecutable(recorded, manager.config.Executable) {
+		return false, true, nil
+	}
+	changed, err = manager.convergeServiceDefinition()
+	return changed, false, err
+}
+
+func (manager *Manager) recordedServiceExecutable() (string, error) {
+	content, err := os.ReadFile(manager.servicePath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read service definition: %w", err)
+	}
+	return definitionExecutable(manager.config.GOOS, string(content)), nil
+}
+
+func definitionExecutable(goos, definition string) string {
+	if goos == "darwin" {
+		arguments := strings.Index(definition, "<key>ProgramArguments</key>")
+		if arguments < 0 {
+			return ""
+		}
+		rest := definition[arguments:]
+		start := strings.Index(rest, "<string>")
+		if start < 0 {
+			return ""
+		}
+		rest = rest[start+len("<string>"):]
+		end := strings.Index(rest, "</string>")
+		if end < 0 {
+			return ""
+		}
+		return xmlUnescape(rest[:end])
+	}
+	for _, line := range strings.Split(definition, "\n") {
+		if value, found := strings.CutPrefix(strings.TrimSpace(line), "ExecStart="); found {
+			return firstSystemdArgument(value)
+		}
+	}
+	return ""
+}
+
+func firstSystemdArgument(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, `"`) {
+		if index := strings.IndexByte(value, ' '); index >= 0 {
+			return value[:index]
+		}
+		return value
+	}
+	var argument strings.Builder
+	for index := 1; index < len(value); index++ {
+		switch {
+		case value[index] == '\\' && index+1 < len(value):
+			index++
+			argument.WriteByte(value[index])
+		case value[index] == '"':
+			return strings.ReplaceAll(argument.String(), "%%", "%")
+		default:
+			argument.WriteByte(value[index])
+		}
+	}
+	return strings.ReplaceAll(argument.String(), "%%", "%")
+}
+
+func sameExecutable(recorded, current string) bool {
+	if recorded == "" || current == "" {
+		return false
+	}
+	if recorded == current {
+		return true
+	}
+	recordedInfo, err := os.Stat(recorded)
+	if err != nil {
+		return false
+	}
+	currentInfo, err := os.Stat(current)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(recordedInfo, currentInfo)
+}
+
+func (manager *Manager) definitionState() (string, error) {
+	current, err := os.ReadFile(manager.servicePath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return DefinitionAbsent, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read service definition: %w", err)
+	}
+	if !bytes.Equal(current, []byte(manager.serviceDefinition())) {
+		return DefinitionStale, nil
+	}
+	return DefinitionCurrent, nil
+}
+
+func (manager *Manager) daemonLogPath() string {
+	return filepath.Join(manager.blackbirdStateDir(), daemonLogFileName)
+}
+
+func (manager *Manager) daemonErrorLogPath() string {
+	return filepath.Join(manager.blackbirdStateDir(), daemonErrFileName)
 }
 
 func xmlEscape(value string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
+	return replacer.Replace(value)
+}
+
+func xmlUnescape(value string) string {
+	replacer := strings.NewReplacer("&lt;", "<", "&gt;", ">", "&quot;", `"`, "&apos;", "'", "&amp;", "&")
 	return replacer.Replace(value)
 }
 

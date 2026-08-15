@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"sync"
@@ -20,6 +23,7 @@ const (
 	developmentVersion = "dev"
 	unknownBuildValue  = "unknown"
 	defaultStopTimeout = 30 * time.Second
+	logLevelVariable   = "BLACKBIRD_LOG_LEVEL"
 )
 
 // StorageBackend identifies the durable storage implementation selected at startup.
@@ -35,8 +39,10 @@ const (
 type Config struct {
 	Storage         StorageBackend
 	SQLitePath      string
+	StateDir        string
 	HTTPAddress     string
 	MCPAddress      string
+	LogLevel        string
 	ShutdownTimeout time.Duration
 }
 
@@ -63,7 +69,37 @@ func (config Config) Validate() error {
 	if config.ShutdownTimeout < 0 {
 		return errors.New("shutdown timeout cannot be negative")
 	}
+	if _, err := config.logLevel(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// logLevel resolves the configured severity. An unparsable value in the
+// environment falls back to the default rather than refusing to start; an
+// unparsable value in Config is a configuration error the caller must see.
+func (config Config) logLevel() (slog.Level, error) {
+	var level slog.Level
+	if config.LogLevel == "" {
+		if text := os.Getenv(logLevelVariable); text != "" && level.UnmarshalText([]byte(text)) == nil {
+			return level, nil
+		}
+		return slog.LevelInfo, nil
+	}
+	if err := level.UnmarshalText([]byte(config.LogLevel)); err != nil {
+		return slog.LevelInfo, fmt.Errorf("log level %q: %w", config.LogLevel, err)
+	}
+	return level, nil
+}
+
+// NewLogger builds the daemon's structured logger. Output belongs on stderr:
+// launchd and systemd both capture it, and stdout carries command output.
+func NewLogger(config Config, output io.Writer) (*slog.Logger, error) {
+	level, err := config.logLevel()
+	if err != nil {
+		return nil, err
+	}
+	return slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level})), nil
 }
 
 func validateTCPAddress(address string) error {
@@ -109,6 +145,16 @@ type Worker interface {
 	Stop(context.Context) error
 }
 
+// BoundAddressReceiver is the optional capability of a Worker that publishes
+// this daemon's reachable address. Composition happens before the listener
+// binds, so a worker composed from configuration alone would publish the
+// request rather than the result — and a configured port of 0 makes that
+// request unreachable. Runtime hands over the bound address between bind and
+// Start for any worker that implements this.
+type BoundAddressReceiver interface {
+	SetBoundHTTPAddress(address string)
+}
+
 // HandlerBundle is the complete ingress and background-work composition. Both
 // handlers are mandatory; runtime never substitutes placeholder handlers.
 type HandlerBundle struct {
@@ -131,6 +177,7 @@ type IngressServer interface {
 // factories use their production implementations; Composer is always required.
 type Dependencies struct {
 	Secrets        SecretSource
+	Logger         *slog.Logger
 	Compose        Composer
 	OpenSQLite     func(context.Context, sqlite.Config) (Storage, error)
 	OpenPostgreSQL func(context.Context, postgres.Config) (Storage, error)
@@ -167,6 +214,7 @@ type Daemon struct {
 	build        BuildInfo
 	config       Config
 	dependencies Dependencies
+	logger       *slog.Logger
 
 	runMu   sync.Mutex
 	running bool
@@ -183,7 +231,7 @@ type Daemon struct {
 // New returns an identity-only daemon retained for build-info callers. Run
 // fails closed because no production composition has been supplied.
 func New(build BuildInfo) *Daemon {
-	return &Daemon{build: build.Normalize()}
+	return &Daemon{build: build.Normalize(), logger: slog.New(slog.NewTextHandler(os.Stderr, nil))}
 }
 
 // NewDaemon validates process configuration and installs production defaults
@@ -222,7 +270,20 @@ func NewDaemon(build BuildInfo, config Config, dependencies Dependencies) (*Daem
 			}
 		}
 	}
-	return &Daemon{build: build.Normalize(), config: config, dependencies: dependencies}, nil
+	if dependencies.Logger == nil {
+		logger, err := NewLogger(config, os.Stderr)
+		if err != nil {
+			return nil, fmt.Errorf("runtime configuration: %w", err)
+		}
+		dependencies.Logger = logger
+	}
+	return &Daemon{
+		build: build.Normalize(), config: config, dependencies: dependencies,
+		logger: dependencies.Logger.With(
+			slog.String("version", build.Normalize().Version),
+			slog.Int("pid", os.Getpid()),
+		),
+	}, nil
 }
 
 // BuildInfo returns the daemon's normalized build identity.
@@ -239,24 +300,36 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 	daemon.runMu.Lock()
 	if daemon.running {
 		daemon.runMu.Unlock()
+		daemon.logger.Error("daemon is already running or has run")
 		return errors.New("daemon is already running or has run")
 	}
 	daemon.running = true
 	daemon.runMu.Unlock()
 	if daemon.dependencies.Compose == nil {
+		daemon.logger.Error("daemon has no production composition; use NewDaemon")
 		return errors.New("daemon has no production composition; use NewDaemon")
 	}
+	daemon.logger.Info("daemon starting",
+		slog.String("commit", daemon.build.Commit), slog.String("built_at", daemon.build.BuiltAt),
+		slog.String("storage", string(daemon.config.Storage)), slog.String("database", daemon.config.SQLitePath),
+		slog.String("state_dir", daemon.config.StateDir),
+		slog.String("http_address", daemon.config.HTTPAddress), slog.String("mcp_address", daemon.config.MCPAddress),
+	)
 
 	store, err := daemon.openStorage(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
+			daemon.logger.Info("startup cancelled while opening storage")
 			return nil
 		}
+		daemon.logger.Error("open storage", slog.Any("error", err))
 		return fmt.Errorf("open storage: %w", err)
 	}
 	if isNil(store) {
+		daemon.logger.Error("storage factory returned nil")
 		return errors.New("storage factory returned nil")
 	}
+	daemon.logger.Info("storage opened", slog.String("storage", string(daemon.config.Storage)))
 	daemon.resourcesMu.Lock()
 	daemon.store = store
 	daemon.resourcesMu.Unlock()
@@ -268,19 +341,40 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		shutdownErr := daemon.Shutdown(context.Background())
 		if errors.Is(err, context.Canceled) {
+			daemon.logger.Info("startup cancelled while composing handlers")
 			return shutdownErr
 		}
+		daemon.logger.Error("compose handlers", slog.Any("error", err))
 		return errors.Join(fmt.Errorf("compose handlers: %w", err), shutdownErr)
 	}
 	if isNil(bundle.HTTP) || isNil(bundle.MCP) {
+		daemon.logger.Error("composition supplied incomplete ingress handlers")
 		return errors.Join(errors.New("composition must supply complete HTTP and MCP handlers"), daemon.Shutdown(context.Background()))
 	}
 	if ctx.Err() != nil {
 		return daemon.Shutdown(context.Background())
 	}
+
+	// Listeners bind before workers start. A worker that publishes process-wide
+	// state must never run in a process that lost the address race, or its
+	// rollback destroys the state of the daemon that actually holds the port.
+	httpListener, err := daemon.bind(daemon.config.HTTPAddress, "HTTP")
+	if err != nil {
+		return errors.Join(err, daemon.Shutdown(context.Background()))
+	}
+	mcpListener, err := daemon.bind(daemon.config.MCPAddress, "MCP")
+	if err != nil {
+		return errors.Join(err, daemon.Shutdown(context.Background()))
+	}
+
+	boundHTTPAddress := httpListener.Addr().String()
 	for index, worker := range bundle.Workers {
 		if isNil(worker) {
+			daemon.logger.Error("composition supplied a nil worker", slog.Int("worker", index))
 			return errors.Join(fmt.Errorf("worker %d is nil", index), daemon.Shutdown(context.Background()))
+		}
+		if receiver, ok := worker.(BoundAddressReceiver); ok {
+			receiver.SetBoundHTTPAddress(boundHTTPAddress)
 		}
 		daemon.resourcesMu.Lock()
 		daemon.workers = append(daemon.workers, worker)
@@ -290,6 +384,7 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) {
 				return shutdownErr
 			}
+			daemon.logger.Error("start worker", slog.Int("worker", index), slog.Any("error", err))
 			return errors.Join(fmt.Errorf("start worker %d: %w", index, err), shutdownErr)
 		}
 		if ctx.Err() != nil {
@@ -297,30 +392,10 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	httpListener, err := daemon.dependencies.Listen("tcp", daemon.config.HTTPAddress)
-	if err != nil {
-		return errors.Join(fmt.Errorf("listen HTTP: %w", err), daemon.Shutdown(context.Background()))
-	}
-	if isNil(httpListener) {
-		return errors.Join(errors.New("HTTP listener factory returned nil"), daemon.Shutdown(context.Background()))
-	}
-	daemon.resourcesMu.Lock()
-	daemon.listeners = append(daemon.listeners, httpListener)
-	daemon.resourcesMu.Unlock()
-	mcpListener, err := daemon.dependencies.Listen("tcp", daemon.config.MCPAddress)
-	if err != nil {
-		return errors.Join(fmt.Errorf("listen MCP: %w", err), daemon.Shutdown(context.Background()))
-	}
-	if isNil(mcpListener) {
-		return errors.Join(errors.New("MCP listener factory returned nil"), daemon.Shutdown(context.Background()))
-	}
-	daemon.resourcesMu.Lock()
-	daemon.listeners = append(daemon.listeners, mcpListener)
-	daemon.resourcesMu.Unlock()
-
 	httpServer := daemon.dependencies.NewServer(daemon.config.HTTPAddress, bundle.HTTP)
 	mcpServer := daemon.dependencies.NewServer(daemon.config.MCPAddress, bundle.MCP)
 	if isNil(httpServer) || isNil(mcpServer) {
+		daemon.logger.Error("server factory returned nil")
 		return errors.Join(errors.New("server factory returned nil"), daemon.Shutdown(context.Background()))
 	}
 	daemon.resourcesMu.Lock()
@@ -341,6 +416,7 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 	<-serveStarted
 	select {
 	case serveErr := <-serveResults:
+		daemon.logger.Error("ingress stopped during startup", slog.Any("error", serveErr))
 		return errors.Join(serveErr, daemon.Shutdown(context.Background()), <-serveResults)
 	default:
 	}
@@ -352,16 +428,37 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 	if daemon.dependencies.Ready != nil {
 		daemon.dependencies.Ready()
 	}
+	daemon.logger.Info("daemon ready",
+		slog.String("http_address", boundHTTPAddress), slog.String("mcp_address", mcpListener.Addr().String()))
 
 	select {
 	case <-ctx.Done():
+		daemon.logger.Info("shutdown signalled")
 		shutdownErr := daemon.Shutdown(context.Background())
 		first, second := <-serveResults, <-serveResults
 		return errors.Join(shutdownErr, first, second)
 	case serveErr := <-serveResults:
+		daemon.logger.Error("ingress stopped unexpectedly", slog.Any("error", serveErr))
 		shutdownErr := daemon.Shutdown(context.Background())
 		return errors.Join(serveErr, shutdownErr, <-serveResults)
 	}
+}
+
+func (daemon *Daemon) bind(address, name string) (net.Listener, error) {
+	listener, err := daemon.dependencies.Listen("tcp", address)
+	if err != nil {
+		daemon.logger.Error("bind listener", slog.String("ingress", name), slog.String("address", address), slog.Any("error", err))
+		return nil, fmt.Errorf("listen %s: %w", name, err)
+	}
+	if isNil(listener) {
+		daemon.logger.Error("listener factory returned nil", slog.String("ingress", name))
+		return nil, fmt.Errorf("%s listener factory returned nil", name)
+	}
+	daemon.resourcesMu.Lock()
+	daemon.listeners = append(daemon.listeners, listener)
+	daemon.resourcesMu.Unlock()
+	daemon.logger.Info("listener bound", slog.String("ingress", name), slog.String("address", listener.Addr().String()))
+	return listener, nil
 }
 
 func (daemon *Daemon) openStorage(ctx context.Context) (Storage, error) {
@@ -370,9 +467,11 @@ func (daemon *Daemon) openStorage(ctx context.Context) (Storage, error) {
 	}
 	secrets, err := daemon.dependencies.Secrets.PostgreSQL(ctx)
 	if err != nil {
+		daemon.logger.Error("load PostgreSQL secrets", slog.Any("error", err))
 		return nil, fmt.Errorf("load PostgreSQL secrets: %w", err)
 	}
 	if secrets.DSN == "" {
+		daemon.logger.Error("PostgreSQL secret source returned an empty application DSN")
 		return nil, errors.New("PostgreSQL secret source returned an empty application DSN")
 	}
 	return daemon.dependencies.OpenPostgreSQL(ctx, postgres.Config{
@@ -396,22 +495,32 @@ func (daemon *Daemon) Shutdown(ctx context.Context) error {
 		store := daemon.store
 		daemon.resourcesMu.Unlock()
 
+		daemon.logger.Info("shutdown starting",
+			slog.Int("servers", len(servers)), slog.Int("workers", len(workers)))
 		var shutdownErr error
 		for _, server := range servers {
-			shutdownErr = errors.Join(shutdownErr, server.Shutdown(stopCtx))
+			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("shut down ingress", server.Shutdown(stopCtx)))
 		}
 		for _, listener := range listeners {
-			shutdownErr = errors.Join(shutdownErr, ignoreClosed(listener.Close()))
+			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("close listener", ignoreClosed(listener.Close())))
 		}
 		for index := len(workers) - 1; index >= 0; index-- {
-			shutdownErr = errors.Join(shutdownErr, workers[index].Stop(stopCtx))
+			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("stop worker", workers[index].Stop(stopCtx)))
 		}
 		if store != nil {
-			shutdownErr = errors.Join(shutdownErr, store.Close())
+			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("close storage", store.Close()))
 		}
 		daemon.shutdownErr = shutdownErr
+		daemon.logger.Info("shutdown complete", slog.Bool("clean", shutdownErr == nil))
 	})
 	return daemon.shutdownErr
+}
+
+func (daemon *Daemon) logFailure(message string, err error) error {
+	if err != nil {
+		daemon.logger.Error(message, slog.Any("error", err))
+	}
+	return err
 }
 
 func normalizeServeError(name string, err error) error {

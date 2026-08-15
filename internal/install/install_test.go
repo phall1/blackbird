@@ -149,7 +149,7 @@ func TestStatusReportsDaemonAndUpdater(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(status, "daemon=running (active) installed=true") ||
-		!strings.Contains(status, "updater=scheduled (active) installed=true") || !strings.Contains(status, "interval=6h0m0s") {
+		!strings.Contains(status, "updater=scheduled installed=true") || !strings.Contains(status, "interval=6h0m0s") {
 		t.Fatalf("status = %q", status)
 	}
 	want := []string{
@@ -232,6 +232,9 @@ func TestUpdateRestartsOnlyWhenBrewVersionChanges(t *testing.T) {
 	home := t.TempDir()
 	runner := &recordingRunner{outputs: []string{"blackbird 1.0.0", "", "", "blackbird 1.0.0"}}
 	manager := testManager(home, "linux", runner)
+	if _, err := manager.convergeServiceDefinition(); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := manager.Update(context.Background())
 	if err != nil {
@@ -255,6 +258,550 @@ func TestUpdateRestartsOnlyWhenBrewVersionChanges(t *testing.T) {
 	}) {
 		t.Fatalf("restart commands = %v", got)
 	}
+}
+
+func TestUpdateRepairsALegacyServiceDefinitionWithoutAVersionChange(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	runner := &recordingRunner{outputs: []string{"blackbird 1.0.0", "", "", "blackbird 1.0.0"}}
+	manager := testManager(home, "linux", runner)
+	mustWrite(t, manager.servicePath(), legacyUnit(manager.config.Executable, filepath.Join(home, "data", "blackbird", "blackbird.db")))
+
+	result, err := manager.Update(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Changed {
+		t.Fatalf("update reported a version change = %#v", result)
+	}
+	if got := runner.commands; !reflect.DeepEqual(got[len(got)-3:], []string{
+		"systemctl --user daemon-reload", "systemctl --user enable blackbird.service", "systemctl --user restart blackbird.service",
+	}) {
+		t.Fatalf("restart commands = %v", got)
+	}
+	content, err := os.ReadFile(manager.servicePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), " \"daemon\" ") {
+		t.Fatalf("unit file was not converged: %s", content)
+	}
+}
+
+func TestUpdateNeverRepointsTheServiceAtANonInstalledBinary(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		foreign       bool
+		installed     bool
+		wantSkipped   bool
+		wantRewritten bool
+	}{
+		"a build tree binary leaves the unit alone": {foreign: true, installed: true, wantSkipped: true},
+		"an absent definition is not created":       {wantSkipped: true},
+		"the installed binary repairs its unit":     {installed: true, wantRewritten: true},
+	}
+	for _, goos := range []string{"darwin", "linux"} {
+		for name, test := range tests {
+			t.Run(goos+"/"+name, func(t *testing.T) {
+				t.Parallel()
+				home := t.TempDir()
+				runner := &recordingRunner{outputs: []string{"blackbird 1.0.0", "", "", "blackbird 1.0.0"}}
+				manager := testManager(home, goos, runner)
+				database := filepath.Join(home, "data", "blackbird", "blackbird.db")
+				before := ""
+				if test.installed {
+					recorded := manager.config.Executable
+					if test.foreign {
+						recorded = filepath.Join(home, "build", "dist", "blackbird")
+					}
+					before = legacyDefinition(goos, recorded, database)
+					mustWrite(t, manager.servicePath(), before)
+				}
+
+				result, err := manager.Update(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				content, err := os.ReadFile(manager.servicePath())
+				switch {
+				case !test.installed:
+					if !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("update created a service definition: %q, %v", content, err)
+					}
+				case err != nil:
+					t.Fatal(err)
+				case test.wantRewritten:
+					if !strings.Contains(string(content), daemonCommand) {
+						t.Fatalf("installed unit was not converged: %s", content)
+					}
+				case string(content) != before:
+					t.Fatalf("unit was repointed at a non-installed binary:\n%s", content)
+				}
+				if result.DefinitionSkipped != test.wantSkipped {
+					t.Fatalf("DefinitionSkipped = %t, want %t", result.DefinitionSkipped, test.wantSkipped)
+				}
+				restarted := false
+				for _, command := range runner.commands {
+					if strings.Contains(command, "kickstart") || strings.Contains(command, "restart blackbird.service") {
+						restarted = true
+					}
+				}
+				if restarted != test.wantRewritten {
+					t.Fatalf("restarted = %t, want %t (commands=%v)", restarted, test.wantRewritten, runner.commands)
+				}
+			})
+		}
+	}
+}
+
+func TestInstallAdoptsTheServiceForTheRunningExecutable(t *testing.T) {
+	t.Parallel()
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, goos, &recordingRunner{})
+			mustWrite(t, manager.servicePath(), legacyDefinition(goos, filepath.Join(home, "build", "dist", "blackbird"), "old.db"))
+
+			if _, err := manager.Install(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			content, err := os.ReadFile(manager.servicePath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(content), manager.config.Executable) || strings.Contains(string(content), "old.db") {
+				t.Fatalf("install did not adopt the service: %s", content)
+			}
+		})
+	}
+}
+
+func TestStatusSeparatesASlowStartFromACrashLoop(t *testing.T) {
+	t.Parallel()
+	startupLog := logRecord(2*time.Second, "INFO", "daemon starting") +
+		logRecord(2*time.Second, "INFO", "storage opened") +
+		logRecord(time.Second, "INFO", "handshake published")
+	freshError := logRecord(time.Second, "ERROR", "storage open failed")
+	staleError := logRecord(30*24*time.Hour, "ERROR", "open storage: SQLite schema mismatch: foreign-key check failed")
+	deprecation := "blackbird: bare daemon flags are deprecated, use \"blackbird daemon\"\n"
+	refused := stubProber{err: errors.New("connection refused")}
+	tests := map[string]struct {
+		supervisor string
+		errorLog   string
+		logAge     time.Duration
+		prober     stubProber
+		want       string
+	}{
+		"a still starting daemon is unreachable": {
+			supervisor: "state = running\nlast exit code = 0", errorLog: startupLog,
+			prober: refused, want: "daemon=unreachable",
+		},
+		"a fresh error record is a crash loop": {
+			supervisor: "state = running\nlast exit code = 0", errorLog: startupLog + freshError,
+			prober: refused, want: "daemon=crash-looping",
+		},
+		"a non-zero launchd exit status is a crash loop": {
+			supervisor: "state = running\nlast exit code = 1", errorLog: startupLog,
+			prober: refused, want: "daemon=crash-looping",
+		},
+		"pre-upgrade failures beneath a healthy start are stale": {
+			supervisor: "state = running\nlast exit code = 0", errorLog: strings.Repeat(staleError, 23) + startupLog,
+			prober: refused, want: "daemon=unreachable",
+		},
+		"the legacy argv deprecation notice is not a failure": {
+			supervisor: "state = running", errorLog: deprecation + startupLog,
+			prober: refused, want: "daemon=unreachable",
+		},
+		"an undatable fatal line is left to the supervisor": {
+			supervisor: "state = running", errorLog: "SQLite schema mismatch: foreign-key check failed\n",
+			prober: refused, want: "daemon=unreachable",
+		},
+		"errors outside the crash window are stale": {
+			supervisor: "state = running", errorLog: staleError,
+			prober: refused, want: "daemon=unreachable",
+		},
+		"an untouched error log is not inspected": {
+			supervisor: "state = running", errorLog: freshError, logAge: 2 * time.Hour,
+			prober: refused, want: "daemon=unreachable",
+		},
+		"errors beyond the inspected tail are ignored": {
+			supervisor: "state = running", errorLog: freshError + strings.Repeat(startupLog, errorLogTailBytes/len(startupLog)+2),
+			prober: refused, want: "daemon=unreachable",
+		},
+		"an answering daemon is running": {
+			supervisor: "state = running", errorLog: startupLog + freshError,
+			prober: stubProber{version: "1.0.0"}, want: "daemon=running",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, "darwin", &recordingRunner{outputs: []string{test.supervisor, "state = running"}})
+			manager.config.Prober = test.prober
+			if _, err := manager.convergeServiceDefinition(); err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, manager.daemonErrorLogPath(), test.errorLog)
+			if test.logAge != 0 {
+				stamp := time.Now().Add(-test.logAge)
+				if err := os.Chtimes(manager.daemonErrorLogPath(), stamp, stamp); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			status, err := manager.Status(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(status, test.want) {
+				t.Fatalf("status = %q, want %q", status, test.want)
+			}
+		})
+	}
+}
+
+func TestStatusReportsCrashLoopsTheSupervisorSamplesAsDown(t *testing.T) {
+	t.Parallel()
+	startupLog := "time=2026-08-15T09:00:00.000-04:00 level=INFO msg=\"daemon starting\" version=0.4.0\n"
+	crashLog := "time=2026-08-15T09:00:00.030-04:00 level=ERROR msg=\"storage open failed\" err=\"foreign-key check failed\"\n"
+	launchdRunning := "state = running\nactive count = 1\nruns = 1\nlast exit code = 0"
+	launchdThrottled := "state = not running\nactive count = 0\nruns = 23\nlast exit code = 1"
+	launchdWaiting := "state = waiting\npending execution reason = throttled\nruns = 24\nlast exit code = 0"
+	launchdUnloaded := "Could not find service \"" + serviceLabel + "\" in domain for login"
+	refused := stubProber{err: errors.New("connection refused")}
+	answering := stubProber{version: "0.4.0"}
+	unitDown := errors.New("exit status 3")
+	tests := map[string]struct {
+		goos          string
+		supervisor    string
+		supervisorErr error
+		errorLog      string
+		prober        stubProber
+		want          string
+	}{
+		"darwin healthy steady state": {
+			goos: "darwin", supervisor: launchdRunning, errorLog: startupLog,
+			prober: answering, want: DaemonRunning,
+		},
+		"linux healthy steady state": {
+			goos: "linux", supervisor: "active", errorLog: startupLog,
+			prober: answering, want: DaemonRunning + " (active)",
+		},
+		"darwin healthy slow start": {
+			goos: "darwin", supervisor: launchdRunning, errorLog: startupLog,
+			prober: refused, want: DaemonUnreachable,
+		},
+		"linux healthy slow start": {
+			goos: "linux", supervisor: "active", errorLog: startupLog,
+			prober: refused, want: DaemonUnreachable + " (active)",
+		},
+		"darwin throttled crash loop": {
+			goos: "darwin", supervisor: launchdThrottled, errorLog: startupLog,
+			prober: refused, want: DaemonCrashLooping,
+		},
+		"darwin crash loop waiting out its minimum runtime": {
+			goos: "darwin", supervisor: launchdWaiting, errorLog: startupLog,
+			prober: refused, want: DaemonCrashLooping,
+		},
+		"linux auto-restart loop": {
+			goos: "linux", supervisor: "activating (auto-restart)", supervisorErr: unitDown, errorLog: startupLog,
+			prober: refused, want: DaemonCrashLooping + " (activating (auto-restart))",
+		},
+		"linux failed unit": {
+			goos: "linux", supervisor: "failed", supervisorErr: unitDown, errorLog: startupLog,
+			prober: refused, want: DaemonCrashLooping + " (failed)",
+		},
+		"darwin daemon deliberately stopped": {
+			goos: "darwin", supervisor: launchdUnloaded, supervisorErr: unitDown, errorLog: startupLog + crashLog,
+			prober: refused, want: DaemonStopped,
+		},
+		"linux daemon deliberately stopped": {
+			goos: "linux", supervisor: "inactive", supervisorErr: unitDown, errorLog: startupLog + crashLog,
+			prober: refused, want: DaemonStopped + " (inactive)",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			runner := &recordingRunner{
+				outputs: []string{test.supervisor, test.supervisor},
+				errs:    []error{test.supervisorErr, test.supervisorErr},
+			}
+			manager := testManager(t.TempDir(), test.goos, runner)
+			manager.config.Prober = test.prober
+			if _, err := manager.convergeServiceDefinition(); err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, manager.daemonErrorLogPath(), test.errorLog)
+
+			status, err := manager.Status(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "daemon=" + test.want + " installed=true"; !strings.Contains(status, want) {
+				t.Fatalf("status = %q, want %q", status, want)
+			}
+		})
+	}
+}
+
+func TestStatusReportsAHealthyUpdaterAsScheduledOnEveryPlatform(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		goos       string
+		output     string
+		err        error
+		want       string
+		wantDaemon string
+	}{
+		"an active systemd timer carries no diagnostic detail": {
+			goos: "linux", output: "active", want: "updater=scheduled installed=true", wantDaemon: "daemon=running (active)",
+		},
+		"an idle launchd agent is still scheduled": {
+			goos: "darwin", output: "state = waiting", want: "updater=scheduled installed=true", wantDaemon: "daemon=running",
+		},
+		"a stopped systemd timer keeps its detail": {
+			goos: "linux", output: "inactive", err: errors.New("exit status 3"),
+			want: "updater=stopped (inactive)", wantDaemon: "daemon=running (active)",
+		},
+		"an unloaded launchd agent is stopped": {
+			goos: "darwin", output: "Could not find service", err: errors.New("exit status 113"),
+			want: "updater=stopped", wantDaemon: "daemon=running",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			healthy := "active"
+			if test.goos == "darwin" {
+				healthy = "state = running"
+			}
+			runner := &recordingRunner{outputs: []string{healthy, test.output}, errs: []error{nil, test.err}}
+			manager := testManager(t.TempDir(), test.goos, runner)
+			if _, err := manager.convergeServiceDefinition(); err != nil {
+				t.Fatal(err)
+			}
+			for index, path := range manager.updaterPaths() {
+				mustWrite(t, path, manager.updaterDefinitions()[index])
+			}
+
+			status, err := manager.Status(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(status, test.want) || !strings.Contains(status, test.wantDaemon) {
+				t.Fatalf("status = %q, want %q and %q", status, test.want, test.wantDaemon)
+			}
+		})
+	}
+}
+
+func TestUpdaterDefinitionCarriesTheResolvedXDGEnvironment(t *testing.T) {
+	t.Parallel()
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, goos, &recordingRunner{})
+			definition := manager.updaterDefinitions()[0]
+			environment := map[string]string{
+				"XDG_CONFIG_HOME": filepath.Join(home, "config"),
+				"XDG_DATA_HOME":   filepath.Join(home, "data"),
+				"XDG_STATE_HOME":  filepath.Join(home, "state"),
+			}
+			for key, value := range environment {
+				want := "Environment=\"" + key + "=" + value + "\""
+				if goos == "darwin" {
+					want = "<key>" + key + "</key><string>" + value + "</string>"
+				}
+				if !strings.Contains(definition, want) {
+					t.Fatalf("updater definition missing %q:\n%s", want, definition)
+				}
+			}
+
+			updater := NewManager(Config{
+				GOOS: goos, HomeDir: home, ConfigHome: environment["XDG_CONFIG_HOME"],
+				DataHome: environment["XDG_DATA_HOME"], StateHome: environment["XDG_STATE_HOME"],
+				Executable: manager.config.Executable, UID: 501, Runner: &recordingRunner{},
+			})
+			if got, want := updater.serviceDefinition(), manager.serviceDefinition(); got != want {
+				t.Fatalf("updater converges a different definition:\n%s\nwant:\n%s", got, want)
+			}
+			bare := NewManager(Config{
+				GOOS: goos, HomeDir: home, Executable: manager.config.Executable,
+				UID: 501, Runner: &recordingRunner{},
+			})
+			if bare.serviceDefinition() == manager.serviceDefinition() {
+				t.Fatal("the XDG environment does not affect the converged definition, so this test proves nothing")
+			}
+		})
+	}
+}
+
+func TestServiceDefinitionInvokesTheDaemonSubcommandWithAnExplicitStateDir(t *testing.T) {
+	t.Parallel()
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, goos, &recordingRunner{})
+			definition := manager.serviceDefinition()
+			stateDir := filepath.Join(home, "state", "blackbird")
+			environment := "XDG_STATE_HOME=" + filepath.Join(home, "state")
+			if goos == "darwin" {
+				environment = "<key>XDG_STATE_HOME</key><string>" + filepath.Join(home, "state") + "</string>"
+			}
+			for _, want := range []string{"daemon", "--sqlite-path=" + filepath.Join(home, "data", "blackbird", "blackbird.db"),
+				"--state-dir=" + stateDir, environment} {
+				if !strings.Contains(definition, want) {
+					t.Fatalf("definition missing %q:\n%s", want, definition)
+				}
+			}
+			if got := manager.StateDir(); got != stateDir {
+				t.Fatalf("StateDir() = %q, want %q", got, stateDir)
+			}
+			if got, want := manager.ServiceArgv()[1], "daemon"; got != want {
+				t.Fatalf("ServiceArgv()[1] = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestConvergeServiceDefinitionRewritesLegacyDefinitionOnceOnly(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	manager := testManager(home, "darwin", &recordingRunner{})
+	mustWrite(t, manager.servicePath(), legacyPlist(manager.config.Executable, filepath.Join(home, "data", "blackbird", "blackbird.db")))
+
+	changed, err := manager.convergeServiceDefinition()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("legacy definition was not rewritten")
+	}
+	if state, err := manager.definitionState(); err != nil || state != DefinitionCurrent {
+		t.Fatalf("definitionState() = %q, %v", state, err)
+	}
+	changed, err = manager.convergeServiceDefinition()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("converge rewrote an already current definition")
+	}
+}
+
+func TestStatusReportsLivenessFromTheHandshakeRatherThanTheSupervisor(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		prober    stubProber
+		errorLog  bool
+		installed bool
+		want      string
+	}{
+		"handshake answers":              {prober: stubProber{version: "1.0.0"}, installed: true, want: "daemon=running"},
+		"handshake fails while crashing": {prober: stubProber{err: errors.New("connection refused")}, errorLog: true, installed: true, want: "daemon=crash-looping"},
+		"handshake fails while quiet":    {prober: stubProber{err: errors.New("connection refused")}, installed: true, want: "daemon=unreachable"},
+		"definition absent":              {prober: stubProber{version: "1.0.0"}, want: "daemon=not-installed"},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			runner := &recordingRunner{outputs: []string{"state = running", "state = running"}}
+			manager := testManager(home, "darwin", runner)
+			manager.config.Prober = test.prober
+			if test.installed {
+				if _, err := manager.convergeServiceDefinition(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.errorLog {
+				mustWrite(t, manager.daemonErrorLogPath(), logRecord(time.Second, "ERROR", "open storage: SQLite schema mismatch"))
+			}
+			status, err := manager.Status(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(status, test.want) {
+				t.Fatalf("status = %q, want %q", status, test.want)
+			}
+		})
+	}
+}
+
+func TestStatusReportsStaleServiceDefinitions(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	manager := testManager(home, "darwin", &recordingRunner{outputs: []string{"state = running", "state = running"}})
+	mustWrite(t, manager.servicePath(), legacyPlist(manager.config.Executable, "ignored.db"))
+
+	status, err := manager.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "definition=stale") {
+		t.Fatalf("status = %q", status)
+	}
+}
+
+func TestDefaultStateDirFollowsXDGStateHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "custom-state"))
+	dir, err := DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "custom-state", "blackbird"); dir != want {
+		t.Fatalf("DefaultStateDir() = %q, want %q", dir, want)
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	dir, err = DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, ".local", "state", "blackbird"); dir != want {
+		t.Fatalf("DefaultStateDir() = %q, want %q", dir, want)
+	}
+	if got, want := HandshakePath(dir), filepath.Join(dir, "admin.json"); got != want {
+		t.Fatalf("HandshakePath() = %q, want %q", got, want)
+	}
+}
+
+// logRecord renders one slog text record of a given age, matching the layout
+// the daemon's TextHandler writes into the error log.
+func logRecord(age time.Duration, level, message string) string {
+	return "time=" + time.Now().Add(-age).Format("2006-01-02T15:04:05.000Z07:00") +
+		" level=" + level + " msg=\"" + message + "\"\n"
+}
+
+func legacyPlist(executable, database string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>` + serviceLabel + `</string>
+  <key>ProgramArguments</key>
+  <array><string>` + executable + `</string><string>--sqlite-path=` + database + `</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+`
+}
+
+func legacyUnit(executable, database string) string {
+	return "[Service]\nType=simple\nExecStart=\"" + executable + "\" \"--sqlite-path=" + database + "\"\n"
+}
+
+func legacyDefinition(goos, executable, database string) string {
+	if goos == "darwin" {
+		return legacyPlist(executable, database)
+	}
+	return legacyUnit(executable, database)
 }
 
 func TestUninstallRemovesOnlyServiceDefinition(t *testing.T) {
@@ -307,6 +854,7 @@ func testManager(home, goos string, runner Runner) *Manager {
 		GOOS: goos, HomeDir: home, ConfigHome: filepath.Join(home, "config"),
 		DataHome: filepath.Join(home, "data"), StateHome: filepath.Join(home, "state"),
 		Executable: filepath.Join(home, "bin", "blackbird"), UID: 501, Runner: runner,
+		Prober: stubProber{version: "1.0.0"},
 		LookPath: func(name string) (string, error) {
 			if name == "claude" {
 				return filepath.Join(home, ".local", "bin", "claude"), nil
@@ -322,19 +870,34 @@ func testManager(home, goos string, runner Runner) *Manager {
 	})
 }
 
+type stubProber struct {
+	version string
+	err     error
+}
+
+func (prober stubProber) Probe(context.Context, string) (string, error) {
+	return prober.version, prober.err
+}
+
 type recordingRunner struct {
 	commands []string
 	outputs  []string
+	errs     []error
 }
 
 func (runner *recordingRunner) Run(_ context.Context, name string, args ...string) (string, error) {
 	runner.commands = append(runner.commands, strings.Join(append([]string{name}, args...), " "))
+	var err error
+	if len(runner.errs) > 0 {
+		err = runner.errs[0]
+		runner.errs = runner.errs[1:]
+	}
 	if len(runner.outputs) == 0 {
-		return "", nil
+		return "", err
 	}
 	output := runner.outputs[0]
 	runner.outputs = runner.outputs[1:]
-	return output, nil
+	return output, err
 }
 
 func mustMkdir(t *testing.T, path string) {

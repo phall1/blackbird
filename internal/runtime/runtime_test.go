@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -60,7 +62,10 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestStartupFailureRollsBackInDependencyOrder(t *testing.T) {
+// A worker publishes process-wide state, so it must never start in a process
+// that lost the address race: its rollback would tear down the state of the
+// daemon that actually owns the port.
+func TestListenerFailureRollsBackBeforeAnyWorkerStarts(t *testing.T) {
 	t.Parallel()
 	var events eventLog
 	store := &testStore{close: func() { events.add("storage.close") }}
@@ -81,8 +86,104 @@ func TestStartupFailureRollsBackInDependencyOrder(t *testing.T) {
 	if err := daemon.Run(context.Background()); err == nil {
 		t.Fatal("Run() error = nil")
 	}
-	if got, want := events.values(), []string{"worker.start", "ingress.close", "worker.stop", "storage.close"}; !equalStrings(got, want) {
+	if got, want := events.values(), []string{"ingress.close", "storage.close"}; !equalStrings(got, want) {
 		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+// A worker that publishes a discovery record is composed from configuration,
+// which may ask for port 0. Only the listener knows the reachable address, and
+// the worker must hold it before it publishes anything.
+func TestWorkersReceiveTheBoundAddressBeforeTheyStart(t *testing.T) {
+	t.Parallel()
+	for name, testCase := range map[string]struct {
+		bound string
+		want  string
+	}{
+		"ephemeral port": {bound: "127.0.0.1:59181", want: "127.0.0.1:59181"},
+		"fixed port":     {bound: "127.0.0.1:8080", want: "127.0.0.1:8080"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var events eventLog
+			worker := &testAddressWorker{testWorker: testWorker{events: &events}}
+			var listenCalls atomic.Int32
+			daemon := newTestDaemon(t, Dependencies{
+				OpenSQLite: func(context.Context, sqliteConfig) (Storage, error) { return &testStore{}, nil },
+				Compose: func(context.Context, Storage) (HandlerBundle, error) {
+					return HandlerBundle{
+						HTTP: http.HandlerFunc(noopHandler), MCP: http.HandlerFunc(noopHandler),
+						Workers: []Worker{worker},
+					}, nil
+				},
+				Listen: func(string, string) (net.Listener, error) {
+					if listenCalls.Add(1) == 1 {
+						return &testListener{address: testCase.bound}, nil
+					}
+					return &testListener{address: "127.0.0.1:59182"}, nil
+				},
+				NewServer: func(string, http.Handler) IngressServer {
+					return &testServer{serveErr: errors.New("stop")}
+				},
+			})
+			if err := daemon.Run(context.Background()); err == nil {
+				t.Fatal("Run() error = nil")
+			}
+			if got := worker.addressAtStart(); got != testCase.want {
+				t.Fatalf("address at Start() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestWorkerFailureRollsBackInDependencyOrder(t *testing.T) {
+	t.Parallel()
+	var events eventLog
+	store := &testStore{close: func() { events.add("storage.close") }}
+	failure := errors.New("worker refused to start")
+	worker := &testWorker{events: &events, startErr: failure}
+	daemon := newTestDaemon(t, Dependencies{
+		OpenSQLite: func(context.Context, sqliteConfig) (Storage, error) { return store, nil },
+		Compose: func(context.Context, Storage) (HandlerBundle, error) {
+			return HandlerBundle{HTTP: http.HandlerFunc(noopHandler), MCP: http.HandlerFunc(noopHandler), Workers: []Worker{worker}}, nil
+		},
+		Listen: func(string, string) (net.Listener, error) {
+			return &testListener{close: func() { events.add("ingress.close") }}, nil
+		},
+	})
+	if err := daemon.Run(context.Background()); !errors.Is(err, failure) {
+		t.Fatalf("Run() error = %v, want %v", err, failure)
+	}
+	if got, want := events.values(), []string{"worker.start", "ingress.close", "ingress.close", "worker.stop", "storage.close"}; !equalStrings(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestConfigRejectsAnUnparsableLogLevel(t *testing.T) {
+	t.Parallel()
+	config := Config{Storage: StorageSQLite, SQLitePath: "blackbird.db", HTTPAddress: ":8080", MCPAddress: ":8081", LogLevel: "chatty"}
+	if err := config.Validate(); err == nil {
+		t.Fatal("Validate() error = nil")
+	}
+	config.LogLevel = "debug"
+	if err := config.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if _, err := NewLogger(config, io.Discard); err != nil {
+		t.Fatalf("NewLogger() error = %v", err)
+	}
+}
+
+func TestLogLevelFallsBackToTheEnvironmentThenInfo(t *testing.T) {
+	t.Setenv(logLevelVariable, "debug")
+	level, err := Config{}.logLevel()
+	if err != nil || level != slog.LevelDebug {
+		t.Fatalf("logLevel() = %v, %v", level, err)
+	}
+	t.Setenv(logLevelVariable, "not-a-level")
+	level, err = Config{}.logLevel()
+	if err != nil || level != slog.LevelInfo {
+		t.Fatalf("logLevel() = %v, %v", level, err)
 	}
 }
 
@@ -172,6 +273,7 @@ func TestPostgreSQLUsesSecretSource(t *testing.T) {
 		Storage: StoragePostgreSQL, HTTPAddress: ":1", MCPAddress: ":2",
 	}, Dependencies{
 		Secrets: testSecrets{value: secret},
+		Logger:  slog.New(slog.DiscardHandler),
 		Compose: func(context.Context, Storage) (HandlerBundle, error) { return HandlerBundle{}, errors.New("stop") },
 		OpenPostgreSQL: func(_ context.Context, config postgresConfig) (Storage, error) {
 			if config.DSN != secret.DSN || config.MigrationDSN != secret.MigrationDSN {
@@ -195,6 +297,9 @@ type postgresConfig = postgres.Config
 
 func newTestDaemon(t *testing.T, dependencies Dependencies) *Daemon {
 	t.Helper()
+	if dependencies.Logger == nil {
+		dependencies.Logger = slog.New(slog.DiscardHandler)
+	}
 	daemon, err := NewDaemon(BuildInfo{}, Config{
 		Storage: StorageSQLite, SQLitePath: "unused.db", HTTPAddress: ":1", MCPAddress: ":2", ShutdownTimeout: time.Second,
 	}, dependencies)
@@ -220,18 +325,57 @@ func (store *testStore) Close() error {
 	return nil
 }
 
-type testWorker struct{ events *eventLog }
+type testWorker struct {
+	events   *eventLog
+	startErr error
+}
 
-func (worker *testWorker) Start(context.Context) error { worker.events.add("worker.start"); return nil }
-func (worker *testWorker) Stop(context.Context) error  { worker.events.add("worker.stop"); return nil }
+func (worker *testWorker) Start(context.Context) error {
+	worker.events.add("worker.start")
+	return worker.startErr
+}
+
+func (worker *testWorker) Stop(context.Context) error { worker.events.add("worker.stop"); return nil }
+
+type testAddressWorker struct {
+	testWorker
+	mu       sync.Mutex
+	address  string
+	observed string
+}
+
+func (worker *testAddressWorker) SetBoundHTTPAddress(address string) {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	worker.address = address
+}
+
+func (worker *testAddressWorker) Start(ctx context.Context) error {
+	worker.mu.Lock()
+	worker.observed = worker.address
+	worker.mu.Unlock()
+	return worker.testWorker.Start(ctx)
+}
+
+func (worker *testAddressWorker) addressAtStart() string {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	return worker.observed
+}
 
 type testListener struct {
-	once  sync.Once
-	close func()
+	once    sync.Once
+	address string
+	close   func()
 }
 
 func (*testListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
-func (*testListener) Addr() net.Addr            { return testAddress("test") }
+func (listener *testListener) Addr() net.Addr {
+	if listener.address == "" {
+		return testAddress("test")
+	}
+	return testAddress(listener.address)
+}
 func (listener *testListener) Close() error {
 	listener.once.Do(func() {
 		if listener.close != nil {

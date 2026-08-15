@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -45,10 +47,39 @@ func NewProductionDaemon(build BuildInfo, config Config) (*Daemon, error) {
 		}
 		config.SQLitePath = filepath.Clean(path)
 	}
-	return NewDaemon(build, config, Dependencies{Compose: composeProduction})
+	if config.StateDir != "" {
+		path, err := filepath.Abs(config.StateDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve state directory: %w", err)
+		}
+		config.StateDir = filepath.Clean(path)
+	}
+	logger, err := NewLogger(config, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("runtime configuration: %w", err)
+	}
+	return NewDaemon(build, config, Dependencies{
+		Logger:  logger,
+		Compose: composeProduction(build.Normalize(), config, logger),
+	})
 }
 
-func composeProduction(_ context.Context, storage Storage) (HandlerBundle, error) {
+// composeProduction closes over build identity and process configuration so the
+// admin and health surfaces can describe the daemon without reaching back into
+// the process for facts the composition root already holds.
+func composeProduction(build BuildInfo, config Config, logger *slog.Logger) Composer {
+	return func(ctx context.Context, storage Storage) (HandlerBundle, error) {
+		return composeProductionBundle(ctx, build, config, logger, storage)
+	}
+}
+
+func composeProductionBundle(
+	_ context.Context,
+	build BuildInfo,
+	config Config,
+	logger *slog.Logger,
+	storage Storage,
+) (HandlerBundle, error) {
 	store, ok := storage.(productionStore)
 	if !ok {
 		return HandlerBundle{}, errors.New("production storage does not implement the application ports")
@@ -152,7 +183,42 @@ func composeProduction(_ context.Context, storage Storage) (HandlerBundle, error
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose local HTTP transport: %w", err)
 	}
+	admin, ok := storage.(application.LocalAdminStore)
+	if !ok {
+		return HandlerBundle{}, errors.New("production storage does not implement the local admin projections")
+	}
+	token, err := newAdminToken()
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("mint admin token: %w", err)
+	}
+	started := time.Now().UTC()
+	adminHTTPHandler, err := httptransport.NewAdminHandler(httptransport.AdminDependencies{
+		Admin: admin, Token: httptransport.NewAdminTokenDigest(token),
+		Identity: httptransport.LocalIdentity{
+			Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt,
+			PID: os.Getpid(), StartedAt: started,
+			HTTPAddress: config.HTTPAddress, MCPAddress: config.MCPAddress,
+		},
+	})
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose admin HTTP transport: %w", err)
+	}
+	healthHandler, err := httptransport.NewHealthHandler(httptransport.HealthDependencies{
+		Readiness: admin, Version: build.Version,
+	})
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose health HTTP transport: %w", err)
+	}
+	handshake, err := newAdminHandshakeWorker(config.StateDir, token, config.HTTPAddress, build.Version, started, logger)
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose admin handshake: %w", err)
+	}
+	// Method-and-path patterns and the longer admin prefix both beat the "/"
+	// catch-all under net/http precedence, so registration order is immaterial.
 	httpMux := http.NewServeMux()
+	httpMux.Handle("GET "+httptransport.PathHealth, healthHandler)
+	httpMux.Handle("GET "+httptransport.PathReady, healthHandler)
+	httpMux.Handle(httptransport.PathLocalAdmin, adminHTTPHandler)
 	httpMux.Handle("/api/v1/local/", localHTTPHandler)
 	httpMux.Handle("/", httpHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
@@ -169,7 +235,24 @@ func composeProduction(_ context.Context, storage Storage) (HandlerBundle, error
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose MCP transport: %w", err)
 	}
-	return HandlerBundle{HTTP: httpMux, MCP: mcpServer.HTTPHandler(nil)}, nil
+	logger.Info("ingress composed",
+		slog.String("admin_path", httptransport.PathLocalAdmin),
+		slog.String("health_path", httptransport.PathHealth),
+		slog.String("readiness_path", httptransport.PathReady))
+	return HandlerBundle{
+		HTTP: httpMux, MCP: mcpServer.HTTPHandler(nil), Workers: []Worker{handshake},
+	}, nil
+}
+
+// SetBoundHTTPAddress replaces the configured address with the one the HTTP
+// listener actually bound. Composition runs before the bind, so the worker is
+// built from the request; runtime supplies the result before Start, which is
+// the only value a client can dial when the configuration asks for port 0.
+func (worker *adminHandshakeWorker) SetBoundHTTPAddress(address string) {
+	if address == "" {
+		return
+	}
+	worker.handshake.HTTPAddress = address
 }
 
 func localCoordinationStore(storage Storage) application.LocalCoordinationStore {

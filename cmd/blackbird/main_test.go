@@ -14,18 +14,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phall1/blackbird/internal/cli"
 	"github.com/phall1/blackbird/internal/install"
 	blackbirdruntime "github.com/phall1/blackbird/internal/runtime"
+	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
 
 func TestExecutePrintsVersion(t *testing.T) {
 	t.Parallel()
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	code := execute(context.Background(), []string{"--version"}, &stdout, &stderr)
-	if code != exitOK {
-		t.Fatalf("execute() = %d, want %d; stderr=%q", code, exitOK, stderr.String())
+	if code != cli.ExitOK {
+		t.Fatalf("execute() = %d, want %d; stderr=%q", code, cli.ExitOK, stderr.String())
 	}
 	if got, want := stdout.String(), "blackbird version=dev commit=unknown built_at=unknown\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
@@ -37,11 +38,11 @@ func TestExecuteRejectsUnexpectedArgument(t *testing.T) {
 
 	var stderr bytes.Buffer
 	code := execute(context.Background(), []string{"serve"}, ioDiscard{}, &stderr)
-	if code != exitUsage {
-		t.Fatalf("execute() = %d, want %d", code, exitUsage)
+	if code != cli.ExitUsage {
+		t.Fatalf("execute() = %d, want %d", code, cli.ExitUsage)
 	}
 	if !strings.Contains(stderr.String(), "unexpected argument") {
-		t.Fatalf("stderr = %q, want unexpected argument error", stderr.String())
+		t.Fatalf("stderr = %q, want an unexpected-argument error", stderr.String())
 	}
 }
 
@@ -51,21 +52,25 @@ func TestExecuteStopsCleanlyOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if code := execute(ctx, nil, ioDiscard{}, ioDiscard{}); code != exitOK {
-		t.Fatalf("execute() = %d, want %d", code, exitOK)
+	if code := execute(ctx, nil, ioDiscard{}, ioDiscard{}); code != cli.ExitOK {
+		t.Fatalf("execute() = %d, want %d", code, cli.ExitOK)
 	}
 }
 
 func TestExecuteReturnsErrorWhenVersionCannotBeWritten(t *testing.T) {
 	t.Parallel()
 
-	if code := execute(context.Background(), []string{"--version"}, errorWriter{}, ioDiscard{}); code != exitError {
-		t.Fatalf("execute() = %d, want %d", code, exitError)
+	if code := execute(context.Background(), []string{"--version"}, errorWriter{}, ioDiscard{}); code != cli.ExitError {
+		t.Fatalf("execute() = %d, want %d", code, cli.ExitError)
 	}
 }
 
+// TestExecuteInjectsNonSecretConfiguration keeps the pre-Kong seam working: the
+// injected configuration supplies the daemon flag defaults, and an explicit flag
+// still wins over the injected value.
 func TestExecuteInjectsNonSecretConfiguration(t *testing.T) {
 	t.Parallel()
+
 	injected := blackbirdruntime.Config{
 		Storage: blackbirdruntime.StorageSQLite, SQLitePath: "injected.db",
 		HTTPAddress: "127.0.0.1:9000", MCPAddress: "127.0.0.1:9001",
@@ -78,22 +83,83 @@ func TestExecuteInjectsNonSecretConfiguration(t *testing.T) {
 	code := executeConfigured(context.Background(), []string{
 		"--storage=postgres", "--http-address=127.0.0.1:9100",
 	}, ioDiscard{}, ioDiscard{}, &injected, factory)
-	if code != exitOK {
-		t.Fatalf("executeConfigured() = %d, want %d", code, exitOK)
+	if code != cli.ExitOK {
+		t.Fatalf("executeConfigured() = %d, want %d", code, cli.ExitOK)
 	}
-	if got.Storage != blackbirdruntime.StoragePostgreSQL || got.SQLitePath != "injected.db" || got.HTTPAddress != "127.0.0.1:9100" {
+	if got.Storage != blackbirdruntime.StoragePostgreSQL || got.SQLitePath != "injected.db" ||
+		got.HTTPAddress != "127.0.0.1:9100" || got.MCPAddress != "127.0.0.1:9001" {
 		t.Fatalf("config = %#v", got)
+	}
+}
+
+// TestLegacyPlistArgvReachesTheDaemon feeds the exact argv the installed launchd
+// plist runs. Homebrew swaps the binary before anything rewrites that file, so
+// rejecting this argv crash-loops every upgraded machine.
+func TestLegacyPlistArgvReachesTheDaemon(t *testing.T) {
+	t.Parallel()
+
+	const databasePath = "/Users/phall/.local/share/blackbird/blackbird.db"
+	var got blackbirdruntime.Config
+	factory := func(_ blackbirdruntime.BuildInfo, config blackbirdruntime.Config) (daemonRunner, error) {
+		got = config
+		return cancelledRunner{}, nil
+	}
+	var stderr bytes.Buffer
+	code := executeConfigured(context.Background(), []string{"--sqlite-path=" + databasePath},
+		ioDiscard{}, &stderr, nil, factory)
+	if code != cli.ExitOK {
+		t.Fatalf("executeConfigured() = %d, want %d; stderr=%q", code, cli.ExitOK, stderr.String())
+	}
+	if got.SQLitePath != databasePath {
+		t.Fatalf("SQLitePath = %q, want %q", got.SQLitePath, databasePath)
+	}
+	if !strings.Contains(stderr.String(), "deprecated") {
+		t.Fatalf("stderr = %q, want a deprecation notice", stderr.String())
+	}
+}
+
+// TestInstalledServiceArgvParses is the other half of the same contract: the
+// argv the installer writes today must reach the daemon adapter unchanged.
+func TestInstalledServiceArgvParses(t *testing.T) {
+	t.Parallel()
+
+	manager := install.NewManager(install.Config{
+		GOOS: "darwin", HomeDir: t.TempDir(), Executable: "/opt/homebrew/bin/blackbird", UID: 501,
+	})
+	argv := manager.ServiceArgv()
+	if len(argv) < 2 || argv[1] != "daemon" {
+		t.Fatalf("ServiceArgv() = %v, want a daemon subcommand", argv)
+	}
+
+	var got blackbirdruntime.Config
+	factory := func(_ blackbirdruntime.BuildInfo, config blackbirdruntime.Config) (daemonRunner, error) {
+		got = config
+		return cancelledRunner{}, nil
+	}
+	var stderr bytes.Buffer
+	if code := executeConfigured(context.Background(), argv[1:], ioDiscard{}, &stderr, nil, factory); code != cli.ExitOK {
+		t.Fatalf("executeConfigured(%v) = %d; stderr=%q", argv[1:], code, stderr.String())
+	}
+	if got.StateDir != manager.StateDir() {
+		t.Fatalf("StateDir = %q, want %q", got.StateDir, manager.StateDir())
+	}
+	if want := filepath.Base(got.SQLitePath); want != "blackbird.db" {
+		t.Fatalf("SQLitePath = %q", got.SQLitePath)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want nothing for the current argv", stderr.String())
 	}
 }
 
 func TestExecuteDoesNotAcceptSecretsOnCommandLine(t *testing.T) {
 	t.Parallel()
+
 	for _, argument := range []string{"--dsn=postgres://secret", "--postgres-password=secret", "--migration-dsn=postgres://secret"} {
 		var stderr bytes.Buffer
-		if code := execute(context.Background(), []string{argument}, ioDiscard{}, &stderr); code != exitUsage {
-			t.Fatalf("execute(%q) = %d, want %d", argument, code, exitUsage)
+		if code := execute(context.Background(), []string{argument}, ioDiscard{}, &stderr); code != cli.ExitUsage {
+			t.Fatalf("execute(%q) = %d, want %d", argument, code, cli.ExitUsage)
 		}
-		if !strings.Contains(stderr.String(), "flag provided but not defined") {
+		if !strings.Contains(stderr.String(), "unknown flag") {
 			t.Fatalf("stderr for %q = %q", argument, stderr.String())
 		}
 	}
@@ -101,23 +167,22 @@ func TestExecuteDoesNotAcceptSecretsOnCommandLine(t *testing.T) {
 
 func TestExecuteDispatchesProductCommands(t *testing.T) {
 	t.Parallel()
+
 	tests := []struct {
 		command string
 		want    string
 	}{
 		{command: "install", want: "installed service=/service updater=/updater clients=opencode,codex\n"},
-		{command: "status", want: "daemon=running installed=true path=/service updater=scheduled installed=true paths=/updater interval=6h0m0s\n"},
 		{command: "update", want: "updated changed=true before=\"blackbird 1.0.0\" after=\"blackbird 1.1.0\"\n"},
 		{command: "uninstall", want: "uninstalled service=/service updater=/updater data=retained\n"},
 	}
 	for _, test := range tests {
 		t.Run(test.command, func(t *testing.T) {
 			t.Parallel()
-			var stdout bytes.Buffer
-			var stderr bytes.Buffer
+			var stdout, stderr bytes.Buffer
 			manager := &fakeProductManager{}
 			code := executeWithManager(context.Background(), []string{test.command}, &stdout, &stderr, nil, nil, manager)
-			if code != exitOK || stdout.String() != test.want || stderr.Len() != 0 {
+			if code != cli.ExitOK || stdout.String() != test.want || stderr.Len() != 0 {
 				t.Fatalf("execute = %d, stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
 			}
 			if manager.called != test.command {
@@ -129,21 +194,261 @@ func TestExecuteDispatchesProductCommands(t *testing.T) {
 
 func TestExecuteRejectsProductCommandArguments(t *testing.T) {
 	t.Parallel()
+
 	var stderr bytes.Buffer
-	code := executeWithManager(context.Background(), []string{"install", "extra"}, ioDiscard{}, &stderr, nil, nil, &fakeProductManager{})
-	if code != exitUsage || !strings.Contains(stderr.String(), "does not accept arguments") {
-		t.Fatalf("execute = %d, stderr=%q", code, stderr.String())
+	code := executeWithManager(context.Background(), []string{"install", "extra"},
+		ioDiscard{}, &stderr, nil, nil, &fakeProductManager{})
+	if code != cli.ExitUsage {
+		t.Fatalf("execute = %d, want %d; stderr=%q", code, cli.ExitUsage, stderr.String())
+	}
+}
+
+func TestDaemonAdapterTranslatesOptions(t *testing.T) {
+	t.Parallel()
+
+	var got blackbirdruntime.Config
+	adapter := daemonAdapter{
+		build: blackbirdruntime.BuildInfo{Version: "0.4.0"},
+		factory: func(_ blackbirdruntime.BuildInfo, config blackbirdruntime.Config) (daemonRunner, error) {
+			got = config
+			return cancelledRunner{}, nil
+		},
+	}
+	options := cli.DaemonOptions{
+		Storage: "sqlite", SQLitePath: "/data/blackbird.db", StateDir: "/state",
+		HTTPAddress: "127.0.0.1:1", MCPAddress: "127.0.0.1:2", LogLevel: "debug",
+		ShutdownTimeout: 7 * time.Second,
+	}
+	if err := adapter.Run(context.Background(), options); err != nil {
+		t.Fatalf("Run() = %v", err)
+	}
+	want := blackbirdruntime.Config{
+		Storage: blackbirdruntime.StorageSQLite, SQLitePath: "/data/blackbird.db", StateDir: "/state",
+		HTTPAddress: "127.0.0.1:1", MCPAddress: "127.0.0.1:2", LogLevel: "debug",
+		ShutdownTimeout: 7 * time.Second,
+	}
+	if got != want {
+		t.Fatalf("config = %#v, want %#v", got, want)
+	}
+}
+
+func TestDaemonAdapterWrapsFactoryFailure(t *testing.T) {
+	t.Parallel()
+
+	adapter := daemonAdapter{factory: func(blackbirdruntime.BuildInfo, blackbirdruntime.Config) (daemonRunner, error) {
+		return nil, errors.New("bad configuration")
+	}}
+	err := adapter.Run(context.Background(), cli.DaemonOptions{Storage: "sqlite"})
+	if err == nil || !strings.Contains(err.Error(), "construct daemon") {
+		t.Fatalf("Run() = %v", err)
+	}
+}
+
+func TestDefaultDatabasePathIsAbsolute(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "/tmp/xdg")
+	if got, want := defaultDatabasePath(), filepath.Join("/tmp/xdg", "blackbird", "blackbird.db"); got != want {
+		t.Fatalf("defaultDatabasePath() = %q, want %q", got, want)
+	}
+	t.Setenv("XDG_DATA_HOME", "relative")
+	if got := defaultDatabasePath(); got != "" && !filepath.IsAbs(got) {
+		t.Fatalf("defaultDatabasePath() = %q, want an absolute path", got)
+	}
+}
+
+func TestHandshakePathTracksTheStateDirectory(t *testing.T) {
+	t.Parallel()
+
+	if got := handshakePath(""); got != "" {
+		t.Fatalf("handshakePath(\"\") = %q", got)
+	}
+	if got, want := handshakePath("/state"), install.HandshakePath("/state"); got != want {
+		t.Fatalf("handshakePath = %q, want %q", got, want)
+	}
+	if got := stateDirectory(&fakeProductManager{}); got != "/state/blackbird" {
+		t.Fatalf("stateDirectory = %q", got)
+	}
+}
+
+func TestDeviceOfClassifiesStreams(t *testing.T) {
+	t.Parallel()
+
+	if deviceOf(&bytes.Buffer{}) != nil {
+		t.Fatal("a buffer is not a device")
+	}
+	if deviceOf(os.Stdout) == nil {
+		t.Fatal("os.Stdout is a device")
+	}
+}
+
+// TestReaderAdapterInspectsWithoutWriting is the guard against an inspection
+// command reopening the database through sqlite.Open, which creates
+// directories, applies migrations, and claims the runtime row.
+func TestReaderAdapterInspectsWithoutWriting(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "blackbird.db")
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: path})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	facts, err := readerAdapter{}.Inspect(context.Background(), path, true)
+	if err != nil {
+		t.Fatalf("Inspect() = %v", err)
+	}
+	if !facts.Present || !facts.Supported {
+		t.Fatalf("facts = %#v", facts)
+	}
+	if facts.SchemaVersion != sqlite.SchemaVersion || facts.ApplicationID != sqlite.ApplicationID {
+		t.Fatalf("schema = %d/%d, want %d/%d", facts.SchemaVersion, facts.ApplicationID,
+			sqlite.SchemaVersion, sqlite.ApplicationID)
+	}
+	if facts.QuickCheck != "ok" {
+		t.Fatalf("quick check = %q", facts.QuickCheck)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("the reader modified the database file")
+	}
+}
+
+// TestGCReclaimsSpaceInTheShippedBinary is the regression for --checkpoint and
+// --vacuum being dead flags: the assembly point never wired a maintenance port,
+// so the shipped binary answered "this binary cannot rewrite the database" and
+// exited 4 no matter how large the write-ahead log had grown.
+func TestGCReclaimsSpaceInTheShippedBinary(t *testing.T) {
+	t.Parallel()
+
+	path := blackbirdDatabase(t)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := executeWithManager(context.Background(),
+		[]string{"gc", "--checkpoint", "--vacuum", "--json", "--db", path},
+		&stdout, &stderr, nil, nil, &fakeProductManager{})
+	if code != cli.ExitOK {
+		t.Fatalf("gc = %d, want %d; stderr=%q", code, cli.ExitOK, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"reclaimed"`) {
+		t.Fatalf("stdout = %q, want a reclaimed report", stdout.String())
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() >= before.Size() {
+		t.Fatalf("database is %d bytes, want less than %d", after.Size(), before.Size())
+	}
+	if wal, err := os.Stat(path + "-wal"); err == nil && wal.Size() != 0 {
+		t.Fatalf("write-ahead log is %d bytes, want it truncated", wal.Size())
+	}
+}
+
+func TestDependenciesWireAMaintenancePort(t *testing.T) {
+	t.Parallel()
+
+	if dependencies(nil, nil, &fakeProductManager{}, ioDiscard{}).Maintenance == nil {
+		t.Fatal("no maintenance port: gc --checkpoint and --vacuum cannot work")
+	}
+}
+
+func TestMaintenanceAdapterRefusesToWriteWhatIsNotADatabase(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	absent := filepath.Join(directory, "absent.db")
+	if _, err := (maintenanceAdapter{}).Reclaim(context.Background(), absent,
+		cli.ReclaimPlan{Checkpoint: true}); err == nil {
+		t.Fatal("Reclaim() accepted a database that does not exist")
+	}
+	if _, err := os.Stat(absent); err == nil {
+		t.Fatal("Reclaim() created the database it was asked to compact")
+	}
+
+	foreign := filepath.Join(directory, "foreign.db")
+	if err := os.WriteFile(foreign, []byte("not a database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (maintenanceAdapter{}).Reclaim(context.Background(), foreign, cli.ReclaimPlan{Vacuum: true})
+	if err == nil {
+		t.Fatal("Reclaim() rewrote a file that is not a Blackbird database")
+	}
+}
+
+// blackbirdDatabase returns a real Blackbird database carrying free pages and an
+// uncheckpointed write-ahead log, which is the state gc exists to clean up.
+func blackbirdDatabase(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "blackbird.db")
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: path})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	database, err := openForMaintenance(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open for ballast: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	if _, err := database.ExecContext(context.Background(),
+		"CREATE TABLE ballast (id INTEGER PRIMARY KEY, payload TEXT)"); err != nil {
+		t.Fatalf("create ballast: %v", err)
+	}
+	for range 40 {
+		if _, err := database.ExecContext(context.Background(),
+			"INSERT INTO ballast (payload) SELECT hex(randomblob(4096))"); err != nil {
+			t.Fatalf("fill ballast: %v", err)
+		}
+	}
+	if _, err := database.ExecContext(context.Background(), "DROP TABLE ballast"); err != nil {
+		t.Fatalf("drop ballast: %v", err)
+	}
+	return path
+}
+
+func TestReaderAdapterReportsAMissingDatabase(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "absent.db")
+	facts, err := readerAdapter{}.Inspect(context.Background(), path, false)
+	if err != nil {
+		t.Fatalf("Inspect() = %v", err)
+	}
+	if facts.Present {
+		t.Fatalf("facts = %#v, want an absent database", facts)
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Fatal("the reader created the database it was asked to inspect")
 	}
 }
 
 func TestSourceBuiltDaemonStartsSQLiteAndServesW0Surfaces(t *testing.T) {
+	stateDir := t.TempDir()
 	databasePath := filepath.Join(t.TempDir(), "blackbird.db")
 	httpAddress := availableAddress(t)
 	mcpAddress := availableAddress(t)
 	command := exec.Command(os.Args[0], "-test.run=TestBlackbirdProcess")
 	command.Env = append(os.Environ(),
 		"BLACKBIRD_PROCESS_HELPER=1",
-		"BLACKBIRD_PROCESS_ARGS=--sqlite-path="+databasePath+"\n--http-address="+httpAddress+"\n--mcp-address="+mcpAddress,
+		"BLACKBIRD_PROCESS_ARGS=daemon\n--sqlite-path="+databasePath+"\n--state-dir="+stateDir+
+			"\n--http-address="+httpAddress+"\n--mcp-address="+mcpAddress,
 	)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
@@ -170,6 +475,14 @@ func TestSourceBuiltDaemonStartsSQLiteAndServesW0Surfaces(t *testing.T) {
 	defer func() { _ = httpResponse.Body.Close() }()
 	if httpResponse.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("W0 HTTP status = %d, want %d", httpResponse.StatusCode, http.StatusUnauthorized)
+	}
+
+	healthResponse := awaitRequest(t, processDone, &stderr, "http://"+httpAddress+"/healthz", func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, "http://"+httpAddress+"/healthz", nil)
+	})
+	defer func() { _ = healthResponse.Body.Close() }()
+	if healthResponse.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", healthResponse.StatusCode, http.StatusOK)
 	}
 
 	mcpResponse := awaitRequest(t, processDone, &stderr, "http://"+mcpAddress, func() (*http.Request, error) {
@@ -279,7 +592,8 @@ func (manager *fakeProductManager) Install(context.Context) (install.Result, err
 
 func (manager *fakeProductManager) Status(context.Context) (string, error) {
 	manager.called = "status"
-	return "daemon=running installed=true path=/service updater=scheduled installed=true paths=/updater interval=6h0m0s", nil
+	return "daemon=running installed=true path=/service definition=current updater=scheduled " +
+		"installed=true paths=/updater interval=6h0m0s", nil
 }
 
 func (manager *fakeProductManager) Update(context.Context) (install.UpdateResult, error) {
@@ -291,3 +605,9 @@ func (manager *fakeProductManager) Uninstall(context.Context) (install.Result, e
 	manager.called = "uninstall"
 	return install.Result{ServicePath: "/service", UpdaterPaths: []string{"/updater"}}, nil
 }
+
+func (manager *fakeProductManager) ServiceArgv() []string {
+	return []string{"/opt/homebrew/bin/blackbird", "daemon"}
+}
+
+func (manager *fakeProductManager) StateDir() string { return "/state/blackbird" }
