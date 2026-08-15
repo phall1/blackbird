@@ -5,5 +5,17 @@
 
 ### Features
 
-* add a first-class command line surface ([70d13e7](https://github.com/phall1/blackbird/commit/70d13e7145ea34969cc8d385271572e8e9e277b8))
-* add a first-class command line surface ([#3](https://github.com/phall1/blackbird/issues/3)) ([c46464c](https://github.com/phall1/blackbird/commit/c46464c7e7a16ed5bdfb2271bab45b1294290f9f))
+* add a first-class command line surface ([c46464c](https://github.com/phall1/blackbird/commit/c46464c7e7a16ed5bdfb2271bab45b1294290f9f))
+
+`blackbird` now has a real command line: grouped `--help`, shell completions,
+and `status`, `doctor`, `gc`, `overview`, `projects`, `agents`, `inbox`,
+`threads`, `reservations`, `events`, and `logs`, each rendering human output or
+`--json` from the same data.
+
+The daemon gained structured logging, `/healthz`, and `/readyz`, and `status`
+now handshakes with the running process instead of trusting the supervisor.
+
+Upgrading is safe without action: the installed service definition keeps
+working. Run `blackbird install` to move it to the explicit `daemon` command.
+A bare `blackbird` with no arguments now prints help instead of starting a
+daemon, and no longer creates a database in the current directory.
