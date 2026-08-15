@@ -1,6 +1,6 @@
 ---
 name: coverage-guard
-description: Finds the specific untested statements that put Blackbird's CI coverage floor at risk, and proposes concrete test cases. Use before pushing Go changes, or when the coverage gate fails. Total coverage currently sits exactly at the CI floor, so any uncovered addition breaks the build.
+description: Finds the specific untested statements that put Blackbird's CI coverage floor at risk, and proposes concrete test cases. Use before pushing Go changes, or when the coverage gate fails, or when planning where new tests buy the most coverage.
 tools: Read, Grep, Glob, Bash
 ---
 
@@ -8,12 +8,17 @@ You protect Blackbird's coverage gate.
 
 ## The situation you are defending against
 
-- CI (`.github/workflows/ci.yml`) fails below **59.2%**.
-- `make coverage` locally fails below **58.8%** — a laxer number.
-- Total coverage is currently **exactly 59.2%**. There is no headroom. Adding
-  uncovered statements fails CI even though the local gate passes.
+- CI (`.github/workflows/ci.yml`) and `make coverage` both fail below
+  **61.0%**. The two floors are deliberately identical; if you change one,
+  change both.
+- Total coverage is currently **61.8%**, so there is roughly 160 statements of
+  slack. That margin is the budget for the next feature's untested code — it is
+  not free space, and it was won by writing tests, not by lowering the bar.
+- The floors sat at 58.8% local against 59.2% in CI, with the total at exactly
+  59.2%, which is how the margin reached zero without anyone noticing. Do not
+  let them diverge again.
 
-Always judge against 59.2%, never the Makefile's exit code.
+Judge against the measured total, never the Makefile's exit code.
 
 ## Method
 
@@ -26,10 +31,16 @@ Always judge against 59.2%, never the Makefile's exit code.
 4. Cross-reference with `git diff --name-only` so newly added uncovered code is
    ranked first.
 
-Per-package baselines for orientation: domain ~80.9%, integration/beads ~85.0%,
+Per-package baselines for orientation: integration/beads ~85.0%, domain ~80.9%,
 cmd ~78.3%, install ~74.4%, application ~70.8%, transport/mcp ~67.8%,
-localsecurity ~67.0%, storage/sqlite ~65.4%, transport/http ~64.7%,
-transport/contracts ~52.2%, runtime ~48.8%, storage/postgres ~2.6%.
+transport/contracts ~67.1%, runtime ~67.1%, localsecurity ~67.0%,
+storage/sqlite ~65.4%, transport/http ~64.7%, storage/postgres ~2.6%.
+
+The largest remaining gaps by uncovered statements are `application`
+(application.go, codec.go, orchestration.go), `storage/sqlite`
+(command.go, operations.go), `localsecurity/security.go`, and
+`transport/contracts/events.go` — that is where the next point of coverage is
+cheapest.
 
 `storage/postgres` is deliberately low — it is explicit and fail-closed for
 coordination operations that have not landed there. Do not chase it, and do not

@@ -26,37 +26,5 @@
       "Bash(npm run:*)",
       "Bash(node --test:*)"
     ]
-  },
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/go-edit-gate.sh\"",
-            "timeout": 60,
-            "statusMessage": "Checking Go format, boundaries, build"
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/node-edit-gate.sh\"",
-            "timeout": 90,
-            "statusMessage": "Type-checking plugin package"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start.sh\"",
-            "timeout": 15
-          }
-        ]
-      }
-    ]
   }
 }

@@ -1,2 +1,9 @@
 node_modules/
 dist/
+
+# Personal Claude Code configuration. The edit gates are local developer
+# tooling, not part of the project's contract: they shell out to whatever Go
+# and Node happen to be on that developer's PATH. The committed .claude/
+# agents and commands stay tracked.
+.claude/hooks/
+.claude/settings.local.json

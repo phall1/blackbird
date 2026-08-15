@@ -229,22 +229,29 @@ than working around it silently.
 Repository-local Claude Code configuration. Each layer exists to remove work
 from the next session rather than only from this one.
 
-**Automatic checks** — `.claude/hooks/`, wired in `.claude/settings.json`:
+**Automatic checks** — optional, and deliberately *not* committed.
+`.claude/hooks/` and `.claude/settings.local.json` are gitignored: edit gates
+shell out to whatever Go and Node happen to be on a given developer's PATH, so
+they are personal tooling rather than part of the project's contract. Nothing
+in this repository depends on them, and `make check` remains the only gate that
+speaks for the project. If you want the same feedback loop, the three scripts
+worth having are:
 
-- `go-edit-gate.sh` runs on every `Edit`/`Write`. It reformats non-gofmt-clean
-  Go files, checks the edited file's imports against the layer rules above, and
-  compiles the package. Findings come back as context; it never blocks, so a
-  half-finished refactor is not treated as an error.
-- `node-edit-gate.sh` does the same for the plugin packages: syntax-checks
-  `.js`/`.mjs`, type-checks `.ts` against the package's own `tsconfig.json`, and
-  says so when a package has no `node_modules` to gate with.
-- `session-start.sh` reports whether the daemon is up and which Go is on PATH.
+- a `PostToolUse` gate on `Edit`/`Write` that reformats non-gofmt-clean Go
+  files, checks the edited file's imports against the layer rules above, and
+  compiles the package — reporting findings as context and never blocking, so a
+  half-finished refactor is not treated as an error;
+- the same for the plugin packages: syntax-check `.js`/`.mjs`, type-check `.ts`
+  against the package's own `tsconfig.json`, and say so when a package has no
+  `node_modules` to gate with;
+- a `SessionStart` probe reporting whether the daemon is up and which Go is on
+  PATH.
 
 **Specialists** — `.claude/agents/`. Delegate rather than re-deriving:
 
 - `boundary-auditor` — hexagonal import boundaries, with the inversion that
   fixes each violation.
-- `coverage-guard` — which uncovered statements threaten the 59.2% floor.
+- `coverage-guard` — which uncovered statements threaten the 61.0% floor.
 - `contract-reviewer` — MCP/HTTP surface changes and their effect on the three
   plugin packages.
 
@@ -257,4 +264,6 @@ from the next session rather than only from this one.
 
 `/flywheel` is the part that compounds. When something costs you more than one
 attempt to figure out, that is the signal to run it: the fix belongs in this
-file, an agent, a command, or a hook — not only in the current transcript.
+file, an agent, or a command — somewhere the next session will read it, not only
+in the current transcript. Prefer this file and `.claude/agents/` over a hook,
+since those are what teammates actually get on clone.
