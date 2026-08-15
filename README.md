@@ -34,6 +34,44 @@ blackbird status
 `blackbird install` starts the service and adds the remote MCP endpoint at
 `http://127.0.0.1:8081` to detected OpenCode, Claude Code, and Codex clients.
 
+Upgrading from 0.3.x needs no action: the installed service definition keeps
+working. Run `blackbird install` once to move it to the explicit `daemon`
+command, which is required before 0.5.0.
+
+## Command Line
+
+`blackbird --help` lists every command. Each one renders a report for a
+terminal or, with `--json`, the same data for a script.
+
+```sh
+blackbird overview                 # projects, agents, mail, reservations at a glance
+blackbird status                   # service, daemon handshake, and database state
+blackbird doctor                   # diagnose the installation and print remedies
+blackbird agents --project=$PWD    # who is registered, and what they hold
+blackbird inbox --unread           # mail waiting on an agent
+blackbird reservations --state=expired
+blackbird events --limit=20        # tail the coordination journal
+blackbird logs --follow
+```
+
+`status` handshakes with the running daemon rather than trusting the
+supervisor, so a loaded-but-crashing job reports as crash-looping instead of
+running. `doctor` exits 0 when clean, 1 on warnings, and 2 on failures, and
+names the exact command that resolves each finding.
+
+Shell completions come from the binary itself:
+
+```sh
+blackbird completion bash > $(brew --prefix)/etc/bash_completion.d/blackbird
+blackbird completion zsh  > "${fpath[1]}/_blackbird"
+blackbird completion fish > ~/.config/fish/completions/blackbird.fish
+```
+
+The CLI reads a loopback-only admin API and authenticates with a per-start
+token the daemon writes to `$XDG_STATE_HOME/blackbird/admin.json` with owner
+only permissions. `--address` targets a daemon on a non-default port and
+refuses any host that is not loopback, since every request carries that token.
+
 ## Daily Use
 
 Start with `blackbird_agent_register`, passing an absolute repository path as
@@ -125,6 +163,31 @@ binary and local issue store.
 Build metadata can be supplied with linker flags targeting `main.version`,
 `main.commit`, and `main.builtAt`. Unset fields use explicit development
 values.
+
+## Releases
+
+Releases are cut by release-please from Conventional Commit subjects. `feat:`
+takes the minor, `fix:` and `perf:` take the patch, and every other type is
+recorded without appearing in the changelog.
+
+Landing a commit on `main` updates a single `chore: release main` pull request,
+rebased onto `main` each run. That pull request is the release: merging it
+writes the changelog and manifest, tags `vX.Y.Z`, and triggers the release
+workflow, which builds each target on its own native runner, rebuilds and
+compares the binary to prove the build is reproducible, asserts `--version`
+against the tag, publishes the archives with checksums, and dispatches the
+formula update to `phall1/homebrew-tap`.
+
+The release branch is generated. Never commit to it or merge into it: the next
+run rebases it away. Anything that belongs to a human — upgrade notes, guidance,
+rationale — belongs in this README or in the commit subject that earns the
+changelog line.
+
+The pinned Go toolchain is deliberate and appears in `go.mod` and both
+workflows. Keep them in step, and note that the release build omits
+`-buildid=`: with it, Go emits a macOS binary without an `LC_UUID` load command
+that the dynamic loader refuses to run. Builds stay reproducible without it,
+which the workflow verifies on every release.
 
 ## Local Product Management
 
