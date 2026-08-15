@@ -1475,9 +1475,15 @@ func (request WorkRefObserveRequestDTO) Values() (WorkRefObserveValues, error) {
 	if err != nil {
 		return WorkRefObserveValues{}, invalid("body", err.Error())
 	}
-	previous, err := domain.NewOpaqueProviderValue(request.Body.PreviousProviderVersion)
-	if err != nil {
-		return WorkRefObserveValues{}, invalid("body.previous_provider_version", err.Error())
+	// A first observation carries no superseded provider version, and the
+	// opaque value type rejects the empty string, so the conversion only runs
+	// once the field is actually present.
+	var previous domain.OpaqueProviderValue
+	if request.Body.PreviousProviderVersion != "" {
+		previous, err = domain.NewOpaqueProviderValue(request.Body.PreviousProviderVersion)
+		if err != nil {
+			return WorkRefObserveValues{}, invalid("body.previous_provider_version", err.Error())
+		}
 	}
 	return WorkRefObserveValues{
 		Metadata: request.CommandMetadataDTO, ClientInstanceID: request.ClientInstanceID,
