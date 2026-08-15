@@ -682,10 +682,18 @@ func acquireAdminLeaseAs(t *testing.T, store *Store, holder application.LocalAge
 	return lease
 }
 
+// expireAdminLease backdates a lease by an hour rather than expiring it one
+// microsecond after acquisition. Expiry is reported in whole milliseconds, so a
+// lease that went stale within the same millisecond the query runs reports
+// ExpiresInMS of exactly 0 and reads as neither overdue nor live. The row must
+// keep expires_at_us > acquired_at_us to satisfy the table's own constraint,
+// and SQLite evaluates every assignment against the pre-update row.
 func expireAdminLease(t *testing.T, store *Store, lease domain.LeaseID) {
 	t.Helper()
+	const hourUS = int64(time.Hour / time.Microsecond)
 	if _, err := store.db.ExecContext(context.Background(),
-		`UPDATE leases SET expires_at_us = acquired_at_us + 1 WHERE lease_id = ?`, lease.String()); err != nil {
+		`UPDATE leases SET acquired_at_us = acquired_at_us - ?, expires_at_us = acquired_at_us - ?
+		 WHERE lease_id = ?`, hourUS, hourUS/2, lease.String()); err != nil {
 		t.Fatal(err)
 	}
 }
