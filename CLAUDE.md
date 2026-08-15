@@ -14,17 +14,21 @@ Match CI exactly. Mismatched versions produce failures that reproduce nowhere.
 
 | Tool | Version | Notes |
 | --- | --- | --- |
-| Go | 1.26.5 | `go.mod` requires 1.26.4, `toolchain` pins 1.26.5 |
+| Go | 1.26.6 | `go.mod` requires 1.26.4, `toolchain` pins 1.26.6 |
 | golangci-lint | 2.12.0 | config is `version: "2"` schema; v1 will not parse it |
 | Node | >= 22.19.0 | plugin packages only |
 | prek | >= 0.2.0 | `make hooks` installs pre-commit and pre-push |
 
-`GOTOOLCHAIN=go1.26.5` is set in `.claude/settings.json` so sessions build with
+`GOTOOLCHAIN=go1.26.6` is set in `.claude/settings.json` so sessions build with
 exactly CI's compiler. Do not rely on the version in a downloaded tarball's
-filename — `go.dev/dl/go1.26.5.linux-amd64.tar.gz` currently serves a newer
-patch release (1.26.6), and `GOTOOLCHAIN=auto` will happily use a newer local
-toolchain because it satisfies the `toolchain` directive. Check with
-`go version` inside the repo, not the name of the file you downloaded.
+filename — `go.dev/dl/` serves the current patch release under an older
+release's name, and `GOTOOLCHAIN=auto` will happily use a newer local toolchain
+because it satisfies the `toolchain` directive. Check with `go version` inside
+the repo, not the name of the file you downloaded.
+
+The patch version is a security floor, not a preference: `make vuln` reports
+every stdlib advisory fixed in a later patch release, so a toolchain left behind
+turns the gate red with no code change. 1.26.5 carried six such advisories.
 
 ## Quality gates
 

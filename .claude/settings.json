@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
-    "GOTOOLCHAIN": "go1.26.5"
+    "GOTOOLCHAIN": "go1.26.6"
   },
   "enabledMcpjsonServers": [
     "blackbird"

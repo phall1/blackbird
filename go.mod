@@ -2,7 +2,7 @@ module github.com/phall1/blackbird
 
 go 1.26.4
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/google/jsonschema-go v0.4.3
