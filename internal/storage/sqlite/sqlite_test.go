@@ -598,14 +598,22 @@ func TestExecuteSecurityDenialSaturationAndReservedAdmission(t *testing.T) {
 }
 
 func TestExecuteSecurityScopeDenialSaturationSummaryIsUnique(t *testing.T) {
+	t.Parallel()
 	store := openSecurityStore(t)
 	fixture := newSecurityFixture(t)
 	initializeSecurityFixture(t, store, fixture)
-
-	var bucket int64
-	if err := store.db.QueryRow("SELECT CAST(unixepoch('subsec') AS INTEGER) / 60").Scan(&bucket); err != nil {
+	// Pin the authority clock ahead of the wall clock so the seeded rows and the
+	// executions under test share one minute bucket. Reading the bucket from the
+	// wall clock instead loses saturation whenever a minute boundary falls
+	// between the seed and the execution.
+	bucketFloor := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Minute).Add(10 * time.Second)
+	if _, err := store.db.Exec(`UPDATE authority_streams SET authority_time_floor_us = ?
+		WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`,
+		timeMicros(bucketFloor), string(fixture.scope.Kind()), fixture.scope.ID(), fixture.epoch.String()); err != nil {
 		t.Fatal(err)
 	}
+	bucket := bucketFloor.Unix() / 60
+
 	err := store.withImmediate(context.Background(), func(tx *sql.Tx) error {
 		for index := range application.MaxDenialEntriesPerScopeMinute {
 			fingerprint := sha256.Sum256([]byte(fmt.Sprintf("scope-entry-%d", index)))
@@ -651,6 +659,65 @@ func TestExecuteSecurityScopeDenialSaturationSummaryIsUnique(t *testing.T) {
 	}
 	if summaries != 1 {
 		t.Fatalf("scope saturation summaries=%d, want 1", summaries)
+	}
+}
+
+func TestCommandDenialBucketFollowsAuthorityTimeFloor(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name   string
+		offset time.Duration
+	}{
+		{name: "floor ahead of wall clock", offset: 7 * time.Minute},
+		{name: "floor far ahead of wall clock", offset: 91 * time.Minute},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			store := openSecurityStore(t)
+			fixture := newSecurityFixture(t)
+			initializeSecurityFixture(t, store, fixture)
+			floor := time.Now().UTC().Add(testCase.offset).Truncate(time.Minute).Add(10 * time.Second)
+			if _, err := store.db.Exec(`UPDATE authority_streams SET authority_time_floor_us = ?
+				WHERE scope_kind = ? AND scope_id = ? AND authority_epoch = ?`,
+				timeMicros(floor), string(fixture.scope.Kind()), fixture.scope.ID(), fixture.epoch.String()); err != nil {
+				t.Fatal(err)
+			}
+			var wallBucket int64
+			if err := store.db.QueryRow("SELECT CAST(unixepoch('subsec') AS INTEGER) / 60").Scan(&wallBucket); err != nil {
+				t.Fatal(err)
+			}
+			spec := newCommandDenialSpec(t, fixture, "floor-bucket")
+			var bucket int64
+			execution, err := store.ExecuteSecurity(context.Background(), spec,
+				func(locked application.SecurityContext) (application.SecurityDecision, error) {
+					admission, _ := locked.DenialAdmission()
+					bucket = admission.MinuteBucket()
+					return auditOrSuppressDenial(t, spec)(locked)
+				})
+			if err != nil || execution.Kind() != application.SecurityCommandDenialAudited {
+				t.Fatalf("denial execution=%q error=%v", execution.Kind(), err)
+			}
+			if want := floor.Unix() / 60; bucket != want {
+				t.Fatalf("denial bucket=%d, want authority floor bucket %d", bucket, want)
+			}
+			if bucket == wallBucket {
+				t.Fatalf("denial bucket %d tracked the wall clock instead of the authority floor", bucket)
+			}
+			var stored int64
+			if err := store.db.QueryRow(`SELECT bucket FROM security_denials
+				WHERE record_kind = 'command' AND scope_id = ?`, fixture.scope.ID()).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored != bucket {
+				t.Fatalf("stored denial bucket=%d, want %d", stored, bucket)
+			}
+			// Admission counts the prior denial only if it queries the same
+			// bucket it stored, so replaying the spec must suppress.
+			execution, err = store.ExecuteSecurity(context.Background(), spec, auditOrSuppressDenial(t, spec))
+			if err != nil || execution.Kind() != application.SecurityCommandDenialSuppressed {
+				t.Fatalf("replayed denial execution=%q error=%v", execution.Kind(), err)
+			}
+		})
 	}
 }
 
