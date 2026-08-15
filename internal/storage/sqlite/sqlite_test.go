@@ -602,29 +602,7 @@ func TestExecuteSecurityScopeDenialSaturationSummaryIsUnique(t *testing.T) {
 	fixture := newSecurityFixture(t)
 	initializeSecurityFixture(t, store, fixture)
 
-	var bucket int64
-	if err := store.db.QueryRow("SELECT CAST(unixepoch('subsec') AS INTEGER) / 60").Scan(&bucket); err != nil {
-		t.Fatal(err)
-	}
-	err := store.withImmediate(context.Background(), func(tx *sql.Tx) error {
-		for index := range application.MaxDenialEntriesPerScopeMinute {
-			fingerprint := sha256.Sum256([]byte(fmt.Sprintf("scope-entry-%d", index)))
-			if _, err := tx.Exec(`INSERT INTO security_denials(
-				record_kind, denial_fingerprint, scope_kind, scope_id, subject_kind, subject_id,
-				operation, operation_major, denial_class, reason, bucket, occurrence_count,
-				first_recorded_at_us, last_recorded_at_us
-			) VALUES ('command', ?, 'installation', ?, 'unattributed_source', ?, 'actor.create.v1', 1,
-				'authentication', 'proof_rejected', ?, 1, 1, 1)`,
-				fingerprint[:], fixture.scope.ID(), fmt.Sprintf("source-%d", index), bucket,
-			); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	bucket := seedSaturatedScopeBucket(t, store, fixture)
 
 	spec := newCommandDenialSpec(t, fixture, "scope-saturation")
 	var admissionKind application.DenialAdmissionKind
@@ -692,6 +670,68 @@ type securityFixture struct {
 	admission                application.GuardGeneration
 	invitation               domain.InstallationInvitationState
 	generationA, generationB domain.BootstrapGenerationID
+}
+
+// currentDenialBucket reports the authority-time minute the denial ledger is
+// writing into, and how much of that minute is left.
+func currentDenialBucket(t *testing.T, store *Store) (int64, time.Duration) {
+	t.Helper()
+	var epochSeconds int64
+	if err := store.db.QueryRow("SELECT CAST(unixepoch('subsec') AS INTEGER)").Scan(&epochSeconds); err != nil {
+		t.Fatal(err)
+	}
+	return epochSeconds / 60, time.Duration(60-epochSeconds%60) * time.Second
+}
+
+// seedSaturatedScopeBucket fills the scope's denial quota for the current
+// authority-time minute and returns the bucket it filled.
+//
+// Saturation is per minute, and ExecuteSecurity derives its own bucket from the
+// authority time at execution. Seeding a thousand rows takes several seconds
+// under the race detector, so a seed started near a minute boundary lands in
+// the previous bucket while the assertion reads the next one — which is empty,
+// admitting the command as distinct rather than saturated. Wait out any minute
+// that is nearly over instead of racing it, and confirm the bucket held across
+// the seed before trusting it.
+func seedSaturatedScopeBucket(t *testing.T, store *Store, fixture securityFixture) int64 {
+	t.Helper()
+	const seedingHeadroom = 20 * time.Second
+	for range 4 {
+		bucket, remaining := currentDenialBucket(t, store)
+		if remaining < seedingHeadroom {
+			time.Sleep(remaining + 100*time.Millisecond)
+			continue
+		}
+		if err := store.withImmediate(context.Background(), func(tx *sql.Tx) error {
+			for index := range application.MaxDenialEntriesPerScopeMinute {
+				fingerprint := sha256.Sum256([]byte(fmt.Sprintf("scope-entry-%d", index)))
+				if _, err := tx.Exec(`INSERT INTO security_denials(
+					record_kind, denial_fingerprint, scope_kind, scope_id, subject_kind, subject_id,
+					operation, operation_major, denial_class, reason, bucket, occurrence_count,
+					first_recorded_at_us, last_recorded_at_us
+				) VALUES ('command', ?, 'installation', ?, 'unattributed_source', ?, 'actor.create.v1', 1,
+					'authentication', 'proof_rejected', ?, 1, 1, 1)`,
+					fingerprint[:], fixture.scope.ID(), fmt.Sprintf("source-%d", index), bucket,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if settled, _ := currentDenialBucket(t, store); settled == bucket {
+			return bucket
+		}
+		// The minute rolled while seeding: the rows just written describe a
+		// bucket the assertion will never read. Start over in the new one.
+		if _, err := store.db.Exec("DELETE FROM security_denials WHERE scope_id = ? AND bucket = ?",
+			fixture.scope.ID(), bucket); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("could not seed a saturated denial bucket that outlived the seed")
+	return 0
 }
 
 func openSecurityStore(t *testing.T) *Store {
