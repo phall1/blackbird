@@ -42,18 +42,28 @@ make build       # go mod verify, go mod tidy -diff, CGO_ENABLED=0 build
 make vuln        # govulncheck v1.6.0
 ```
 
-**Coverage floor trap.** `make coverage` enforces 58.8% but CI enforces
-**59.2%**, and total coverage is currently **exactly 59.2%**. There is no
-headroom: any statement added without a test fails CI while `make coverage`
-still exits zero. Never conclude coverage is fine from the Makefile's exit
-code — read the number:
+**Coverage floor.** `make coverage` and CI both enforce **61.0%**; total
+coverage is currently **61.8%**. The two floors live in `Makefile`
+(`COVERAGE_FLOOR`) and `.github/workflows/ci.yml` — they are deliberately
+identical, so a green `make coverage` now means a green CI gate. If you change
+one, change both, and read the number rather than trusting the exit code:
 
 ```sh
 go tool cover -func=/tmp/blackbird-coverage.out | tail -1
 ```
 
-The two floors live in `Makefile` (`COVERAGE_FLOOR`) and
-`.github/workflows/ci.yml`; if you change one, change both.
+They previously differed (58.8% local, 59.2% CI, sitting exactly on the CI
+floor), which meant any uncovered statement failed CI while `make coverage`
+still exited zero. Do not reintroduce that gap: when you raise coverage, ratchet
+both floors up together and leave a little slack.
+
+**The plugin packages are their own Go module.** `packages/go.mod` exists only
+so `npm ci` cannot change the root module's package set: `flatted`, a transitive
+dependency of `opencode-plugin`, vendors a Go package under `node_modules`, and
+without the nested module it joined `./...` — dragging the coverage total down
+~0.5pp on any workstation that had installed the Node dependencies while CI,
+which never runs `npm ci` in the Go job, saw a different number. Do not delete
+it.
 
 CI additionally requires `test -z "$(gofmt -l .)"`, `go mod tidy -diff`, and
 runs the test matrix on ubuntu-24.04 and macos-15.
