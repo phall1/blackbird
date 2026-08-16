@@ -183,6 +183,11 @@ run rebases it away. Anything that belongs to a human — upgrade notes, guidanc
 rationale — belongs in this README or in the commit subject that earns the
 changelog line.
 
+Pull requests squash, and the repository allows nothing else. One pull request
+becomes one commit whose subject is the pull request title, so a change earns
+exactly one changelog line. A merge commit that repeats the branch's own
+`feat:` subject earns two, which is how 0.4.0 came to list its feature twice.
+
 The pinned Go toolchain is deliberate and appears in `go.mod` and both
 workflows. Keep them in step, and note that the release build omits
 `-buildid=`: with it, Go emits a macOS binary without an `LC_UUID` load command
