@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "GOTOOLCHAIN": "go1.26.6"
+  },
+  "enabledMcpjsonServers": [
+    "blackbird"
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go run:*)",
+      "Bash(go list:*)",
+      "Bash(go mod:*)",
+      "Bash(go tool:*)",
+      "Bash(gofmt:*)",
+      "Bash(golangci-lint:*)",
+      "Bash(make:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(npm test:*)",
+      "Bash(npm run:*)",
+      "Bash(node --test:*)"
+    ]
+  }
+}

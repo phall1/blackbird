@@ -1,10 +1,11 @@
-.PHONY: format lint lint-fix vet test test-race test-stress coverage build vuln check hooks
+.PHONY: format lint lint-fix vet test test-race test-stress coverage build vuln check hooks daemon
 
 GO ?= go
 GOLANGCI_LINT ?= golangci-lint
 PREK ?= uvx prek
 GOVULNCHECK_VERSION ?= v1.6.0
-COVERAGE_FLOOR ?= 58.8
+BLACKBIRD_DB ?= $(HOME)/.local/share/blackbird/blackbird.db
+COVERAGE_FLOOR ?= 65.0
 
 format:
 	$(GOLANGCI_LINT) fmt
@@ -48,3 +49,9 @@ check: lint vet test-race coverage build vuln
 
 hooks:
 	$(PREK) install --hook-type pre-commit --hook-type pre-push
+
+# Run the coordination daemon this repository's agents coordinate through.
+# HTTP on 127.0.0.1:8080, MCP on 127.0.0.1:8081.
+daemon:
+	mkdir -p $(dir $(BLACKBIRD_DB))
+	$(GO) run ./cmd/blackbird -sqlite-path $(BLACKBIRD_DB)

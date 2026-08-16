@@ -530,6 +530,20 @@ func validateAggregateID(kind domain.AggregateKind, value string) error {
 		_, err = domain.ParseGrantID(value)
 	case domain.AggregateKindInvitation:
 		_, err = domain.ParseInvitationID(value)
+	case domain.AggregateKindWorkReference:
+		_, err = domain.ParseWorkReferenceID(value)
+	case domain.AggregateKindObjective:
+		_, err = domain.ParseObjectiveID(value)
+	case domain.AggregateKindWorkUnit:
+		_, err = domain.ParseWorkUnitID(value)
+	case domain.AggregateKindRun:
+		_, err = domain.ParseRunID(value)
+	case domain.AggregateKindRunParticipation:
+		_, err = domain.ParseRunParticipationID(value)
+	case domain.AggregateKindRuntimeBinding:
+		_, err = domain.ParseRuntimeBindingID(value)
+	case domain.AggregateKindRuntimeEndpoint:
+		_, err = domain.ParseRuntimeEndpointID(value)
 	default:
 		return invalid("aggregate.type", "is not a supported aggregate kind")
 	}

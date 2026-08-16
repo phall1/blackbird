@@ -15,7 +15,13 @@ import (
 
 func TestOnlineBackupRemainsConsistentDuringActiveWALWrites(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// The deadline is a hang guard, not a latency assertion. Eight backups with
+	// verification take about twenty seconds under -race in isolation, but this
+	// test runs in parallel with the rest of the package while `go test ./...`
+	// runs other package binaries alongside it, so the wall-clock cost scales
+	// with machine load rather than with anything the test measures. Budget for
+	// a saturated machine; a real hang still fails, just later.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	root := t.TempDir()
 	store, err := Open(ctx, Config{Path: filepath.Join(root, "active-source.db")})

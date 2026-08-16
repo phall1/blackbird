@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,4 +171,53 @@ func requestJSON(t *testing.T, client *http.Client, method, url, token string) j
 		t.Fatalf("decode %s: %v", url, err)
 	}
 	return jsonResponse{status: response.StatusCode, body: body}
+}
+
+// nonPortStorage satisfies the daemon's Storage seam without implementing the
+// application ports the production graph needs.
+type nonPortStorage struct{}
+
+func (nonPortStorage) Close() error { return nil }
+
+// TestComposeProductionRejectsStorageWithoutApplicationPorts pins the composition
+// root's only fail-closed branch. Every other test here hands it a real SQLite
+// store, which satisfies the ports by construction and so never reaches this
+// path — leaving the error that guards a mis-wired storage adapter untested.
+func TestComposeProductionRejectsStorageWithoutApplicationPorts(t *testing.T) {
+	t.Parallel()
+	config := Config{
+		Storage: StorageSQLite, SQLitePath: filepath.Join(t.TempDir(), "blackbird.db"),
+		StateDir: t.TempDir(), HTTPAddress: "127.0.0.1:8080", MCPAddress: "127.0.0.1:8081",
+	}
+	compose := composeProduction(BuildInfo{Version: "test"}, config, slog.New(slog.DiscardHandler))
+
+	_, err := compose(context.Background(), nonPortStorage{})
+	if err == nil || !strings.Contains(err.Error(), "application ports") {
+		t.Fatalf("composeProduction() error = %v, want a port-contract failure", err)
+	}
+}
+
+// TestNewProductionDaemonCleansConfiguredPaths pins that the product resolves and
+// cleans both filesystem paths before the daemon opens anything, so a relative
+// or unclean path cannot escape the directory the operator named.
+func TestNewProductionDaemonCleansConfiguredPaths(t *testing.T) {
+	t.Parallel()
+	databaseDir := t.TempDir()
+	stateDir := t.TempDir()
+	daemon, err := NewProductionDaemon(BuildInfo{Version: "test"}, Config{
+		Storage:     StorageSQLite,
+		SQLitePath:  filepath.Join(databaseDir, "nested", "..", "blackbird.db"),
+		StateDir:    filepath.Join(stateDir, "nested", "..") + string(filepath.Separator),
+		HTTPAddress: "127.0.0.1:8080",
+		MCPAddress:  "127.0.0.1:8081",
+	})
+	if err != nil {
+		t.Fatalf("NewProductionDaemon() error = %v", err)
+	}
+	if want := filepath.Join(databaseDir, "blackbird.db"); daemon.config.SQLitePath != want {
+		t.Fatalf("SQLitePath = %q, want %q", daemon.config.SQLitePath, want)
+	}
+	if daemon.config.StateDir != stateDir {
+		t.Fatalf("StateDir = %q, want %q", daemon.config.StateDir, stateDir)
+	}
 }
