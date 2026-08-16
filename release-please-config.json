@@ -18,7 +18,6 @@
   "packages": {
     ".": {
       "release-type": "go",
-      "component": "blackbird",
       "include-component-in-tag": false,
       "include-v-in-tag": true,
       "exclude-paths": [

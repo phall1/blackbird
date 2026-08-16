@@ -188,6 +188,16 @@ becomes one commit whose subject is the pull request title, so a change earns
 exactly one changelog line. A merge commit that repeats the branch's own
 `feat:` subject earns two, which is how 0.4.0 came to list its feature twice.
 
+Two settings are load-bearing and easy to break. The root package declares no
+`component`: release-please parses the component back out of the merged release
+pull request's title, an aggregate title carries none, and a configured
+component it cannot find makes it refuse to tag with `PR component: undefined
+does not match configured component`. The release then sits merged and
+untagged, which blocks every later release too. Branch auto-deletion is also
+off, so a merged release branch survives long enough for its release to be
+built. If a release ever lands merged but untagged, read the Release Please run
+log before touching anything: the abort line names the cause.
+
 The pinned Go toolchain is deliberate and appears in `go.mod` and both
 workflows. Keep them in step, and note that the release build omits
 `-buildid=`: with it, Go emits a macOS binary without an `LC_UUID` load command
