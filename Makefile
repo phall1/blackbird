@@ -54,4 +54,4 @@ hooks:
 # HTTP on 127.0.0.1:8080, MCP on 127.0.0.1:8081.
 daemon:
 	mkdir -p $(dir $(BLACKBIRD_DB))
-	$(GO) run ./cmd/blackbird -sqlite-path $(BLACKBIRD_DB)
+	$(GO) run ./cmd/blackbird daemon --sqlite-path=$(BLACKBIRD_DB)
