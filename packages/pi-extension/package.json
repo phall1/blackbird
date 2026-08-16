@@ -1,21 +1,40 @@
 {
   "name": "blackbird-pi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deliver durable Blackbird messages into active Pi sessions.",
   "type": "module",
-  "files": ["extensions", "README.md", "LICENSE"],
-  "keywords": ["blackbird", "pi-package", "extension", "agent"],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "blackbird",
+    "pi-package",
+    "extension",
+    "agent"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/phall1/blackbird.git",
     "directory": "packages/pi-extension"
   },
-  "bugs": { "url": "https://github.com/phall1/blackbird/issues" },
+  "bugs": {
+    "url": "https://github.com/phall1/blackbird/issues"
+  },
   "homepage": "https://github.com/phall1/blackbird/tree/main/packages/pi-extension#readme",
-  "engines": { "node": ">=22.19.0" },
-  "pi": { "extensions": ["./extensions/index.ts"] },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.1",
     "@types/node": "24.2.1",
@@ -28,5 +47,8 @@
     "test:pack": "node scripts/pack-test.mjs",
     "gates": "npm run check && npm test && npm run test:pack"
   },
-  "publishConfig": { "access": "public", "provenance": true }
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

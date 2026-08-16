@@ -5,6 +5,7 @@ go 1.26.4
 toolchain go1.26.6
 
 require (
+	github.com/alecthomas/kong v1.16.1
 	github.com/google/jsonschema-go v0.4.3
 	github.com/gowebpki/jcs v1.0.1
 	github.com/jackc/pgx/v5 v5.10.0

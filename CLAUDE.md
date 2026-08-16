@@ -15,6 +15,11 @@ goes stale silently — which is worse than saying nothing, because it is
 confidently wrong. So this file states **invariants and where to look**, and
 gives you the command to derive anything that changes.
 
+It is also deliberately agent-facing and narrow. `README.md` is the human-facing
+document and owns install, the command line, daily use, delivery to each client,
+and the release flow. When the two overlap, README wins and this file should
+point at it rather than restate it.
+
 Two consequences for you:
 
 - **A number or path you need is derived, not quoted.** Where a threshold, a
@@ -191,6 +196,13 @@ an inversion rather than an exemption.
   changelogs from them. `feat:` and `fix:` cut releases; scope a change to a
   plugin package so the right component is versioned. A `chore:` or `test:` that
   should have been a `fix:` silently withholds a release from users.
+- **Pull requests squash, and the repository allows nothing else** — so the
+  subject that reaches `main`, and therefore the changelog, is the **pull
+  request title**, not any commit subject on your branch. A branch whose commits
+  are impeccably conventional still releases nothing if its PR title is prose.
+  Title the PR as the commit you want, and let the strongest change on the
+  branch decide the type. `README.md` under "Releases" is the human-facing
+  authority on this; do not duplicate its detail here.
 - **Lint policy is `default: all` with an explicit disable list.** The disabled
   linters in `.golangci.yml` are a deliberate decision to drop subjective
   style and architecture linters while keeping the full bug and security

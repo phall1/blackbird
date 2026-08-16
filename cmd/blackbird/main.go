@@ -1,22 +1,34 @@
+// Command blackbird is the coordination service and its command-line client.
+// This package is one of the two blessed assembly points: it constructs the
+// storage, transport, and installation adapters and binds them into the command
+// grammar, which itself depends on none of them.
 package main
 
 import (
 	"context"
-	"flag"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
+	"time"
 
+	sqlitedriver "modernc.org/sqlite"
+
+	"github.com/phall1/blackbird/internal/cli"
+	"github.com/phall1/blackbird/internal/cli/adminclient"
+	"github.com/phall1/blackbird/internal/cli/logsource"
+	"github.com/phall1/blackbird/internal/cli/render"
+	"github.com/phall1/blackbird/internal/cli/termwidth"
 	"github.com/phall1/blackbird/internal/install"
 	blackbirdruntime "github.com/phall1/blackbird/internal/runtime"
-)
-
-const (
-	exitOK    = 0
-	exitUsage = 2
-	exitError = 1
+	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
 
 var (
@@ -30,13 +42,6 @@ type daemonRunner interface {
 }
 
 type daemonFactory func(blackbirdruntime.BuildInfo, blackbirdruntime.Config) (daemonRunner, error)
-
-type productManager interface {
-	Install(context.Context) (install.Result, error)
-	Status(context.Context) (string, error)
-	Update(context.Context) (install.UpdateResult, error)
-	Uninstall(context.Context) (install.Result, error)
-}
 
 func main() {
 	os.Exit(runMain(os.Args[1:], os.Stdout, os.Stderr))
@@ -53,6 +58,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return executeConfigured(ctx, args, stdout, stderr, nil, nil)
 }
 
+// executeConfigured is the test seam for daemon assembly: injected supplies the
+// non-secret configuration a caller would otherwise have to pass as flags, and
+// factory replaces the production daemon.
 func executeConfigured(
 	ctx context.Context,
 	args []string,
@@ -71,151 +79,356 @@ func executeWithManager(
 	stderr io.Writer,
 	injected *blackbirdruntime.Config,
 	factory daemonFactory,
-	manager productManager,
+	manager cli.ProductPort,
 ) int {
-	if len(args) > 0 && isProductCommand(args[0]) {
-		if len(args) != 1 {
-			if err := writef(stderr, "blackbird: %s does not accept arguments\n", args[0]); err != nil {
-				return exitError
-			}
-			return exitUsage
+	return cli.Run(ctx, dependencies(injected, factory, manager, stdout), args, stdout, stderr)
+}
+
+func dependencies(
+	injected *blackbirdruntime.Config,
+	factory daemonFactory,
+	manager cli.ProductPort,
+	stdout io.Writer,
+) cli.Dependencies {
+	build := blackbirdruntime.BuildInfo{Version: version, Commit: commit, BuiltAt: builtAt}.Normalize()
+	if manager == nil {
+		if resolved, err := install.New(); err == nil {
+			manager = resolved
 		}
-		if manager == nil {
-			var err error
-			manager, err = install.New()
-			if err != nil {
-				if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
-					return exitError
-				}
-				return exitError
-			}
+	}
+	stateDir := stateDirectory(manager)
+	defaults := daemonDefaults(injected, stateDir)
+
+	return cli.Dependencies{
+		Build:        cli.BuildInfo{Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt},
+		Defaults:     defaults,
+		DatabasePath: defaultDatabasePath(),
+		Daemon:       daemonAdapter{build: build, injected: injected, factory: factory},
+		Admin:        adminclient.New(handshakePath(stateDir), ""),
+		Store:        readerAdapter{},
+		Maintenance:  maintenanceAdapter{},
+		Product:      manager,
+		Logs:         logsource.New(stateDir),
+		Now:          time.Now,
+		Env:          os.LookupEnv,
+		Device:       deviceOf(stdout),
+		WidthProbe:   termwidth.Probe,
+	}
+}
+
+func daemonDefaults(injected *blackbirdruntime.Config, stateDir string) cli.DaemonOptions {
+	defaults := cli.DaemonOptions{
+		Storage:         string(blackbirdruntime.StorageSQLite),
+		SQLitePath:      defaultDatabasePath(),
+		StateDir:        stateDir,
+		HTTPAddress:     "127.0.0.1:8080",
+		MCPAddress:      "127.0.0.1:8081",
+		ShutdownTimeout: 30 * time.Second,
+	}
+	if injected == nil {
+		return defaults
+	}
+	if injected.Storage != "" {
+		defaults.Storage = string(injected.Storage)
+	}
+	if injected.SQLitePath != "" {
+		defaults.SQLitePath = injected.SQLitePath
+	}
+	if injected.StateDir != "" {
+		defaults.StateDir = injected.StateDir
+	}
+	if injected.HTTPAddress != "" {
+		defaults.HTTPAddress = injected.HTTPAddress
+	}
+	if injected.MCPAddress != "" {
+		defaults.MCPAddress = injected.MCPAddress
+	}
+	if injected.LogLevel != "" {
+		defaults.LogLevel = injected.LogLevel
+	}
+	if injected.ShutdownTimeout > 0 {
+		defaults.ShutdownTimeout = injected.ShutdownTimeout
+	}
+	return defaults
+}
+
+// defaultDatabasePath is the installed data path, never a relative filename: a
+// relative default is resolved against the working directory, which is how a
+// stray invocation used to migrate a full database into whatever directory the
+// user happened to stand in.
+func defaultDatabasePath() string {
+	if data := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(data) {
+		return filepath.Join(data, "blackbird", "blackbird.db")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "blackbird", "blackbird.db")
+}
+
+func stateDirectory(manager cli.ProductPort) string {
+	if manager != nil {
+		if dir := manager.StateDir(); dir != "" {
+			return dir
 		}
-		return executeProductCommand(ctx, args[0], manager, stdout, stderr)
+	}
+	dir, err := install.DefaultStateDir()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+func handshakePath(stateDir string) string {
+	if stateDir == "" {
+		return ""
+	}
+	return install.HandshakePath(stateDir)
+}
+
+func deviceOf(stream io.Writer) render.Device {
+	file, ok := stream.(*os.File)
+	if !ok {
+		return nil
+	}
+	return file
+}
+
+// daemonAdapter is the only place the command grammar's daemon options meet the
+// runtime's configuration.
+type daemonAdapter struct {
+	build    blackbirdruntime.BuildInfo
+	injected *blackbirdruntime.Config
+	factory  daemonFactory
+}
+
+func (adapter daemonAdapter) Run(ctx context.Context, options cli.DaemonOptions) error {
+	config := blackbirdruntime.Config{}
+	if adapter.injected != nil {
+		config = *adapter.injected
+	}
+	config.Storage = blackbirdruntime.StorageBackend(options.Storage)
+	config.SQLitePath = options.SQLitePath
+	config.StateDir = options.StateDir
+	config.HTTPAddress = options.HTTPAddress
+	config.MCPAddress = options.MCPAddress
+	config.ShutdownTimeout = options.ShutdownTimeout
+	if options.LogLevel != "" {
+		config.LogLevel = options.LogLevel
 	}
 
-	flags := flag.NewFlagSet("blackbird", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	showVersion := flags.Bool("version", false, "print build identity and exit")
-	config := blackbirdruntime.Config{
-		Storage: blackbirdruntime.StorageSQLite, SQLitePath: "blackbird.db",
-		HTTPAddress: "127.0.0.1:8080", MCPAddress: "127.0.0.1:8081",
-	}
-	if injected != nil {
-		config = *injected
-	}
-	storage := flags.String("storage", string(config.Storage), "storage backend (sqlite or postgres)")
-	flags.StringVar(&config.SQLitePath, "sqlite-path", config.SQLitePath, "SQLite database path")
-	flags.StringVar(&config.HTTPAddress, "http-address", config.HTTPAddress, "HTTP listen address")
-	flags.StringVar(&config.MCPAddress, "mcp-address", config.MCPAddress, "MCP listen address")
-	if err := flags.Parse(args); err != nil {
-		if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
-			return exitError
-		}
-		return exitUsage
-	}
-	if flags.NArg() != 0 {
-		if err := writef(stderr, "blackbird: unexpected argument %q\n", flags.Arg(0)); err != nil {
-			return exitError
-		}
-		return exitUsage
-	}
-
-	build := blackbirdruntime.BuildInfo{
-		Version: version,
-		Commit:  commit,
-		BuiltAt: builtAt,
-	}.Normalize()
-	if *showVersion {
-		if err := writef(stdout, "blackbird version=%s commit=%s built_at=%s\n", build.Version, build.Commit, build.BuiltAt); err != nil {
-			return exitError
-		}
-		return exitOK
-	}
-	if ctx.Err() != nil {
-		return exitOK
-	}
-	config.Storage = blackbirdruntime.StorageBackend(*storage)
+	factory := adapter.factory
 	if factory == nil {
 		factory = func(build blackbirdruntime.BuildInfo, config blackbirdruntime.Config) (daemonRunner, error) {
 			return blackbirdruntime.NewProductionDaemon(build, config)
 		}
 	}
-	daemon, err := factory(build, config)
+	daemon, err := factory(adapter.build, config)
 	if err != nil {
-		if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
-			return exitError
-		}
-		return exitError
+		return fmt.Errorf("construct daemon: %w", err)
 	}
-
 	if err := daemon.Run(ctx); err != nil {
-		if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
-			return exitError
-		}
-		return exitError
+		return fmt.Errorf("run daemon: %w", err)
 	}
-
-	return exitOK
+	return nil
 }
 
-func isProductCommand(argument string) bool {
-	switch argument {
-	case "install", "status", "update", "uninstall":
-		return true
-	default:
-		return false
-	}
-}
+// readerAdapter inspects the database file read-only. It never calls
+// sqlite.Open, which creates directories, applies migrations, and claims the
+// runtime row: an inspection command must not be able to write.
+type readerAdapter struct{}
 
-func executeProductCommand(ctx context.Context, command string, manager productManager, stdout, stderr io.Writer) int {
-	var err error
-	switch command {
-	case "install":
-		var result install.Result
-		result, err = manager.Install(ctx)
-		if err == nil {
-			err = writef(stdout, "installed service=%s updater=%s clients=%s\n", result.ServicePath, stringsOrNone(result.UpdaterPaths), stringsOrNone(result.Clients))
-		}
-	case "status":
-		var status string
-		status, err = manager.Status(ctx)
-		if err == nil {
-			err = writef(stdout, "%s\n", status)
-		}
-	case "update":
-		var result install.UpdateResult
-		result, err = manager.Update(ctx)
-		if err == nil {
-			err = writef(stdout, "updated changed=%t before=%q after=%q\n", result.Changed, result.Before, result.After)
-		}
-	case "uninstall":
-		var result install.Result
-		result, err = manager.Uninstall(ctx)
-		if err == nil {
-			err = writef(stdout, "uninstalled service=%s updater=%s data=retained\n", result.ServicePath, stringsOrNone(result.UpdaterPaths))
-		}
+func (readerAdapter) Inspect(ctx context.Context, path string, deep bool) (cli.Database, error) {
+	facts := cli.Database{Path: path, ExpectedSchemaVersion: sqlite.SchemaVersion, ExpectedApplicationID: sqlite.ApplicationID}
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return facts, nil
 	}
 	if err != nil {
-		if writeErr := writef(stderr, "blackbird: %v\n", err); writeErr != nil {
-			return exitError
+		return facts, fmt.Errorf("inspect %s: %w", path, err)
+	}
+	facts.Present = true
+	facts.SizeBytes = info.Size()
+	facts.FileMode = info.Mode().Perm().String()
+
+	reader, err := sqlite.OpenReader(ctx, sqlite.ReaderConfig{Path: path, AllowStale: true})
+	if err != nil {
+		return facts, fmt.Errorf("open %s read-only: %w", path, err)
+	}
+	defer func() { _ = reader.Close() }()
+	facts.Mode = string(reader.Mode())
+
+	schema, err := reader.Schema(ctx)
+	if err != nil {
+		return facts, fmt.Errorf("read schema: %w", err)
+	}
+	facts.SchemaVersion = schema.SchemaVersion
+	facts.ApplicationID = schema.ApplicationID
+	facts.Supported = schema.Supported
+	facts.LedgerComplete = schema.LedgerComplete
+
+	storage, err := reader.Storage(ctx)
+	if err != nil {
+		return facts, fmt.Errorf("read storage facts: %w", err)
+	}
+	facts.WALBytes = storage.WALBytes
+	facts.FreeBytes = int64(storage.FreeBytes)
+	facts.PageSize = storage.PageSize
+	facts.PageCount = storage.PageCount
+	facts.JournalMode = storage.JournalMode
+
+	runtimeState, err := reader.Runtime(ctx)
+	if err != nil {
+		return facts, fmt.Errorf("read runtime state: %w", err)
+	}
+	facts.CleanShutdown = runtimeState.CleanShutdown
+
+	coordination, err := reader.Coordination(ctx)
+	if err != nil {
+		return facts, fmt.Errorf("read coordination counts: %w", err)
+	}
+	facts.Projects = coordination.Projects
+	facts.Agents = coordination.Agents
+	facts.Conversations = coordination.Conversations
+	facts.Messages = coordination.Messages
+	facts.Events = coordination.Events
+	facts.Deliveries = coordination.Deliveries
+	facts.UnreadDeliveries = coordination.UnreadDeliveries
+	facts.UnackedDeliveries = coordination.UnacknowledgedDeliveries
+	facts.ActiveLeases = coordination.ActiveLeases
+	facts.ExpiredActiveLeases = coordination.ExpiredActiveLeases
+	facts.OpenSessions = coordination.OpenSessions
+	facts.StaleOpenSessions = coordination.StaleOpenSessions
+
+	if deep {
+		integrity, err := reader.Integrity(ctx)
+		if err != nil {
+			return facts, fmt.Errorf("check integrity: %w", err)
 		}
-		return exitError
+		facts.QuickCheck = integrity.QuickCheck
+		facts.ForeignKeyFailures = len(integrity.ForeignKeyFailures)
 	}
-	return exitOK
+	return facts, nil
 }
 
-func stringsOrNone(values []string) string {
-	if len(values) == 0 {
-		return "none"
+// maintenanceAdapter is the write half of gc. It opens the database read-write
+// with mode=rw, so a missing file is an error rather than a fresh database, and
+// with a short busy timeout, so a database another process still holds fails
+// fast instead of blocking behind SQLite's writer claim. gc refuses to call it
+// while the daemon answers; this timeout is the second line of that defence.
+type maintenanceAdapter struct{}
+
+const maintenanceBusyTimeout = 2 * time.Second
+
+func (maintenanceAdapter) Reclaim(ctx context.Context, path string, plan cli.ReclaimPlan) (cli.Reclaimed, error) {
+	before, err := databaseBytes(path)
+	if err != nil {
+		return cli.Reclaimed{}, err
 	}
-	result := values[0]
-	for _, value := range values[1:] {
-		result += "," + value
+	database, err := openForMaintenance(ctx, path)
+	if err != nil {
+		return cli.Reclaimed{}, err
 	}
-	return result
+	defer func() { _ = database.Close() }()
+
+	if plan.Checkpoint {
+		if err := checkpointWAL(ctx, database, path); err != nil {
+			return cli.Reclaimed{}, err
+		}
+	}
+	if plan.Vacuum {
+		if _, err := database.ExecContext(ctx, "VACUUM"); err != nil {
+			return cli.Reclaimed{}, fmt.Errorf("vacuum %s: %w", path, err)
+		}
+		if plan.Checkpoint {
+			if err := checkpointWAL(ctx, database, path); err != nil {
+				return cli.Reclaimed{}, err
+			}
+		}
+	}
+	if err := database.Close(); err != nil {
+		return cli.Reclaimed{}, fmt.Errorf("close %s: %w", path, err)
+	}
+
+	after, err := databaseBytes(path)
+	if err != nil {
+		return cli.Reclaimed{}, err
+	}
+	walAfter, err := fileBytes(path + "-wal")
+	if err != nil {
+		return cli.Reclaimed{}, err
+	}
+	return cli.Reclaimed{BeforeBytes: before, AfterBytes: after, WALBytes: walAfter}, nil
 }
 
-func writef(output io.Writer, format string, args ...any) error {
-	_, err := fmt.Fprintf(output, format, args...)
-	return err
+func openForMaintenance(ctx context.Context, path string) (*sql.DB, error) {
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("reclaim %s: the database path must be absolute", path)
+	}
+	query := url.Values{}
+	query.Set("mode", "rw")
+	query.Set("_busy_timeout", strconv.FormatInt(maintenanceBusyTimeout.Milliseconds(), 10))
+	query.Set("_dqs", "false")
+	query.Add("_pragma", "trusted_schema(OFF)")
+	connector, err := sqlitedriver.NewConnector(
+		(&url.URL{Scheme: "file", Path: filepath.ToSlash(path), RawQuery: query.Encode()}).String())
+	if err != nil {
+		return nil, fmt.Errorf("open %s read-write: %w", path, err)
+	}
+	database := sql.OpenDB(connector)
+	database.SetMaxOpenConns(1)
+	var applicationID int
+	if err := database.QueryRowContext(ctx, "PRAGMA application_id").Scan(&applicationID); err != nil {
+		_ = database.Close()
+		return nil, fmt.Errorf("open %s read-write: %w", path, err)
+	}
+	if applicationID != sqlite.ApplicationID {
+		_ = database.Close()
+		return nil, fmt.Errorf("reclaim %s: application id %d is not a Blackbird database", path, applicationID)
+	}
+	return database, nil
+}
+
+// checkpointWAL truncates the write-ahead log. A busy checkpoint means another
+// connection is reading the database, which leaves the log in place: report it
+// rather than claim space that was never reclaimed.
+func checkpointWAL(ctx context.Context, database *sql.DB, path string) error {
+	var busy, walFrames, checkpointed int
+	if err := database.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").
+		Scan(&busy, &walFrames, &checkpointed); err != nil {
+		return fmt.Errorf("checkpoint %s: %w", path, err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("checkpoint %s: another connection is using the database", path)
+	}
+	return nil
+}
+
+// databaseBytes is the space the database actually occupies: the file plus its
+// write-ahead log, because truncating the log is most of what gc reclaims.
+func databaseBytes(path string) (int64, error) {
+	main, err := fileBytes(path)
+	if err != nil {
+		return 0, err
+	}
+	if main == 0 {
+		return 0, fmt.Errorf("reclaim %s: no such database", path)
+	}
+	wal, err := fileBytes(path + "-wal")
+	if err != nil {
+		return 0, err
+	}
+	return main + wal, nil
+}
+
+func fileBytes(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("inspect %s: %w", path, err)
+	}
+	return info.Size(), nil
 }

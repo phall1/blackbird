@@ -34,6 +34,7 @@ var allowedInternalLayers = map[string]bool{
 	"runtime":          true,
 	"install":          true,
 	"companion":        true,
+	"cli":              true,
 	"architecturetest": true,
 }
 
@@ -152,6 +153,11 @@ func TestBoundaryPolicyExamples(t *testing.T) {
 		{name: "storage integration", importer: "storage", importPath: modulePath + "/internal/integration/phux", wantError: true},
 		{name: "storage runtime", importer: "storage", importPath: modulePath + "/internal/runtime", wantError: true},
 		{name: "runtime transport", importer: "runtime", importPath: modulePath + "/internal/transport/http"},
+		{name: "cli domain", importer: "cli", importPath: modulePath + "/internal/domain"},
+		{name: "cli same layer", importer: "cli", importPath: modulePath + "/internal/cli/render"},
+		{name: "cli storage", importer: "cli", importPath: modulePath + "/internal/storage/sqlite", wantError: true},
+		{name: "cli transport", importer: "cli", importPath: modulePath + "/internal/transport/http", wantError: true},
+		{name: "cmd assembles cli", importer: "cmd", importPath: modulePath + "/internal/cli"},
 		{name: "unknown assembles storage", importer: "other", importPath: modulePath + "/internal/storage/sqlite", wantError: true},
 		{name: "undeclared internal import", importer: "runtime", importPath: modulePath + "/internal/experimental", wantError: true},
 		{name: "spike forbidden", importer: "runtime", importPath: "github.com/phall1/blackmail/spikes/go-stack/internal/application", wantError: true},

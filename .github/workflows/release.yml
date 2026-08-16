@@ -60,7 +60,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Install Go 1.26.5
+      - name: Install Go 1.26.6
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.6
@@ -112,7 +112,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Install Go 1.26.5
+      - name: Install Go 1.26.6
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.6
@@ -141,7 +141,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          ldflags="-buildid= -s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.builtAt=${BUILT_AT}"
+          ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.builtAt=${BUILT_AT}"
           go build -trimpath -buildvcs=false -tags='netgo osusergo' \
             -ldflags="$ldflags" -o "dist/blackbird-${TARGET}" ./cmd/blackbird
           go build -trimpath -buildvcs=false -tags='netgo osusergo' \
