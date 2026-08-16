@@ -56,8 +56,9 @@ blackbird logs --follow
 
 `status` handshakes with the running daemon rather than trusting the
 supervisor, so a loaded-but-crashing job reports as crash-looping instead of
-running. `doctor` exits 0 when clean, 1 on warnings, and 2 on failures, and
-names the exact command that resolves each finding.
+running. `doctor` exits 5 when any check fails and 0 otherwise, so warnings stay
+advisory; `--strict` makes a warning fail too. Every finding names the exact
+command that resolves it.
 
 Shell completions come from the binary itself:
 
