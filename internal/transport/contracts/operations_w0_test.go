@@ -558,19 +558,13 @@ func TestW0OrdinaryDecodersRejectMalformedJSON(t *testing.T) {
 }
 
 // w1ObserveUpdateDTO turns the shared observation fixture into an update of an
-// existing work reference.
-//
-// The fixture as written is a *first* observation — expected_versions.
-// work_reference is zero, which Values() reads as "create". That request cannot
-// be marshalled: domain.Version refuses to encode a zero version, and the field
-// is neither a pointer nor omitempty. Handler tests never noticed because they
-// pass the struct in-process and never encode it. These decoder tests must go
-// through JSON, so they exercise the update path; the create path's encoding
-// gap is a contract defect, not something to pin as expected behaviour here.
+// existing work reference. The fixture itself is a first observation, which the
+// test below covers separately.
 func w1ObserveUpdateDTO(t *testing.T, fixture authenticationFixture, adapter domain.PrincipalID) WorkRefObserveRequestDTO {
 	t.Helper()
 	request := workRefObserveTestDTO(t, fixture, adapter)
-	request.ExpectedVersions.WorkReference = domain.InitialVersion()
+	current := domain.InitialVersion()
+	request.ExpectedVersions.WorkReference = &current
 	// An update must name the provider version it believes it is replacing.
 	request.Body.PreviousProviderVersion = "etag-a0"
 	return request
@@ -735,5 +729,71 @@ func TestW1RequestDecodersRejectMalformedRequests(t *testing.T) {
 				t.Fatal("decode() error = nil, want a rejection")
 			}
 		})
+	}
+}
+
+// TestWorkRefObserveCreateSurvivesJSON is the regression for a defect these
+// decoder tests uncovered: a first observation was expressible in Go and
+// accepted by Values(), but could not be encoded. expected_versions.
+// work_reference was a non-pointer domain.Version, and domain.Version refuses
+// to marshal a zero value, so every Go client failed at the encoder while a
+// hand-written payload omitting the member was accepted. Handler tests never
+// caught it because they pass the struct in-process and never encode it.
+//
+// The field is now a pointer, so absence — not a zero value — selects create.
+func TestWorkRefObserveCreateSurvivesJSON(t *testing.T) {
+	t.Parallel()
+
+	fixture := newAuthenticationFixture(t)
+	adapter, err := domain.NewPrincipalID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := workRefObserveTestDTO(t, fixture, adapter)
+	if create.ExpectedVersions.WorkReference != nil {
+		t.Fatal("the shared fixture is no longer a first observation, so this test proves nothing")
+	}
+
+	encoded := mustMarshal(t, create)
+	decoded, err := DecodeWorkRefObserveRequest(encoded)
+	if err != nil {
+		t.Fatalf("a first observation did not survive JSON: %v", err)
+	}
+	if decoded.ExpectedVersions.WorkReference != nil {
+		t.Fatalf("work_reference = %v, want nil to select the create path", decoded.ExpectedVersions.WorkReference)
+	}
+	values, err := decoded.Values()
+	if err != nil {
+		t.Fatalf("Values() rejected a decoded first observation: %v", err)
+	}
+	if !values.ExpectedWorkReferenceVersion.IsZero() {
+		t.Fatalf("ExpectedWorkReferenceVersion = %v, want the zero version for a create",
+			values.ExpectedWorkReferenceVersion)
+	}
+
+	// Omitting the member entirely is what pre-pointer clients had to hand-write,
+	// and it must keep selecting create rather than becoming a decode error.
+	omitted := mustRemoveJSONField(t, encoded, `,"work_reference":null`)
+	fromOmitted, err := DecodeWorkRefObserveRequest(omitted)
+	if err != nil {
+		t.Fatalf("an omitted work_reference was rejected: %v", err)
+	}
+	if fromOmitted.ExpectedVersions.WorkReference != nil {
+		t.Fatal("an omitted work_reference did not select the create path")
+	}
+
+	// A create may not also claim to supersede a provider version.
+	conflicting := workRefObserveTestDTO(t, fixture, adapter)
+	conflicting.Body.PreviousProviderVersion = "etag-a0"
+	if _, err := DecodeWorkRefObserveRequest(mustMarshal(t, conflicting)); err == nil {
+		t.Fatal("a create carrying previous_provider_version was accepted")
+	}
+
+	// An update must still pin a usable version.
+	zero := workRefObserveTestDTO(t, fixture, adapter)
+	unusable := domain.Version{}
+	zero.ExpectedVersions.WorkReference = &unusable
+	if _, err := zero.Values(); err == nil {
+		t.Fatal("a present but unusable work_reference was treated as a create")
 	}
 }

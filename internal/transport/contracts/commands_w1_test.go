@@ -360,8 +360,10 @@ func TestHandleWorkRefObservePinsExpectedVersionOnSubsequentObservation(t *testi
 	handler := newW1TestHandler(t, dispatcher)
 	dto := workRefObserveTestDTO(t, fixture, evidence.PrincipalID())
 	// An update pins the current work reference version and must declare the
-	// provider version it supersedes.
-	dto.ExpectedVersions.WorkReference = domain.InitialVersion()
+	// provider version it supersedes. The version is a pointer because its
+	// absence, not a zero value, is what selects the create path.
+	current := domain.InitialVersion()
+	dto.ExpectedVersions.WorkReference = &current
 	dto.Body.PreviousProviderVersion = "etag-a0"
 
 	_, failure, err := handler.HandleWorkRefObserve(context.Background(), evidence, dto)
