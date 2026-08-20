@@ -192,7 +192,14 @@ func (cmd *DoctorCmd) serviceChecks(ctx context.Context, console *Console, daemo
 	}
 
 	updater := checkResult{Name: "updater", Status: checkPass, Detail: "updater=" + orAbsent(facts["updater"])}
-	if facts["updater"] != "scheduled" {
+	switch facts["updater"] {
+	case install.UpdaterScheduled:
+	case install.UpdaterUnsupported:
+		// A pass, not a warning: nothing is broken, and the remedy below would
+		// send this machine to an install that declines to schedule an updater.
+		// Under --strict a warning here would fail the gate on every tick.
+		updater.Detail += ": " + install.UpdaterUnsupportedReason
+	default:
 		updater.Status = checkWarn
 		updater.Remedy = "run \"blackbird install\" to schedule unattended updates"
 	}

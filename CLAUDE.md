@@ -254,19 +254,33 @@ entry is what teammates get on clone.
 MCP is served over Streamable HTTP at the **root** of the MCP listener — the
 endpoint has no path suffix. Getting this wrong looks like a dead server.
 
-**Verify before trusting the installer's updater.** The supported install path
-is Homebrew, and the update path has assumed it, so a source build on a machine
-without Homebrew can end up with a scheduled updater that fails on every fire.
-Check after installing:
+**The updater is conditional on Homebrew, and every surface must agree on
+that.** It upgrades the Homebrew formula, so on a machine without Homebrew there
+is nothing to schedule: `install` writes no updater and tears down one an
+earlier install left, `status` reports `unsupported`, `doctor` passes it, and
+`update` refuses before invoking `brew`. Read the states and the one detector
+they all route through:
 
 ```sh
-blackbird status
-systemctl --user list-timers 'blackbird*'   # Linux
+grep -n 'Updater\(Scheduled\|Stopped\|Unsupported\|UnsupportedReason\)' internal/install/install.go
+grep -n 'func (manager \*Manager) homebrew' -A 4 internal/install/install.go
 ```
 
-If the updater cannot work on your machine, disable that timer rather than
-letting it fail on a schedule. If you find this is still true, it is a product
-bug worth fixing rather than documenting again.
+Two rules follow, and breaking either recreates the bug this replaced:
+
+- **Detection reads the updater's PATH, not the process's.** A Homebrew under a
+  custom prefix is on the login shell's PATH and absent from the unit's, so
+  `exec.LookPath` would schedule a job that cannot run. That is why `LookPathIn`
+  exists; do not "simplify" it back to `exec.LookPath`.
+- **`unsupported` is a passing state, not a degraded one.** It is a property of
+  the machine that no command changes — and the obvious remedy, "run `blackbird
+  install`", is precisely what declines to schedule an updater. A warning here
+  fails `doctor --strict` forever on every source build.
+
+Because detection is injected, tests must set it rather than inherit it: a test
+that lets the real lookup run asserts something different on a workstation with
+Homebrew than on one without. `internal/install`'s test manager stubs it, and
+that is why every install assertion in the package is reproducible.
 
 ## Agent coordination protocol
 

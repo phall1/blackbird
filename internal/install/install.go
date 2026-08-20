@@ -48,8 +48,17 @@ const (
 	errorLogTailBytes  = 64 << 10
 	errorLevelMarker   = "level=ERROR"
 	logTimeField       = "time="
-	updaterScheduled   = "scheduled"
-	updaterStopped     = "stopped"
+)
+
+// Updater states reported by Status. UpdaterUnsupported is not a failure and no
+// command resolves it: the unattended updater upgrades the Homebrew formula, so
+// on a machine without Homebrew there is nothing worth scheduling. Reporting it
+// as stopped instead would send every such machine into "run blackbird install"
+// forever, and install would keep declining to schedule it.
+const (
+	UpdaterScheduled   = "scheduled"
+	UpdaterStopped     = "stopped"
+	UpdaterUnsupported = "unsupported"
 )
 
 // Daemon states reported by Status. They combine three independent facts: the
@@ -127,6 +136,11 @@ type Config struct {
 	Runner         Runner
 	Prober         Prober
 	LookPath       func(string) (string, error)
+	// LookPathIn resolves an executable within an explicit PATH list instead of
+	// the process environment. The unattended updater runs with updaterPath and
+	// inherits no login shell, so that list — not the caller's PATH — decides
+	// whether the updater can reach Homebrew.
+	LookPathIn func(pathList, name string) (string, error)
 }
 
 // Manager manages the local Blackbird product installation.
@@ -134,11 +148,19 @@ type Manager struct {
 	config Config
 }
 
+// UpdaterUnsupportedReason explains an installation that scheduled no updater.
+// It is phrased for a user reading install or status output, not for a log.
+const UpdaterUnsupportedReason = "Homebrew is not installed, and the unattended updater upgrades the Homebrew formula"
+
 // Result describes files changed by an operation.
 type Result struct {
 	ServicePath  string
 	UpdaterPaths []string
 	Clients      []string
+	// UpdaterSkipped explains why no unattended updater was scheduled, and is
+	// empty when one was. It is not an error: the rest of the installation
+	// converged, and only unattended upgrades are unavailable.
+	UpdaterSkipped string
 }
 
 // UpdateResult reports whether Homebrew installed a different version.
@@ -201,6 +223,9 @@ func NewManager(config Config) *Manager {
 	}
 	if config.LookPath == nil {
 		config.LookPath = exec.LookPath
+	}
+	if config.LookPathIn == nil {
+		config.LookPathIn = lookPathIn
 	}
 	if config.UID == 0 {
 		config.UID = os.Getuid()
@@ -278,19 +303,75 @@ func (manager *Manager) Install(ctx context.Context) (Result, error) {
 	if _, err := manager.convergeServiceDefinition(); err != nil {
 		return Result{}, err
 	}
+	// Without Homebrew the updater has nothing to upgrade through, so scheduling
+	// one buys a job that fails on every tick and a doctor warning no command
+	// clears. Converge the other way instead: tear down an updater an earlier
+	// install left behind, so a machine that loses Homebrew stops firing one.
 	updaterPaths := manager.updaterPaths()
-	for index, path := range updaterPaths {
-		if err := atomicWrite(path, []byte(manager.updaterDefinitions()[index]), 0o600); err != nil {
-			return Result{}, fmt.Errorf("write updater definition: %w", err)
+	skipped := ""
+	if manager.homebrewAvailable() {
+		for index, path := range updaterPaths {
+			if err := atomicWrite(path, []byte(manager.updaterDefinitions()[index]), 0o600); err != nil {
+				return Result{}, fmt.Errorf("write updater definition: %w", err)
+			}
 		}
+	} else {
+		if err := manager.disableUpdater(ctx); err != nil {
+			return Result{}, err
+		}
+		updaterPaths, skipped = nil, UpdaterUnsupportedReason
 	}
 	if err := manager.restart(ctx); err != nil {
 		return Result{}, err
 	}
-	if err := manager.restartUpdater(ctx); err != nil {
-		return Result{}, err
+	if skipped == "" {
+		if err := manager.restartUpdater(ctx); err != nil {
+			return Result{}, err
+		}
 	}
-	return Result{ServicePath: servicePath, UpdaterPaths: updaterPaths, Clients: clients}, nil
+	return Result{
+		ServicePath: servicePath, UpdaterPaths: updaterPaths,
+		Clients: clients, UpdaterSkipped: skipped,
+	}, nil
+}
+
+// disableUpdater stops and removes an updater this machine can no longer run.
+// It leaves the reload to the caller, which restarts the service immediately
+// afterwards and reloads the supervisor as part of that.
+func (manager *Manager) disableUpdater(ctx context.Context) error {
+	// Each definition is inspected on its own rather than as a set: a partial
+	// installation is exactly the state worth converging, and treating "all
+	// present" as the trigger would strand whichever file survived.
+	var present []string
+	timerExists := false
+	for _, path := range manager.updaterPaths() {
+		switch _, err := os.Stat(path); {
+		case err == nil:
+			present = append(present, path)
+			timerExists = timerExists || strings.HasSuffix(path, ".timer")
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			return fmt.Errorf("inspect updater definition: %w", err)
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	// Disabling a unit systemd has never heard of is an error, so ask only when
+	// the timer is really there. Its absence still leaves files to remove.
+	if manager.config.GOOS == "darwin" {
+		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), present[0])
+	} else if timerExists {
+		if _, err := manager.runRequired(ctx, "systemctl", "--user", "disable", "--now", "blackbird-update.timer"); err != nil {
+			return err
+		}
+	}
+	for _, path := range present {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove updater definition: %w", err)
+		}
+	}
+	return nil
 }
 
 // Status reports the daemon and periodic updater definitions and native states.
@@ -327,9 +408,15 @@ func (manager *Manager) Status(ctx context.Context) (string, error) {
 	// bare on both platforms because consumers match this field exactly, and a
 	// healthy systemd timer would otherwise read as "scheduled (active)" and
 	// never satisfy them.
-	updaterState := nativeState(manager.config.GOOS, updaterOutput, updaterErr, updaterScheduled, updaterStopped)
+	updaterState := nativeState(manager.config.GOOS, updaterOutput, updaterErr, UpdaterScheduled, UpdaterStopped)
 	if updaterErr == nil {
-		updaterState = updaterScheduled
+		updaterState = UpdaterScheduled
+	}
+	// Homebrew's absence outranks whatever the supervisor says. A timer left
+	// behind by an install that predates this check still reports as scheduled,
+	// and it still cannot upgrade anything.
+	if !manager.homebrewAvailable() {
+		updaterState = UpdaterUnsupported
 	}
 	definitionState, err := manager.definitionState()
 	if err != nil {
@@ -515,6 +602,13 @@ func freshFailureRecord(line string) bool {
 
 // Update refreshes Homebrew metadata, upgrades Blackbird, and restarts only after a version change.
 func (manager *Manager) Update(ctx context.Context) (UpdateResult, error) {
+	// Fail on the cause rather than on its symptom. Reaching brew first reports
+	// `exec: "brew": executable file not found in $PATH`, which reads as a
+	// broken PATH on a machine that simply never had Homebrew.
+	if _, err := manager.homebrew(); err != nil {
+		return UpdateResult{}, fmt.Errorf(
+			"cannot update: %s; update this installation the way it was installed", UpdaterUnsupportedReason)
+	}
 	before, err := manager.runRequired(ctx, "brew", "list", "--versions", formula)
 	if err != nil {
 		return UpdateResult{}, err
@@ -616,6 +710,38 @@ func (manager *Manager) cleanupLegacyAdapters(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// lookPathIn resolves name against an explicit PATH list. exec.LookPath cannot
+// do this: it reads the process environment, which is the one PATH the
+// unattended updater will never run with.
+func lookPathIn(pathList, name string) (string, error) {
+	for _, directory := range filepath.SplitList(pathList) {
+		if directory == "" {
+			continue
+		}
+		candidate := filepath.Join(directory, name)
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("%q not found in %s: %w", name, pathList, fs.ErrNotExist)
+}
+
+// homebrew reports where the unattended updater would find Homebrew. Detection
+// deliberately searches updaterPath rather than the caller's PATH: a Homebrew
+// installed under a custom prefix is on the login shell's PATH and absent from
+// the updater's, and scheduling a job on the strength of the wrong PATH is the
+// failure this check exists to prevent.
+func (manager *Manager) homebrew() (string, error) {
+	return manager.config.LookPathIn(updaterPath, "brew")
+}
+
+func (manager *Manager) homebrewAvailable() bool {
+	_, err := manager.homebrew()
+	return err == nil
 }
 
 func pathsExist(paths ...string) (bool, error) {
