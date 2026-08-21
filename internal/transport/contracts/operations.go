@@ -1354,9 +1354,15 @@ type WorkRefObserveRequestDTO struct {
 	Body             WorkRefObserveBodyDTO             `json:"body"`
 }
 type WorkRefObserveExpectedVersionsDTO struct {
-	Adapter       domain.Version `json:"adapter"`
-	Workspace     domain.Version `json:"workspace"`
-	WorkReference domain.Version `json:"work_reference"`
+	Adapter   domain.Version `json:"adapter"`
+	Workspace domain.Version `json:"workspace"`
+	// WorkReference is absent when the observation creates the work reference
+	// and present when it updates one. It is a pointer for the same reason
+	// SessionStart's optional device versions are: domain.Version refuses to
+	// encode a zero value, so a non-pointer field cannot express "no prior
+	// version" at all — the daemon accepted such a request but no Go client
+	// could marshal one.
+	WorkReference *domain.Version `json:"work_reference"`
 }
 type WorkRefObserveBodyDTO struct {
 	AdapterID               domain.PrincipalID     `json:"adapter_id"`
@@ -1437,17 +1443,21 @@ func (request WorkRefObserveRequestDTO) Values() (WorkRefObserveValues, error) {
 	if err := validateRawJSONObject("body.selected_fields", request.Body.SelectedFields); err != nil {
 		return WorkRefObserveValues{}, err
 	}
-	create := request.ExpectedVersions.WorkReference.IsZero()
+	create := request.ExpectedVersions.WorkReference == nil
 	if err := validateText("body.previous_provider_version", request.Body.PreviousProviderVersion, maxOpaqueProviderValueBytes, !create); err != nil {
 		return WorkRefObserveValues{}, err
 	}
 	if create && request.Body.PreviousProviderVersion != "" {
 		return WorkRefObserveValues{}, invalid("body.previous_provider_version", "must be absent when creating a new work reference")
 	}
+	// A present-but-unusable version is a malformed update, not a create. Only
+	// the member's absence selects the create path.
+	expectedWorkReference := domain.Version{}
 	if !create {
-		if err := validateVersion("expected_versions.work_reference", request.ExpectedVersions.WorkReference); err != nil {
+		if err := validateVersion("expected_versions.work_reference", *request.ExpectedVersions.WorkReference); err != nil {
 			return WorkRefObserveValues{}, err
 		}
+		expectedWorkReference = *request.ExpectedVersions.WorkReference
 	}
 	namespace, err := domain.NewOpaqueProviderValue(request.Body.ProviderNamespace)
 	if err != nil {
@@ -1490,7 +1500,7 @@ func (request WorkRefObserveRequestDTO) Values() (WorkRefObserveValues, error) {
 		AdapterID: request.Body.AdapterID, AdapterVersion: request.ExpectedVersions.Adapter,
 		WorkspaceID: request.Body.WorkspaceID, WorkspaceVersion: request.ExpectedVersions.Workspace,
 		WorkReferenceID:              request.Body.WorkReferenceID,
-		ExpectedWorkReferenceVersion: request.ExpectedVersions.WorkReference,
+		ExpectedWorkReferenceVersion: expectedWorkReference,
 		Observation:                  observation, PreviousProviderVersion: previous,
 	}, nil
 }

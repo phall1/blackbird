@@ -116,11 +116,19 @@ func TestHandshakePublishesTheBoundAddressForAnEphemeralPort(t *testing.T) {
 			t.Errorf("Run() error = %v", err)
 		}
 	})
+	// The deadline is a hang guard, not a latency assertion. Bringing a real
+	// daemon up — SQLite, both listeners, and the handshake record — takes a few
+	// seconds under -race in isolation, but this test runs while `go test ./...`
+	// runs every other package binary alongside it, so the wall-clock cost
+	// scales with machine load rather than with anything the test measures. Ten
+	// seconds left roughly two seconds of headroom and failed intermittently on
+	// a loaded workstation. Budget for a saturated machine; a daemon that never
+	// starts still fails, just later.
 	select {
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("daemon stopped before it was ready: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(2 * time.Minute):
 		t.Fatal("daemon did not become ready")
 	}
 
