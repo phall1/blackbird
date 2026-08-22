@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.2](https://github.com/phall1/blackbird/compare/v0.4.1...v0.4.2) (2026-08-22)
+
+
+### Bug Fixes
+
+* let release-please tag the root package again ([0b53949](https://github.com/phall1/blackbird/commit/0b539492676f60b1ed2b700b0ef0f2173bdc86cd))
+* schedule no updater on a machine without Homebrew ([#8](https://github.com/phall1/blackbird/issues/8)) ([41e7940](https://github.com/phall1/blackbird/commit/41e7940f9ff91e85e59250452fc5b795dd16023d))
+
 ## [0.4.1](https://github.com/phall1/blackbird/compare/v0.4.0...v0.4.1) (2026-08-16)
 
 
