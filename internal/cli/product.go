@@ -13,9 +13,10 @@ import (
 type InstallCmd struct{}
 
 type installReport struct {
-	ServicePath  string   `json:"service_path"`
-	UpdaterPaths []string `json:"updater_paths"`
-	Clients      []string `json:"clients"`
+	ServicePath    string   `json:"service_path"`
+	UpdaterPaths   []string `json:"updater_paths"`
+	Clients        []string `json:"clients"`
+	UpdaterSkipped string   `json:"updater_skipped,omitempty"`
 }
 
 func (cmd *InstallCmd) Run(ctx context.Context, console *Console) error {
@@ -28,15 +29,22 @@ func (cmd *InstallCmd) Run(ctx context.Context, console *Console) error {
 		return fault(ExitError, err, "install")
 	}
 	return console.present(newView(installReport{
-		ServicePath:  result.ServicePath,
-		UpdaterPaths: result.UpdaterPaths,
-		Clients:      result.Clients,
+		ServicePath:    result.ServicePath,
+		UpdaterPaths:   result.UpdaterPaths,
+		Clients:        result.Clients,
+		UpdaterSkipped: result.UpdaterSkipped,
 	}, drawInstall))
 }
 
 func drawInstall(doc *render.Document, report installReport) {
 	doc.Linef(render.RolePlain, "installed service=%s updater=%s clients=%s",
 		report.ServicePath, joinOrNone(report.UpdaterPaths), joinOrNone(report.Clients))
+	// An install that silently scheduled nothing is how a machine ends up
+	// believing it updates itself, so say so on the successful path.
+	if report.UpdaterSkipped != "" {
+		doc.Linef(render.RoleMuted, "  no unattended updater: %s; update with the tool you installed with",
+			report.UpdaterSkipped)
+	}
 }
 
 // UpdateCmd upgrades through Homebrew and converges the service definition.

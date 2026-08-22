@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -849,8 +850,12 @@ func TestUninstallRemovesOnlyServiceDefinition(t *testing.T) {
 	}
 }
 
+// testManager builds a manager for the supported installation: Homebrew
+// present. Detection is injected rather than inherited from the host, because
+// the real lookup would otherwise make every install assertion in this file
+// depend on whether the workstation running it happens to have Homebrew.
 func testManager(home, goos string, runner Runner) *Manager {
-	return NewManager(Config{
+	manager := NewManager(Config{
 		GOOS: goos, HomeDir: home, ConfigHome: filepath.Join(home, "config"),
 		DataHome: filepath.Join(home, "data"), StateHome: filepath.Join(home, "state"),
 		Executable: filepath.Join(home, "bin", "blackbird"), UID: 501, Runner: runner,
@@ -867,7 +872,27 @@ func testManager(home, goos string, runner Runner) *Manager {
 			}
 			return "", os.ErrNotExist
 		},
+		LookPathIn: stubHomebrew(true),
 	})
+	return manager
+}
+
+// stubHomebrew resolves "brew" the way lookPathIn would on a machine that has
+// it, or refuses the way it would on one that does not.
+func stubHomebrew(present bool) func(string, string) (string, error) {
+	return func(_, name string) (string, error) {
+		if name == "brew" && present {
+			return "/opt/homebrew/bin/brew", nil
+		}
+		return "", os.ErrNotExist
+	}
+}
+
+// withoutHomebrew re-points a manager at a host with no Homebrew on the
+// updater's PATH.
+func withoutHomebrew(manager *Manager) *Manager {
+	manager.config.LookPathIn = stubHomebrew(false)
+	return manager
 }
 
 type stubProber struct {
@@ -926,4 +951,182 @@ func readAll(t *testing.T, paths []string) map[string]string {
 		result[path] = string(content)
 	}
 	return result
+}
+
+// TestInstallSchedulesNoUpdaterWithoutHomebrew pins the decision this package
+// exists to make on a source build: the updater upgrades a Homebrew formula, so
+// without Homebrew the honest outcome is no updater at all. Scheduling one
+// anyway is what left Linux workstations running a timer that failed every tick.
+func TestInstallSchedulesNoUpdaterWithoutHomebrew(t *testing.T) {
+	t.Parallel()
+	for _, goos := range []string{"linux", "darwin"} {
+		t.Run(goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			runner := &recordingRunner{}
+			manager := withoutHomebrew(testManager(home, goos, runner))
+
+			result, err := manager.Install(context.Background())
+			if err != nil {
+				t.Fatalf("Install() failed: %v", err)
+			}
+			if len(result.UpdaterPaths) != 0 {
+				t.Fatalf("UpdaterPaths = %v, want none", result.UpdaterPaths)
+			}
+			if result.UpdaterSkipped != UpdaterUnsupportedReason {
+				t.Fatalf("UpdaterSkipped = %q, want %q", result.UpdaterSkipped, UpdaterUnsupportedReason)
+			}
+			if result.ServicePath == "" {
+				t.Fatal("the daemon service must still be installed")
+			}
+			for _, path := range manager.updaterPaths() {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("updater definition %s exists, want none", path)
+				}
+			}
+			for _, command := range runner.commands {
+				if strings.Contains(command, "blackbird-update") || strings.Contains(command, updaterLabel) {
+					t.Fatalf("commands scheduled an updater: %v", runner.commands)
+				}
+			}
+		})
+	}
+}
+
+// TestInstallTearsDownAnUpdaterHomebrewNoLongerBacks covers the machine that was
+// installed when Homebrew was present and has since lost it. Declining to write
+// a new updater is not enough: the old timer stays enabled and keeps firing.
+func TestInstallTearsDownAnUpdaterHomebrewNoLongerBacks(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	manager := testManager(home, "linux", &recordingRunner{})
+	first, err := manager.Install(context.Background())
+	if err != nil {
+		t.Fatalf("Install() with Homebrew failed: %v", err)
+	}
+	if len(first.UpdaterPaths) == 0 {
+		t.Fatal("the Homebrew install scheduled no updater, so this test proves nothing")
+	}
+
+	runner := &recordingRunner{}
+	manager.config.Runner = runner
+	if _, err := withoutHomebrew(manager).Install(context.Background()); err != nil {
+		t.Fatalf("Install() without Homebrew failed: %v", err)
+	}
+	for _, path := range first.UpdaterPaths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale updater definition %s survived", path)
+		}
+	}
+	if !slices.Contains(runner.commands, "systemctl --user disable --now blackbird-update.timer") {
+		t.Fatalf("the stale timer was never disabled: %v", runner.commands)
+	}
+}
+
+// TestStatusReportsAnUnsupportedUpdater proves Homebrew's absence outranks the
+// supervisor's opinion. A timer an earlier install left enabled answers
+// is-active successfully and would otherwise report as scheduled forever.
+func TestStatusReportsAnUnsupportedUpdater(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	manager := testManager(home, "linux", &recordingRunner{outputs: []string{"active", "active"}})
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+
+	withBrew, err := manager.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status() failed: %v", err)
+	}
+	if !strings.Contains(withBrew, "updater="+UpdaterScheduled) {
+		t.Fatalf("status with Homebrew = %q, want updater=%s", withBrew, UpdaterScheduled)
+	}
+
+	manager.config.Runner = &recordingRunner{outputs: []string{"active", "active"}}
+	line, err := withoutHomebrew(manager).Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status() without Homebrew failed: %v", err)
+	}
+	if !strings.Contains(line, "updater="+UpdaterUnsupported) {
+		t.Fatalf("status = %q, want updater=%s", line, UpdaterUnsupported)
+	}
+}
+
+// TestUpdateRefusesWithoutHomebrewBeforeRunningBrew keeps the failure legible.
+// Reaching brew first reports a missing executable, which reads as a broken
+// PATH rather than as a machine Homebrew never installed.
+func TestUpdateRefusesWithoutHomebrewBeforeRunningBrew(t *testing.T) {
+	t.Parallel()
+	runner := &recordingRunner{}
+	manager := withoutHomebrew(testManager(t.TempDir(), "linux", runner))
+
+	if _, err := manager.Update(context.Background()); err == nil {
+		t.Fatal("Update() succeeded without Homebrew")
+	} else if !strings.Contains(err.Error(), "Homebrew is not installed") {
+		t.Fatalf("Update() error = %v, want it to name Homebrew", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("commands = %v, want none before the refusal", runner.commands)
+	}
+}
+
+// TestLookPathInSearchesTheGivenListOnly is the detector's own contract: it must
+// read the PATH the updater unit runs with, never the process environment.
+func TestLookPathInSearchesTheGivenListOnly(t *testing.T) {
+	t.Parallel()
+	absent := t.TempDir()
+	present := t.TempDir()
+	notExecutable := t.TempDir()
+	mustWrite(t, filepath.Join(present, "brew"), "#!/bin/sh\n")
+	if err := os.Chmod(filepath.Join(present, "brew"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(notExecutable, "brew"), "#!/bin/sh\n")
+	mustMkdir(t, filepath.Join(absent, "brew"))
+
+	found, err := lookPathIn(strings.Join([]string{absent, notExecutable, present}, string(os.PathListSeparator)), "brew")
+	if err != nil {
+		t.Fatalf("lookPathIn() failed: %v", err)
+	}
+	if want := filepath.Join(present, "brew"); found != want {
+		t.Fatalf("lookPathIn() = %q, want %q", found, want)
+	}
+	if _, err := lookPathIn(strings.Join([]string{absent, notExecutable}, string(os.PathListSeparator)), "brew"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lookPathIn() error = %v, want os.ErrNotExist", err)
+	}
+}
+
+// TestInstallConvergesAPartialUpdaterInstallation covers the half-written state
+// a failed install or a hand-edited unit directory leaves behind. Treating the
+// pair as all-or-nothing would strand whichever file survived, and asking
+// systemd to disable a timer it never loaded fails the install outright.
+func TestInstallConvergesAPartialUpdaterInstallation(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	manager := testManager(home, "linux", &recordingRunner{})
+	if _, err := manager.Install(context.Background()); err != nil {
+		t.Fatalf("Install() with Homebrew failed: %v", err)
+	}
+	paths := manager.updaterPaths()
+	timer := paths[len(paths)-1]
+	if !strings.HasSuffix(timer, ".timer") {
+		t.Fatalf("updaterPaths() = %v, want the timer last", paths)
+	}
+	if err := os.Remove(timer); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &recordingRunner{}
+	manager.config.Runner = runner
+	if _, err := withoutHomebrew(manager).Install(context.Background()); err != nil {
+		t.Fatalf("Install() over a partial updater failed: %v", err)
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("updater definition %s survived: %v", path, err)
+		}
+	}
+	if slices.Contains(runner.commands, "systemctl --user disable --now blackbird-update.timer") {
+		t.Fatalf("disabled a timer that was not installed: %v", runner.commands)
+	}
 }

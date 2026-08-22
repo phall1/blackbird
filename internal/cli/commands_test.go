@@ -184,16 +184,21 @@ func (store *fakeStore) Inspect(_ context.Context, path string, deep bool) (Data
 }
 
 type fakeProduct struct {
-	called    string
-	status    string
-	statusErr error
-	err       error
+	called         string
+	status         string
+	statusErr      error
+	err            error
+	updaterSkipped string
 }
 
 func (product *fakeProduct) Install(context.Context) (install.Result, error) {
 	product.called = "install"
 	if product.err != nil {
 		return install.Result{}, product.err
+	}
+	if product.updaterSkipped != "" {
+		return install.Result{ServicePath: "/service", Clients: []string{"opencode", "codex"},
+			UpdaterSkipped: product.updaterSkipped}, nil
 	}
 	return install.Result{ServicePath: "/service", UpdaterPaths: []string{"/updater"},
 		Clients: []string{"opencode", "codex"}}, nil
@@ -1633,5 +1638,89 @@ func TestEveryDoctorCheckIsSelectableByName(t *testing.T) {
 				t.Fatalf("--only=%s produced %#v", name, only.Checks)
 			}
 		})
+	}
+}
+
+// TestDoctorPassesAnUnsupportedUpdater is the half of this fix that keeps the
+// diagnosis honest. Warning here would be advisory noise on every non-Homebrew
+// machine and, under --strict, a permanent failure whose printed remedy is an
+// install that deliberately declines to schedule an updater.
+func TestDoctorPassesAnUnsupportedUpdater(t *testing.T) {
+	t.Parallel()
+
+	const line = "daemon=running installed=true path=/s definition=current updater=" + install.UpdaterUnsupported
+	for _, strict := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default", true: "strict"}[strict], func(t *testing.T) {
+			t.Parallel()
+			deps := dependencies(t)
+			deps.Product = &fakeProduct{status: line}
+			deps.Admin = &fakeAdmin{health: Health{Reachable: true, Ready: true, Version: "0.4.0", SchemaVersion: 4}}
+			deps.Store = &fakeStore{database: healthyDatabase()}
+
+			args := []string{"doctor", "--only=updater", "--json"}
+			if strict {
+				args = append(args, "--strict")
+			}
+			result := runCLI(t, deps, args)
+			if result.code != ExitOK {
+				t.Fatalf("code = %d, want %d; stdout=%q", result.code, ExitOK, result.stdout)
+			}
+			var report doctorReport
+			if err := json.Unmarshal([]byte(result.stdout), &report); err != nil {
+				t.Fatal(err)
+			}
+			if len(report.Checks) != 1 || report.Checks[0].Status != checkPass {
+				t.Fatalf("checks = %#v, want one passing check", report.Checks)
+			}
+			if report.Checks[0].Remedy != "" {
+				t.Fatalf("remedy = %q, want none: no command schedules an updater here", report.Checks[0].Remedy)
+			}
+			if !strings.Contains(report.Checks[0].Detail, "Homebrew") {
+				t.Fatalf("detail = %q, want it to name Homebrew", report.Checks[0].Detail)
+			}
+		})
+	}
+}
+
+// TestStatusExplainsAnUnsupportedUpdater proves the state is not left as a bare
+// word the reader has to interpret: "unsupported" beside no explanation reads as
+// a broken installation.
+func TestStatusExplainsAnUnsupportedUpdater(t *testing.T) {
+	t.Parallel()
+
+	deps := dependencies(t)
+	deps.Product = &fakeProduct{status: "daemon=running installed=true path=/s definition=current " +
+		"updater=" + install.UpdaterUnsupported + " installed=false paths= interval=6h0m0s"}
+	deps.Admin = &fakeAdmin{health: Health{Reachable: true, Ready: true}}
+	deps.Store = &fakeStore{database: healthyDatabase()}
+
+	result := runCLI(t, deps, []string{"status"})
+	if result.code != ExitOK {
+		t.Fatalf("code = %d, want %d", result.code, ExitOK)
+	}
+	// The sentence folds at the render width, so assert on fragments that
+	// cannot straddle the fold.
+	if !strings.Contains(result.stdout, install.UpdaterUnsupported) ||
+		!strings.Contains(result.stdout, "Homebrew") ||
+		!strings.Contains(result.stdout, "Problems") {
+		t.Fatalf("stdout = %q, want the unsupported updater explained", result.stdout)
+	}
+}
+
+// TestInstallReportsSchedulingNoUpdater keeps a silent success from implying
+// unattended updates that will never run.
+func TestInstallReportsSchedulingNoUpdater(t *testing.T) {
+	t.Parallel()
+
+	deps := dependencies(t)
+	deps.Product = &fakeProduct{updaterSkipped: install.UpdaterUnsupportedReason}
+
+	result := runCLI(t, deps, []string{"install"})
+	if result.code != ExitOK {
+		t.Fatalf("code = %d, want %d; stderr=%q", result.code, ExitOK, result.stderr)
+	}
+	if !strings.Contains(result.stdout, "updater=none") ||
+		!strings.Contains(result.stdout, "Homebrew") {
+		t.Fatalf("stdout = %q, want the skipped updater named", result.stdout)
 	}
 }

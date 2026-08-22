@@ -229,6 +229,16 @@ oneshot service on Linux. Updater failures are retained in Blackbird's state
 logs on macOS and the user journal on Linux. The updater never restarts itself;
 the daemon restarts only after the installed formula version changes.
 
+The updater is scheduled only when Homebrew is present, because it upgrades the
+Homebrew formula and has nothing to do without it. Detection searches the PATH
+the updater itself runs with rather than your shell's, since a Homebrew under a
+custom prefix is on one and not the other. On a machine without it — a source
+build, typically — `install` schedules no updater and removes one an earlier
+install left behind, `status` and `doctor` report `updater=unsupported` rather
+than a fault, and `update` refuses with that reason instead of a missing-`brew`
+error. Nothing else about the installation changes, and such a machine is
+updated by whatever installed it.
+
 Installation also adds one `blackbird` HTTP MCP entry to detected OpenCode,
 Claude Code, and Codex configurations while preserving unrelated settings.
 When user-managed OpenCode JSONC exists, Blackbird leaves it untouched rather
@@ -237,6 +247,7 @@ daemon, updater, and client definitions.
 
 `update` runs `brew update` followed by
 `brew upgrade phall1/tap/blackbird`; the service is restarted only when the
-installed formula version changes. `status` reports both the daemon and updater.
+installed formula version changes, and it fails before running either command
+when Homebrew is absent. `status` reports both the daemon and updater.
 `uninstall` stops the daemon and updater, cleans legacy adapter definitions, and
 retains databases, transcripts, logs, XDG directories, and MCP client settings.

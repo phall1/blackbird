@@ -64,6 +64,9 @@ func (cmd *StatusCmd) collect(ctx context.Context, console *Console) (statusRepo
 		} else {
 			report.Service = serviceFacts(line)
 			report.Daemon = report.Service["daemon"]
+			if report.Service["updater"] == install.UpdaterUnsupported {
+				report.Problems = append(report.Problems, updaterUnsupportedProblem)
+			}
 			if console.Globals.Verbose > 0 {
 				report.ServiceLine = line
 			}
@@ -291,6 +294,11 @@ const (
 	undiscoveredState   = install.DaemonRunning + " (no discovery record)"
 	undiscoveredRemedy  = "restart the daemon with \"blackbird install\" to republish its discovery record"
 	undiscoveredProblem = "the daemon is serving but left no discovery record; restart it with \"blackbird install\""
+
+	// Named as a standing property of the machine rather than a fault, because
+	// no command changes it and "blackbird install" deliberately will not.
+	updaterUnsupportedProblem = "unattended updates are unavailable: " + install.UpdaterUnsupportedReason +
+		"; update Blackbird with the tool you installed it with"
 
 	probeTimeout       = 2 * time.Second
 	probeResponseLimit = 4 << 10
