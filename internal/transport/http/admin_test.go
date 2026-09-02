@@ -12,6 +12,7 @@ import (
 
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
+	"github.com/phall1/blackbird/internal/transport/metrics"
 )
 
 const adminTestToken = "bba_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -385,7 +386,10 @@ func TestLocalAdminForceReleaseRequiresTokenAndValidLease(t *testing.T) {
 func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 	t.Parallel()
 	fixture := newAdminFixture(t)
-	handler := newAdminTestHandler(t, fixture.store)
+	metrics := metrics.New()
+	metrics.ObserveRequest("mcp blackbird_agents_list", "ok")
+	metrics.ObserveLeaseConflict()
+	handler := newAdminTestHandler(t, fixture.store, metrics)
 
 	t.Run("identity", func(t *testing.T) {
 		var identity localAdminIdentity
@@ -393,7 +397,9 @@ func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 		if identity.Version != "0.4.0" || identity.Commit != "abcdef" || identity.PID != 4242 ||
 			identity.HTTPAddress != "127.0.0.1:8080" || identity.MCPAddress != "127.0.0.1:8081" ||
 			identity.StorageBackend != "sqlite" || identity.DatabasePath != "/state/blackbird.db" ||
-			identity.SchemaVersion != 4 || identity.ObservedAt != fixture.observedAt || identity.UptimeMS <= 0 {
+			identity.SchemaVersion != 4 || identity.ObservedAt != fixture.observedAt || identity.UptimeMS <= 0 ||
+			identity.Metrics.Requests["mcp blackbird_agents_list"]["ok"] != 1 ||
+			identity.Metrics.LeaseConflicts != 1 {
 			t.Fatalf("identity=%+v", identity)
 		}
 	})
@@ -698,9 +704,15 @@ func newAdminFixture(t *testing.T) adminFixture {
 		leaseID: leaseID, observedAt: observed.Format(time.RFC3339Nano), createdAt: created.Format(time.RFC3339Nano)}
 }
 
-func newAdminTestHandler(t *testing.T, store application.LocalAdminStore) stdhttp.Handler {
+func newAdminTestHandler(t *testing.T, store application.LocalAdminStore,
+	registries ...*metrics.Registry) stdhttp.Handler {
 	t.Helper()
+	var metrics *metrics.Registry
+	if len(registries) != 0 {
+		metrics = registries[0]
+	}
 	handler, err := NewAdminHandler(AdminDependencies{Admin: store, Token: NewAdminTokenDigest(adminTestToken),
+		Metrics: metrics,
 		Identity: LocalIdentity{Version: "0.4.0", Commit: "abcdef", BuiltAt: "2026-08-15T00:00:00Z", PID: 4242,
 			StartedAt: time.Now().Add(-time.Minute), HTTPAddress: "127.0.0.1:8080", MCPAddress: "127.0.0.1:8081"}})
 	if err != nil {

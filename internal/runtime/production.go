@@ -21,6 +21,7 @@ import (
 	"github.com/phall1/blackbird/internal/transport/contracts"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 	mcptransport "github.com/phall1/blackbird/internal/transport/mcp"
+	"github.com/phall1/blackbird/internal/transport/metrics"
 )
 
 const (
@@ -98,6 +99,7 @@ func composeProductionBundle(
 	if !ok {
 		return HandlerBundle{}, errors.New("production storage does not implement the application ports")
 	}
+	telemetry := metrics.New()
 
 	checkpointIDs := productionCheckpointIDs{}
 	queries, err := application.NewQueryService(store, checkpointIDs)
@@ -209,7 +211,7 @@ func composeProductionBundle(
 	}
 	started := time.Now().UTC()
 	adminHTTPHandler, err := httptransport.NewAdminHandler(httptransport.AdminDependencies{
-		Admin: admin, Token: httptransport.NewAdminTokenDigest(token),
+		Admin: admin, Token: httptransport.NewAdminTokenDigest(token), Metrics: telemetry,
 		Identity: httptransport.LocalIdentity{
 			Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt,
 			PID: os.Getpid(), StartedAt: started,
@@ -239,6 +241,7 @@ func composeProductionBundle(
 	httpMux.Handle("/", httpHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Logger:        logger,
+		Metrics:       telemetry,
 		Authenticator: mcpIngressAuthenticator{ingress}, CurrentSession: productionCurrentSession{},
 		// The W0/W1 plane stays off MCP: nothing on this transport can attach a
 		// verified ingress credential, so those tools could only answer
@@ -262,7 +265,8 @@ func composeProductionBundle(
 		slog.String("health_path", httptransport.PathHealth),
 		slog.String("readiness_path", httptransport.PathReady))
 	return HandlerBundle{
-		HTTP: httpMux, Workers: []Worker{handshake},
+		HTTP:    telemetry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
+		Workers: []Worker{handshake},
 		// Without a session timeout the SDK never closes an idle session, so a
 		// crashed agent or a killed terminal leaks its map entry and goroutines
 		// for the daemon's lifetime.

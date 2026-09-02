@@ -1454,8 +1454,11 @@ func TestStatusVerboseAddsTheRawLineAndIdentity(t *testing.T) {
 	deps := dependencies(t)
 	deps.Product = &fakeProduct{}
 	deps.Admin = &fakeAdmin{
-		health:   Health{Reachable: true, Ready: true},
-		identity: Identity{PID: 4242, UptimeMS: 90000, HTTPAddress: "127.0.0.1:8080", DatabasePath: "/data/b.db"},
+		health: Health{Reachable: true, Ready: true},
+		identity: Identity{PID: 4242, UptimeMS: 90000, HTTPAddress: "127.0.0.1:8080", DatabasePath: "/data/b.db",
+			Metrics: RuntimeMetrics{Requests: map[string]map[string]int64{
+				"mcp blackbird_agents_list": {"ok": 3, "UNAUTHENTICATED": 1},
+			}, LeaseConflicts: 2, SSEConnections: 1, DatabaseBytes: 4096, WALBytes: 1024}},
 	}
 	deps.Store = &fakeStore{database: healthyDatabase()}
 
@@ -1464,8 +1467,11 @@ func TestStatusVerboseAddsTheRawLineAndIdentity(t *testing.T) {
 		t.Fatalf("stdout = %q, want no identity without --verbose", quiet.stdout)
 	}
 	verbose := runCLI(t, deps, []string{"status", "-v"})
-	if !strings.Contains(verbose.stdout, "4242") || !strings.Contains(verbose.stdout, "interval=6h0m0s") {
-		t.Fatalf("stdout = %q", verbose.stdout)
+	for _, want := range []string{"4242", "interval=6h0m0s", "Metrics", "requests", "4", "lease-conflicts", "2",
+		"sse-active", "1", "mcp blackbird_agents_list", "UNAUTHENTICATED=1 ok=3"} {
+		if !strings.Contains(verbose.stdout, want) {
+			t.Fatalf("stdout missing %q: %q", want, verbose.stdout)
+		}
 	}
 }
 

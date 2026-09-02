@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/phall1/blackbird/internal/cli/render"
@@ -169,6 +172,9 @@ func drawStatus(doc *render.Document, report statusReport) {
 			{Key: "mcp", Value: orAbsent(report.Identity.MCPAddress)},
 			{Key: "database", Value: orAbsent(report.Identity.DatabasePath)},
 		}})
+		doc.Blank()
+		doc.Heading("Metrics")
+		doc.Fields(render.Fields{Indent: 2, Items: metricsFields(report.Identity.Metrics)})
 	}
 
 	doc.Blank()
@@ -182,6 +188,42 @@ func drawStatus(doc *render.Document, report statusReport) {
 			doc.Status(render.StatusWarn, problem)
 		}
 	}
+}
+
+func metricsFields(metrics RuntimeMetrics) []render.Field {
+	operations := make([]string, 0, len(metrics.Requests))
+	total := int64(0)
+	for operation, outcomes := range metrics.Requests {
+		operations = append(operations, operation)
+		for _, count := range outcomes {
+			total += count
+		}
+	}
+	sort.Strings(operations)
+	fields := []render.Field{
+		{Key: "requests", Value: strconv.FormatInt(total, 10)},
+		{Key: "lease-conflicts", Value: strconv.FormatInt(metrics.LeaseConflicts, 10)},
+		{Key: "sse-active", Value: strconv.FormatInt(metrics.SSEConnections, 10)},
+		{Key: "database", Value: render.Bytes(metrics.DatabaseBytes)},
+		{Key: "wal", Value: render.Bytes(metrics.WALBytes)},
+	}
+	for _, operation := range operations {
+		fields = append(fields, render.Field{Key: operation, Value: metricOutcomeSummary(metrics.Requests[operation])})
+	}
+	return fields
+}
+
+func metricOutcomeSummary(outcomes map[string]int64) string {
+	names := make([]string, 0, len(outcomes))
+	for outcome := range outcomes {
+		names = append(names, outcome)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, outcome := range names {
+		parts = append(parts, outcome+"="+strconv.FormatInt(outcomes[outcome], 10))
+	}
+	return strings.Join(parts, " ")
 }
 
 // daemonFields refuses to answer "reachable no" about a process that is

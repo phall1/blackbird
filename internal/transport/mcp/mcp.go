@@ -81,6 +81,13 @@ type CurrentSessionBinder interface {
 	CurrentActorSession(context.Context, contracts.AuthenticationEvidence, string) (domain.ActorSessionID, *contracts.ErrorDTO, error)
 }
 
+// MetricsObserver receives bounded operational labels only; tool arguments are
+// never metrics because they carry credentials and unbounded user text.
+type MetricsObserver interface {
+	ObserveRequest(operation, outcome string)
+	ObserveLeaseConflict()
+}
+
 type Dependencies struct {
 	Authenticator             Authenticator
 	CurrentSession            CurrentSessionBinder
@@ -108,7 +115,8 @@ type Dependencies struct {
 	// Logger receives one record per failed tool call: the tool's name and the
 	// failure the caller was already given. A nil Logger is silent rather than a
 	// composition error, so a test can exercise a tool without a log sink.
-	Logger *slog.Logger
+	Logger  *slog.Logger
+	Metrics MetricsObserver
 
 	// ExposeIdentityPlane registers the W0/W1 identity and work tools on this
 	// transport. It defaults to false because MCP carries no place to attach a
@@ -149,7 +157,7 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	// SDK synthesizes a failure result for, and it reads only the tool name and
 	// the failure text -- so a bearer token or a message body in the arguments
 	// can never reach a log line by way of a new tool nobody remembered to wire.
-	sdk.AddReceivingMiddleware(logToolFailures(logger))
+	sdk.AddReceivingMiddleware(logToolFailures(logger, dependencies.Metrics))
 	if dependencies.ExposeIdentityPlane {
 		registerIdentityPlaneTools(sdk, dependencies)
 	}
@@ -164,7 +172,7 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 // logToolFailures records the operation and cause behind every failed tool
 // call. A typed tool handler's error never reaches the middleware as an error:
 // the SDK turns it into a result carrying IsError, so both shapes are checked.
-func logToolFailures(logger *slog.Logger) sdkmcp.Middleware {
+func logToolFailures(logger *slog.Logger, metrics MetricsObserver) sdkmcp.Middleware {
 	return func(next sdkmcp.MethodHandler) sdkmcp.MethodHandler {
 		return func(ctx context.Context, method string, request sdkmcp.Request) (sdkmcp.Result, error) {
 			result, err := next(ctx, method, request)
@@ -172,38 +180,46 @@ func logToolFailures(logger *slog.Logger) sdkmcp.Middleware {
 			if !isCall || call.Params == nil {
 				return result, err
 			}
+			metricOutcome := "ok"
 			if err != nil {
+				metricOutcome = "error"
 				logger.Error("mcp tool failed", slog.String("tool", call.Params.Name), slog.Any("error", err))
-				return result, err
+			} else if outcome, isToolResult := result.(*sdkmcp.CallToolResult); isToolResult && outcome != nil && outcome.IsError {
+				metricOutcome = structuredFailureCode(outcome)
+				if metricOutcome == "" {
+					metricOutcome = "error"
+					logger.Error("mcp tool failed", slog.String("tool", call.Params.Name),
+						slog.String("error", toolFailureText(outcome)))
+				}
 			}
-			outcome, isToolResult := result.(*sdkmcp.CallToolResult)
-			if isToolResult && outcome != nil && outcome.IsError && !carriesStructuredFailure(outcome) {
-				logger.Error("mcp tool failed", slog.String("tool", call.Params.Name),
-					slog.String("error", toolFailureText(outcome)))
+			if metrics != nil {
+				metrics.ObserveRequest("mcp "+call.Params.Name, metricOutcome)
+				if metricOutcome == string(domain.ErrorCodeLeaseConflict) {
+					metrics.ObserveLeaseConflict()
+				}
 			}
 			return result, err
 		}
 	}
 }
 
-// carriesStructuredFailure reports whether the result is a coordination failure
-// that already recorded itself. Those records carry the request id the caller
-// was given and the cause chain behind the sanitized message, neither of which
-// survives into the result, so repeating the sanitized half here would make the
-// log longer without making it more complete. A rejection the SDK synthesizes
-// before a handler runs -- an argument that fails the input schema -- carries no
-// structured payload and therefore still earns the generic record, which is the
-// only one it will ever get.
-func carriesStructuredFailure(result *sdkmcp.CallToolResult) bool {
+// structuredFailureCode identifies a coordination failure that already logged
+// its cause chain and returns the bounded outcome label used by metrics. An SDK
+// rejection before a handler runs carries no structured payload and falls back
+// to the generic error label and log record.
+func structuredFailureCode(result *sdkmcp.CallToolResult) string {
 	encoded, isJSON := result.StructuredContent.(json.RawMessage)
 	if !isJSON {
-		return false
+		return ""
 	}
 	var failure struct {
 		RequestID string `json:"request_id"`
 		Code      string `json:"code"`
 	}
-	return json.Unmarshal(encoded, &failure) == nil && failure.RequestID != "" && failure.Code != ""
+	if json.Unmarshal(encoded, &failure) != nil || failure.RequestID == "" {
+		return ""
+	}
+	return failure.Code
 }
 
 // toolFailureText reads the message the caller was already shown. Structured

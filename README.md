@@ -59,9 +59,11 @@ blackbird support-bundle           # one redacted document describing the whole 
 
 `status` handshakes with the running daemon rather than trusting the
 supervisor, so a loaded-but-crashing job reports as crash-looping instead of
-running. `doctor` exits 5 when any check fails and 0 otherwise, so warnings stay
-advisory; `--strict` makes a warning fail too. Every finding names the exact
-command that resolves it.
+running. `status -v` adds process-local request outcomes, lease contention,
+live SSE connections, and database/WAL bytes from the authenticated loopback
+admin surface. `doctor` exits 5 when any check fails and 0 otherwise, so
+warnings stay advisory; `--strict` makes a warning fail too. Every finding names
+the exact command that resolves it.
 
 `support-bundle` collects what a bug report needs in one pass -- build
 identity, a deep `doctor` run, `status`, the gc report, the tail of each log

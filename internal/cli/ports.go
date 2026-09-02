@@ -46,19 +46,28 @@ type Health struct {
 	Detail        string `json:"detail,omitempty"`
 }
 
+type RuntimeMetrics struct {
+	Requests       map[string]map[string]int64 `json:"requests"`
+	LeaseConflicts int64                       `json:"lease_conflicts"`
+	SSEConnections int64                       `json:"sse_connections"`
+	DatabaseBytes  int64                       `json:"database_bytes"`
+	WALBytes       int64                       `json:"wal_bytes"`
+}
+
 type Identity struct {
-	Version        string `json:"version"`
-	Commit         string `json:"commit"`
-	BuiltAt        string `json:"built_at"`
-	PID            int    `json:"pid"`
-	StartedAt      string `json:"started_at"`
-	UptimeMS       int64  `json:"uptime_ms"`
-	HTTPAddress    string `json:"http_address"`
-	MCPAddress     string `json:"mcp_address"`
-	StorageBackend string `json:"storage_backend"`
-	DatabasePath   string `json:"database_path"`
-	SchemaVersion  int    `json:"schema_version"`
-	ObservedAt     string `json:"observed_at"`
+	Version        string         `json:"version"`
+	Commit         string         `json:"commit"`
+	BuiltAt        string         `json:"built_at"`
+	PID            int            `json:"pid"`
+	StartedAt      string         `json:"started_at"`
+	UptimeMS       int64          `json:"uptime_ms"`
+	HTTPAddress    string         `json:"http_address"`
+	MCPAddress     string         `json:"mcp_address"`
+	StorageBackend string         `json:"storage_backend"`
+	DatabasePath   string         `json:"database_path"`
+	SchemaVersion  int            `json:"schema_version"`
+	ObservedAt     string         `json:"observed_at"`
+	Metrics        RuntimeMetrics `json:"metrics"`
 }
 
 type Overview struct {

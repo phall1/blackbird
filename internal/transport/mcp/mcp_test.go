@@ -573,6 +573,41 @@ func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
 	}
 }
 
+type metricObservation struct {
+	operation string
+	outcome   string
+	conflicts int
+}
+
+func (observation *metricObservation) ObserveRequest(operation, outcome string) {
+	observation.operation, observation.outcome = operation, outcome
+}
+
+func (observation *metricObservation) ObserveLeaseConflict() { observation.conflicts++ }
+
+func TestMCPMiddlewareRecordsToolOutcomeAndLeaseContention(t *testing.T) {
+	t.Parallel()
+	observation := &metricObservation{}
+	failure, err := json.Marshal(coordinationFailureOutput{
+		RequestID: "req_metric", Code: string(domain.ErrorCodeLeaseConflict),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := func(context.Context, string, sdkmcp.Request) (sdkmcp.Result, error) {
+		return &sdkmcp.CallToolResult{IsError: true, StructuredContent: json.RawMessage(failure)}, nil
+	}
+	request := &sdkmcp.CallToolRequest{Params: &sdkmcp.CallToolParamsRaw{Name: ToolReservationAcquire}}
+	if _, err := logToolFailures(slog.New(slog.DiscardHandler), observation)(next)(
+		context.Background(), "tools/call", request); err != nil {
+		t.Fatal(err)
+	}
+	if observation.operation != "mcp "+ToolReservationAcquire ||
+		observation.outcome != string(domain.ErrorCodeLeaseConflict) || observation.conflicts != 1 {
+		t.Fatalf("observation = %+v", observation)
+	}
+}
+
 // TestMCPToolFailuresReachTheLoggerWithoutArguments covers the transport's only
 // diagnostic. MCP had no logger at all, so a coordination tool that failed left
 // nothing behind; and the arguments it fails on carry the agent's bearer token,

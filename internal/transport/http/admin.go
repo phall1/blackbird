@@ -16,6 +16,7 @@ import (
 
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
+	"github.com/phall1/blackbird/internal/transport/metrics"
 )
 
 const (
@@ -58,28 +59,31 @@ type AdminDependencies struct {
 	Admin    application.LocalAdminStore
 	Token    AdminTokenDigest
 	Identity LocalIdentity
+	Metrics  *metrics.Registry
 }
 
 type adminHandler struct {
 	admin    application.LocalAdminStore
 	token    AdminTokenDigest
 	identity LocalIdentity
+	metrics  *metrics.Registry
 	now      func() time.Time
 }
 
 type localAdminIdentity struct {
-	Version        string `json:"version"`
-	Commit         string `json:"commit"`
-	BuiltAt        string `json:"built_at"`
-	PID            int    `json:"pid"`
-	StartedAt      string `json:"started_at"`
-	UptimeMS       int64  `json:"uptime_ms"`
-	HTTPAddress    string `json:"http_address"`
-	MCPAddress     string `json:"mcp_address"`
-	StorageBackend string `json:"storage_backend"`
-	DatabasePath   string `json:"database_path"`
-	SchemaVersion  int    `json:"schema_version"`
-	ObservedAt     string `json:"observed_at"`
+	Version        string           `json:"version"`
+	Commit         string           `json:"commit"`
+	BuiltAt        string           `json:"built_at"`
+	PID            int              `json:"pid"`
+	StartedAt      string           `json:"started_at"`
+	UptimeMS       int64            `json:"uptime_ms"`
+	HTTPAddress    string           `json:"http_address"`
+	MCPAddress     string           `json:"mcp_address"`
+	StorageBackend string           `json:"storage_backend"`
+	DatabasePath   string           `json:"database_path"`
+	SchemaVersion  int              `json:"schema_version"`
+	ObservedAt     string           `json:"observed_at"`
+	Metrics        metrics.Snapshot `json:"metrics"`
 }
 
 type localAdminOverview struct {
@@ -253,7 +257,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 		return nil, errors.New("local admin HTTP transport requires an admin token digest")
 	}
 	handler := &adminHandler{admin: dependencies.Admin, token: dependencies.Token,
-		identity: dependencies.Identity, now: time.Now}
+		identity: dependencies.Identity, metrics: dependencies.Metrics, now: time.Now}
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("GET "+PathLocalAdminIdentity, handler.describe)
 	mux.HandleFunc("GET "+PathLocalAdminOverview, handler.overview)
@@ -285,7 +289,8 @@ func (handler *adminHandler) describe(writer stdhttp.ResponseWriter, request *st
 		StartedAt: localAdminInstant(application.MicrosFromTime(handler.identity.StartedAt)), UptimeMS: uptime,
 		HTTPAddress: handler.identity.HTTPAddress, MCPAddress: handler.identity.MCPAddress,
 		StorageBackend: storage.StorageBackend, DatabasePath: storage.DatabasePath,
-		SchemaVersion: storage.SchemaVersion, ObservedAt: localAdminInstant(storage.ObservedAtUS)})
+		SchemaVersion: storage.SchemaVersion, ObservedAt: localAdminInstant(storage.ObservedAtUS),
+		Metrics: handler.metrics.Snapshot(storage.DatabasePath)})
 }
 
 func (handler *adminHandler) overview(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
