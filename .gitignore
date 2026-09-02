@@ -8,3 +8,15 @@ dist/
 # agents and commands stay tracked.
 .claude/hooks/
 .claude/settings.local.json
+
+# Beads. The Dolt database is machine-local state that syncs over
+# refs/dolt/data, not over refs/heads; .beads/issues.jsonl is the tracked
+# export so the backlog is readable from a plain clone.
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+.beads/embeddeddolt/
+.beads/backup/
+.beads/last-touched
+.beads/interactions.jsonl

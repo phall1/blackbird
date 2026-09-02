@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "blackbird",
+  "project_id": "cd4f9327-440d-4edb-acfa-f1863169d9f9"
+}

@@ -196,13 +196,16 @@ an inversion rather than an exemption.
   changelogs from them. `feat:` and `fix:` cut releases; scope a change to a
   plugin package so the right component is versioned. A `chore:` or `test:` that
   should have been a `fix:` silently withholds a release from users.
-- **Pull requests squash, and the repository allows nothing else** — so the
-  subject that reaches `main`, and therefore the changelog, is the **pull
-  request title**, not any commit subject on your branch. A branch whose commits
-  are impeccably conventional still releases nothing if its PR title is prose.
-  Title the PR as the commit you want, and let the strongest change on the
-  branch decide the type. `README.md` under "Releases" is the human-facing
-  authority on this; do not duplicate its detail here.
+- **Whatever subject lands on `main` is the changelog.** Work reaches `main`
+  two ways here and the rule differs: a pull request squashes, so its **title**
+  becomes the subject and a branch of impeccable commits still releases nothing
+  behind a prose PR title; a direct push keeps **each commit subject** verbatim,
+  so every one of them is read by release-please. `main` is not protected —
+  pushing straight to it is normal for this repo, and it makes the subjects you
+  write load-bearing rather than disposable. Prefer one commit per coherent
+  change with its own correct type over a single omnibus commit, since that is
+  what produces an honest changelog. `README.md` under "Releases" is the
+  human-facing authority; do not duplicate its detail here.
 - **Lint policy is `default: all` with an explicit disable list.** The disabled
   linters in `.golangci.yml` are a deliberate decision to drop subjective
   style and architecture linters while keeping the full bug and security
@@ -353,3 +356,59 @@ in the current transcript. Prefer this file and `.claude/agents/` over a hook,
 since those are what teammates actually get on clone. And write it the way this
 file is written: state the invariant, give the command that derives the value,
 and resist quoting a number that will be false next month.
+
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+
+## Agent Context Profiles
+
+The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
+
+- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
+- **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
+- **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
+
+## Session Completion
+
+This protocol applies when ending a Beads implementation workflow. It is subordinate to explicit user, repository, and orchestrator instructions.
+
+1. **File issues for remaining work** - Create beads for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **Handle git/sync by active profile**:
+   ```bash
+   # Conservative/minimal/default: report status and proposed commands; wait for approval.
+   git status
+
+   # Team-maintainer opt-in only, unless current instructions forbid it:
+   git pull --rebase
+   git push
+   git status
+   ```
+5. **Hand off** - Summarize changes, validation, issue status, and any blocked sync/commit/push step
+
+**Critical rules:**
+- Explicit user or orchestrator instructions override this Beads block.
+- Do not commit or push without clear authority from the active profile or the current user request.
+- If a required sync or push is blocked, stop and report the exact command and error.
+<!-- END BEADS INTEGRATION -->
