@@ -45,7 +45,7 @@
     "check": "tsc --noEmit",
     "test": "vitest run",
     "test:pack": "node scripts/pack-test.mjs",
-    "gates": "npm run check && npm test && npm run test:pack"
+    "gates": "npm run check && npm test && npm run test:pack && npm audit --audit-level=high"
   },
   "publishConfig": {
     "access": "public",
