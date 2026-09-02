@@ -182,7 +182,64 @@ func openReaderMode(ctx context.Context, path string, mode ReadMode) (*Reader, e
 		_ = db.Close()
 		return nil, fmt.Errorf("%w: %v", ErrReaderUnavailable, err)
 	}
+	if err := assertReadOnlyConnection(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("%w: %v", ErrReaderUnavailable, err)
+	}
 	return &Reader{db: db, path: path, mode: mode}, nil
+}
+
+// readOnlyProbeStatement is a schema write, chosen because a read-only
+// connection refuses it identically whatever the WAL happens to contain.
+const readOnlyProbeStatement = "CREATE TABLE blackbird_read_only_probe (unused INTEGER)"
+
+// assertReadOnlyConnection proves the connection refuses writes before the
+// reader is handed out, rather than trusting that the DSN asked for it.
+//
+// The reader's read-only guarantee was previously enforced only by SQLite's own
+// file mode, and that enforcement is silent when there is nothing to refuse:
+// `PRAGMA wal_checkpoint(TRUNCATE)` on a read-only connection reports an I/O
+// error while the WAL holds frames, and plain success once the writer's passive
+// checkpoint loop has drained it, because a checkpoint with no frames to move
+// touches no file at all. Anything that inferred "read-only" from that pragma
+// erroring was reading a signal that disappears on its own every minute.
+//
+// So the guarantee is asserted here instead, on two facts that hold regardless
+// of WAL state: query_only is set, and a schema write is refused. The probe runs
+// inside a transaction that is always rolled back, so it cannot leave the table
+// behind even in the failure case it exists to detect.
+func assertReadOnlyConnection(ctx context.Context, db *sql.DB) error {
+	// The write probe runs first because it is the property that matters;
+	// query_only is a secondary check on how we asked for it.
+	if err := probeReadOnlyWrite(ctx, db); err != nil {
+		return err
+	}
+	var queryOnly int
+	if err := db.QueryRowContext(ctx, "PRAGMA query_only").Scan(&queryOnly); err != nil {
+		return fmt.Errorf("read SQLite query_only: %w", err)
+	}
+	if queryOnly != 1 {
+		return errors.New("SQLite reader connection is not query_only")
+	}
+	return nil
+}
+
+// probeReadOnlyWrite attempts one schema write and always rolls it back.
+//
+// The transaction is scoped to this function rather than inlined above because
+// a reader's pool holds exactly one connection: anything that queries while the
+// transaction is still open waits for a connection the transaction itself is
+// holding, and the open deadlocks rather than fails.
+func probeReadOnlyWrite(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin SQLite read-only probe: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, readOnlyProbeStatement); err == nil {
+		return errors.New("SQLite reader connection accepted a schema write")
+	}
+	return nil
 }
 
 func staleReaderURI(path string) string {

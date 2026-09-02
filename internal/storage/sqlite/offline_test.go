@@ -75,7 +75,13 @@ func TestOpenReaderCannotWrite(t *testing.T) {
 		{name: "user version", statement: "PRAGMA user_version = 99"},
 		{name: "journal mode", statement: "PRAGMA journal_mode = delete"},
 		{name: "vacuum", statement: "VACUUM"},
-		{name: "checkpoint", statement: "PRAGMA wal_checkpoint(TRUNCATE)"},
+		// PRAGMA wal_checkpoint deliberately does not appear here. It is the one
+		// statement whose refusal is not stable: it reports an I/O error while
+		// the WAL holds frames and plain success once the writer's passive
+		// checkpoint loop has drained it, because a checkpoint with nothing to
+		// move touches no file at all. Asserting an error here made this test
+		// fail whenever a run outlived the sixty-second loop.
+		// TestOpenReaderNeverCheckpointsFrames asserts the property instead.
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -83,6 +89,75 @@ func TestOpenReaderCannotWrite(t *testing.T) {
 				t.Fatalf("the read-only reader executed %q", testCase.statement)
 			}
 		})
+	}
+}
+
+// A read-only reader must never move a WAL frame. That is the property; an
+// error from PRAGMA wal_checkpoint is only one of the ways it can hold, and the
+// weaker one -- the pragma reports an I/O error while the WAL holds frames and
+// plain success once it has been drained, because a checkpoint with nothing to
+// move touches no file. Both states are exercised here so the assertion cannot
+// depend on whether the writer's sixty-second passive loop happened to fire.
+func TestOpenReaderNeverCheckpointsFrames(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCoordinationStore(t)
+	if _, _, err := store.RegisterLocalAgent(ctx, "/workspace/reader-checkpoint", "alice", ""); err != nil {
+		t.Fatal(err)
+	}
+	reader := openTestReader(t, store.path, false)
+
+	reported := assertReaderMovesNoFrames(t, reader, "with a live WAL")
+
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := store.Checkpoint(bounded, CheckpointPassive); err != nil {
+		t.Fatalf("writer passive checkpoint: %v", err)
+	}
+	reported = assertReaderMovesNoFrames(t, reader, "after the writer drained the WAL") || reported
+
+	// A run in which the pragma was refused in both phases would pass without
+	// ever checking the frame count, and would stop covering the case this test
+	// exists for -- the drained WAL, where the pragma succeeds and only the
+	// frame count distinguishes a no-op from a write.
+	if !reported {
+		t.Fatal("the checkpoint pragma never returned a row, so the frame count was never asserted")
+	}
+}
+
+// assertReaderMovesNoFrames reports whether the pragma answered with a row.
+func assertReaderMovesNoFrames(t *testing.T, reader *Reader, phase string) bool {
+	t.Helper()
+	var busy, logFrames, checkpointed int
+	if err := reader.db.QueryRowContext(context.Background(),
+		"PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		// Refused outright, which is the strongest outcome available.
+		return false
+	}
+	if checkpointed > 0 {
+		t.Fatalf("%s: the read-only reader checkpointed %d of %d frames", phase, checkpointed, logFrames)
+	}
+	return true
+}
+
+// The read-only guarantee must not rest on the DSN being written correctly. A
+// writable connection reaching the reader path is a composition defect, and it
+// has to fail closed rather than hand out a reader that can write.
+func TestOpenReaderRejectsAWritableConnection(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	if err := assertReadOnlyConnection(context.Background(), store.db); err == nil {
+		t.Fatal("a writable connection must not pass the read-only assertion")
+	}
+	// The probe writes inside a transaction it always rolls back, so even the
+	// connection that accepts the write keeps nothing.
+	var present int
+	if err := store.db.QueryRowContext(context.Background(),
+		"SELECT count(*) FROM sqlite_schema WHERE name = 'blackbird_read_only_probe'").Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present != 0 {
+		t.Fatal("the read-only probe left its table behind")
 	}
 }
 
