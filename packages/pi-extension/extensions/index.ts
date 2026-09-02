@@ -37,6 +37,8 @@ interface RuntimeOptions {
   legacyStateDir: string
 }
 
+import { TelemetryEmitter, normalizePiUsage, outcomeForStopReason } from "./telemetry.js"
+
 export interface SupervisorDependencies {
   fetch: typeof globalThis.fetch
   sleep(milliseconds: number, signal: AbortSignal): Promise<void>
@@ -251,6 +253,58 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
       void persist()
     }
     pi.on("message_end", onMessageEnd)
+
+    // The observation plane (blackbird ADR-0001). Pi is the only harness that
+    // hands an extension a fully normalized Usage, so this records what it is
+    // given rather than reinterpreting it.
+    //
+    // It rides the same bearer token and shares this supervisor's lifetime, and
+    // it is deliberately downstream of everything above: an emitter failure
+    // cannot reach mail delivery, because the emitter never throws.
+    const telemetry = process.env["BLACKBIRD_PI_TELEMETRY"] === "0"
+      ? undefined
+      : new TelemetryEmitter({ baseURL: options.baseURL, token, fetch: dependencies.fetch })
+    // message_end reports when a response finished. Latency needs when it
+    // started, which only message_start knows, so the pair is what produces a
+    // duration rather than a timestamp.
+    const startedAt = new Map<string, number>()
+    const turnKey = (message: Record<string, unknown>): string =>
+      typeof message["responseId"] === "string" && message["responseId"] !== "" ? message["responseId"] : "current"
+    const onMessageStart = (): void => { startedAt.set("current", Date.now()) }
+    const onModelUsage = (event: { message: unknown }): void => {
+      if (!telemetry) return
+      const message = object(event.message)
+      if (!message || message["role"] !== "assistant") return
+      const usage = object(message["usage"])
+      if (!usage) return
+      const key = turnKey(message)
+      const began = startedAt.get(key) ?? startedAt.get("current") ?? Date.now()
+      startedAt.delete(key)
+      startedAt.delete("current")
+      const responseId = typeof message["responseId"] === "string" ? message["responseId"] : ""
+      const model = typeof message["responseModel"] === "string" && message["responseModel"] !== ""
+        ? message["responseModel"]
+        : typeof message["model"] === "string" ? message["model"] : ""
+      const provider = typeof message["provider"] === "string" ? message["provider"] : ""
+      if (model === "" || provider === "") return
+      telemetry.record({
+        // responseId is the provider's own identifier when present, which makes
+        // a retry or a replayed event idempotent at the daemon. Without one a
+        // synthesized key simply never dedupes, which is correct.
+        dedupe_key: responseId !== "" ? responseId : `pi:${String(began)}:${String(Math.random()).slice(2, 10)}`,
+        harness: "pi",
+        provider,
+        model,
+        operation: "chat",
+        usage: normalizePiUsage(usage),
+        outcome: outcomeForStopReason(message["stopReason"]),
+        started_at: new Date(began).toISOString(),
+        duration_ms: Math.max(0, Date.now() - began),
+      })
+    }
+    pi.on("message_start", onMessageStart)
+    pi.on("message_end", onModelUsage)
+    signal.addEventListener("abort", () => { void telemetry?.close() }, { once: true })
     const deliver = async (message: Message): Promise<void> => {
       if (delivered.has(message.message_id) || quarantined.has(message.message_id)) return
       await new Promise<void>((resolve, reject) => {
