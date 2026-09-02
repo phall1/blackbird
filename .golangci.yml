@@ -15,7 +15,6 @@ linters:
     - copyloopvar
     - decorder
     - depguard
-    - dupl
     - dogsled
     - dupword
     - embeddedstructfieldcheck
@@ -28,7 +27,6 @@ linters:
     - funcorder
     - funlen
     - gochecknoglobals
-    - gocognit
     - goconst
     - gocyclo
     - gocritic
@@ -73,13 +71,21 @@ linters:
     - wsl
     - wsl_v5
   settings:
+    # Ratchets sit one step above today's measured production maxima. Lower
+    # them as the complexity tail and storage duplication are removed.
+    dupl:
+      threshold: 1216
+    gocognit:
+      min-complexity: 73
     gosec:
       severity: medium
       confidence: medium
   exclusions:
     rules:
+      - path-except: ^internal/storage/
+        linters: [dupl]
       - path: _test\.go
-        linters: [errcheck, errchkjson]
+        linters: [errcheck, errchkjson, gocognit]
       - path: internal/transport/http/local\.go
         text: Error return value of `encoding/json.Marshal` is not checked
 
