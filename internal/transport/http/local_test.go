@@ -107,8 +107,89 @@ func TestLocalHTTPRegistrationSSEWakeAndCatchUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if response.StatusCode != stdhttp.StatusOK || len(page.Events) != 1 || page.Events[0].Type != application.CoordinationEventMessageAvailable ||
-		page.Events[0].Subject != messageID.String() || page.NextCursor != wakeup.Cursor {
+		page.Events[0].Subject != messageID.String() || page.NextCursor != wakeup.Cursor || page.Events[0].Cursor != page.NextCursor {
 		t.Fatalf("catch-up response=%d page=%+v wakeup=%+v", response.StatusCode, page, wakeup)
+	}
+
+	consumerURL := server.URL + PathLocalCoordinationEvents + "?consumer=pi-extension&limit=1"
+	consumerRequest, _ := stdhttp.NewRequest(stdhttp.MethodGet, consumerURL, nil)
+	consumerRequest.Header.Set("Authorization", "Bearer "+bob.RegistrationToken)
+	consumerResponse, err := server.Client().Do(consumerRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var consumerPage localCoordinationEventsPage
+	if err := json.NewDecoder(consumerResponse.Body).Decode(&consumerPage); err != nil {
+		t.Fatal(err)
+	}
+	_ = consumerResponse.Body.Close()
+	if len(consumerPage.Events) != 1 || consumerPage.Events[0].Cursor == "" {
+		t.Fatalf("consumer page=%+v", consumerPage)
+	}
+	ackBody, _ := json.Marshal(localCoordinationConsumerAck{ConsumerID: "pi-extension", Cursor: consumerPage.Events[0].Cursor})
+	ackRequest, _ := stdhttp.NewRequest(stdhttp.MethodPost, server.URL+PathLocalCoordinationEventsAck, bytes.NewReader(ackBody))
+	ackRequest.Header.Set("Authorization", "Bearer "+bob.RegistrationToken)
+	ackRequest.Header.Set("Content-Type", "application/json")
+	ackResponse, err := server.Client().Do(ackRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ackResponse.Body.Close()
+	if ackResponse.StatusCode != stdhttp.StatusNoContent {
+		t.Fatalf("ack status=%d", ackResponse.StatusCode)
+	}
+	consumerRequest, _ = stdhttp.NewRequest(stdhttp.MethodGet, consumerURL, nil)
+	consumerRequest.Header.Set("Authorization", "Bearer "+bob.RegistrationToken)
+	consumerResponse, err = server.Client().Do(consumerRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(consumerResponse.Body).Decode(&consumerPage); err != nil {
+		t.Fatal(err)
+	}
+	_ = consumerResponse.Body.Close()
+	if len(consumerPage.Events) != 0 {
+		t.Fatalf("acknowledged consumer replayed events: %+v", consumerPage)
+	}
+
+	consumerStreamContext, cancelConsumerStream := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelConsumerStream()
+	consumerStreamRequest, _ := stdhttp.NewRequestWithContext(consumerStreamContext, stdhttp.MethodGet,
+		server.URL+PathLocalCoordinationEventsStream+"?consumer=pi-extension", nil)
+	consumerStreamRequest.Header.Set("Authorization", "Bearer "+bob.RegistrationToken)
+	consumerStreamRequest.Header.Set("Accept", "text/event-stream")
+	// Browsers send this automatically. Consumer mode must ignore it and resume
+	// from the server-side committed position instead of rejecting the URL.
+	consumerStreamRequest.Header.Set("Last-Event-ID", consumerPage.NextCursor)
+	consumerStreamResponse, err := server.Client().Do(consumerStreamRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = consumerStreamResponse.Body.Close() }()
+	if consumerStreamResponse.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("consumer reconnect status=%d", consumerStreamResponse.StatusCode)
+	}
+	secondMessageID, _ := domain.NewMessageID()
+	if _, err = store.SendMessage(context.Background(), application.SendMessageParams{MessageID: secondMessageID,
+		ConversationID: conversationID, WorkspaceID: aliceSession.WorkspaceID, Author: aliceSession.ActorID,
+		AuthorSession: aliceSession.ActorSessionID, Subject: "wake again", Body: "durable",
+		Recipients: []application.Recipient{recipient}}); err != nil {
+		t.Fatal(err)
+	}
+	consumerWakeup := readLocalWakeup(t, consumerStreamResponse.Body)
+	if consumerWakeup.Cursor == consumerPage.NextCursor {
+		t.Fatalf("consumer stream replayed acknowledged cursor %q", consumerWakeup.Cursor)
+	}
+
+	invalidRequest, _ := stdhttp.NewRequest(stdhttp.MethodGet, consumerURL+"&after="+url.QueryEscape(page.NextCursor), nil)
+	invalidRequest.Header.Set("Authorization", "Bearer "+bob.RegistrationToken)
+	invalidResponse, err := server.Client().Do(invalidRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = invalidResponse.Body.Close()
+	if invalidResponse.StatusCode != stdhttp.StatusBadRequest {
+		t.Fatalf("after+consumer status=%d", invalidResponse.StatusCode)
 	}
 }
 

@@ -206,6 +206,46 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if err != nil || len(second.Events()) != 1 || second.HasMore() || second.Events()[0].Position() <= first.Events()[0].Position() {
 		t.Fatalf("second coordination page=%+v error=%v", second, err)
 	}
+	if len(first.EventCursors()) != 1 || first.EventCursors()[0].IsZero() || len(second.EventCursors()) != 1 {
+		t.Fatalf("event cursors first=%+v second=%+v", first.EventCursors(), second.EventCursors())
+	}
+	consumer, _ := application.NewCoordinationConsumerID("pi-extension")
+	consumerQuery, _ := application.NewCoordinationConsumerEventsQuery(workspace, recipient, consumer, 1)
+	consumerFirst, err := store.SyncCoordinationEvents(context.Background(), consumerQuery)
+	if err != nil || len(consumerFirst.Events()) != 1 || consumerFirst.Events()[0].Position() != first.Events()[0].Position() {
+		t.Fatalf("initial consumer page=%+v error=%v", consumerFirst, err)
+	}
+	commit, _ := application.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
+	if err := store.CommitCoordinationConsumer(context.Background(), commit); err != nil {
+		t.Fatal(err)
+	}
+	consumerSecond, err := store.SyncCoordinationEvents(context.Background(), consumerQuery)
+	if err != nil || len(consumerSecond.Events()) != 1 || consumerSecond.Events()[0].Position() != second.Events()[0].Position() {
+		t.Fatalf("advanced consumer page=%+v error=%v", consumerSecond, err)
+	}
+	commit, _ = application.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerSecond.EventCursors()[0])
+	if err := store.CommitCoordinationConsumer(context.Background(), commit); err != nil {
+		t.Fatal(err)
+	}
+	// A delayed duplicate acknowledgement cannot move the consumer backwards.
+	stale, _ := application.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
+	if err := store.CommitCoordinationConsumer(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	drained, err := store.SyncCoordinationEvents(context.Background(), consumerQuery)
+	if err != nil || len(drained.Events()) != 0 {
+		t.Fatalf("drained consumer page=%+v error=%v", drained, err)
+	}
+	independent, _ := application.NewCoordinationConsumerID("opencode")
+	independentQuery, _ := application.NewCoordinationConsumerEventsQuery(workspace, recipient, independent, 1)
+	independentPage, err := store.SyncCoordinationEvents(context.Background(), independentQuery)
+	if err != nil || len(independentPage.Events()) != 1 || independentPage.Events()[0].Position() != first.Events()[0].Position() {
+		t.Fatalf("independent consumer page=%+v error=%v", independentPage, err)
+	}
+	wrongScope, _ := application.NewCoordinationConsumerCommit(workspace, other, consumer, first.EventCursors()[0])
+	if err := store.CommitCoordinationConsumer(context.Background(), wrongScope); err == nil {
+		t.Fatal("actor-scoped acknowledgement was accepted for another actor")
+	}
 	otherQuery, _ := application.NewCoordinationEventsQuery(workspace, other, application.CoordinationEventCursor{}, 10)
 	private, err := store.SyncCoordinationEvents(context.Background(), otherQuery)
 	if err != nil || len(private.Events()) != 0 {

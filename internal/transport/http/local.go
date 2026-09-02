@@ -23,6 +23,7 @@ import (
 const (
 	PathLocalAgentRegister            = "/api/v1/local/agents/register"
 	PathLocalCoordinationEvents       = "/api/v1/local/coordination/events"
+	PathLocalCoordinationEventsAck    = "/api/v1/local/coordination/events/ack"
 	PathLocalCoordinationEventsStream = "/api/v1/local/coordination/events/stream"
 	PathLocalMessages                 = "/api/v1/local/messages/"
 	PathLocalTelemetry                = "/api/v1/local/telemetry"
@@ -97,6 +98,12 @@ type localCoordinationEvent struct {
 	Subject    string                            `json:"subject"`
 	Payload    json.RawMessage                   `json:"payload"`
 	OccurredAt string                            `json:"occurred_at"`
+	Cursor     string                            `json:"cursor"`
+}
+
+type localCoordinationConsumerAck struct {
+	ConsumerID string `json:"consumer_id"`
+	Cursor     string `json:"cursor"`
 }
 
 type localCoordinationEventsPage struct {
@@ -164,6 +171,7 @@ func NewLocalHandler(dependencies LocalDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("POST "+PathLocalAgentRegister, handler.register)
 	mux.HandleFunc("POST "+PathLocalTelemetry, handler.telemetry)
 	mux.HandleFunc("GET "+PathLocalCoordinationEvents, handler.events)
+	mux.HandleFunc("POST "+PathLocalCoordinationEventsAck, handler.ackEvents)
 	mux.HandleFunc("GET "+PathLocalCoordinationEventsStream, handler.stream)
 	mux.HandleFunc("GET "+PathLocalMessages+"{message_id}", handler.message)
 	// Access logging wraps the loopback guard so a rejected non-loopback caller
@@ -357,22 +365,60 @@ func (handler *localHandler) events(writer stdhttp.ResponseWriter, request *stdh
 	if !ok {
 		return
 	}
-	after, limit, ok := localEventQuery(writer, request.URL.Query(), true)
+	after, consumer, limit, ok := localEventQuery(writer, request.URL.Query(), true)
 	if !ok {
 		return
 	}
-	page, err := handler.sync(request, session, after, limit)
+	page, err := handler.sync(request, session, after, consumer, limit)
 	if err != nil {
 		handler.fail(writer, request, "coordination.events", err)
 		return
 	}
-	events := make([]localCoordinationEvent, 0, len(page.Events()))
-	for _, event := range page.Events() {
+	domainEvents, cursors := page.Events(), page.EventCursors()
+	events := make([]localCoordinationEvent, 0, len(domainEvents))
+	for index, event := range domainEvents {
 		events = append(events, localCoordinationEvent{Type: event.EventType(), Subject: event.SubjectID(),
-			Payload: json.RawMessage(event.Payload()), OccurredAt: event.OccurredAt().Format(time.RFC3339Nano)})
+			Payload: json.RawMessage(event.Payload()), OccurredAt: event.OccurredAt().Format(time.RFC3339Nano),
+			Cursor: cursors[index].String()})
 	}
 	writeLocalJSON(writer, stdhttp.StatusOK, localCoordinationEventsPage{Events: events,
 		NextCursor: page.NextCursor().String(), HasMore: page.HasMore()})
+}
+
+func (handler *localHandler) ackEvents(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
+	if !strictJSONRequest(writer, request) {
+		return
+	}
+	session, ok := handler.authenticate(writer, request)
+	if !ok {
+		return
+	}
+	var input localCoordinationConsumerAck
+	if err := decodeLocalJSON(writer, request, &input); err != nil {
+		writeLocalProblem(writer, stdhttp.StatusUnprocessableEntity, domain.ErrorCodeInvalidSchema,
+			"request body does not match the coordination consumer acknowledgement schema")
+		return
+	}
+	consumer, err := application.NewCoordinationConsumerID(input.ConsumerID)
+	if err != nil {
+		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
+			"consumer_id must contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens")
+		return
+	}
+	cursor, err := application.NewCoordinationEventCursor(input.Cursor)
+	if err != nil {
+		handler.fail(writer, request, "coordination.events.ack", err)
+		return
+	}
+	commit, err := application.NewCoordinationConsumerCommit(session.WorkspaceID, session.ActorID, consumer, cursor)
+	if err == nil {
+		err = handler.coordination.CommitCoordinationConsumer(request.Context(), commit)
+	}
+	if err != nil {
+		handler.fail(writer, request, "coordination.events.ack", err)
+		return
+	}
+	writer.WriteHeader(stdhttp.StatusNoContent)
 }
 
 func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
@@ -383,11 +429,14 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 	if !ok {
 		return
 	}
-	after, _, ok := localEventQuery(writer, request.URL.Query(), false)
+	after, consumer, _, ok := localEventQuery(writer, request.URL.Query(), false)
 	if !ok {
 		return
 	}
-	if after == "" {
+	// A named consumer resumes from server state. Browsers attach Last-Event-ID
+	// automatically on reconnect; it must not turn that durable mode into an
+	// explicit-cursor request or make the stable consumer URL invalid.
+	if after == "" && consumer == "" {
 		after = request.Header.Get("Last-Event-ID")
 	}
 	if strings.ContainsAny(after, "\r\n") {
@@ -400,7 +449,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 		return
 	}
 	// Validate the supplied cursor before committing an SSE response.
-	page, err := handler.sync(request, session, after, application.MaxQueryPageSize)
+	page, err := handler.sync(request, session, after, consumer, application.MaxQueryPageSize)
 	if err != nil {
 		handler.fail(writer, request, "coordination.events.stream", err)
 		return
@@ -423,7 +472,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 	heartbeat := time.NewTicker(handler.heartbeat)
 	defer poll.Stop()
 	defer heartbeat.Stop()
-	cursor := after
+	cursor := page.NextCursor().String()
 	for {
 		if len(page.Events()) > 0 {
 			next := page.NextCursor().String()
@@ -433,7 +482,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 			}
 			cursor = next
 			if page.HasMore() {
-				page, err = handler.sync(request, session, cursor, application.MaxQueryPageSize)
+				page, err = handler.sync(request, session, cursor, "", application.MaxQueryPageSize)
 				if err != nil {
 					handler.logFailure(request, "coordination.events.stream", err)
 					return
@@ -449,7 +498,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 				return
 			}
 		case <-poll.C:
-			page, err = handler.sync(request, session, cursor, application.MaxQueryPageSize)
+			page, err = handler.sync(request, session, cursor, "", application.MaxQueryPageSize)
 			if err != nil {
 				handler.logFailure(request, "coordination.events.stream", err)
 				return
@@ -487,8 +536,8 @@ func (handler *localHandler) authenticate(writer stdhttp.ResponseWriter, request
 	return session, true
 }
 
-func (handler *localHandler) sync(request *stdhttp.Request, session application.LocalAgentSession, after string,
-	limit uint16) (application.CoordinationEventsPage, error) {
+func (handler *localHandler) sync(request *stdhttp.Request, session application.LocalAgentSession,
+	after, consumerText string, limit uint16) (application.CoordinationEventsPage, error) {
 	var cursor application.CoordinationEventCursor
 	var err error
 	if after != "" {
@@ -497,32 +546,53 @@ func (handler *localHandler) sync(request *stdhttp.Request, session application.
 			return application.CoordinationEventsPage{}, err
 		}
 	}
-	query, err := application.NewCoordinationEventsQuery(session.WorkspaceID, session.ActorID, cursor, limit)
+	var query application.CoordinationEventsQuery
+	if consumerText != "" {
+		consumer, consumerErr := application.NewCoordinationConsumerID(consumerText)
+		if consumerErr != nil {
+			return application.CoordinationEventsPage{}, consumerErr
+		}
+		query, err = application.NewCoordinationConsumerEventsQuery(session.WorkspaceID, session.ActorID, consumer, limit)
+	} else {
+		query, err = application.NewCoordinationEventsQuery(session.WorkspaceID, session.ActorID, cursor, limit)
+	}
 	if err != nil {
 		return application.CoordinationEventsPage{}, err
 	}
 	return handler.coordination.SyncCoordinationEvents(request.Context(), query)
 }
 
-func localEventQuery(writer stdhttp.ResponseWriter, values url.Values, allowLimit bool) (string, uint16, bool) {
+func localEventQuery(writer stdhttp.ResponseWriter, values url.Values, allowLimit bool) (string, string, uint16, bool) {
 	for key, entries := range values {
-		if key != "after" && (key != "limit" || !allowLimit) || len(entries) != 1 {
+		if key != "after" && key != "consumer" && (key != "limit" || !allowLimit) || len(entries) != 1 {
 			writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "query parameters are invalid")
-			return "", 0, false
+			return "", "", 0, false
 		}
 	}
-	after := values.Get("after")
+	after, consumer := values.Get("after"), values.Get("consumer")
+	if after != "" && consumer != "" {
+		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
+			"after and consumer cannot be supplied together")
+		return "", "", 0, false
+	}
+	if consumer != "" {
+		if _, err := application.NewCoordinationConsumerID(consumer); err != nil {
+			writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
+				"consumer must contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens")
+			return "", "", 0, false
+		}
+	}
 	limit := uint16(localDefaultLimit)
 	if text := values.Get("limit"); text != "" {
 		parsed, err := strconv.ParseUint(text, 10, 16)
 		if err != nil || parsed == 0 || parsed > application.MaxQueryPageSize {
 			writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
 				fmt.Sprintf("limit must be from 1 through %d", application.MaxQueryPageSize))
-			return "", 0, false
+			return "", "", 0, false
 		}
 		limit = uint16(parsed)
 	}
-	return after, limit, true
+	return after, consumer, limit, true
 }
 
 func strictJSONRequest(writer stdhttp.ResponseWriter, request *stdhttp.Request) bool {

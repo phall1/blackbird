@@ -1178,6 +1178,13 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		if err != nil {
 			return application.CoordinationEventsPage{}, err
 		}
+	} else if query.ConsumerID() != "" {
+		err = tx.QueryRowContext(ctx, `SELECT position FROM coordination_event_consumers
+			WHERE workspace_id = ? AND actor_id = ? AND consumer_id = ?`, query.WorkspaceID().String(),
+			query.ActorID().String(), query.ConsumerID().String()).Scan(&after)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return application.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination consumer: %w", err)
+		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT event.position, event.actor_id, event.event_type, event.subject_id,
 		event.occurred_at_us, event.payload FROM coordination_events AS event
@@ -1194,6 +1201,7 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 	}
 	defer func() { _ = rows.Close() }()
 	events := make([]application.CoordinationEvent, 0, query.Limit())
+	eventCursors := make([]application.CoordinationEventCursor, 0, query.Limit())
 	hasMore := false
 	nextPosition := after
 	for rows.Next() {
@@ -1218,7 +1226,12 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		if eventErr != nil {
 			return application.CoordinationEventsPage{}, eventErr
 		}
+		cursor, cursorErr := encodeCoordinationCursor(ctx, tx, query.WorkspaceID(), query.ActorID(), position)
+		if cursorErr != nil {
+			return application.CoordinationEventsPage{}, cursorErr
+		}
 		events = append(events, event)
+		eventCursors = append(eventCursors, cursor)
 		nextPosition = position
 	}
 	if err := rows.Err(); err != nil {
@@ -1238,7 +1251,36 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 	if err != nil {
 		return application.CoordinationEventsPage{}, err
 	}
-	return application.NewCoordinationEventsPage(events, next, hasMore)
+	return application.NewCoordinationEventsPage(events, eventCursors, next, hasMore)
+}
+
+// CommitCoordinationConsumer advances one authenticated adapter monotonically.
+// Replaying the same or an older acknowledgement is idempotent and can never
+// move delivery backwards.
+func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit application.CoordinationConsumerCommit) error {
+	if commit.WorkspaceID().IsZero() || commit.ActorID().IsZero() || commit.ConsumerID() == "" || commit.Cursor().IsZero() {
+		return application.ErrInvalidCoordination
+	}
+	return store.withImmediate(ctx, func(tx *sql.Tx) error {
+		position, err := decodeCoordinationCursor(ctx, tx, commit.Cursor(), commit.WorkspaceID(), commit.ActorID())
+		if err != nil {
+			return err
+		}
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO coordination_event_consumers(
+			workspace_id, actor_id, consumer_id, position, updated_at_us) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(workspace_id, actor_id, consumer_id) DO UPDATE SET
+			position = excluded.position, updated_at_us = excluded.updated_at_us
+			WHERE excluded.position > coordination_event_consumers.position`, commit.WorkspaceID().String(),
+			commit.ActorID().String(), commit.ConsumerID().String(), position, timeMicros(now))
+		if err != nil {
+			return fmt.Errorf("commit SQLite coordination consumer: %w", err)
+		}
+		return nil
+	})
 }
 
 func encodeCoordinationCursor(ctx context.Context, query interface {

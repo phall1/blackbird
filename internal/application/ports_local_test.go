@@ -82,6 +82,21 @@ func TestCoordinationWaitCeilingBoundsTheHeartbeatLag(t *testing.T) {
 	}
 }
 
+func TestCoordinationConsumerIDIsBoundedAndRetypeable(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"pi-extension", "opencode.v1", "Claude_Code", strings.Repeat("a", MaxCoordinationConsumerIDBytes)} {
+		id, err := NewCoordinationConsumerID(value)
+		if err != nil || id.String() != value {
+			t.Fatalf("consumer %q id=%q error=%v", value, id, err)
+		}
+	}
+	for _, value := range []string{"", "has space", "slash/name", "snowman-☃", strings.Repeat("a", MaxCoordinationConsumerIDBytes+1)} {
+		if _, err := NewCoordinationConsumerID(value); err == nil {
+			t.Fatalf("consumer %q was accepted", value)
+		}
+	}
+}
+
 func conversationParamsFixture(t *testing.T) OpenConversationParams {
 	t.Helper()
 	conversation, e1 := domain.ParseConversationID(applicationUUID(901))

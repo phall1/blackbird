@@ -9,6 +9,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
@@ -17,9 +18,10 @@ import (
 )
 
 const (
-	MaxCanonicalInteger  uint64 = domain.MaxCanonicalInteger
-	MaxQueryPageSize            = 256
-	MaxQueryPayloadBytes        = 256 * 1024
+	MaxCanonicalInteger            uint64 = domain.MaxCanonicalInteger
+	MaxQueryPageSize                      = 256
+	MaxQueryPayloadBytes                  = 256 * 1024
+	MaxCoordinationConsumerIDBytes        = 64
 )
 
 type Digest [sha256.Size]byte
@@ -366,45 +368,98 @@ func (event CoordinationEvent) SubjectID() string                { return event.
 func (event CoordinationEvent) OccurredAt() time.Time            { return event.occurredAt }
 func (event CoordinationEvent) Payload() []byte                  { return append([]byte(nil), event.payload...) }
 
+type CoordinationConsumerID string
+
+func NewCoordinationConsumerID(value string) (CoordinationConsumerID, error) {
+	if value == "" || len(value) > MaxCoordinationConsumerIDBytes {
+		return "", ErrInvalidCoordination
+	}
+	for _, character := range value {
+		if character > unicode.MaxASCII || !unicode.IsLetter(character) && !unicode.IsDigit(character) && !strings.ContainsRune("._-", character) {
+			return "", ErrInvalidCoordination
+		}
+	}
+	return CoordinationConsumerID(value), nil
+}
+
+func (id CoordinationConsumerID) String() string { return string(id) }
+
+// CoordinationEventsQuery uses either an explicit cursor or the committed
+// position of one named consumer. The two modes are deliberately exclusive.
 type CoordinationEventsQuery struct {
 	workspace domain.WorkspaceID
 	actor     domain.ActorID
 	after     CoordinationEventCursor
+	consumer  CoordinationConsumerID
 	limit     uint16
 }
 
 func NewCoordinationEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
 	after CoordinationEventCursor, limit uint16) (CoordinationEventsQuery, error) {
-	if workspace.IsZero() || actor.IsZero() || limit == 0 || limit > MaxQueryPageSize {
+	return newCoordinationEventsQuery(workspace, actor, after, "", limit)
+}
+
+func NewCoordinationConsumerEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
+	consumer CoordinationConsumerID, limit uint16) (CoordinationEventsQuery, error) {
+	return newCoordinationEventsQuery(workspace, actor, CoordinationEventCursor{}, consumer, limit)
+}
+
+func newCoordinationEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID, after CoordinationEventCursor,
+	consumer CoordinationConsumerID, limit uint16) (CoordinationEventsQuery, error) {
+	if workspace.IsZero() || actor.IsZero() || limit == 0 || limit > MaxQueryPageSize ||
+		(!after.IsZero() && consumer != "") {
 		return CoordinationEventsQuery{}, ErrInvalidCoordination
 	}
-	return CoordinationEventsQuery{workspace: workspace, actor: actor, after: after, limit: limit}, nil
+	return CoordinationEventsQuery{workspace: workspace, actor: actor, after: after, consumer: consumer, limit: limit}, nil
 }
 
 func (query CoordinationEventsQuery) WorkspaceID() domain.WorkspaceID      { return query.workspace }
 func (query CoordinationEventsQuery) ActorID() domain.ActorID              { return query.actor }
 func (query CoordinationEventsQuery) AfterCursor() CoordinationEventCursor { return query.after }
+func (query CoordinationEventsQuery) ConsumerID() CoordinationConsumerID   { return query.consumer }
 func (query CoordinationEventsQuery) Limit() uint16                        { return query.limit }
 
-type CoordinationEventsPage struct {
-	events  []CoordinationEvent
-	next    CoordinationEventCursor
-	hasMore bool
+type CoordinationConsumerCommit struct {
+	workspace domain.WorkspaceID
+	actor     domain.ActorID
+	consumer  CoordinationConsumerID
+	cursor    CoordinationEventCursor
 }
 
-func NewCoordinationEventsPage(events []CoordinationEvent, next CoordinationEventCursor,
-	hasMore bool) (CoordinationEventsPage, error) {
-	if next.IsZero() || len(events) > MaxQueryPageSize {
+func NewCoordinationConsumerCommit(workspace domain.WorkspaceID, actor domain.ActorID,
+	consumer CoordinationConsumerID, cursor CoordinationEventCursor) (CoordinationConsumerCommit, error) {
+	if workspace.IsZero() || actor.IsZero() || consumer == "" || cursor.IsZero() {
+		return CoordinationConsumerCommit{}, ErrInvalidCoordination
+	}
+	return CoordinationConsumerCommit{workspace: workspace, actor: actor, consumer: consumer, cursor: cursor}, nil
+}
+
+func (commit CoordinationConsumerCommit) WorkspaceID() domain.WorkspaceID    { return commit.workspace }
+func (commit CoordinationConsumerCommit) ActorID() domain.ActorID            { return commit.actor }
+func (commit CoordinationConsumerCommit) ConsumerID() CoordinationConsumerID { return commit.consumer }
+func (commit CoordinationConsumerCommit) Cursor() CoordinationEventCursor    { return commit.cursor }
+
+type CoordinationEventsPage struct {
+	events       []CoordinationEvent
+	eventCursors []CoordinationEventCursor
+	next         CoordinationEventCursor
+	hasMore      bool
+}
+
+func NewCoordinationEventsPage(events []CoordinationEvent, eventCursors []CoordinationEventCursor,
+	next CoordinationEventCursor, hasMore bool) (CoordinationEventsPage, error) {
+	if next.IsZero() || len(events) > MaxQueryPageSize || len(events) != len(eventCursors) {
 		return CoordinationEventsPage{}, ErrInvalidCoordination
 	}
 	cloned := append([]CoordinationEvent(nil), events...)
 	for index := range cloned {
-		if cloned[index].position == 0 || index > 0 && cloned[index-1].position >= cloned[index].position {
+		if cloned[index].position == 0 || eventCursors[index].IsZero() || index > 0 && cloned[index-1].position >= cloned[index].position {
 			return CoordinationEventsPage{}, ErrInvalidCoordination
 		}
 		cloned[index].payload = append([]byte(nil), cloned[index].payload...)
 	}
-	return CoordinationEventsPage{events: cloned, next: next, hasMore: hasMore}, nil
+	return CoordinationEventsPage{events: cloned, eventCursors: append([]CoordinationEventCursor(nil), eventCursors...),
+		next: next, hasMore: hasMore}, nil
 }
 
 func (page CoordinationEventsPage) Events() []CoordinationEvent {
@@ -413,6 +468,9 @@ func (page CoordinationEventsPage) Events() []CoordinationEvent {
 		result[index].payload = append([]byte(nil), result[index].payload...)
 	}
 	return result
+}
+func (page CoordinationEventsPage) EventCursors() []CoordinationEventCursor {
+	return append([]CoordinationEventCursor(nil), page.eventCursors...)
 }
 func (page CoordinationEventsPage) NextCursor() CoordinationEventCursor { return page.next }
 func (page CoordinationEventsPage) HasMore() bool                       { return page.hasMore }
@@ -631,6 +689,7 @@ type CoordinationStore interface {
 	ReleaseLease(context.Context, ChangeLeaseParams) (Lease, error)
 	ValidateFence(context.Context, domain.LeaseID, domain.AuthorityEpoch, []Fence) error
 	SyncCoordinationEvents(context.Context, CoordinationEventsQuery) (CoordinationEventsPage, error)
+	CommitCoordinationConsumer(context.Context, CoordinationConsumerCommit) error
 }
 
 const (
