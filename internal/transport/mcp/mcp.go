@@ -98,6 +98,14 @@ type Dependencies struct {
 	ContextGet                contracts.ContextGetHandler
 	EventsSync                contracts.EventsSyncHandler
 	Coordination              application.LocalCoordinationStore
+
+	// ExposeIdentityPlane registers the W0/W1 identity and work tools on this
+	// transport. It defaults to false because MCP carries no place to attach a
+	// verified ingress credential, so every one of those tools answers
+	// UNAUTHENTICATED while spending roughly ninety percent of the tool-list
+	// tokens in each client's context window. The same operations stay fully
+	// available over HTTP, where the credential can be attached.
+	ExposeIdentityPlane bool
 }
 
 // Server embeds the SDK server and adds Blackbird's context-head wake-up API.
@@ -122,6 +130,20 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 		PageSize:     64,
 	})
 	server := &Server{Server: sdk}
+	if dependencies.ExposeIdentityPlane {
+		registerIdentityPlaneTools(sdk, dependencies)
+	}
+	registerResources(sdk, dependencies)
+	if !isNil(dependencies.Coordination) {
+		registerCoordinationTools(sdk, dependencies.Coordination)
+	}
+	return server, nil
+}
+
+// registerIdentityPlaneTools publishes the W0/W1 ceremonies as MCP tools. Only
+// a transport that can carry a verified ingress credential should call it;
+// without one every tool here fails authentication before reaching a handler.
+func registerIdentityPlaneTools(sdk *sdkmcp.Server, dependencies Dependencies) {
 	registerCommand(sdk, ToolInstallationBootstrap, contracts.OperationInstallationBootstrap, dependencies.Authenticator,
 		contracts.DecodeInstallationBootstrapRequest, func(value contracts.InstallationBootstrapRequestDTO) time.Time { return value.Deadline },
 		dependencies.InstallationBootstrap.HandleInstallationBootstrap, func(value contracts.InstallationBootstrapResultDTO) error { return value.Validate() })
@@ -177,17 +199,12 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 		contracts.DecodeContextGetRequest, dependencies.ContextGet.HandleContextGet, func(value contracts.ContextPageDTO) error { return value.Validate() })
 	registerQuery(sdk, ToolEventsSync, contracts.OperationEventsSync, dependencies.Authenticator,
 		contracts.DecodeEventsSyncRequest, dependencies.EventsSync.HandleEventsSync, func(value contracts.EventPageDTO) error { return value.Validate() })
-	registerResources(sdk, dependencies)
-	if !isNil(dependencies.Coordination) {
-		registerCoordinationTools(sdk, dependencies.Coordination)
-	}
-	return server, nil
 }
 
 type registerAgentInput struct {
 	ProjectKey        string  `json:"project_key" jsonschema:"Repository or workspace key, preferably its absolute path."`
 	AgentName         string  `json:"agent_name"`
-	RegistrationToken *string `json:"registration_token,omitempty" jsonschema:"Existing token required when restarting a registered name."`
+	RegistrationToken *string `json:"registration_token,omitempty" jsonschema:"Existing token required when restarting a registered name. Every other tool takes this same value as agent_token."`
 }
 type agentSessionOutput struct {
 	ProjectKey        string `json:"project_key"`
@@ -211,7 +228,7 @@ type activeAgentsOutput struct {
 }
 type openConversationInput struct {
 	AgentToken string `json:"agent_token"`
-	Topic      string `json:"topic"`
+	Topic      string `json:"topic" jsonschema:"Short subject naming the one work item this conversation covers."`
 }
 type conversationOutput struct {
 	ConversationID string `json:"conversation_id"`
@@ -220,15 +237,15 @@ type conversationOutput struct {
 }
 type sendMessageInput struct {
 	AgentToken              string   `json:"agent_token"`
-	ConversationID          string   `json:"conversation_id"`
-	To                      []string `json:"to"`
+	ConversationID          string   `json:"conversation_id" jsonschema:"Conversation returned by blackbird_conversation_open."`
+	To                      []string `json:"to" jsonschema:"Recipient agent names as registered, not actor IDs; blackbird_agents_list reports them."`
 	Subject                 string   `json:"subject"`
 	Body                    string   `json:"body"`
-	AcknowledgementRequired bool     `json:"acknowledgement_required,omitempty"`
+	AcknowledgementRequired bool     `json:"acknowledgement_required,omitempty" jsonschema:"Require the recipient to acknowledge this exact body, not merely read it."`
 }
 type replyMessageInput struct {
 	sendMessageInput
-	ReplyToMessageID string `json:"reply_to_message_id"`
+	ReplyToMessageID string `json:"reply_to_message_id" jsonschema:"Message this reply answers, from an inbox or thread fetch."`
 }
 type deliveryOutput struct {
 	RecipientActorID string `json:"recipient_actor_id"`
@@ -250,13 +267,13 @@ type messageOutput struct {
 }
 type fetchInboxInput struct {
 	AgentToken string `json:"agent_token"`
-	UnreadOnly bool   `json:"unread_only,omitempty"`
+	UnreadOnly bool   `json:"unread_only,omitempty" jsonschema:"Return only messages this agent has not marked read."`
 	After      uint64 `json:"after,omitempty"`
 	Limit      uint16 `json:"limit,omitempty"`
 }
 type fetchThreadInput struct {
 	AgentToken     string `json:"agent_token"`
-	ConversationID string `json:"conversation_id"`
+	ConversationID string `json:"conversation_id" jsonschema:"Conversation to read, as returned by blackbird_conversation_open."`
 	After          uint64 `json:"after,omitempty"`
 	Limit          uint16 `json:"limit,omitempty"`
 }
@@ -267,7 +284,7 @@ type messagePageOutput struct {
 }
 type messageFactInput struct {
 	AgentToken string `json:"agent_token"`
-	MessageID  string `json:"message_id"`
+	MessageID  string `json:"message_id" jsonschema:"Message to record the fact against; it must be visible in this agent's inbox."`
 }
 type deliveryFactOutput struct {
 	MessageID    string `json:"message_id"`
@@ -275,8 +292,8 @@ type deliveryFactOutput struct {
 	Acknowledged bool   `json:"acknowledged"`
 }
 type reservationSelectorInput struct {
-	Kind string `json:"kind" jsonschema:"exact or subtree"`
-	Path string `json:"path"`
+	Kind string `json:"kind"`
+	Path string `json:"path" jsonschema:"Repository-relative path the reservation covers."`
 }
 type reservationAcquireInput struct {
 	AgentToken string                     `json:"agent_token"`
@@ -284,20 +301,23 @@ type reservationAcquireInput struct {
 	Selectors  []reservationSelectorInput `json:"selectors"`
 	TTLSeconds uint32                     `json:"ttl_seconds,omitempty"`
 }
+
+// fenceOutput is both a result and an argument, so its descriptions have to read
+// correctly in either direction.
 type fenceOutput struct {
-	ConflictKey string `json:"conflict_key"`
-	Counter     uint64 `json:"counter"`
+	ConflictKey string `json:"conflict_key" jsonschema:"Opaque key naming one contended path; send it back unchanged when renewing or releasing."`
+	Counter     uint64 `json:"counter" jsonschema:"Fencing counter for that key. Renew and release must carry the value from the most recent acquire or renew; a stale one is rejected."`
 }
 type reservationChangeInput struct {
 	AgentToken string        `json:"agent_token"`
-	LeaseID    string        `json:"lease_id"`
-	Fences     []fenceOutput `json:"fences"`
+	LeaseID    string        `json:"lease_id" jsonschema:"Lease returned by blackbird_reservation_acquire."`
+	Fences     []fenceOutput `json:"fences" jsonschema:"The lease's current fences, from the most recent acquire or renew."`
 	TTLSeconds uint32        `json:"ttl_seconds,omitempty"`
 }
 type reservationReleaseInput struct {
 	AgentToken string        `json:"agent_token"`
-	LeaseID    string        `json:"lease_id"`
-	Fences     []fenceOutput `json:"fences"`
+	LeaseID    string        `json:"lease_id" jsonschema:"Lease returned by blackbird_reservation_acquire."`
+	Fences     []fenceOutput `json:"fences" jsonschema:"The lease's current fences, from the most recent acquire or renew."`
 }
 type reservationOutput struct {
 	LeaseID    string                     `json:"lease_id"`
@@ -323,7 +343,8 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 				WorkspaceID: session.WorkspaceID.String(), ActorID: session.ActorID.String(), SessionID: session.ActorSessionID.String(),
 				RegistrationToken: issued}, nil
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentsList, Description: "List agent sessions active in the caller's repository."},
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentsList, Description: "List agent sessions active in the caller's repository.",
+		InputSchema: coordinationInputSchema[tokenInput]()},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input tokenInput) (*sdkmcp.CallToolResult, activeAgentsOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
@@ -340,7 +361,8 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 			}
 			return nil, output, nil
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolConversationOpen, Description: "Open a durable conversation in the caller's repository."},
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolConversationOpen, Description: "Open a durable conversation in the caller's repository.",
+		InputSchema: coordinationInputSchema[openConversationInput]()},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input openConversationInput) (*sdkmcp.CallToolResult, conversationOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
@@ -492,7 +514,8 @@ func registerDeliveryFactTool(server *sdkmcp.Server, name string, kind applicati
 	if kind == application.DeliveryAcknowledged {
 		description = "Acknowledge the exact durable message body."
 	}
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: name, Description: description},
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: name, Description: description,
+		InputSchema: coordinationInputSchema[messageFactInput]()},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input messageFactInput) (*sdkmcp.CallToolResult, deliveryFactOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
@@ -505,11 +528,13 @@ func registerDeliveryFactTool(server *sdkmcp.Server, name string, kind applicati
 			params := application.RecordDeliveryFactParams{WorkspaceID: session.WorkspaceID, MessageID: messageID,
 				Recipient: session.ActorID, ActorSessionID: &session.ActorSessionID, Kind: kind}
 			if kind == application.DeliveryAcknowledged {
-				digest, findErr := findInboxMessageDigest(ctx, store, session, messageID)
+				// An acknowledgement is a promise about the exact stored body, so the
+				// digest is read back from the message rather than taken on trust.
+				message, findErr := store.GetVisibleMessage(ctx, session.WorkspaceID, session.ActorID, messageID)
 				if findErr != nil {
 					return nil, deliveryFactOutput{}, findErr
 				}
-				params.MessageDigest = digest
+				params.MessageDigest = message.Digest()
 			}
 			delivery, err := store.RecordDeliveryFact(ctx, params)
 			if err != nil {
@@ -521,31 +546,11 @@ func registerDeliveryFactTool(server *sdkmcp.Server, name string, kind applicati
 		})
 }
 
-func findInboxMessageDigest(ctx context.Context, store application.LocalCoordinationStore, session application.LocalAgentSession,
-	want domain.MessageID) (application.Digest, error) {
-	var after uint64
-	for {
-		page, err := store.Inbox(ctx, application.InboxQuery{WorkspaceID: session.WorkspaceID, Recipient: session.ActorID,
-			After: after, Limit: 256})
-		if err != nil {
-			return application.Digest{}, err
-		}
-		for _, message := range page.Messages() {
-			if message.ID() == want {
-				return message.Digest(), nil
-			}
-		}
-		if !page.HasMore() {
-			return application.Digest{}, errors.New("message is not visible in the agent inbox")
-		}
-		after = page.NextCursor()
-	}
-}
-
 func registerReservationTools(server *sdkmcp.Server, store application.LocalCoordinationStore) {
 	acquireInputSchema := coordinationInputSchema[reservationAcquireInput](func(properties map[string]*jsonschema.Schema) {
 		properties["mode"].Default = json.RawMessage(`"exclusive"`)
 		properties["mode"].Enum = []any{string(application.LeaseShared), string(application.LeaseExclusive)}
+		setSelectorKindSchema(properties["selectors"].Items.Properties["kind"])
 		setTTLSchema(properties["ttl_seconds"])
 	})
 	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationAcquire, Description: "Acquire shared or exclusive exact/subtree file reservations.", InputSchema: acquireInputSchema},
@@ -583,7 +588,8 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 			lease, err := changeLocalReservation(ctx, store, input, false)
 			return nil, lease, err
 		})
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRelease, Description: "Release a held file reservation using its current fences."},
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolReservationRelease, Description: "Release a held file reservation using its current fences.",
+		InputSchema: coordinationInputSchema[reservationReleaseInput]()},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input reservationReleaseInput) (*sdkmcp.CallToolResult, reservationOutput, error) {
 			lease, err := changeLocalReservation(ctx, store, reservationChangeInput{AgentToken: input.AgentToken,
 				LeaseID: input.LeaseID, Fences: input.Fences}, true)
@@ -591,13 +597,32 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 		})
 }
 
-func coordinationInputSchema[Input any](configure func(map[string]*jsonschema.Schema)) *jsonschema.Schema {
+// agentTokenDescription names the field's own source. Registration issues the
+// value as registration_token and every other tool reads it back as
+// agent_token, so without this a first call is a guaranteed schema rejection
+// whose message never mentions the other name.
+const agentTokenDescription = "The registration_token returned by blackbird_agent_register (same value, different field name)."
+
+func coordinationInputSchema[Input any](configure ...func(map[string]*jsonschema.Schema)) *jsonschema.Schema {
 	schema, err := jsonschema.For[Input](nil)
 	if err != nil {
 		panic(fmt.Sprintf("infer local coordination input schema: %v", err))
 	}
-	configure(schema.Properties)
+	if token, ok := schema.Properties["agent_token"]; ok {
+		token.Description = agentTokenDescription
+	}
+	for _, apply := range configure {
+		apply(schema.Properties)
+	}
 	return schema
+}
+
+// setSelectorKindSchema turns the selector kind into a validated enum. As prose
+// the field accepted any string, so an invented kind passed the schema and was
+// rejected later with no hint that only two values exist.
+func setSelectorKindSchema(schema *jsonschema.Schema) {
+	schema.Enum = []any{string(application.LeaseSelectorExact), string(application.LeaseSelectorSubtree)}
+	schema.Description = "exact reserves the one named file; subtree reserves the directory and everything beneath it. Prefer exact unless the edit genuinely spans a package."
 }
 
 func setPageLimitSchema(schema *jsonschema.Schema) {

@@ -24,6 +24,16 @@ import (
 
 const testActorSessionID = "01b8e094-9888-7000-8000-00000000001f"
 
+// identityPlaneToolNames is the W0/W1 surface whose MCP registration is
+// conditional. The same operations stay reachable over HTTP either way.
+var identityPlaneToolNames = []string{
+	ToolInstallationBootstrap, ToolPrincipalRegister, ToolDevicePairingBegin, ToolDevicePair,
+	ToolWorkspaceCreate, ToolWorkspaceMemberInvite, ToolWorkspaceMembershipAccept, ToolActorCreate,
+	ToolActorDelegationPropose, ToolActorDelegationActivate, ToolSessionStart, ToolWorkRefObserve,
+	ToolObjectiveAndWorkCreate, ToolObjectiveActivate, ToolRunPlanWithBindings, ToolRunJoin,
+	ToolRunStart, ToolContextGet, ToolEventsSync,
+}
+
 type testMCPAuthenticator struct{}
 
 func (testMCPAuthenticator) Authenticate(context.Context, string, string) (contracts.AuthenticationEvidence, *contracts.ErrorDTO, error) {
@@ -345,6 +355,10 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if !read.Read || !ack.Read || !ack.Acknowledged {
 		t.Fatalf("read/ack = %+v / %+v", read, ack)
 	}
+	// Acknowledgement resolves the digest from the single stored message, so a
+	// message the caller cannot see fails outright instead of being searched for.
+	assertCoordinationInputRejected(t, client, ToolMessageAcknowledge, messageFactInput{
+		AgentToken: bob.RegistrationToken, MessageID: "01b8e094-9888-7000-8000-0000000000ff"})
 	if unread := callCoord[messagePageOutput](t, client, ToolInboxFetch,
 		fetchInboxInput{AgentToken: bob.RegistrationToken, UnreadOnly: true, Limit: 32}); len(unread.Messages) != 0 {
 		t.Fatalf("read message remained unread: %+v", unread)
@@ -423,6 +437,45 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "docs/guide.md"}}})
 }
 
+func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
+	t.Parallel()
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "exposure.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	handlers := &testHandlers{events: successfulEvents, context: contextFailure}
+	binder := &testSessionBinder{session: parseSession(t)}
+	server := newServerExposing(t, false, handlers, binder, store)
+	client, closeMCP := connect(t, server)
+	defer closeMCP()
+
+	tools, err := client.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	listed := make(map[string]bool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		listed[tool.Name] = true
+	}
+	for _, name := range identityPlaneToolNames {
+		if listed[name] {
+			t.Errorf("identity-plane tool %q was published on a transport that carries no credential", name)
+		}
+	}
+	if !listed[ToolAgentRegister] || !listed[ToolReservationAcquire] || len(listed) != 12 {
+		t.Fatalf("coordination surface = %d tools, want the 12 coordination tools: %v", len(listed), listed)
+	}
+	// Resources are a fixed pair of URIs rather than a per-request token cost, so
+	// withholding the tools must not withhold them.
+	if _, err := client.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCurrentContext}); err != nil {
+		t.Fatalf("ReadResource: %v", err)
+	}
+	if !binder.called.Load() {
+		t.Fatal("resource did not resolve the bound actor session")
+	}
+}
+
 func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) {
 	t.Helper()
 	result, err := session.ListTools(context.Background(), nil)
@@ -467,6 +520,59 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 				t.Errorf("%s.%s default = %#v, want %#v", toolName, field, got, want)
 			}
 		}
+	}
+
+	for name, tool := range tools {
+		encoded, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshal %s schema: %v", name, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+				Enum        []any  `json:"enum"`
+				Items       struct {
+					Properties map[string]struct {
+						Enum []any `json:"enum"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(encoded, &schema); err != nil {
+			t.Fatalf("decode %s schema: %v", name, err)
+		}
+		token, ok := schema.Properties["agent_token"]
+		if !ok {
+			continue
+		}
+		if !strings.Contains(token.Description, "registration_token") {
+			t.Errorf("%s.agent_token description does not name registration_token: %q", name, token.Description)
+		}
+	}
+
+	acquire := tools[ToolReservationAcquire]
+	acquireSchema, err := json.Marshal(acquire.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal acquire schema: %v", err)
+	}
+	var acquireDecoded struct {
+		Properties struct {
+			Selectors struct {
+				Items struct {
+					Properties struct {
+						Kind struct {
+							Enum []any `json:"enum"`
+						} `json:"kind"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"selectors"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(acquireSchema, &acquireDecoded); err != nil {
+		t.Fatalf("decode acquire schema: %v", err)
+	}
+	if kinds := acquireDecoded.Properties.Selectors.Items.Properties.Kind.Enum; !reflect.DeepEqual(kinds, []any{"exact", "subtree"}) {
+		t.Errorf("selector kind enum = %#v, want exact and subtree", kinds)
 	}
 
 	release := tools[ToolReservationRelease]
@@ -557,14 +663,21 @@ func callMCP(t *testing.T, handlers *testHandlers, request contracts.EventsSyncR
 
 func newTestServer(t *testing.T, handlers *testHandlers, binder CurrentSessionBinder, coordination ...application.LocalCoordinationStore) *Server {
 	t.Helper()
+	return newServerExposing(t, true, handlers, binder, coordination...)
+}
+
+func newServerExposing(t *testing.T, identityPlane bool, handlers *testHandlers, binder CurrentSessionBinder,
+	coordination ...application.LocalCoordinationStore) *Server {
+	t.Helper()
 	var coordinationStore application.LocalCoordinationStore
 	if len(coordination) != 0 {
 		coordinationStore = coordination[0]
 	}
 	server, err := NewServer(Dependencies{
 		Authenticator: testMCPAuthenticator{}, CurrentSession: binder, InstallationBootstrap: handlers,
-		Coordination:      coordinationStore,
-		PrincipalRegister: handlers, DevicePairingBegin: handlers, DevicePair: handlers, WorkspaceCreate: handlers,
+		Coordination:        coordinationStore,
+		ExposeIdentityPlane: identityPlane,
+		PrincipalRegister:   handlers, DevicePairingBegin: handlers, DevicePair: handlers, WorkspaceCreate: handlers,
 		WorkspaceMemberInvite: handlers, WorkspaceMembershipAccept: handlers, ActorCreate: handlers,
 		ActorDelegationPropose: handlers, ActorDelegationActivate: handlers, SessionStart: handlers,
 		WorkRefObserve: handlers, ObjectiveAndWorkCreate: handlers, ObjectiveActivate: handlers,

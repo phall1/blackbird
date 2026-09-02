@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/integration/localsecurity"
@@ -27,6 +29,11 @@ const (
 	recoveryCapsuleKeyID = "blackbird-local-recovery-v1"
 	recoveryCredentialID = "recovery-signing-key"
 	productionAssurance  = "local-credential"
+
+	// mcpSessionTimeout bounds how long an idle MCP session survives without a
+	// client request. It is long enough to outlast a thinking agent and short
+	// enough that an abandoned session is reclaimed within one work break.
+	mcpSessionTimeout = 30 * time.Minute
 )
 
 type productionStore interface {
@@ -54,13 +61,14 @@ func NewProductionDaemon(build BuildInfo, config Config) (*Daemon, error) {
 		}
 		config.StateDir = filepath.Clean(path)
 	}
-	logger, err := NewLogger(config, os.Stderr)
+	logger, severity, err := NewLeveledLogger(config, os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("runtime configuration: %w", err)
 	}
 	return NewDaemon(build, config, Dependencies{
-		Logger:  logger,
-		Compose: composeProduction(build.Normalize(), config, logger),
+		Logger:      logger,
+		LogSeverity: severity,
+		Compose:     composeProduction(build.Normalize(), config, logger),
 	})
 }
 
@@ -166,6 +174,7 @@ func composeProductionBundle(
 	}
 	ingress := productionIngressAuthenticator{authenticator: authenticator}
 	httpHandler, err := httptransport.NewHandler(httptransport.Dependencies{
+		Logger:                logger,
 		Authenticator:         httpIngressAuthenticator{ingress},
 		InstallationBootstrap: handler, PrincipalRegister: handler,
 		DevicePairingBegin: handler, DevicePair: handler, WorkspaceCreate: handler,
@@ -179,7 +188,9 @@ func composeProductionBundle(
 		return HandlerBundle{}, fmt.Errorf("compose HTTP transport: %w", err)
 	}
 	coordination := localCoordinationStore(storage)
-	localHTTPHandler, err := httptransport.NewLocalHandler(httptransport.LocalDependencies{Coordination: coordination})
+	localHTTPHandler, err := httptransport.NewLocalHandler(httptransport.LocalDependencies{
+		Coordination: coordination, Logger: logger,
+	})
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose local HTTP transport: %w", err)
 	}
@@ -223,6 +234,11 @@ func composeProductionBundle(
 	httpMux.Handle("/", httpHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Authenticator: mcpIngressAuthenticator{ingress}, CurrentSession: productionCurrentSession{},
+		// The W0/W1 plane stays off MCP: nothing on this transport can attach a
+		// verified ingress credential, so those tools could only answer
+		// UNAUTHENTICATED while spending most of every client's tool-list budget.
+		// They keep their full HTTP surface, where the credential travels.
+		ExposeIdentityPlane:   false,
 		Coordination:          coordination,
 		InstallationBootstrap: handler, PrincipalRegister: handler,
 		DevicePairingBegin: handler, DevicePair: handler, WorkspaceCreate: handler,
@@ -240,7 +256,11 @@ func composeProductionBundle(
 		slog.String("health_path", httptransport.PathHealth),
 		slog.String("readiness_path", httptransport.PathReady))
 	return HandlerBundle{
-		HTTP: httpMux, MCP: mcpServer.HTTPHandler(nil), Workers: []Worker{handshake},
+		HTTP: httpMux, Workers: []Worker{handshake},
+		// Without a session timeout the SDK never closes an idle session, so a
+		// crashed agent or a killed terminal leaks its map entry and goroutines
+		// for the daemon's lifetime.
+		MCP: mcpServer.HTTPHandler(&sdkmcp.StreamableHTTPOptions{SessionTimeout: mcpSessionTimeout}),
 	}, nil
 }
 
