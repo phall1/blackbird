@@ -114,6 +114,9 @@ func composeProductionBundle(
 	httpMux.Handle("/api/v1/local/", localHTTPHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Logger: logger, Metrics: telemetry, Coordination: store,
+		// Reading the observation plane is composed independently of writing
+		// it: a store that cannot answer a rollup simply does not get the tool.
+		Observations: observationReader(store),
 	})
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose MCP transport: %w", err)
@@ -135,6 +138,17 @@ func (worker *adminHandshakeWorker) SetBoundHTTPAddress(address string) {
 	if address != "" {
 		worker.handshake.HTTPAddress = address
 	}
+}
+
+// observationReader returns a nil interface rather than a typed nil when the
+// store cannot answer rollups, so the MCP transport's nil check decides whether
+// the agent-facing tool exists at all.
+func observationReader(store Storage) application.TelemetryReader {
+	reader, ok := store.(application.TelemetryReader)
+	if !ok {
+		return nil
+	}
+	return reader
 }
 
 func telemetryOffer(worker *telemetryWorker) httptransport.TelemetryOffer {

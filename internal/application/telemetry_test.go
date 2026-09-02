@@ -220,3 +220,69 @@ func TestOfferIgnoresEmptyEnvelopes(t *testing.T) {
 		t.Fatalf("stats=%+v, want an empty envelope to count as nothing", stats)
 	}
 }
+
+// The window and the reply size are decided in one place so the transport
+// cannot widen either, whatever a caller sends.
+func TestSpendQueryNormalizationClampsWindowAndLimit(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+
+	defaulted := application.SpendQuery{Dimension: application.SpendByModel}.Normalized(now)
+	if defaulted.Limit != application.DefaultSpendGroups {
+		t.Fatalf("limit=%d, want the default", defaulted.Limit)
+	}
+	if !defaulted.Since.Equal(now.Add(-application.DefaultSpendWindow)) {
+		t.Fatalf("since=%s, want the default window", defaulted.Since)
+	}
+
+	// A caller asking for the whole history is clamped rather than refused: the
+	// answer it gets is still useful, which a rejection would not be.
+	wide := application.SpendQuery{
+		Dimension: application.SpendByModel,
+		Since:     now.Add(-365 * 24 * time.Hour),
+		Limit:     5000,
+	}.Normalized(now)
+	if !wide.Since.Equal(now.Add(-application.MaxSpendWindow)) {
+		t.Fatalf("since=%s, want the window clamped to the maximum", wide.Since)
+	}
+	if wide.Limit != application.DefaultSpendGroups {
+		t.Fatalf("limit=%d, want an over-large limit brought back to the default", wide.Limit)
+	}
+
+	// A reasonable explicit request survives untouched.
+	kept := application.SpendQuery{
+		Dimension: application.SpendBySpanName, Since: now.Add(-2 * time.Hour), Limit: 25,
+	}.Normalized(now)
+	if !kept.Since.Equal(now.Add(-2*time.Hour)) || kept.Limit != 25 {
+		t.Fatalf("query=%+v, want an in-bounds request preserved", kept)
+	}
+}
+
+func TestSpendDimensionSeparatesTokenAndSpanTables(t *testing.T) {
+	t.Parallel()
+	for _, dimension := range []application.SpendDimension{
+		application.SpendByModel, application.SpendByAgent, application.SpendByHarness,
+	} {
+		if !dimension.Valid() || dimension.Spans() {
+			t.Fatalf("%q must be a valid model-call dimension", dimension)
+		}
+	}
+	for _, dimension := range []application.SpendDimension{
+		application.SpendBySpanKind, application.SpendBySpanName,
+	} {
+		if !dimension.Valid() || !dimension.Spans() {
+			t.Fatalf("%q must be a valid span dimension", dimension)
+		}
+	}
+	if application.SpendDimension("vibes").Valid() {
+		t.Fatal("the dimension set is closed because each value is a column expression")
+	}
+}
+
+func TestSpendGroupBilledInputExcludesOutput(t *testing.T) {
+	t.Parallel()
+	group := application.SpendGroup{UncachedInput: 2, CacheRead: 26354, CacheWrite: 23947, Output: 1469}
+	if group.BilledInput() != 50303 {
+		t.Fatalf("BilledInput=%d, want the three input classes and not output", group.BilledInput())
+	}
+}

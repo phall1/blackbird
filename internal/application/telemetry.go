@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -293,4 +294,147 @@ func (sink *TelemetrySink) Stats() TelemetrySinkStats {
 		WriteFailures: sink.writeFailures.Load(),
 		Batches:       sink.batches.Load(),
 	}
+}
+
+// The read half of the observation plane.
+//
+// The plane is written by adapters and read by agents, and those are different
+// jobs with different risks. Ingest must never block coordination; a rollup is
+// an ordinary bounded read that answers one question -- where did the tokens
+// and the time go -- for one project, over one window, grouped one way.
+//
+// It is deliberately a rollup and never a row feed. An agent asking what it
+// spent wants a handful of totals it can act on, not a page of observations it
+// has to add up in context; returning rows would spend more tokens reporting
+// spend than the answer is worth.
+
+// SpendDimension is the closed set of groupings the plane answers. It is closed
+// because each value is a column expression, and an open one would either be a
+// SQL injection surface or a switch pretending not to be.
+type SpendDimension string
+
+const (
+	// SpendByModel answers "which models is this project's budget going to".
+	SpendByModel SpendDimension = "model"
+	// SpendByAgent attributes spend to the agent that incurred it.
+	SpendByAgent SpendDimension = "agent"
+	// SpendByHarness separates Claude Code, OpenCode, and Pi.
+	SpendByHarness SpendDimension = "harness"
+	// SpendBySpanKind and SpendBySpanName read the span table instead, which is
+	// where "what is actually slow" is answered. Spans carry no tokens, so a
+	// span grouping reports duration and leaves the token totals at zero.
+	SpendBySpanKind SpendDimension = "span_kind"
+	SpendBySpanName SpendDimension = "span_name"
+)
+
+func (dimension SpendDimension) Valid() bool {
+	switch dimension {
+	case SpendByModel, SpendByAgent, SpendByHarness, SpendBySpanKind, SpendBySpanName:
+		return true
+	default:
+		return false
+	}
+}
+
+// Spans reports whether this dimension reads the span table rather than the
+// model-call table.
+func (dimension SpendDimension) Spans() bool {
+	return dimension == SpendBySpanKind || dimension == SpendBySpanName
+}
+
+const (
+	// DefaultSpendWindow is the window a caller that names none gets. A day is
+	// the span of a working session, which is the question agents actually ask.
+	DefaultSpendWindow = 24 * time.Hour
+	// MaxSpendWindow bounds the scan. Retention is longer than this, so a
+	// caller wanting the whole history is asking for a report no agent reads.
+	MaxSpendWindow = 30 * 24 * time.Hour
+	// DefaultSpendGroups and MaxSpendGroups bound the reply. The long tail of a
+	// group-by is noise, and an unbounded reply lands in a model's context.
+	DefaultSpendGroups = 10
+	MaxSpendGroups     = 50
+)
+
+// SpendQuery selects one rollup. ProjectKey is not a field: the report is
+// always the caller's own project, taken from the authenticated session, so
+// this can never read across into another workspace.
+type SpendQuery struct {
+	Dimension SpendDimension
+	// Since bounds the window on started_at -- when the work happened, which is
+	// what the caller is asking about, rather than when this daemon recorded it.
+	Since time.Time
+	// MineOnly narrows to the calling agent, which is how an agent asks what it
+	// personally has spent rather than what the project has.
+	MineOnly bool
+	Limit    uint16
+}
+
+// Normalized fills defaults and clamps bounds. It is the single place the
+// window and the reply size are decided, so the transport cannot widen either.
+func (query SpendQuery) Normalized(now time.Time) SpendQuery {
+	if query.Limit == 0 || query.Limit > MaxSpendGroups {
+		query.Limit = DefaultSpendGroups
+	}
+	earliest := now.Add(-MaxSpendWindow)
+	if query.Since.IsZero() {
+		query.Since = now.Add(-DefaultSpendWindow)
+	}
+	if query.Since.Before(earliest) {
+		query.Since = earliest
+	}
+	return query
+}
+
+func (query SpendQuery) Validate() error {
+	if !query.Dimension.Valid() {
+		return fmt.Errorf("%w: unknown spend dimension %q", ErrInvalidCoordination, query.Dimension)
+	}
+	return nil
+}
+
+// SpendGroup is one row of a rollup. Token totals are zero for a span
+// dimension, because a span has no tokens rather than because they are unknown.
+type SpendGroup struct {
+	// Key is the model, agent name, harness, span kind, or span name. An
+	// observation whose agent has since been deleted groups under an empty key
+	// rather than disappearing: the spend happened either way.
+	Key           string
+	Observations  uint64
+	UncachedInput uint64
+	CacheRead     uint64
+	CacheWrite    uint64
+	Output        uint64
+	Reasoning     uint64
+	// MeasuredDurations counts the observations that carried a duration at all.
+	// Claude Code reports none, so a mean taken over Observations rather than
+	// this would report every Claude call as instant.
+	MeasuredDurations uint64
+	TotalDurationMS   uint64
+	MaxDurationMS     uint64
+}
+
+// BilledInput is what a provider invoices as input: the three disjoint input
+// classes summed. It is derived so no caller has to know which classes exist.
+func (group SpendGroup) BilledInput() uint64 {
+	return group.UncachedInput + group.CacheRead + group.CacheWrite
+}
+
+// SpendReport is the whole answer. Totals covers the window, not merely the
+// groups returned, so a truncated report still reports honest totals.
+type SpendReport struct {
+	Dimension SpendDimension
+	Since     time.Time
+	Groups    []SpendGroup
+	Totals    SpendGroup
+	// Truncated says the window held more groups than Limit. Without it a
+	// caller cannot tell a complete report from the top of a long tail.
+	Truncated bool
+}
+
+// TelemetryReader is the read port. It is separate from TelemetryStore because
+// the write path is a fail-open sink with its own failure rules and the read
+// path is an ordinary query -- and because a daemon may compose one without the
+// other, in which case the agent-facing tool is simply not registered.
+type TelemetryReader interface {
+	SpendReport(context.Context, LocalAgentSession, SpendQuery) (SpendReport, error)
 }

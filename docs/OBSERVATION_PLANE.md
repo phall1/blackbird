@@ -178,6 +178,51 @@ slow or absent daemon cannot delay a turn. A transcript records what a call
 cost and never how long it took, so `duration_ms` is omitted rather than
 faked — this is the one adapter that reports no latency.
 
+## Reading it back
+
+One MCP tool, `blackbird_spend_report`, and no other read surface. There is no
+CLI, no dashboard, and no row feed — the plane is written by processes and read
+by agents, and an agent asking what it spent wants a handful of totals it can
+act on, not a page of observations it has to add up in its own context.
+
+It is one tool rather than several because every tool costs every session a
+slice of context on every turn. A `dimension` parameter answers "which model",
+"which agent", "which harness", and "what is slow" without four entries in
+`tools/list`. And it is registered **only when a telemetry reader is composed**,
+so a daemon that collects nothing advertises nothing.
+
+| `dimension` | Table | Ranked by | Answers |
+|---|---|---|---|
+| `model` (default) | model calls | tokens | where the budget goes |
+| `agent` | model calls | tokens | who is spending it |
+| `harness` | model calls | tokens | Claude Code vs OpenCode vs Pi |
+| `span_kind` | spans | total duration | which kind of work takes the clock |
+| `span_name` | spans | total duration | which specific activity is slow |
+
+Span dimensions report zero tokens. A span has none — that is the truth, not a
+missing value.
+
+Scope is not a parameter. The report always covers the caller's own project,
+taken from the authenticated session, so it can never read across into another
+workspace; `mine_only` narrows further to the calling agent, which is how an
+agent asks what it personally has cost. `since_hours` defaults to 24 and is
+capped at 720, and `limit` defaults to 10 and is capped at 50 — both are
+clamped rather than rejected, because a clamped answer is still useful.
+
+Two fields deserve care when reading a group:
+
+- **`billed_input_tokens`** is the headline — `uncached + cache_read +
+  cache_write`, what a provider actually invoices. Compare it against
+  `uncached_input_tokens` to see what caching is really saving.
+- **`measured_durations`**, not `observations`, is the denominator for any mean
+  latency. Claude Code reports no latency at all, so dividing
+  `total_duration_ms` by `observations` reports its calls as instant. For
+  finding a bottleneck, prefer `total_duration_ms` outright: the group holding
+  the most wall clock is the one to fix, however fast any single call looks.
+
+`totals` covers the whole window rather than the returned groups, so it stays
+honest when `truncated` is true.
+
 ## Retention
 
 Telemetry rows are neither immutable nor journaled, and are swept on a
