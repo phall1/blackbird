@@ -180,6 +180,20 @@ claude --channels plugin:blackbird@blackbird
 
 Adapter delivery never marks a Blackbird message read or acknowledged.
 
+## Gemini CLI Delivery
+
+Gemini CLI push delivery is not on the roadmap. Its [hook events][gemini-hooks]
+run only from the CLI's own lifecycle, so an external Blackbird message cannot
+wake an active session. Its A2A server also advertises
+[`pushNotifications: false`][gemini-a2a], while the HTTP API still has an open
+[authentication defect][gemini-a2a-auth]. Reconsider this only if Gemini ships
+an externally triggerable, authenticated push primitive; MCP remains the pull
+half and cannot substitute for one.
+
+[gemini-hooks]: https://geminicli.com/docs/hooks/reference/
+[gemini-a2a]: https://github.com/google-gemini/gemini-cli/blob/4963a4456a886bb6af7dcfb807ad6e3e46ce46fc/packages/a2a-server/src/http/app.ts
+[gemini-a2a-auth]: https://github.com/google-gemini/gemini-cli/issues/29001
+
 ## Development
 
 ```sh
