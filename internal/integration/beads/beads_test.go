@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	validVersion = `{"branch":"v1.1.2","build":"Homebrew","schema_version":1,"version":"1.1.2"}`
+	validVersion = `{"branch":"v1.2.2","build":"Homebrew","schema_version":1,"version":"1.2.2"}`
 	validIssue   = `[{"id":"bd-fam.2.2","title":"Work boundary","status":"in_progress","priority":1,"issue_type":"feature","assignee":"agent","updated_at":"2026-08-05T19:41:30Z","dependencies":[{"id":"bd-fam.2.1","status":"closed","dependency_type":"blocks"}],"provider_extra":"ignored"}]`
 )
 
@@ -45,10 +45,10 @@ func runFakeExecutable() {
 	if slices.Equal(arguments, []string{"--json", "version"}) {
 		response := validVersion
 		if mode == "incompatible" {
-			response = strings.Replace(response, `"1.1.2"`, `"2.0.0"`, 1)
+			response = strings.Replace(response, `"1.2.2"`, `"2.0.0"`, 1)
 		}
 		if mode == "malformed" {
-			response = `{"version":"1.1.2","schema_version":1,"unknown":true}`
+			response = `{"version":"1.2.2","schema_version":1,"unknown":true}`
 		}
 		_, _ = os.Stdout.WriteString(response)
 		return
@@ -180,6 +180,18 @@ func TestTypedFailuresAndCancellation(t *testing.T) {
 			t.Fatalf("New() = %v after %s", err, time.Since(started))
 		}
 	})
+}
+
+func TestProjectValidationSupportsCoordinationProjectKeys(t *testing.T) {
+	t.Parallel()
+	for project, want := range map[string]bool{
+		"blackbird": true, "/workspace/repo": true, "relative/path": false,
+		"/workspace/repo\nother": false, "": false,
+	} {
+		if got := validProject(project); got != want {
+			t.Errorf("validProject(%q) = %t, want %t", project, got, want)
+		}
+	}
 }
 
 func TestInputAndTranscriptDefensiveCopies(t *testing.T) {

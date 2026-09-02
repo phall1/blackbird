@@ -7,12 +7,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/integration/beads"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 	mcptransport "github.com/phall1/blackbird/internal/transport/mcp"
 	"github.com/phall1/blackbird/internal/transport/metrics"
@@ -114,9 +116,7 @@ func composeProductionBundle(
 	httpMux.Handle("/api/v1/local/", localHTTPHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Logger: logger, Metrics: telemetry, Coordination: store,
-		// Reading the observation plane is composed independently of writing
-		// it: a store that cannot answer a rollup simply does not get the tool.
-		Observations: observationReader(store),
+		Observations: observationReader(store), WorkReferences: beadsWorkReferenceObserver{},
 	})
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose MCP transport: %w", err)
@@ -163,4 +163,32 @@ func telemetryWorkers(handshake Worker, telemetry *telemetryWorker) []Worker {
 		return []Worker{handshake}
 	}
 	return []Worker{handshake, telemetry}
+}
+
+type beadsWorkReferenceObserver struct{}
+
+func (beadsWorkReferenceObserver) ObserveWorkReference(
+	ctx context.Context,
+	projectDir string,
+	objectID string,
+) (application.WorkReference, error) {
+	executable, err := exec.LookPath("bd")
+	if err != nil {
+		return application.WorkReference{}, &beads.DependencyError{
+			Kind: beads.ErrorUnavailable, Operation: "configure", Detail: "bd executable is unavailable", Cause: err,
+		}
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return application.WorkReference{}, &beads.DependencyError{
+			Kind: beads.ErrorUnavailable, Operation: "configure", Detail: "bd executable cannot be resolved", Cause: err,
+		}
+	}
+	provider, err := beads.New(ctx, beads.Config{
+		Executable: executable, ProjectDir: projectDir, Project: projectDir,
+	})
+	if err != nil {
+		return application.WorkReference{}, err
+	}
+	return provider.Observe(ctx, objectID)
 }

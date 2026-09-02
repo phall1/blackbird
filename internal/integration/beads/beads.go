@@ -17,13 +17,16 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/phall1/blackbird/internal/application"
 )
 
 const (
 	ProviderName           = "beads"
-	SupportedVersion       = "1.1.2"
+	SupportedVersion       = "1.2.2"
 	SupportedSchemaVersion = 1
 	CapabilityObserveWork  = "work_reference.observe"
 
@@ -70,45 +73,12 @@ type Config struct {
 	MaxOutputBytes int
 }
 
-// Probe describes the exact supported provider interface and artifact.
-type Probe struct {
-	Provider      string   `json:"provider"`
-	Version       string   `json:"version"`
-	Build         string   `json:"build"`
-	Branch        string   `json:"branch"`
-	SchemaVersion int      `json:"schema_version"`
-	Capabilities  []string `json:"capabilities"`
-	Executable    string   `json:"executable"`
-	BinarySHA256  string   `json:"binary_sha256"`
-}
-
-// Dependency is a provider-owned dependency observation.
-type Dependency struct {
-	ObjectID string `json:"object_id"`
-	Type     string `json:"type"`
-	Status   string `json:"status"`
-}
-
-// WorkFields is the deliberately narrow provider-owned projection.
-type WorkFields struct {
-	Title        string       `json:"title"`
-	IssueType    string       `json:"issue_type"`
-	Status       string       `json:"status"`
-	Priority     int          `json:"priority"`
-	Assignee     string       `json:"assignee,omitempty"`
-	Dependencies []Dependency `json:"dependencies"`
-}
-
-// WorkReference is an observation, not Blackbird authority over work fields.
-type WorkReference struct {
-	Provider        string     `json:"provider"`
-	Project         string     `json:"project"`
-	ObjectID        string     `json:"object_id"`
-	ObservedVersion string     `json:"observed_version"`
-	ObservedAt      time.Time  `json:"observed_at"`
-	Fields          WorkFields `json:"fields"`
-	Provenance      Probe      `json:"provenance"`
-}
+// Provider-neutral work observations live at the application boundary; these
+// aliases preserve the adapter's public API.
+type Probe = application.WorkReferenceProvenance
+type Dependency = application.WorkReferenceDependency
+type WorkFields = application.WorkReferenceFields
+type WorkReference = application.WorkReference
 
 // Invocation is a stable, body-free audit record of one direct execution.
 type Invocation struct {
@@ -190,7 +160,7 @@ func validateConfig(config Config) (Config, string, error) {
 	if !filepath.IsAbs(config.Executable) {
 		return Config{}, "", &DependencyError{Kind: ErrorUnavailable, Operation: "configure", Detail: "executable must be absolute"}
 	}
-	if !filepath.IsAbs(config.ProjectDir) || !identifierPattern.MatchString(config.Project) ||
+	if !filepath.IsAbs(config.ProjectDir) || !validProject(config.Project) ||
 		config.Timeout <= 0 || config.MaxOutputBytes <= 0 {
 		return Config{}, "", &DependencyError{Kind: ErrorMalformed, Operation: "configure", Detail: "configuration is invalid"}
 	}
@@ -203,6 +173,14 @@ func validateConfig(config Config) (Config, string, error) {
 		return Config{}, "", &DependencyError{Kind: ErrorUnavailable, Operation: "configure", Detail: "executable cannot be verified", Cause: err}
 	}
 	return config, digest, nil
+}
+
+func validProject(project string) bool {
+	if identifierPattern.MatchString(project) {
+		return true
+	}
+	return len(project) <= 4096 && filepath.IsAbs(project) && filepath.Clean(project) == project &&
+		!strings.ContainsAny(project, "\x00\r\n")
 }
 
 func (a *Adapter) Probe() Probe {

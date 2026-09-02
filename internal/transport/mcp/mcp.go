@@ -22,17 +22,18 @@ import (
 )
 
 const (
-	ToolAgentRegister      = "blackbird_agent_register"
-	ToolAgentsList         = "blackbird_agents_list"
-	ToolConversationOpen   = "blackbird_conversation_open"
-	ToolMessageSend        = "blackbird_message_send"
-	ToolInboxFetch         = "blackbird_inbox_fetch"
-	ToolThreadFetch        = "blackbird_thread_fetch"
-	ToolMessageFact        = "blackbird_message_fact"
-	ToolReservationAcquire = "blackbird_reservation_acquire"
-	ToolReservationChange  = "blackbird_reservation_change"
-	ToolReservationsStatus = "blackbird_reservations_status"
-	ToolWait               = "blackbird_wait"
+	ToolAgentRegister        = "blackbird_agent_register"
+	ToolAgentsList           = "blackbird_agents_list"
+	ToolConversationOpen     = "blackbird_conversation_open"
+	ToolMessageSend          = "blackbird_message_send"
+	ToolInboxFetch           = "blackbird_inbox_fetch"
+	ToolThreadFetch          = "blackbird_thread_fetch"
+	ToolMessageFact          = "blackbird_message_fact"
+	ToolReservationAcquire   = "blackbird_reservation_acquire"
+	ToolReservationChange    = "blackbird_reservation_change"
+	ToolReservationsStatus   = "blackbird_reservations_status"
+	ToolWait                 = "blackbird_wait"
+	ToolWorkReferenceObserve = "blackbird_work_reference_observe"
 
 	ResourceCoordinationProtocol = "blackbird://coordination/protocol"
 	mediaTypeMarkdown            = "text/markdown"
@@ -48,13 +49,11 @@ type MetricsObserver interface {
 }
 
 type Dependencies struct {
-	Coordination application.LocalCoordinationStore
-	// Observations is optional. When it is absent the spend tool is not
-	// registered at all, so a daemon that collects no telemetry spends none of
-	// its clients' tool-list budget advertising a report it cannot produce.
-	Observations application.TelemetryReader
-	Logger       *slog.Logger
-	Metrics      MetricsObserver
+	Coordination   application.LocalCoordinationStore
+	Observations   application.TelemetryReader
+	WorkReferences application.WorkReferenceObserver
+	Logger         *slog.Logger
+	Metrics        MetricsObserver
 }
 
 type Server struct{ *sdkmcp.Server }
@@ -73,7 +72,7 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	}
 	sdk.AddReceivingMiddleware(logToolFailures(logger, dependencies.Metrics))
 	registerCoordinationProtocol(sdk)
-	registerCoordinationTools(sdk, dependencies.Coordination, logger)
+	registerCoordinationTools(sdk, dependencies.Coordination, dependencies.WorkReferences, logger)
 	if !isNil(dependencies.Observations) {
 		registerSpendTool(sdk, dependencies.Coordination, dependencies.Observations, logger)
 	}
@@ -205,6 +204,10 @@ type agentPeerOutput struct {
 }
 type tokenInput struct {
 	AgentToken string `json:"agent_token"`
+}
+type observeWorkReferenceInput struct {
+	AgentToken string `json:"agent_token" jsonschema:"The registration_token returned by blackbird_agent_register for this repository."`
+	ObjectID   string `json:"object_id" jsonschema:"Issue identifier owned by the repository's work tracker."`
 }
 type activeAgentOutput struct {
 	Name       string `json:"name"`
@@ -377,7 +380,12 @@ type blockedError struct {
 func (blocked *blockedError) Error() string { return blocked.cause.Error() }
 func (blocked *blockedError) Unwrap() error { return blocked.cause }
 
-func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoordinationStore, logger *slog.Logger) {
+func registerCoordinationTools(
+	server *sdkmcp.Server,
+	store application.LocalCoordinationStore,
+	workReferences application.WorkReferenceObserver,
+	logger *slog.Logger,
+) {
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolAgentRegister,
 		Description: "Call this first. Read blackbird://coordination/protocol for the complete workflow. " +
 			"Start or resume a durable local agent session for a repository key and agent name. " +
@@ -399,6 +407,18 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 			}
 			return localAgentSessionOutput(session, issued, snapshot), nil
 		})
+	if !isNil(workReferences) {
+		coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolWorkReferenceObserve,
+			Description: "Observe one provider-owned work item for the caller's repository. " +
+				"The result is a read-only citation; Blackbird does not own or mutate tracker state."},
+			func(ctx context.Context, input observeWorkReferenceInput) (application.WorkReference, error) {
+				session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+				if err != nil {
+					return application.WorkReference{}, err
+				}
+				return workReferences.ObserveWorkReference(ctx, session.ProjectKey, input.ObjectID)
+			})
+	}
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolAgentsList,
 		Description: "List agent sessions active in the caller's repository. Use it to learn the names " +
 			"blackbird_message_send addresses; use blackbird_reservations_status to learn what they are holding.",

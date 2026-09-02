@@ -24,7 +24,7 @@ import (
 var coordinationToolNames = []string{
 	ToolAgentRegister, ToolAgentsList, ToolConversationOpen, ToolMessageSend,
 	ToolInboxFetch, ToolThreadFetch, ToolMessageFact, ToolReservationAcquire,
-	ToolReservationChange, ToolReservationsStatus, ToolWait,
+	ToolReservationChange, ToolReservationsStatus, ToolWait, ToolWorkReferenceObserve,
 }
 
 func TestNewServerRequiresCompleteComposition(t *testing.T) {
@@ -180,6 +180,26 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "docs"}}})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "docs/guide.md"}}})
+}
+
+func TestWorkReferenceObservationUsesAuthenticatedProject(t *testing.T) {
+	t.Parallel()
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "work-reference.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	client, closeMCP := connect(t, newTestServer(t, store))
+	defer closeMCP()
+
+	session := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
+	observed := callCoord[application.WorkReference](t, client, ToolWorkReferenceObserve,
+		observeWorkReferenceInput{AgentToken: session.RegistrationToken, ObjectID: "blackbird-a1u.10"})
+	if observed.Project != "/workspace/repo" || observed.ObjectID != "blackbird-a1u.10" ||
+		observed.Provider != "test" || observed.Fields.Title != "Observed work" {
+		t.Fatalf("observed work reference = %+v", observed)
+	}
 }
 
 func TestCoordinationSurfaceAndProtocol(t *testing.T) {
@@ -991,9 +1011,23 @@ func callCoord[Output any](t *testing.T, session *sdkmcp.ClientSession, tool str
 	return output
 }
 
+type testWorkReferenceObserver struct{}
+
+func (testWorkReferenceObserver) ObserveWorkReference(
+	_ context.Context,
+	projectDir string,
+	objectID string,
+) (application.WorkReference, error) {
+	return application.WorkReference{
+		Provider: "test", Project: projectDir, ObjectID: objectID,
+		ObservedVersion: "1", ObservedAt: time.Unix(1, 0).UTC(),
+		Fields: application.WorkReferenceFields{Title: "Observed work", IssueType: "task", Status: "open"},
+	}, nil
+}
+
 func newTestServer(t *testing.T, store application.LocalCoordinationStore) *Server {
 	t.Helper()
-	server, err := NewServer(Dependencies{Coordination: store})
+	server, err := NewServer(Dependencies{Coordination: store, WorkReferences: testWorkReferenceObserver{}})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

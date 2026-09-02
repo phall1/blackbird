@@ -635,6 +635,48 @@ const (
 	MaxCoordinationNameBytes = 128
 )
 
+// WorkReferenceObserver reads provider-owned work without making Blackbird an
+// authority over its fields.
+type WorkReferenceObserver interface {
+	ObserveWorkReference(context.Context, string, string) (WorkReference, error)
+}
+
+type WorkReference struct {
+	Provider        string                  `json:"provider"`
+	Project         string                  `json:"project"`
+	ObjectID        string                  `json:"object_id"`
+	ObservedVersion string                  `json:"observed_version"`
+	ObservedAt      time.Time               `json:"observed_at"`
+	Fields          WorkReferenceFields     `json:"fields"`
+	Provenance      WorkReferenceProvenance `json:"provenance"`
+}
+
+type WorkReferenceFields struct {
+	Title        string                    `json:"title"`
+	IssueType    string                    `json:"issue_type"`
+	Status       string                    `json:"status"`
+	Priority     int                       `json:"priority"`
+	Assignee     string                    `json:"assignee,omitempty"`
+	Dependencies []WorkReferenceDependency `json:"dependencies"`
+}
+
+type WorkReferenceDependency struct {
+	ObjectID string `json:"object_id"`
+	Type     string `json:"type"`
+	Status   string `json:"status"`
+}
+
+type WorkReferenceProvenance struct {
+	Provider      string   `json:"provider"`
+	Version       string   `json:"version"`
+	Build         string   `json:"build"`
+	Branch        string   `json:"branch"`
+	SchemaVersion int      `json:"schema_version"`
+	Capabilities  []string `json:"capabilities"`
+	Executable    string   `json:"executable"`
+	BinarySHA256  string   `json:"binary_sha256"`
+}
+
 type LocalAgentSession struct {
 	ProjectKey     string
 	AgentName      string
