@@ -1,12 +1,14 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -459,4 +461,67 @@ type testSecrets struct{ value PostgreSQLSecrets }
 
 func (source testSecrets) PostgreSQL(context.Context) (PostgreSQLSecrets, error) {
 	return source.value, nil
+}
+
+func TestLogSeverityIsAdjustableWithoutARestart(t *testing.T) {
+	t.Parallel()
+	var output syncWriter
+	config := Config{Storage: StorageSQLite, SQLitePath: "blackbird.db", HTTPAddress: ":8080", MCPAddress: ":8081"}
+	logger, severity, err := NewLeveledLogger(config, &output)
+	if err != nil {
+		t.Fatalf("NewLeveledLogger() error = %v", err)
+	}
+	daemon, err := NewDaemon(BuildInfo{}, config, Dependencies{
+		Logger: logger, LogSeverity: severity, Compose: func(context.Context, Storage) (HandlerBundle, error) {
+			return HandlerBundle{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDaemon() error = %v", err)
+	}
+	if daemon.LogLevel() != slog.LevelInfo {
+		t.Fatalf("LogLevel() = %v, want INFO", daemon.LogLevel())
+	}
+	logger.Debug("before")
+	if strings.Contains(output.String(), "before") {
+		t.Fatalf("debug record emitted at INFO:\n%s", output.String())
+	}
+	if !daemon.SetLogLevel(slog.LevelDebug) {
+		t.Fatal("SetLogLevel() = false, want the runtime-owned severity to move")
+	}
+	logger.Debug("after")
+	if !strings.Contains(output.String(), "after") || daemon.LogLevel() != slog.LevelDebug {
+		t.Fatalf("debug record suppressed after raising verbosity:\n%s", output.String())
+	}
+}
+
+func TestLogSeverityIsNotClaimedForACallerOwnedHandler(t *testing.T) {
+	t.Parallel()
+	daemon := newTestDaemon(t, Dependencies{Compose: func(context.Context, Storage) (HandlerBundle, error) {
+		return HandlerBundle{}, nil
+	}})
+	if daemon.SetLogLevel(slog.LevelDebug) {
+		t.Fatal("SetLogLevel() = true for a logger whose level control runtime never received")
+	}
+	if daemon.LogLevel() != slog.LevelInfo {
+		t.Fatalf("LogLevel() = %v, want the INFO default", daemon.LogLevel())
+	}
+}
+
+// syncWriter collects log output written from whichever goroutine emitted it.
+type syncWriter struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (writer *syncWriter) Write(data []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.buffer.Write(data)
+}
+
+func (writer *syncWriter) String() string {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.buffer.String()
 }

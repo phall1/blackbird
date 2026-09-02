@@ -2,11 +2,13 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	stdhttp "net/http"
 	"net/url"
@@ -33,6 +35,10 @@ const (
 
 type LocalDependencies struct {
 	Coordination application.LocalCoordinationStore
+	// Logger receives the causes the sanitized local problems drop, plus one
+	// access record per request. A nil Logger is silent rather than a
+	// composition error, so a test can exercise a route without a log sink.
+	Logger       *slog.Logger
 	PollInterval time.Duration
 	Heartbeat    time.Duration
 	WriteTimeout time.Duration
@@ -40,9 +46,20 @@ type LocalDependencies struct {
 
 type localHandler struct {
 	coordination application.LocalCoordinationStore
+	logger       *slog.Logger
 	pollInterval time.Duration
 	heartbeat    time.Duration
 	writeTimeout time.Duration
+}
+
+// localRequestIDKey carries the request's correlation id from the access
+// middleware to the handlers, so a logged failure and its access record share
+// one key even though the local wire contract has no request_id field.
+type localRequestIDKey struct{}
+
+func localRequestID(request *stdhttp.Request) string {
+	value, _ := request.Context().Value(localRequestIDKey{}).(string)
+	return value
 }
 
 type localRegisterRequest struct {
@@ -118,14 +135,93 @@ func NewLocalHandler(dependencies LocalDependencies) (stdhttp.Handler, error) {
 	if dependencies.WriteTimeout == 0 {
 		dependencies.WriteTimeout = localWriteTimeout
 	}
-	handler := &localHandler{coordination: dependencies.Coordination, pollInterval: dependencies.PollInterval,
-		heartbeat: dependencies.Heartbeat, writeTimeout: dependencies.WriteTimeout}
+	logger := dependencies.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	handler := &localHandler{coordination: dependencies.Coordination, logger: logger,
+		pollInterval: dependencies.PollInterval,
+		heartbeat:    dependencies.Heartbeat, writeTimeout: dependencies.WriteTimeout}
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("POST "+PathLocalAgentRegister, handler.register)
 	mux.HandleFunc("GET "+PathLocalCoordinationEvents, handler.events)
 	mux.HandleFunc("GET "+PathLocalCoordinationEventsStream, handler.stream)
 	mux.HandleFunc("GET "+PathLocalMessages+"{message_id}", handler.message)
-	return localSafety(mux), nil
+	// Access logging wraps the loopback guard so a rejected non-loopback caller
+	// is recorded too — that rejection is exactly the one an operator hunts for.
+	return handler.access(localSafety(mux)), nil
+}
+
+// access resolves the request's correlation id and emits one record per
+// request. It logs the path but never the query string or any header: the local
+// surface carries bearer tokens in both places.
+func (handler *localHandler) access(next stdhttp.Handler) stdhttp.Handler {
+	return stdhttp.HandlerFunc(func(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
+		started := time.Now()
+		requestID := inboundRequestID(request)
+		recorder := &localRecorder{ResponseWriter: writer}
+		next.ServeHTTP(recorder, request.WithContext(
+			context.WithValue(request.Context(), localRequestIDKey{}, requestID)))
+		handler.logger.Info("local request",
+			slog.String("request_id", requestID),
+			slog.String("method", request.Method),
+			slog.String("path", request.URL.Path),
+			slog.Int("status", recorder.committedStatus()),
+			slog.Int64("duration_ms", time.Since(started).Milliseconds()))
+	})
+}
+
+// localRecorder observes the committed status for the access record. It has to
+// forward the streaming capabilities the SSE route depends on: Flush directly,
+// and the write deadlines ResponseController reaches through Unwrap.
+type localRecorder struct {
+	stdhttp.ResponseWriter
+	status int
+}
+
+func (recorder *localRecorder) WriteHeader(status int) {
+	if recorder.status == 0 {
+		recorder.status = status
+	}
+	recorder.ResponseWriter.WriteHeader(status)
+}
+
+func (recorder *localRecorder) Write(data []byte) (int, error) {
+	if recorder.status == 0 {
+		recorder.status = stdhttp.StatusOK
+	}
+	return recorder.ResponseWriter.Write(data)
+}
+
+func (recorder *localRecorder) Flush() {
+	if flusher, ok := recorder.ResponseWriter.(stdhttp.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (recorder *localRecorder) Unwrap() stdhttp.ResponseWriter { return recorder.ResponseWriter }
+
+// committedStatus reports what net/http will have sent: a handler that returned
+// without writing anything still produces 200.
+func (recorder *localRecorder) committedStatus() int {
+	if recorder.status == 0 {
+		return stdhttp.StatusOK
+	}
+	return recorder.status
+}
+
+// fail records the cause before the client receives the sanitized problem.
+// Without it every %w chain the application built dies at this boundary.
+func (handler *localHandler) fail(writer stdhttp.ResponseWriter, request *stdhttp.Request, operation string, err error) {
+	handler.logFailure(request, operation, err)
+	writeLocalError(writer, err)
+}
+
+func (handler *localHandler) logFailure(request *stdhttp.Request, operation string, err error) {
+	handler.logger.Error("local operation failed",
+		slog.String("request_id", localRequestID(request)),
+		slog.String("operation", operation),
+		slog.Any("error", err))
 }
 
 func (handler *localHandler) message(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
@@ -152,7 +248,7 @@ func (handler *localHandler) message(writer stdhttp.ResponseWriter, request *std
 			writeLocalProblem(writer, stdhttp.StatusNotFound, domain.ErrorCodeNotFound, "message was not found")
 			return
 		}
-		writeLocalError(writer, err)
+		handler.fail(writer, request, "message.get", err)
 		return
 	}
 	writeLocalJSON(writer, stdhttp.StatusOK, localMessageOutput(message))
@@ -226,7 +322,7 @@ func (handler *localHandler) register(writer stdhttp.ResponseWriter, request *st
 	}
 	session, issued, err := handler.coordination.RegisterLocalAgent(request.Context(), input.ProjectKey, input.AgentName, token)
 	if err != nil {
-		writeLocalError(writer, err)
+		handler.fail(writer, request, "agent.register", err)
 		return
 	}
 	writeLocalJSON(writer, stdhttp.StatusOK, localRegisterResponse{ProjectKey: session.ProjectKey, AgentName: session.AgentName,
@@ -248,7 +344,7 @@ func (handler *localHandler) events(writer stdhttp.ResponseWriter, request *stdh
 	}
 	page, err := handler.sync(request, session, after, limit)
 	if err != nil {
-		writeLocalError(writer, err)
+		handler.fail(writer, request, "coordination.events", err)
 		return
 	}
 	events := make([]localCoordinationEvent, 0, len(page.Events()))
@@ -287,7 +383,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 	// Validate the supplied cursor before committing an SSE response.
 	page, err := handler.sync(request, session, after, application.MaxQueryPageSize)
 	if err != nil {
-		writeLocalError(writer, err)
+		handler.fail(writer, request, "coordination.events.stream", err)
 		return
 	}
 	writer.Header().Set("Content-Type", "text/event-stream")
@@ -320,6 +416,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 			if page.HasMore() {
 				page, err = handler.sync(request, session, cursor, application.MaxQueryPageSize)
 				if err != nil {
+					handler.logFailure(request, "coordination.events.stream", err)
 					return
 				}
 				continue
@@ -335,6 +432,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 		case <-poll.C:
 			page, err = handler.sync(request, session, cursor, application.MaxQueryPageSize)
 			if err != nil {
+				handler.logFailure(request, "coordination.events.stream", err)
 				return
 			}
 		}
@@ -364,7 +462,7 @@ func (handler *localHandler) authenticate(writer stdhttp.ResponseWriter, request
 	session, err := handler.coordination.AuthenticateLocalAgent(request.Context(), value[7:])
 	if err != nil {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
-		writeLocalError(writer, err)
+		handler.fail(writer, request, "agent.authenticate", err)
 		return application.LocalAgentSession{}, false
 	}
 	return session, true

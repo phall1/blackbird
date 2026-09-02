@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	stdhttp "net/http"
 	"reflect"
@@ -41,7 +42,16 @@ const (
 
 	mediaTypeJSON    = "application/json"
 	mediaTypeProblem = "application/problem+json"
+
+	// headerRequestID lets a caller supply the correlation id this transport
+	// would otherwise mint, so a client trace and a daemon log line share one key.
+	headerRequestID = "X-Request-Id"
 )
+
+// errIncoherentResult names the contract violation of a collaborator that
+// returned neither a usable value nor a single typed failure. Logging it beats
+// logging a nil error, which reads as a spurious success in the record.
+var errIncoherentResult = errors.New("collaborator returned neither a value nor a single typed failure")
 
 type AuthenticationEvidence = contracts.AuthenticationEvidence
 
@@ -73,6 +83,10 @@ type ContextGetHandler = contracts.ContextGetHandler
 type EventsSyncHandler = contracts.EventsSyncHandler
 
 type Dependencies struct {
+	// Logger receives the wrapped causes the sanitized wire DTOs must not carry,
+	// plus one access record per request. A nil Logger is silent rather than a
+	// composition error, so a test can exercise a route without a log sink.
+	Logger                    *slog.Logger
 	Authenticator             Authenticator
 	InstallationBootstrap     InstallationBootstrapHandler
 	PrincipalRegister         PrincipalRegisterHandler
@@ -111,61 +125,66 @@ func NewHandler(dependencies Dependencies) (stdhttp.Handler, error) {
 		return nil, errors.New("http transport requires every W0/W1 handler and authenticator")
 	}
 
+	logger := dependencies.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+
 	mux := stdhttp.NewServeMux()
-	commandRoute(mux, PathInstallationBootstrap, contracts.OperationInstallationBootstrap, dependencies.Authenticator,
+	commandRoute(mux, logger, PathInstallationBootstrap, contracts.OperationInstallationBootstrap, dependencies.Authenticator,
 		contracts.DecodeInstallationBootstrapRequest, func(request contracts.InstallationBootstrapRequestDTO) time.Time { return request.Deadline },
 		dependencies.InstallationBootstrap.HandleInstallationBootstrap, func(result contracts.InstallationBootstrapResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathPrincipalRegister, contracts.OperationPrincipalRegister, dependencies.Authenticator,
+	commandRoute(mux, logger, PathPrincipalRegister, contracts.OperationPrincipalRegister, dependencies.Authenticator,
 		contracts.DecodePrincipalRegisterRequest, func(request contracts.PrincipalRegisterRequestDTO) time.Time { return request.Deadline },
 		dependencies.PrincipalRegister.HandlePrincipalRegister, func(result contracts.PrincipalRegisterResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathDevicePairingBegin, contracts.OperationDevicePairingBegin, dependencies.Authenticator,
+	commandRoute(mux, logger, PathDevicePairingBegin, contracts.OperationDevicePairingBegin, dependencies.Authenticator,
 		contracts.DecodeDevicePairingBeginRequest, func(request contracts.DevicePairingBeginRequestDTO) time.Time { return request.Deadline },
 		dependencies.DevicePairingBegin.HandleDevicePairingBegin, func(result contracts.DevicePairingBeginResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathDevicePair, contracts.OperationDevicePair, dependencies.Authenticator,
+	commandRoute(mux, logger, PathDevicePair, contracts.OperationDevicePair, dependencies.Authenticator,
 		contracts.DecodeDevicePairRequest, func(request contracts.DevicePairRequestDTO) time.Time { return request.Deadline },
 		dependencies.DevicePair.HandleDevicePair, func(result contracts.DevicePairResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathWorkspaceCreate, contracts.OperationWorkspaceCreate, dependencies.Authenticator,
+	commandRoute(mux, logger, PathWorkspaceCreate, contracts.OperationWorkspaceCreate, dependencies.Authenticator,
 		contracts.DecodeWorkspaceCreateRequest, func(request contracts.WorkspaceCreateRequestDTO) time.Time { return request.Deadline },
 		dependencies.WorkspaceCreate.HandleWorkspaceCreate, func(result contracts.WorkspaceCreateResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathWorkspaceMemberInvite, contracts.OperationWorkspaceMemberInvite, dependencies.Authenticator,
+	commandRoute(mux, logger, PathWorkspaceMemberInvite, contracts.OperationWorkspaceMemberInvite, dependencies.Authenticator,
 		contracts.DecodeWorkspaceMemberInviteRequest, func(request contracts.WorkspaceMemberInviteRequestDTO) time.Time { return request.Deadline },
 		dependencies.WorkspaceMemberInvite.HandleWorkspaceMemberInvite, func(result contracts.WorkspaceMemberInviteResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathWorkspaceMembershipAccept, contracts.OperationWorkspaceMembershipAccept, dependencies.Authenticator,
+	commandRoute(mux, logger, PathWorkspaceMembershipAccept, contracts.OperationWorkspaceMembershipAccept, dependencies.Authenticator,
 		contracts.DecodeWorkspaceMembershipAcceptRequest, func(request contracts.WorkspaceMembershipAcceptRequestDTO) time.Time { return request.Deadline },
 		dependencies.WorkspaceMembershipAccept.HandleWorkspaceMembershipAccept, func(result contracts.WorkspaceMembershipAcceptResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathActorCreate, contracts.OperationActorCreate, dependencies.Authenticator,
+	commandRoute(mux, logger, PathActorCreate, contracts.OperationActorCreate, dependencies.Authenticator,
 		contracts.DecodeActorCreateRequest, func(request contracts.ActorCreateRequestDTO) time.Time { return request.Deadline },
 		dependencies.ActorCreate.HandleActorCreate, func(result contracts.ActorCreateResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathActorDelegationPropose, contracts.OperationActorDelegationPropose, dependencies.Authenticator,
+	commandRoute(mux, logger, PathActorDelegationPropose, contracts.OperationActorDelegationPropose, dependencies.Authenticator,
 		contracts.DecodeActorDelegationProposeRequest, func(request contracts.ActorDelegationProposeRequestDTO) time.Time { return request.Deadline },
 		dependencies.ActorDelegationPropose.HandleActorDelegationPropose, func(result contracts.ActorDelegationProposeResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathActorDelegationActivate, contracts.OperationActorDelegationActivate, dependencies.Authenticator,
+	commandRoute(mux, logger, PathActorDelegationActivate, contracts.OperationActorDelegationActivate, dependencies.Authenticator,
 		contracts.DecodeActorDelegationActivateRequest, func(request contracts.ActorDelegationActivateRequestDTO) time.Time { return request.Deadline },
 		dependencies.ActorDelegationActivate.HandleActorDelegationActivate, func(result contracts.ActorDelegationActivateResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathSessionStart, contracts.OperationSessionStart, dependencies.Authenticator,
+	commandRoute(mux, logger, PathSessionStart, contracts.OperationSessionStart, dependencies.Authenticator,
 		contracts.DecodeSessionStartRequest, func(request contracts.SessionStartRequestDTO) time.Time { return request.Deadline },
 		dependencies.SessionStart.HandleSessionStart, func(result contracts.SessionStartResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathWorkRefObserve, contracts.OperationWorkRefObserve, dependencies.Authenticator,
+	commandRoute(mux, logger, PathWorkRefObserve, contracts.OperationWorkRefObserve, dependencies.Authenticator,
 		contracts.DecodeWorkRefObserveRequest, func(request contracts.WorkRefObserveRequestDTO) time.Time { return request.Deadline },
 		dependencies.WorkRefObserve.HandleWorkRefObserve, func(result contracts.WorkRefObserveResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathObjectiveAndWorkCreate, contracts.OperationObjectiveAndWorkCreate, dependencies.Authenticator,
+	commandRoute(mux, logger, PathObjectiveAndWorkCreate, contracts.OperationObjectiveAndWorkCreate, dependencies.Authenticator,
 		contracts.DecodeObjectiveAndWorkCreateRequest, func(request contracts.ObjectiveAndWorkCreateRequestDTO) time.Time { return request.Deadline },
 		dependencies.ObjectiveAndWorkCreate.HandleObjectiveAndWorkCreate, func(result contracts.ObjectiveAndWorkCreateResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathObjectiveActivate, contracts.OperationObjectiveActivate, dependencies.Authenticator,
+	commandRoute(mux, logger, PathObjectiveActivate, contracts.OperationObjectiveActivate, dependencies.Authenticator,
 		contracts.DecodeObjectiveActivateRequest, func(request contracts.ObjectiveActivateRequestDTO) time.Time { return request.Deadline },
 		dependencies.ObjectiveActivate.HandleObjectiveActivate, func(result contracts.ObjectiveActivateResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathRunPlanWithBindings, contracts.OperationRunPlanWithBindings, dependencies.Authenticator,
+	commandRoute(mux, logger, PathRunPlanWithBindings, contracts.OperationRunPlanWithBindings, dependencies.Authenticator,
 		contracts.DecodeRunPlanWithBindingsRequest, func(request contracts.RunPlanWithBindingsRequestDTO) time.Time { return request.Deadline },
 		dependencies.RunPlanWithBindings.HandleRunPlanWithBindings, func(result contracts.RunPlanWithBindingsResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathRunJoin, contracts.OperationRunJoin, dependencies.Authenticator,
+	commandRoute(mux, logger, PathRunJoin, contracts.OperationRunJoin, dependencies.Authenticator,
 		contracts.DecodeRunJoinRequest, func(request contracts.RunJoinRequestDTO) time.Time { return request.Deadline },
 		dependencies.RunJoin.HandleRunJoin, func(result contracts.RunJoinResultDTO) error { return result.Validate() })
-	commandRoute(mux, PathRunStart, contracts.OperationRunStart, dependencies.Authenticator,
+	commandRoute(mux, logger, PathRunStart, contracts.OperationRunStart, dependencies.Authenticator,
 		contracts.DecodeRunStartRequest, func(request contracts.RunStartRequestDTO) time.Time { return request.Deadline },
 		dependencies.RunStart.HandleRunStart, func(result contracts.RunStartResultDTO) error { return result.Validate() })
-	queryRoute(mux, PathContextGet, contracts.OperationContextGet, dependencies.Authenticator,
+	queryRoute(mux, logger, PathContextGet, contracts.OperationContextGet, dependencies.Authenticator,
 		contracts.DecodeContextGetRequest, dependencies.ContextGet.HandleContextGet, func(result contracts.ContextPageDTO) error { return result.Validate() })
-	queryRoute(mux, PathEventsSync, contracts.OperationEventsSync, dependencies.Authenticator,
+	queryRoute(mux, logger, PathEventsSync, contracts.OperationEventsSync, dependencies.Authenticator,
 		contracts.DecodeEventsSyncRequest, dependencies.EventsSync.HandleEventsSync, func(result contracts.EventPageDTO) error { return result.Validate() })
 	return mux, nil
 }
@@ -174,6 +193,7 @@ type operationHandler[Request, Result any] func(context.Context, AuthenticationE
 
 func commandRoute[Request, Result any](
 	mux *stdhttp.ServeMux,
+	logger *slog.Logger,
 	path, operation string,
 	authenticator Authenticator,
 	decode func([]byte) (Request, error),
@@ -181,21 +201,23 @@ func commandRoute[Request, Result any](
 	handle operationHandler[Request, Result],
 	validate func(Result) error,
 ) {
-	mux.HandleFunc("POST "+path, serveOperation(operation, authenticator, decode, deadline, handle, validate))
+	mux.HandleFunc("POST "+path, serveOperation(logger, operation, authenticator, decode, deadline, handle, validate))
 }
 
 func queryRoute[Request, Result any](
 	mux *stdhttp.ServeMux,
+	logger *slog.Logger,
 	path, operation string,
 	authenticator Authenticator,
 	decode func([]byte) (Request, error),
 	handle operationHandler[Request, Result],
 	validate func(Result) error,
 ) {
-	mux.HandleFunc("POST "+path, serveOperation(operation, authenticator, decode, nil, handle, validate))
+	mux.HandleFunc("POST "+path, serveOperation(logger, operation, authenticator, decode, nil, handle, validate))
 }
 
 func serveOperation[Request, Result any](
+	logger *slog.Logger,
 	operation string,
 	authenticator Authenticator,
 	decode func([]byte) (Request, error),
@@ -204,9 +226,25 @@ func serveOperation[Request, Result any](
 	validate func(Result) error,
 ) stdhttp.HandlerFunc {
 	return func(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
-		requestID := newRequestID()
+		started := time.Now()
+		requestID := inboundRequestID(request)
+		var outcome domain.ErrorCode
+		var actor accessActor
+		// The access record is emitted from a defer so every early return is
+		// accounted for, and it reads the variables below at emit time so it
+		// reports the request id the client was actually answered with.
+		defer func() {
+			logAccess(logger, operation, requestID, outcome, actor, started)
+		}()
+		// Routing every rejection through one closure keeps the logged outcome
+		// and the client's error code from drifting apart.
+		reject := func(failure contracts.ErrorDTO) {
+			outcome = failure.Code
+			writeProblem(writer, failure)
+		}
+
 		if request.Header.Get("Content-Encoding") != "" || !isJSONContentType(request.Header.Get("Content-Type")) {
-			writeProblem(writer, invalidSchema(requestID, "content_type", "request must use unencoded application/json"))
+			reject(invalidSchema(requestID, "content_type", "request must use unencoded application/json"))
 			return
 		}
 		authenticationRequest := request.Clone(request.Context())
@@ -214,26 +252,29 @@ func serveOperation[Request, Result any](
 		authenticationRequest.GetBody = nil
 		evidence, failure, err := authenticator.Authenticate(request.Context(), authenticationRequest, operation, requestID)
 		if err != nil || evidence.Valid() == (failure != nil) {
-			writeProblem(writer, internalFailure(requestID))
+			logOperationFailure(logger, operation, requestID, "authenticate", reportable(err))
+			reject(internalFailure(requestID))
 			return
 		}
 		if failure != nil {
-			writeProblem(writer, checkedFailure(requestID, failure))
+			reject(checkedFailure(requestID, failure))
 			return
 		}
+		actor = actorOf(evidence)
 		body, err := readBody(writer, request)
 		if err != nil {
-			field := "body"
 			message := "request body is invalid JSON"
 			if errors.Is(err, contracts.ErrPayloadTooLarge) {
 				message = fmt.Sprintf("request body exceeds %d bytes", contracts.MaxCommandJSONBytes)
 			}
-			writeProblem(writer, invalidSchema(requestID, field, message))
+			logOperationFailure(logger, operation, requestID, "read_body", err)
+			reject(invalidSchema(requestID, "body", message))
 			return
 		}
 		input, err := decode(body)
 		if err != nil {
-			writeProblem(writer, invalidSchema(requestID, "body", "request body does not match the operation schema"))
+			logOperationFailure(logger, operation, requestID, "decode_request", err)
+			reject(invalidSchema(requestID, "body", "request body does not match the operation schema"))
 			return
 		}
 		requestID = requestIDOf(input, requestID)
@@ -246,26 +287,117 @@ func serveOperation[Request, Result any](
 		result, failure, err := handle(ctx, evidence, input)
 		if err != nil || failure != nil {
 			if err != nil || failure == nil {
-				writeProblem(writer, internalFailure(requestID))
+				logOperationFailure(logger, operation, requestID, "handle", reportable(err))
+				reject(internalFailure(requestID))
 				return
 			}
-			writeProblem(writer, checkedFailure(requestID, failure))
+			reject(checkedFailure(requestID, failure))
 			return
 		}
-		if err := validate(result); err != nil || responseRequestID(result) != requestID {
-			writeProblem(writer, internalFailure(requestID))
+		if err := validate(result); err != nil {
+			logOperationFailure(logger, operation, requestID, "validate_result", err)
+			reject(internalFailure(requestID))
+			return
+		}
+		if carried := responseRequestID(result); carried != requestID {
+			logOperationFailure(logger, operation, requestID, "correlate_result",
+				fmt.Errorf("result carries request id %q", carried))
+			reject(internalFailure(requestID))
 			return
 		}
 		encoded, err := json.Marshal(result)
-		if err != nil || len(encoded) > contracts.MaxOutcomeJSONBytes {
-			writeProblem(writer, internalFailure(requestID))
+		if err != nil {
+			logOperationFailure(logger, operation, requestID, "encode_result", err)
+			reject(internalFailure(requestID))
+			return
+		}
+		if len(encoded) > contracts.MaxOutcomeJSONBytes {
+			logOperationFailure(logger, operation, requestID, "encode_result",
+				fmt.Errorf("result is %d bytes, over the %d byte outcome limit", len(encoded), contracts.MaxOutcomeJSONBytes))
+			reject(internalFailure(requestID))
 			return
 		}
 		writer.Header().Set("Content-Type", mediaTypeJSON)
 		writer.Header().Set("Cache-Control", "no-store")
 		writer.WriteHeader(stdhttp.StatusOK)
-		_, _ = writer.Write(encoded)
+		if _, err := writer.Write(encoded); err != nil {
+			// The status line is already committed, so nothing can be reported to
+			// the client. The log is the only place a truncated answer surfaces.
+			logOperationFailure(logger, operation, requestID, "write_response", err)
+		}
 	}
+}
+
+// accessActor is the identity portion of an access record. It carries opaque
+// identifiers only: the credential fingerprint and channel binding on the
+// evidence are secrets and must never reach a log line.
+type accessActor struct {
+	principalID    string
+	actorSessionID string
+}
+
+func actorOf(evidence AuthenticationEvidence) accessActor {
+	actor := accessActor{principalID: evidence.PrincipalID().String()}
+	if session, present := evidence.ActorSessionID(); present {
+		actor.actorSessionID = session.String()
+	}
+	return actor
+}
+
+// logAccess emits the one record per request that makes a correlation id worth
+// minting: without it the id echoed to the client matches nothing anywhere.
+func logAccess(
+	logger *slog.Logger,
+	operation, requestID string,
+	outcome domain.ErrorCode,
+	actor accessActor,
+	started time.Time,
+) {
+	attributes := []any{
+		slog.String("operation", operation),
+		slog.String("request_id", requestID),
+		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+	}
+	if outcome == "" {
+		attributes = append(attributes, slog.String("outcome", "ok"))
+	} else {
+		attributes = append(attributes, slog.String("outcome", "error"), slog.String("error_code", string(outcome)))
+	}
+	if actor.principalID != "" {
+		attributes = append(attributes, slog.String("principal_id", actor.principalID))
+	}
+	if actor.actorSessionID != "" {
+		attributes = append(attributes, slog.String("actor_session_id", actor.actorSessionID))
+	}
+	logger.Info("http request", attributes...)
+}
+
+// logOperationFailure preserves the wrapped cause the sanitized DTO deliberately
+// drops. The client keeps the generic message; the %w chain goes here and only
+// here.
+func logOperationFailure(logger *slog.Logger, operation, requestID, stage string, err error) {
+	logger.Error("http operation failed",
+		slog.String("operation", operation), slog.String("request_id", requestID),
+		slog.String("stage", stage), slog.Any("error", err))
+}
+
+func reportable(err error) error {
+	if err == nil {
+		return errIncoherentResult
+	}
+	return err
+}
+
+// inboundRequestID prefers a caller-supplied correlation id so a client trace
+// and this daemon's log share one key, and mints one otherwise. Acceptance is
+// decided by round-tripping the candidate through the error contract's own
+// validation, so the size and character rule can never drift from contracts.
+func inboundRequestID(request *stdhttp.Request) string {
+	supplied := request.Header.Values(headerRequestID)
+	if len(supplied) != 1 || internalFailure(supplied[0]).Validate() != nil {
+		return newRequestID()
+	}
+	return supplied[0]
 }
 
 func readBody(writer stdhttp.ResponseWriter, request *stdhttp.Request) ([]byte, error) {

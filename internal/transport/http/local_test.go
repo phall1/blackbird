@@ -366,3 +366,68 @@ func readLocalWakeup(t *testing.T, body io.Reader) localWakeup {
 	t.Fatalf("stream ended before wakeup: %v", scanner.Err())
 	return localWakeup{}
 }
+
+func TestLocalTransportRecordsAccessAndPreservesDiscardedCauses(t *testing.T) {
+	store := openLocalHTTPStore(t, filepath.Join(t.TempDir(), "coordination.db"))
+	sink, logger := newLoggingSink()
+	handler, err := NewLocalHandler(LocalDependencies{Coordination: store, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := registerLocalHTTPDirect(t, handler)
+	if logged := sink.String(); !strings.Contains(logged, `msg="local request"`) ||
+		!strings.Contains(logged, "path="+PathLocalAgentRegister) ||
+		!strings.Contains(logged, "status=200") || !strings.Contains(logged, "duration_ms=") {
+		t.Fatalf("registration access record missing:\n%s", logged)
+	}
+	if strings.Contains(sink.String(), agent.RegistrationToken) {
+		t.Fatalf("access record leaked the registration token:\n%s", sink.String())
+	}
+
+	// A closed store makes every coordination call fail with a wrapped cause the
+	// sanitized local problem is required to drop.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := newLocalHTTPRequest(stdhttp.MethodGet, PathLocalCoordinationEvents, nil)
+	request.Header.Set("Authorization", "Bearer "+agent.RegistrationToken)
+	request.Header.Set(headerRequestID, "req-local-supplied")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code == stdhttp.StatusOK {
+		t.Fatalf("closed store answered %d", response.Code)
+	}
+	logged := sink.String()
+	if !strings.Contains(logged, `msg="local operation failed"`) ||
+		!strings.Contains(logged, "operation=agent.authenticate") {
+		t.Fatalf("failure record missing:\n%s", logged)
+	}
+	if !strings.Contains(logged, "request_id=req-local-supplied") {
+		t.Fatalf("supplied correlation id was not honored:\n%s", logged)
+	}
+	if strings.Contains(response.Body.String(), "sql") || strings.Contains(response.Body.String(), "closed") {
+		t.Fatalf("client body disclosed the cause: %s", response.Body.String())
+	}
+}
+
+func TestLocalAccessRecordRejectsAnInvalidInboundRequestID(t *testing.T) {
+	store := openLocalHTTPStore(t, filepath.Join(t.TempDir(), "coordination.db"))
+	defer func() { _ = store.Close() }()
+	sink, logger := newLoggingSink()
+	handler, err := NewLocalHandler(LocalDependencies{Coordination: store, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := newLocalHTTPRequest(stdhttp.MethodGet, PathLocalCoordinationEvents, nil)
+	request.Header.Set(headerRequestID, "req local supplied")
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	logged := sink.String()
+	if strings.Contains(logged, "req local supplied") {
+		t.Fatalf("access record accepted a request id the error contract rejects:\n%s", logged)
+	}
+	if !strings.Contains(logged, "request_id=req_") || !strings.Contains(logged, "status=401") {
+		t.Fatalf("access record missing a minted id or the rejection status:\n%s", logged)
+	}
+}

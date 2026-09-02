@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +23,7 @@ const actorSessionID = "01b8e094-9888-7000-8000-00000000001f"
 type testAuthenticator struct {
 	operation string
 	seenDone  bool
+	evidence  *AuthenticationEvidence
 	failure   *contracts.ErrorDTO
 	err       error
 }
@@ -40,7 +44,35 @@ func (authenticator *testAuthenticator) Authenticate(
 	if authenticator.err != nil {
 		return AuthenticationEvidence{}, nil, authenticator.err
 	}
+	if authenticator.evidence != nil {
+		return *authenticator.evidence, nil, nil
+	}
 	return validAuthenticationEvidence(), nil, nil
+}
+
+// sessionBoundEvidence is the evidence an authenticated agent presents: the
+// same trusted tuple plus the actor session the access record reports.
+func sessionBoundEvidence(t *testing.T) AuthenticationEvidence {
+	t.Helper()
+	session, err := domain.ParseActorSessionID(actorSessionID)
+	if err != nil {
+		t.Fatalf("parse actor session: %v", err)
+	}
+	base := validAuthenticationEvidence()
+	provenance, err := contracts.NewAuthenticationAuditProvenance(base.AuditProvenance().SourceAuthorityID(), nil)
+	if err != nil {
+		t.Fatalf("audit provenance: %v", err)
+	}
+	evidence, err := contracts.NewAuthenticationEvidence(contracts.AuthenticationEvidenceParams{
+		PrincipalID: base.PrincipalID(), PrincipalRevision: base.PrincipalRevision(),
+		ActorSessionID: &session, ActorSessionRevision: domain.InitialVersion(),
+		ChannelBinding: base.ChannelBindingDigest(), Audience: base.Audience(),
+		AuditProvenance: provenance, VerifiedAt: base.VerifiedAt(),
+	})
+	if err != nil {
+		t.Fatalf("session-bound evidence: %v", err)
+	}
+	return evidence
 }
 
 func validAuthenticationEvidence() AuthenticationEvidence {
@@ -352,4 +384,205 @@ func successfulEvents(
 		Schema: contracts.SchemaEventPage, RequestID: request.RequestID, Operation: contracts.OperationEventsSync,
 		Events: []contracts.RawEventEnvelopeDTO{}, NextCursor: request.AfterCursor, HeadCursor: "bbec1_head", HasMore: false,
 	}, nil, nil
+}
+
+// logSink collects handler log output. It is synchronized because the SSE route
+// logs from a poll loop while the test reads what has been written so far.
+type logSink struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (sink *logSink) Write(data []byte) (int, error) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.buffer.Write(data)
+}
+
+func (sink *logSink) String() string {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.buffer.String()
+}
+
+func newLoggingSink() (*logSink, *slog.Logger) {
+	sink := &logSink{}
+	return sink, slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+func newLoggingTestHandler(t *testing.T, authenticator *testAuthenticator, handlers *testHandlers) (http.Handler, *logSink) {
+	t.Helper()
+	sink, logger := newLoggingSink()
+	dependencies := testDependencies(authenticator, handlers)
+	dependencies.Logger = logger
+	handler, err := NewHandler(dependencies)
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	return handler, sink
+}
+
+func TestInboundRequestIDIsHonoredOnlyWhenTheErrorContractAcceptsIt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		supplied []string
+		want     string
+	}{
+		{name: "absent", supplied: nil},
+		{name: "accepted", supplied: []string{"req-client-supplied"}, want: "req-client-supplied"},
+		{name: "oversize", supplied: []string{"req-" + strings.Repeat("x", 200)}},
+		{name: "whitespace", supplied: []string{"req client supplied"}},
+		{name: "repeated", supplied: []string{"req-first", "req-second"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			handler := newTestHandler(t, &testAuthenticator{}, &testHandlers{events: successfulEvents})
+			// A rejected content type fails before the body is read, so the
+			// answer carries the transport's own correlation id rather than the
+			// one the request payload would have supplied.
+			request := httptest.NewRequest(http.MethodPost, PathEventsSync, strings.NewReader(`{}`))
+			for _, value := range test.supplied {
+				request.Header.Add(headerRequestID, value)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			var problem struct {
+				RequestID string `json:"request_id"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if test.want != "" {
+				if problem.RequestID != test.want {
+					t.Fatalf("request_id = %q, want %q", problem.RequestID, test.want)
+				}
+				return
+			}
+			if !strings.HasPrefix(problem.RequestID, "req_") || len(problem.RequestID) != len("req_")+32 {
+				t.Fatalf("request_id = %q, want a minted req_<128 bits>", problem.RequestID)
+			}
+		})
+	}
+}
+
+func TestDiscardedCausesReachTheLogAndNeverTheClient(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		authenticator *testAuthenticator
+		handlers      *testHandlers
+		stage         string
+	}{
+		{
+			name:          "authenticate",
+			authenticator: &testAuthenticator{err: errors.New("credential backend secret")},
+			handlers:      &testHandlers{events: successfulEvents},
+			stage:         "authenticate",
+		},
+		{
+			name:          "handle",
+			authenticator: &testAuthenticator{},
+			handlers: &testHandlers{events: func(context.Context, AuthenticationEvidence, contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
+				return contracts.EventPageDTO{}, nil, fmt.Errorf("read events: %w", errors.New("credential backend secret"))
+			}},
+			stage: "handle",
+		},
+		{
+			name:          "correlate_result",
+			authenticator: &testAuthenticator{},
+			handlers: &testHandlers{events: func(ctx context.Context, evidence AuthenticationEvidence, request contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
+				page, _, _ := successfulEvents(ctx, evidence, request)
+				page.RequestID = "req-some-other-request"
+				return page, nil, nil
+			}},
+			stage: "correlate_result",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			handler, sink := newLoggingTestHandler(t, test.authenticator, test.handlers)
+			request := httptest.NewRequest(http.MethodPost, PathEventsSync, bytes.NewReader(validEventsRequest(t)))
+			request.Header.Set("Content-Type", mediaTypeJSON)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", response.Code)
+			}
+			if strings.Contains(response.Body.String(), "credential backend secret") ||
+				strings.Contains(response.Body.String(), "req-some-other-request") {
+				t.Fatalf("client body disclosed the cause: %s", response.Body.String())
+			}
+			logged := sink.String()
+			if !strings.Contains(logged, `msg="http operation failed"`) ||
+				!strings.Contains(logged, "stage="+test.stage) ||
+				!strings.Contains(logged, "operation="+contracts.OperationEventsSync) {
+				t.Fatalf("failure record missing stage or operation:\n%s", logged)
+			}
+			if !strings.Contains(logged, "request_id=") {
+				t.Fatalf("failure record omitted the correlation id:\n%s", logged)
+			}
+		})
+	}
+}
+
+func TestAccessRecordCorrelatesOutcomeAndActorWithoutSecrets(t *testing.T) {
+	t.Parallel()
+	failing := &testHandlers{events: func(_ context.Context, _ AuthenticationEvidence, request contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
+		failure := contracts.ErrorDTO{
+			Schema: contracts.SchemaError, RequestID: request.RequestID, Code: domain.ErrorCodeCursorExpired,
+			Category: domain.ErrorCategoryCursor, Message: "The event cursor expired.",
+			Details: contracts.ErrorDetailsDTO{Recovery: contracts.RecoveryObtainCheckpoint},
+		}
+		return contracts.EventPageDTO{}, &failure, nil
+	}}
+	tests := []struct {
+		name     string
+		handlers *testHandlers
+		want     []string
+	}{
+		{
+			name:     "success",
+			handlers: &testHandlers{events: successfulEvents},
+			want:     []string{"outcome=ok", "request_id=req-events-http"},
+		},
+		{
+			name:     "typed failure",
+			handlers: failing,
+			want:     []string{"outcome=error", "error_code=" + string(domain.ErrorCodeCursorExpired)},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			evidence := sessionBoundEvidence(t)
+			handler, sink := newLoggingTestHandler(t, &testAuthenticator{evidence: &evidence}, test.handlers)
+			request := httptest.NewRequest(http.MethodPost, PathEventsSync, bytes.NewReader(validEventsRequest(t)))
+			request.Header.Set("Content-Type", mediaTypeJSON)
+			request.Header.Set("Authorization", "Bearer super-secret-credential")
+			handler.ServeHTTP(httptest.NewRecorder(), request)
+
+			logged := sink.String()
+			if !strings.Contains(logged, `msg="http request"`) {
+				t.Fatalf("no access record:\n%s", logged)
+			}
+			for _, want := range append(test.want,
+				"operation="+contracts.OperationEventsSync,
+				"duration_ms=",
+				"principal_id=01b8e094-9888-7000-8000-000000000004",
+				"actor_session_id="+actorSessionID,
+			) {
+				if !strings.Contains(logged, want) {
+					t.Fatalf("access record missing %q:\n%s", want, logged)
+				}
+			}
+			if strings.Contains(logged, "super-secret-credential") || strings.Contains(logged, strings.Repeat("a", 64)) {
+				t.Fatalf("access record leaked a credential or channel binding:\n%s", logged)
+			}
+		})
+	}
 }

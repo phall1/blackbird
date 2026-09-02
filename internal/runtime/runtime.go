@@ -95,11 +95,23 @@ func (config Config) logLevel() (slog.Level, error) {
 // NewLogger builds the daemon's structured logger. Output belongs on stderr:
 // launchd and systemd both capture it, and stdout carries command output.
 func NewLogger(config Config, output io.Writer) (*slog.Logger, error) {
+	logger, _, err := NewLeveledLogger(config, output)
+	return logger, err
+}
+
+// NewLeveledLogger builds the daemon's logger alongside the severity control it
+// was built with. The level lives in a slog.LevelVar rather than in
+// HandlerOptions because a baked-in level makes raising verbosity cost an edit
+// to a launchd plist or systemd unit and a supervised restart — the daemon is
+// then a different process, and whatever was being diagnosed is gone.
+func NewLeveledLogger(config Config, output io.Writer) (*slog.Logger, *slog.LevelVar, error) {
 	level, err := config.logLevel()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level})), nil
+	severity := new(slog.LevelVar)
+	severity.Set(level)
+	return slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: severity})), severity, nil
 }
 
 func validateTCPAddress(address string) error {
@@ -176,8 +188,12 @@ type IngressServer interface {
 // Dependencies contains lifecycle seams. Zero-valued storage and network
 // factories use their production implementations; Composer is always required.
 type Dependencies struct {
-	Secrets        SecretSource
-	Logger         *slog.Logger
+	Secrets SecretSource
+	Logger  *slog.Logger
+	// LogSeverity is the level control behind Logger. Supplying it alongside a
+	// caller-built Logger is what makes SetLogLevel able to move that logger;
+	// runtime cannot recover a handler's level control from the handler.
+	LogSeverity    *slog.LevelVar
 	Compose        Composer
 	OpenSQLite     func(context.Context, sqlite.Config) (Storage, error)
 	OpenPostgreSQL func(context.Context, postgres.Config) (Storage, error)
@@ -215,6 +231,7 @@ type Daemon struct {
 	config       Config
 	dependencies Dependencies
 	logger       *slog.Logger
+	logSeverity  *slog.LevelVar
 
 	runMu   sync.Mutex
 	running bool
@@ -270,12 +287,14 @@ func NewDaemon(build BuildInfo, config Config, dependencies Dependencies) (*Daem
 			}
 		}
 	}
+	severity := dependencies.LogSeverity
 	if dependencies.Logger == nil {
-		logger, err := NewLogger(config, os.Stderr)
+		logger, defaultSeverity, err := NewLeveledLogger(config, os.Stderr)
 		if err != nil {
 			return nil, fmt.Errorf("runtime configuration: %w", err)
 		}
 		dependencies.Logger = logger
+		severity = defaultSeverity
 	}
 	return &Daemon{
 		build: build.Normalize(), config: config, dependencies: dependencies,
@@ -283,7 +302,29 @@ func NewDaemon(build BuildInfo, config Config, dependencies Dependencies) (*Daem
 			slog.String("version", build.Normalize().Version),
 			slog.Int("pid", os.Getpid()),
 		),
+		logSeverity: severity,
 	}, nil
+}
+
+// SetLogLevel raises or lowers the running daemon's severity and reports
+// whether the change took effect. A caller that supplied its own Logger without
+// the LevelVar that built it owns that handler's level, and runtime must not
+// pretend otherwise.
+func (daemon *Daemon) SetLogLevel(level slog.Level) bool {
+	if daemon.logSeverity == nil {
+		return false
+	}
+	daemon.logSeverity.Set(level)
+	daemon.logger.Info("log level changed", slog.String("level", level.String()))
+	return true
+}
+
+// LogLevel reports the severity the daemon currently emits at.
+func (daemon *Daemon) LogLevel() slog.Level {
+	if daemon.logSeverity == nil {
+		return slog.LevelInfo
+	}
+	return daemon.logSeverity.Level()
 }
 
 // BuildInfo returns the daemon's normalized build identity.
