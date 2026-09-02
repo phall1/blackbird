@@ -11,7 +11,7 @@ import (
 // launchd plist and systemd unit both invoke exactly this command, so every
 // flag here is part of the service definition's contract.
 type DaemonCmd struct {
-	Storage         string        `enum:"sqlite,postgres" default:"${daemon_storage}" help:"Durable storage backend."`
+	Storage         string        `enum:"sqlite" default:"${daemon_storage}" help:"Durable storage backend."`
 	SQLitePath      string        `name:"sqlite-path" placeholder:"PATH" default:"${daemon_sqlite_path}" help:"Absolute path to the SQLite database."`
 	StateDir        string        `name:"state-dir" placeholder:"PATH" default:"${daemon_state_dir}" help:"Directory holding the daemon handshake record."`
 	HTTPAddress     string        `name:"http-address" placeholder:"HOST:PORT" default:"${daemon_http_address}" help:"HTTP listen address."`
@@ -30,7 +30,7 @@ func (cmd *DaemonCmd) Run(ctx context.Context, console *Console) error {
 	if console.Deps.Daemon == nil {
 		return unavailableFault(nil, "this binary cannot run a daemon")
 	}
-	if cmd.Storage == "sqlite" && !filepath.IsAbs(cmd.SQLitePath) {
+	if !filepath.IsAbs(cmd.SQLitePath) {
 		return withRemedy(usageFault("--sqlite-path must be an absolute path; got %q", cmd.SQLitePath),
 			"run \"blackbird install\" to write a service definition with an absolute path")
 	}
