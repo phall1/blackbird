@@ -47,14 +47,11 @@ const (
 	ToolAgentsList                = "blackbird_agents_list"
 	ToolConversationOpen          = "blackbird_conversation_open"
 	ToolMessageSend               = "blackbird_message_send"
-	ToolMessageReply              = "blackbird_message_reply"
 	ToolInboxFetch                = "blackbird_inbox_fetch"
 	ToolThreadFetch               = "blackbird_thread_fetch"
-	ToolMessageMarkRead           = "blackbird_message_mark_read"
-	ToolMessageAcknowledge        = "blackbird_message_acknowledge"
+	ToolMessageFact               = "blackbird_message_fact"
 	ToolReservationAcquire        = "blackbird_reservation_acquire"
-	ToolReservationRenew          = "blackbird_reservation_renew"
-	ToolReservationRelease        = "blackbird_reservation_release"
+	ToolReservationChange         = "blackbird_reservation_change"
 	ToolReservationsStatus        = "blackbird_reservations_status"
 	ToolWait                      = "blackbird_wait"
 
@@ -367,11 +364,8 @@ type sendMessageInput struct {
 	To                      []string `json:"to" jsonschema:"Recipient agent names as registered, not actor IDs; blackbird_agents_list reports them."`
 	Subject                 string   `json:"subject" jsonschema:"One line naming what this message is about."`
 	Body                    string   `json:"body" jsonschema:"The message itself. Say what you did, what you need, and which paths are involved; the recipient may have none of your context."`
+	ReplyToMessageID        string   `json:"reply_to_message_id,omitempty" jsonschema:"Message this answers, from an inbox or thread fetch. Omit only when starting a new exchange."`
 	AcknowledgementRequired bool     `json:"acknowledgement_required,omitempty" jsonschema:"Require the recipient to acknowledge this exact body, not merely read it."`
-}
-type replyMessageInput struct {
-	sendMessageInput
-	ReplyToMessageID string `json:"reply_to_message_id" jsonschema:"Message this reply answers, from an inbox or thread fetch."`
 }
 type deliveryOutput struct {
 	RecipientActorID string `json:"recipient_actor_id"`
@@ -411,6 +405,7 @@ type messagePageOutput struct {
 type messageFactInput struct {
 	AgentToken string `json:"agent_token"`
 	MessageID  string `json:"message_id" jsonschema:"Message to record the fact against; it must be visible in this agent's inbox."`
+	Kind       string `json:"kind" jsonschema:"read clears this delivery from unread inbox results; acknowledged confirms the exact stored body and also marks it read."`
 }
 type deliveryFactOutput struct {
 	MessageID    string `json:"message_id"`
@@ -437,13 +432,9 @@ type fenceOutput struct {
 type reservationChangeInput struct {
 	AgentToken string        `json:"agent_token"`
 	LeaseID    string        `json:"lease_id" jsonschema:"Lease returned by blackbird_reservation_acquire."`
-	Fences     []fenceOutput `json:"fences" jsonschema:"The lease's current fences, from the most recent acquire or renew."`
-	TTLSeconds uint32        `json:"ttl_seconds,omitempty"`
-}
-type reservationReleaseInput struct {
-	AgentToken string        `json:"agent_token"`
-	LeaseID    string        `json:"lease_id" jsonschema:"Lease returned by blackbird_reservation_acquire."`
-	Fences     []fenceOutput `json:"fences" jsonschema:"The lease's current fences, from the most recent acquire or renew."`
+	Fences     []fenceOutput `json:"fences" jsonschema:"The lease's current fences, from the most recent acquire or change."`
+	Action     string        `json:"action" jsonschema:"renew extends the reservation and returns replacement fences; release gives it up immediately."`
+	TTLSeconds uint32        `json:"ttl_seconds,omitempty" jsonschema:"New lifetime for a renew action. Omit for release."`
 }
 type reservationOutput struct {
 	LeaseID    string                     `json:"lease_id"`
@@ -589,25 +580,14 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 		properties["acknowledgement_required"].Default = json.RawMessage("false")
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolMessageSend,
-		Description: "Send a durable message to named agents inside a conversation. Use it to raise something " +
-			"new; use blackbird_message_reply to continue an exchange, so the thread stays readable as one " +
-			"story. Recipients are the names blackbird_agents_list reports. Set acknowledgement_required only " +
-			"when your work cannot proceed until the recipient confirms this exact body -- the result names " +
-			"who it reached, and recording the acknowledgement is theirs to do, never yours.",
+		Description: "Send a durable message to named agents inside a conversation. Set reply_to_message_id " +
+			"when continuing an exchange so the thread stays readable as one story; omit it only to raise " +
+			"something new. Recipients are the names blackbird_agents_list reports. Set acknowledgement_required " +
+			"only when your work cannot proceed until the recipient confirms this exact body -- recording that " +
+			"acknowledgement is theirs to do, never yours.",
 		InputSchema: messageInputSchema},
 		func(ctx context.Context, input sendMessageInput) (messageOutput, error) {
-			return sendLocalMessage(ctx, store, input, "")
-		})
-	replyInputSchema := coordinationInputSchema[replyMessageInput](func(properties map[string]*jsonschema.Schema) {
-		properties["acknowledgement_required"].Default = json.RawMessage("false")
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolMessageReply,
-		Description: "Answer a message inside its own conversation, naming the message you are answering. " +
-			"Prefer it over blackbird_message_send for anything that continues an existing exchange: a reply " +
-			"keeps the thread fetchable in order, and a fresh message scatters it.",
-		InputSchema: replyInputSchema},
-		func(ctx context.Context, input replyMessageInput) (messageOutput, error) {
-			return sendLocalMessage(ctx, store, input.sendMessageInput, input.ReplyToMessageID)
+			return sendLocalMessage(ctx, store, input)
 		})
 	inboxInputSchema := coordinationInputSchema[fetchInboxInput](func(properties map[string]*jsonschema.Schema) {
 		properties["unread_only"].Default = json.RawMessage("false")
@@ -616,8 +596,8 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolInboxFetch,
 		Description: "Read the messages addressed to you. Use unread_only for what still needs attention and " +
-			"omit it to re-read what you have already handled; page with next from the previous answer. Mark " +
-			"what you have acted on with blackbird_message_mark_read, or the same messages come back forever. " +
+			"omit it to re-read what you have already handled; page with next from the previous answer. Record " +
+			"what you acted on with blackbird_message_fact kind=read, or the same messages come back forever. " +
 			"To wait for mail rather than poll for it, use blackbird_wait.",
 		InputSchema: inboxInputSchema},
 		func(ctx context.Context, input fetchInboxInput) (messagePageOutput, error) {
@@ -657,8 +637,7 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 			}
 			return coordinationPageOutput(page), nil
 		})
-	registerDeliveryFactTool(server, logger, ToolMessageMarkRead, application.DeliveryRead, store)
-	registerDeliveryFactTool(server, logger, ToolMessageAcknowledge, application.DeliveryAcknowledged, store)
+	registerDeliveryFactTool(server, logger, store)
 	registerReservationTools(server, store, logger)
 }
 
@@ -745,7 +724,7 @@ func soonestExpiry(blockers []reservationHolderOutput) int64 {
 	return soonest
 }
 
-func sendLocalMessage(ctx context.Context, store application.LocalCoordinationStore, input sendMessageInput, replyText string) (messageOutput, error) {
+func sendLocalMessage(ctx context.Context, store application.LocalCoordinationStore, input sendMessageInput) (messageOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return messageOutput{}, err
@@ -774,8 +753,8 @@ func sendLocalMessage(ctx context.Context, store application.LocalCoordinationSt
 		WorkspaceID: session.WorkspaceID, Author: session.ActorID, AuthorSession: session.ActorSessionID,
 		Subject: input.Subject, Body: input.Body, Recipients: recipients,
 		AcknowledgementRequired: input.AcknowledgementRequired}
-	if replyText != "" {
-		reply, parseErr := domain.ParseMessageID(replyText)
+	if input.ReplyToMessageID != "" {
+		reply, parseErr := domain.ParseMessageID(input.ReplyToMessageID)
 		if parseErr != nil {
 			return messageOutput{}, application.ErrInvalidCoordination
 		}
@@ -869,20 +848,18 @@ func localMessageOutput(message application.Message) messageOutput {
 	return result
 }
 
-func registerDeliveryFactTool(server *sdkmcp.Server, logger *slog.Logger, name string,
-	kind application.DeliveryFactKind, store application.LocalCoordinationStore) {
-	description := "Record that you have read a message, which is what clears it from an unread inbox fetch. " +
-		"It promises nothing about the body: use blackbird_message_acknowledge when the sender required a " +
-		"commitment. A read is a fact about your own delivery, so never record one for another agent."
-	if kind == application.DeliveryAcknowledged {
-		description = "Confirm that you have read and accepted the exact body of a message whose sender " +
-			"required acknowledgement, and mark it read at the same time. The daemon binds the promise to the " +
-			"stored body, so an acknowledgement cannot survive an edit of what you agreed to. Acknowledge only " +
-			"your own deliveries: the fact is about you, and acting on someone else's leaves them still owing it."
-	}
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: name, Description: description,
-		InputSchema: coordinationInputSchema[messageFactInput]()},
+func registerDeliveryFactTool(server *sdkmcp.Server, logger *slog.Logger,
+	store application.LocalCoordinationStore) {
+	inputSchema := coordinationInputSchema[messageFactInput](func(properties map[string]*jsonschema.Schema) {
+		properties["kind"].Enum = []any{string(application.DeliveryRead), string(application.DeliveryAcknowledged)}
+	})
+	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolMessageFact,
+		Description: "Record a fact about your own message delivery. kind=read clears it from unread inbox " +
+			"results without promising anything about the body. kind=acknowledged confirms the exact stored body " +
+			"when the sender required a commitment and marks it read at the same time. Never record a fact for " +
+			"another agent.", InputSchema: inputSchema},
 		func(ctx context.Context, input messageFactInput) (deliveryFactOutput, error) {
+			kind := application.DeliveryFactKind(input.Kind)
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 			if err != nil {
 				return deliveryFactOutput{}, err
@@ -923,9 +900,8 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 		Description: "Claim shared or exclusive file reservations before editing, naming the narrowest paths " +
 			"that cover the work. A LEASE_CONFLICT failure carries the blocking holders and how long they have " +
 			"left: wait for one with blackbird_wait, negotiate with blackbird_message_send, or narrow to a " +
-			"disjoint path. Never widen a selector to get past a conflict. Release with " +
-			"blackbird_reservation_release as soon as the edit lands, and renew before the lease expires if it " +
-			"has not.",
+			"disjoint path. Never widen a selector to get past a conflict. Use blackbird_reservation_change to " +
+			"release as soon as the edit lands or to renew before the lease expires.",
 		InputSchema: acquireInputSchema},
 		func(ctx context.Context, input reservationAcquireInput) (reservationOutput, error) {
 			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
@@ -954,26 +930,18 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 			}
 			return localReservationOutput(lease), nil
 		})
-	renewInputSchema := coordinationInputSchema[reservationChangeInput](func(properties map[string]*jsonschema.Schema) {
-		setTTLSchema(properties["ttl_seconds"])
+	changeInputSchema := coordinationInputSchema[reservationChangeInput](func(properties map[string]*jsonschema.Schema) {
+		properties["action"].Enum = []any{"renew", "release"}
+		setChangeTTLSchema(properties["ttl_seconds"])
 	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationRenew,
-		Description: "Extend a reservation you already hold, using the fences from the most recent acquire or " +
-			"renew. Renew work that outlives its lease rather than letting it lapse; the fences in the result " +
-			"replace the ones you sent. A FENCE_REJECTED failure means the lease moved on without you: acquire " +
-			"it again rather than retrying.",
-		InputSchema: renewInputSchema},
+	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationChange,
+		Description: "Renew or release a reservation you already hold, using the fences from the most recent " +
+			"acquire or change. action=renew extends work that outlives its lease and returns replacement fences. " +
+			"action=release gives the reservation up immediately and must omit ttl_seconds. A FENCE_REJECTED " +
+			"failure means the lease moved on without you: acquire it again rather than retrying.",
+		InputSchema: changeInputSchema},
 		func(ctx context.Context, input reservationChangeInput) (reservationOutput, error) {
-			return changeLocalReservation(ctx, store, input, false)
-		})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationRelease,
-		Description: "Give up a reservation the moment its edit is done, using the fences from the most recent " +
-			"acquire or renew. An abandoned lease blocks every other agent for the rest of its TTL, so release " +
-			"beats waiting for expiry in every case.",
-		InputSchema: coordinationInputSchema[reservationReleaseInput]()},
-		func(ctx context.Context, input reservationReleaseInput) (reservationOutput, error) {
-			return changeLocalReservation(ctx, store, reservationChangeInput{AgentToken: input.AgentToken,
-				LeaseID: input.LeaseID, Fences: input.Fences}, true)
+			return changeLocalReservation(ctx, store, input)
 		})
 	statusInputSchema := coordinationInputSchema[reservationsStatusInput](func(properties map[string]*jsonschema.Schema) {
 		setPageLimitSchema(properties["limit"])
@@ -1144,6 +1112,15 @@ func setTTLSchema(schema *jsonschema.Schema) {
 	schema.Maximum = jsonschema.Ptr(application.MaxLeaseTTL.Seconds())
 }
 
+// A combined renew/release input cannot publish a TTL default: SDK defaulting
+// would attach it to release calls too, turning every valid release into an
+// invalid one. The handler applies the same default only after seeing renew.
+func setChangeTTLSchema(schema *jsonschema.Schema) {
+	schema.Description = "New lifetime for action=renew; omit it for action=release. An omitted renew uses 3600 seconds."
+	schema.Minimum = jsonschema.Ptr(float64(1))
+	schema.Maximum = jsonschema.Ptr(application.MaxLeaseTTL.Seconds())
+}
+
 // setWaitTimeoutSchema states the ceiling the daemon enforces anyway, so a
 // client discovers the bound instead of learning it from a budget that came
 // back shorter than it asked for. The schema is documentation, not the guard;
@@ -1155,8 +1132,14 @@ func setWaitTimeoutSchema(schema *jsonschema.Schema) {
 	schema.Maximum = jsonschema.Ptr(ceiling)
 }
 
-func changeLocalReservation(ctx context.Context, store application.LocalCoordinationStore, input reservationChangeInput,
-	release bool) (reservationOutput, error) {
+func changeLocalReservation(ctx context.Context, store application.LocalCoordinationStore,
+	input reservationChangeInput) (reservationOutput, error) {
+	if input.Action == "release" && input.TTLSeconds != 0 {
+		return reservationOutput{}, application.ErrInvalidCoordination
+	}
+	if input.Action == "renew" && input.TTLSeconds == 0 {
+		input.TTLSeconds = defaultReservationTTLSeconds
+	}
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return reservationOutput{}, err
@@ -1176,10 +1159,13 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	params := application.ChangeLeaseParams{LeaseID: leaseID, HolderSession: session.ActorSessionID,
 		AuthorityEpoch: session.AuthorityEpoch, Fences: fences, TTL: time.Duration(input.TTLSeconds) * time.Second}
 	var lease application.Lease
-	if release {
-		lease, err = store.ReleaseLease(ctx, params)
-	} else {
+	switch input.Action {
+	case "renew":
 		lease, err = store.RenewLease(ctx, params)
+	case "release":
+		lease, err = store.ReleaseLease(ctx, params)
+	default:
+		return reservationOutput{}, application.ErrInvalidCoordination
 	}
 	if err != nil {
 		return reservationOutput{}, err

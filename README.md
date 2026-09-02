@@ -96,14 +96,12 @@ restarts.
 The daily-use MCP tools are:
 
 - `blackbird_agent_register` and `blackbird_agents_list`;
-- `blackbird_conversation_open`, `blackbird_message_send`, and
-  `blackbird_message_reply`;
-- `blackbird_inbox_fetch`, `blackbird_thread_fetch`,
-  `blackbird_message_mark_read`, and `blackbird_message_acknowledge`; and
-- `blackbird_reservation_acquire`, `blackbird_reservation_renew`, and
-  `blackbird_reservation_release`; and
-- `blackbird_reservations_status` and `blackbird_wait`, the "who is blocking me
-  / queue behind it" pair.
+- `blackbird_conversation_open` and `blackbird_message_send`, whose optional
+  `reply_to_message_id` keeps replies threaded;
+- `blackbird_inbox_fetch`, `blackbird_thread_fetch`, and
+  `blackbird_message_fact`, whose `kind` is `read` or `acknowledged`; and
+- `blackbird_reservation_acquire`, `blackbird_reservation_change`,
+  `blackbird_reservations_status`, and `blackbird_wait`.
 
 All tools except initial registration authenticate with the returned
 `agent_token`. Reserve the narrowest relevant paths before editing, use one

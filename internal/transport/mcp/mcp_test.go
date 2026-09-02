@@ -42,9 +42,9 @@ var identityPlaneToolNames = []string{
 // once so the exposure count and the schema assertions cannot describe
 // different sets.
 var coordinationToolNames = []string{
-	ToolAgentRegister, ToolAgentsList, ToolConversationOpen, ToolMessageSend, ToolMessageReply,
-	ToolInboxFetch, ToolThreadFetch, ToolMessageMarkRead, ToolMessageAcknowledge,
-	ToolReservationAcquire, ToolReservationRenew, ToolReservationRelease, ToolReservationsStatus, ToolWait,
+	ToolAgentRegister, ToolAgentsList, ToolConversationOpen, ToolMessageSend,
+	ToolInboxFetch, ToolThreadFetch, ToolMessageFact,
+	ToolReservationAcquire, ToolReservationChange, ToolReservationsStatus, ToolWait,
 }
 
 type testMCPAuthenticator struct{}
@@ -361,17 +361,19 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if len(inbox.Messages) != 1 || inbox.Messages[0].MessageID != message.MessageID {
 		t.Fatalf("bob inbox = %+v", inbox)
 	}
-	read := callCoord[deliveryFactOutput](t, client, ToolMessageMarkRead,
-		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID})
-	ack := callCoord[deliveryFactOutput](t, client, ToolMessageAcknowledge,
-		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID})
+	read := callCoord[deliveryFactOutput](t, client, ToolMessageFact,
+		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID, Kind: "read"})
+	ack := callCoord[deliveryFactOutput](t, client, ToolMessageFact,
+		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID, Kind: "acknowledged"})
 	if !read.Read || !ack.Read || !ack.Acknowledged {
 		t.Fatalf("read/ack = %+v / %+v", read, ack)
 	}
+	assertCoordinationInputRejected(t, client, ToolMessageFact,
+		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID, Kind: "accepted"})
 	// Acknowledgement resolves the digest from the single stored message, so a
 	// message the caller cannot see fails outright instead of being searched for.
-	assertCoordinationInputRejected(t, client, ToolMessageAcknowledge, messageFactInput{
-		AgentToken: bob.RegistrationToken, MessageID: "01b8e094-9888-7000-8000-0000000000ff"})
+	assertCoordinationInputRejected(t, client, ToolMessageFact, messageFactInput{
+		AgentToken: bob.RegistrationToken, MessageID: "01b8e094-9888-7000-8000-0000000000ff", Kind: "acknowledged"})
 	if unread := callCoord[messagePageOutput](t, client, ToolInboxFetch,
 		fetchInboxInput{AgentToken: bob.RegistrationToken, UnreadOnly: true, Limit: 32}); len(unread.Messages) != 0 {
 		t.Fatalf("read message remained unread: %+v", unread)
@@ -380,7 +382,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		map[string]any{"agent_token": bob.RegistrationToken}); len(all.Messages) != 1 {
 		t.Fatalf("all inbox omitted read message: %+v", all)
 	}
-	reply := callCoord[messageOutput](t, client, ToolMessageReply, map[string]any{
+	reply := callCoord[messageOutput](t, client, ToolMessageSend, map[string]any{
 		"agent_token": bob.RegistrationToken, "conversation_id": conversation.ConversationID, "to": []string{"alice"},
 		"subject": "re: handoff", "body": "received", "reply_to_message_id": message.MessageID,
 	})
@@ -440,8 +442,8 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if len(resumedBob.HeldReservations) != 0 {
 		t.Fatalf("bob holds no reservation but was handed %+v", resumedBob.HeldReservations)
 	}
-	renewed := callCoord[reservationOutput](t, client, ToolReservationRenew, map[string]any{
-		"agent_token": aliceToken, "lease_id": lease.LeaseID, "fences": lease.Fences,
+	renewed := callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{
+		"agent_token": aliceToken, "lease_id": lease.LeaseID, "fences": lease.Fences, "action": "renew",
 	})
 	if renewed.LeaseID != lease.LeaseID {
 		t.Fatalf("renewed lease = %+v", renewed)
@@ -465,12 +467,12 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	assertCoordinationInputRejected(t, client, ToolInboxFetch, map[string]any{"agent_token": aliceToken, "limit": 0})
 	assertCoordinationInputRejected(t, client, ToolReservationAcquire, map[string]any{"agent_token": bobToken,
 		"mode": "invalid", "selectors": []reservationSelectorInput{{Kind: "exact", Path: "other.go"}}})
-	assertCoordinationInputRejected(t, client, ToolReservationRenew, map[string]any{"agent_token": aliceToken,
-		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "ttl_seconds": 0})
-	assertCoordinationInputRejected(t, client, ToolReservationRelease, map[string]any{"agent_token": aliceToken,
-		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "ttl_seconds": 1})
-	callCoord[reservationOutput](t, client, ToolReservationRelease, map[string]any{"agent_token": aliceToken,
-		"lease_id": renewed.LeaseID, "fences": renewed.Fences})
+	assertCoordinationInputRejected(t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
+		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "action": "renew", "ttl_seconds": 0})
+	assertCoordinationInputRejected(t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
+		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "action": "release", "ttl_seconds": 1})
+	callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
+		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "action": "release"})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "exclusive", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: aliceToken,
@@ -517,10 +519,11 @@ func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal coordination tools/list: %v", err)
 	}
+	t.Logf("coordination tools/list: %d bytes for %d tools", len(discovery), len(listed))
 	if bytes.Contains(discovery, []byte(`"outputSchema"`)) {
 		t.Fatalf("coordination tools/list publishes redundant output schemas: %d bytes", len(discovery))
 	}
-	const maxCoordinationDiscoveryBytes = 32 << 10
+	const maxCoordinationDiscoveryBytes = 16 << 10
 	if len(discovery) > maxCoordinationDiscoveryBytes {
 		t.Fatalf("coordination tools/list = %d bytes, want at most %d", len(discovery), maxCoordinationDiscoveryBytes)
 	}
@@ -656,8 +659,9 @@ func TestCoordinationFailuresCarryTheirCodeAndTheirBlockers(t *testing.T) {
 		invalid.Retryable {
 		t.Fatalf("invalid request failure = %+v, want a terminal INVALID_ARGUMENT", invalid)
 	}
-	stale := callCoordFailure(t, client, ToolReservationRelease, map[string]any{"agent_token": alice,
-		"lease_id": held.LeaseID, "fences": []fenceOutput{{ConflictKey: held.Fences[0].ConflictKey, Counter: 1 << 20}}})
+	stale := callCoordFailure(t, client, ToolReservationChange, map[string]any{"agent_token": alice,
+		"lease_id": held.LeaseID, "fences": []fenceOutput{{ConflictKey: held.Fences[0].ConflictKey, Counter: 1 << 20}},
+		"action": "release"})
 	if stale.Conflict != string(domain.ConflictFence) || stale.Retryable {
 		t.Fatalf("stale fence failure = %+v, want a terminal FenceConflict", stale)
 	}
@@ -722,8 +726,8 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 	}
 	// A holder that gave up its lease is not a blocker any more, and the waiter
 	// has to be told so rather than sitting out the rest of its budget.
-	callCoord[reservationOutput](t, client, ToolReservationRelease, map[string]any{
-		"agent_token": alice, "lease_id": held.LeaseID, "fences": held.Fences})
+	callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{
+		"agent_token": alice, "lease_id": held.LeaseID, "fences": held.Fences, "action": "release"})
 	freed := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 30})
 	if freed.Reason != string(application.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
@@ -992,11 +996,9 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	}
 	expectedDefaults := map[string]map[string]any{
 		ToolMessageSend:        {"acknowledgement_required": false},
-		ToolMessageReply:       {"acknowledgement_required": false},
 		ToolInboxFetch:         {"unread_only": false, "after": float64(0), "limit": float64(50)},
 		ToolThreadFetch:        {"after": float64(0), "limit": float64(50)},
 		ToolReservationAcquire: {"mode": "exclusive", "ttl_seconds": float64(3600)},
-		ToolReservationRenew:   {"ttl_seconds": float64(3600)},
 		ToolReservationsStatus: {"limit": float64(50)},
 		ToolWait:               {"await_mail": false, "mode": "exclusive", "timeout_seconds": float64(60)},
 	}
@@ -1135,6 +1137,24 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		t.Errorf("selector kind enum = %#v, want exact and subtree", kinds)
 	}
 
+	factSchema, err := json.Marshal(tools[ToolMessageFact].InputSchema)
+	if err != nil {
+		t.Fatalf("marshal message fact schema: %v", err)
+	}
+	var factDecoded struct {
+		Properties struct {
+			Kind struct {
+				Enum []any `json:"enum"`
+			} `json:"kind"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(factSchema, &factDecoded); err != nil {
+		t.Fatalf("decode message fact schema: %v", err)
+	}
+	if kinds := factDecoded.Properties.Kind.Enum; !reflect.DeepEqual(kinds, []any{"read", "acknowledged"}) {
+		t.Errorf("message fact kind enum = %#v, want read and acknowledged", kinds)
+	}
+
 	// agent_register is the one tool whose result an agent must act on, so its
 	// description still names the state it returns even though repeated output
 	// schemas are deliberately omitted from discovery.
@@ -1180,13 +1200,29 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		}
 	}
 
-	release := tools[ToolReservationRelease]
-	encoded, err := json.Marshal(release.InputSchema)
+	change := tools[ToolReservationChange]
+	encoded, err := json.Marshal(change.InputSchema)
 	if err != nil {
-		t.Fatalf("marshal release schema: %v", err)
+		t.Fatalf("marshal reservation change schema: %v", err)
 	}
-	if bytes.Contains(encoded, []byte(`"ttl_seconds"`)) {
-		t.Fatalf("release schema includes ttl_seconds: %s", encoded)
+	var changeDecoded struct {
+		Properties struct {
+			Action struct {
+				Enum []any `json:"enum"`
+			} `json:"action"`
+			TTLSeconds struct {
+				Default any `json:"default"`
+			} `json:"ttl_seconds"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(encoded, &changeDecoded); err != nil {
+		t.Fatalf("decode reservation change schema: %v", err)
+	}
+	if actions := changeDecoded.Properties.Action.Enum; !reflect.DeepEqual(actions, []any{"renew", "release"}) {
+		t.Errorf("reservation action enum = %#v, want renew and release", actions)
+	}
+	if changeDecoded.Properties.TTLSeconds.Default != nil {
+		t.Fatalf("reservation change ttl default would leak into release: %#v", changeDecoded.Properties.TTLSeconds.Default)
 	}
 }
 
