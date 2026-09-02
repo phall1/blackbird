@@ -1,8 +1,10 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1205,5 +1207,51 @@ func TestInstallConvergesAPartialUpdaterInstallation(t *testing.T) {
 	}
 	if slices.Contains(runner.commands, "systemctl --user disable --now blackbird-update.timer") {
 		t.Fatalf("disabled a timer that was not installed: %v", runner.commands)
+	}
+}
+
+func TestRestartRotatesOversizedDaemonLogs(t *testing.T) {
+	home := t.TempDir()
+	manager := testManager(home, "linux", &recordingRunner{})
+	if err := os.MkdirAll(manager.blackbirdStateDir(), 0o700); err != nil {
+		t.Fatalf("create state directory: %v", err)
+	}
+	small := manager.daemonLogPath()
+	large := manager.daemonErrorLogPath()
+	if err := os.WriteFile(small, []byte("recent\n"), 0o600); err != nil {
+		t.Fatalf("write stdout log: %v", err)
+	}
+	if err := os.WriteFile(large, bytes.Repeat([]byte("x"), maximumDaemonLogBytes+1), 0o600); err != nil {
+		t.Fatalf("write stderr log: %v", err)
+	}
+
+	if err := manager.restart(context.Background()); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// The oversized stream is moved aside so the supervisor reopens an empty
+	// file at the original path; the small one is left alone.
+	if _, err := os.Stat(large); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("oversized log should have been rotated away, stat returned %v", err)
+	}
+	rotated, err := os.Stat(large + ".1")
+	if err != nil {
+		t.Fatalf("rotated log is missing: %v", err)
+	}
+	if rotated.Size() != maximumDaemonLogBytes+1 {
+		t.Fatalf("rotated log lost content: got %d bytes", rotated.Size())
+	}
+	if contents, err := os.ReadFile(small); err != nil || string(contents) != "recent\n" {
+		t.Fatalf("small log should be untouched, got %q err %v", contents, err)
+	}
+}
+
+func TestRestartLeavesLogsAloneWhenAbsent(t *testing.T) {
+	home := t.TempDir()
+	manager := testManager(home, "linux", &recordingRunner{})
+	// A first install restarts before either stream exists; rotation must not
+	// turn that into an error.
+	if err := manager.restart(context.Background()); err != nil {
+		t.Fatalf("restart with no logs present: %v", err)
 	}
 }

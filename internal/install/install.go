@@ -56,8 +56,11 @@ const (
 	probeMaxBytes      = 8 << 10
 	crashWindow        = time.Minute
 	errorLogTailBytes  = 64 << 10
-	errorLevelMarker   = "level=ERROR"
-	logTimeField       = "time="
+	// Both supervisors append to the daemon's streams for the lifetime of the
+	// install and neither rotates them, so the cap is enforced here instead.
+	maximumDaemonLogBytes = 8 << 20
+	errorLevelMarker      = "level=ERROR"
+	logTimeField          = "time="
 )
 
 // Updater states reported by Status. UpdaterUnsupported is not a failure and no
@@ -923,7 +926,27 @@ func atomicWrite(path string, content []byte, mode fs.FileMode) error {
 	return os.Rename(temporary, path)
 }
 
+// rotateDaemonLogs keeps one previous generation of each daemon stream.
+//
+// It runs here rather than on a timer because the supervisor -- not the daemon
+// -- opens these files and holds the descriptor: renaming a file it already has
+// open moves the name, not the descriptor, so the supervisor would keep writing
+// to the rotated path and the live log would silently disappear. The restart
+// below is the moment that descriptor is closed and reopened, which is what
+// makes the rename take effect. A failed rotation must never block the restart,
+// because the log is diagnostic and the service is not.
+func (manager *Manager) rotateDaemonLogs() {
+	for _, path := range []string{manager.daemonLogPath(), manager.daemonErrorLogPath()} {
+		info, err := os.Stat(path)
+		if err != nil || info.Size() <= maximumDaemonLogBytes {
+			continue
+		}
+		_ = os.Rename(path, path+".1")
+	}
+}
+
 func (manager *Manager) restart(ctx context.Context) error {
+	manager.rotateDaemonLogs()
 	if manager.config.GOOS == "darwin" {
 		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), manager.servicePath())
 		if _, err := manager.runRequired(ctx, "launchctl", "bootstrap", manager.launchDomain(), manager.servicePath()); err != nil {
