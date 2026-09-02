@@ -235,6 +235,26 @@ Blackbird's storage or delivery semantics.
 
 [ahp]: https://github.com/microsoft/agent-host-protocol
 
+## JetBrains and Zed through ACP
+
+Blackbird does not ship an Agent Client Protocol agent. ACP clients spawn a
+[coding agent that owns its model, tools, and prompt turns][acp-architecture];
+Blackbird is a coordinator, not a second coding-agent runtime. A Blackbird ACP
+process would therefore open a separate coordination-only chat, while wrapping
+an existing ACP agent would duplicate that agent's session, authentication, and
+tool lifecycle just to proxy JSON-RPC.
+
+The useful integration already exists one layer lower. [JetBrains][jetbrains-acp]
+and [Zed][zed-acp] both forward configured MCP servers to the selected external
+agent, so install Blackbird's MCP server for the real coding agent rather than
+replacing it with a Blackbird-branded ACP shell. Reconsider an ACP adapter only
+if the protocol gains a client-side facility for injecting context into an
+already-running external-agent thread; stable ACP v1 exposes no such method.
+
+[acp-architecture]: https://agentclientprotocol.com/get-started/architecture
+[jetbrains-acp]: https://www.jetbrains.com/help/ai-assistant/acp.html
+[zed-acp]: https://zed.dev/docs/ai/external-agents
+
 ## Development
 
 ```sh
