@@ -11,3 +11,14 @@ test("declares a Claude channel and session-owned stdio server", async () => {
   assert.match(server, /"claude\/channel"/)
   assert.match(server, /name: "accept"/)
 })
+
+test("surfaces the daemon's problem document instead of a bare status", async () => {
+  const server = await readFile(new URL("../server.mjs", import.meta.url), "utf8")
+  // The daemon answers failures with application/problem+json carrying a stable
+  // code; throwing only response.status discards what it said.
+  assert.match(server, /async function blackbirdFailure\(response, action\)/)
+  assert.doesNotMatch(server, /failed with HTTP \$\{response\.status\}`\)/)
+  for (const action of ["registration", "catch-up", "message fetch", "stream"]) {
+    assert.match(server, new RegExp(`blackbirdFailure\\((response|messageResponse), "${action}"\\)`))
+  }
+})

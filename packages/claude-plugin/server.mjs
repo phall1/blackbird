@@ -77,6 +77,25 @@ async function importLegacy() {
   }
 }
 
+// The daemon reports a failure as application/problem+json carrying a stable
+// error code and a message written for whoever made the call. Reporting only
+// the status discards both, so a user debugging this plugin sees a bare number
+// where the server had already explained itself.
+async function blackbirdFailure(response, action) {
+  let detail = ""
+  try {
+    const problem = await response.json()
+    if (problem && typeof problem.code === "string") {
+      detail = typeof problem.message === "string" && problem.message !== ""
+        ? `: ${problem.code}: ${problem.message}`
+        : `: ${problem.code}`
+    }
+  } catch {
+    // A body that is absent or not JSON leaves the status as the only signal.
+  }
+  return new Error(`Blackbird ${action} failed with HTTP ${response.status}${detail}`)
+}
+
 async function register(legacyToken) {
   let token
   try { token = (await readFile(tokenPath, "utf8")).trim() || undefined } catch (error) { if (error.code !== "ENOENT") throw error }
@@ -85,7 +104,7 @@ async function register(legacyToken) {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ project_key: cwd, agent_name: agentName, ...(token ? { registration_token: token } : {}) }),
   })
-  if (!response.ok) throw new Error(`Blackbird registration failed with HTTP ${response.status}`)
+  if (!response.ok) throw await blackbirdFailure(response, "registration")
   const result = await response.json()
   token = result.registration_token || token
   if (!token) throw new Error("Blackbird registration returned no reusable token")
@@ -143,12 +162,12 @@ async function catchUp() {
     url.searchParams.set("limit", "100")
     if (state.cursor) url.searchParams.set("after", state.cursor)
     const response = await fetch(url, { headers, signal: controller.signal })
-    if (!response.ok) throw new Error(`Blackbird catch-up failed with HTTP ${response.status}`)
+    if (!response.ok) throw await blackbirdFailure(response, "catch-up")
     const page = await response.json()
     for (const event of page.events) {
       if (event.type !== "message.available" || accepted.has(event.subject) || quarantined.has(event.subject)) continue
       const messageResponse = await fetch(new URL(`api/v1/local/messages/${encodeURIComponent(event.subject)}`, baseURL), { headers, signal: controller.signal })
-      if (!messageResponse.ok) throw new Error(`Blackbird message fetch failed with HTTP ${messageResponse.status}`)
+      if (!messageResponse.ok) throw await blackbirdFailure(messageResponse, "message fetch")
       const message = await messageResponse.json()
       if (message.message_id !== event.subject) throw new Error("Blackbird message ID mismatch")
       const admission = waitForAccept(message.message_id)
@@ -173,7 +192,7 @@ async function run() {
       const url = new URL("api/v1/local/coordination/events/stream", baseURL)
       if (state.cursor) url.searchParams.set("after", state.cursor)
       const response = await fetch(url, { headers: { ...headers, accept: "text/event-stream" }, signal: controller.signal })
-      if (!response.ok) throw new Error(`Blackbird stream failed with HTTP ${response.status}`)
+      if (!response.ok) throw await blackbirdFailure(response, "stream")
       const reader = response.body?.getReader()
       if (!reader) throw new Error("Blackbird stream has no body")
       await reader.read()
