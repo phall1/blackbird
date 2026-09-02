@@ -670,6 +670,83 @@ func TestServiceDefinitionInvokesTheDaemonSubcommandWithAnExplicitStateDir(t *te
 	}
 }
 
+func TestServiceDefinitionRedirectsDaemonOutputWhereTheLogReaderLooks(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		goos         string
+		outDirective string
+		errDirective string
+		redirection  func(directive, path string) string
+	}{
+		{
+			goos: "darwin", outDirective: "StandardOutPath", errDirective: "StandardErrorPath",
+			redirection: func(directive, path string) string {
+				return "<key>" + directive + "</key><string>" + path + "</string>"
+			},
+		},
+		{
+			goos: "linux", outDirective: "StandardOutput", errDirective: "StandardError",
+			redirection: func(directive, path string) string {
+				return directive + "=append:" + path + "\n"
+			},
+		},
+	} {
+		t.Run(testCase.goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, testCase.goos, &recordingRunner{})
+			definition := manager.serviceDefinition()
+			stateDir := filepath.Join(home, "state", "blackbird")
+			// The file names are the log reader's, not this package's: a rename
+			// on either side silently empties `blackbird logs`.
+			for _, stream := range []struct{ directive, fileName string }{
+				{directive: testCase.outDirective, fileName: "blackbird.log"},
+				{directive: testCase.errDirective, fileName: "blackbird.err.log"},
+			} {
+				want := testCase.redirection(stream.directive, filepath.Join(stateDir, stream.fileName))
+				if !strings.Contains(definition, want) {
+					t.Fatalf("definition does not redirect into %s (want %q):\n%s", stream.fileName, want, definition)
+				}
+			}
+		})
+	}
+}
+
+// The supervisor opens the log files itself and creates neither them nor their
+// directory, so systemd fails the whole unit when the state directory is
+// missing. Converging a definition must therefore leave the directory behind
+// even when the bytes on disk already matched and nothing was rewritten.
+func TestConvergeServiceDefinitionCreatesTheStateDirectoryItLogsInto(t *testing.T) {
+	t.Parallel()
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, goos, &recordingRunner{})
+			if _, err := manager.convergeServiceDefinition(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.RemoveAll(manager.StateDir()); err != nil {
+				t.Fatal(err)
+			}
+			changed, err := manager.convergeServiceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed {
+				t.Fatal("converging an unchanged definition reported a rewrite")
+			}
+			info, err := os.Stat(manager.StateDir())
+			if err != nil {
+				t.Fatalf("state directory missing after converge: %v", err)
+			}
+			if !info.IsDir() {
+				t.Fatalf("%s is not a directory", manager.StateDir())
+			}
+		})
+	}
+}
+
 func TestConvergeServiceDefinitionRewritesLegacyDefinitionOnceOnly(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()

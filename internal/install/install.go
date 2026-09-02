@@ -1113,6 +1113,13 @@ func (manager *Manager) serviceDefinition() string {
 	for _, argument := range argv {
 		arguments = append(arguments, systemdEscape(argument))
 	}
+	// Without these the daemon's output goes to the journal, where the log
+	// reader cannot see it: it only ever reads these two files, so a Linux user
+	// following `blackbird logs` — which three doctor remedies point at — gets
+	// an empty stream. Appending to the same paths the launchd agent writes
+	// makes both platforms behave identically. systemd creates the files but not
+	// their parent, which is why convergeServiceDefinition ensures the state
+	// directory before this definition reaches disk.
 	return fmt.Sprintf(`[Unit]
 Description=Blackbird local coordination service
 After=network.target
@@ -1121,12 +1128,15 @@ After=network.target
 Type=simple
 Environment=%s
 ExecStart=%s
+StandardOutput=append:%s
+StandardError=append:%s
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=default.target
-`, systemdEscape("XDG_STATE_HOME="+manager.config.StateHome), strings.Join(arguments, " "))
+`, systemdEscape("XDG_STATE_HOME="+manager.config.StateHome), strings.Join(arguments, " "),
+		systemdPath(manager.daemonLogPath()), systemdPath(manager.daemonErrorLogPath()))
 }
 
 // convergeServiceDefinition rewrites the service definition only when the
@@ -1134,6 +1144,15 @@ WantedBy=default.target
 // repairs its own unit file on the next unattended updater tick.
 func (manager *Manager) convergeServiceDefinition() (bool, error) {
 	path := manager.servicePath()
+	// Both supervisors open the daemon's log files themselves and neither
+	// creates the directory holding them, so a missing state directory fails the
+	// unit outright rather than degrading to no logs. Install creates it before
+	// reaching here, but the unattended updater converges the definition without
+	// having created anything, and the early return below skips straight to a
+	// restart — so the guarantee belongs here, ahead of the comparison.
+	if err := os.MkdirAll(manager.blackbirdStateDir(), 0o700); err != nil {
+		return false, fmt.Errorf("create state directory: %w", err)
+	}
 	wanted := []byte(manager.serviceDefinition())
 	current, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -1282,4 +1301,12 @@ func xmlUnescape(value string) string {
 func systemdEscape(value string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`)
 	return `"` + replacer.Replace(value) + `"`
+}
+
+// systemdPath renders a path for a directive that takes the rest of its line
+// literally, such as StandardOutput=append:. Those are not unquoted the way
+// ExecStart= and Environment= are, so systemdEscape's quotes would become part
+// of the path; only the specifier introducer still has to be escaped.
+func systemdPath(value string) string {
+	return strings.ReplaceAll(value, "%", "%%")
 }
