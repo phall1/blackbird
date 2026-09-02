@@ -100,6 +100,11 @@ func TestProductionImportBoundaries(t *testing.T) {
 			if err := validateImport(importer, importPath, standard); err != nil {
 				position := fileSet.Position(imported.Pos())
 				t.Errorf("%s: %v", position, err)
+				continue
+			}
+			if err := validatePackageImport(filepath.ToSlash(filepath.Dir(relative)), importPath); err != nil {
+				position := fileSet.Position(imported.Pos())
+				t.Errorf("%s: %v", position, err)
 			}
 		}
 
@@ -170,8 +175,14 @@ func TestBoundaryPolicyExamples(t *testing.T) {
 		{name: "storage integration", importer: "storage", importPath: modulePath + "/internal/integration/phux", wantError: true},
 		{name: "storage runtime", importer: "storage", importPath: modulePath + "/internal/runtime", wantError: true},
 		{name: "runtime transport", importer: "runtime", importPath: modulePath + "/internal/transport/http"},
-		{name: "cli domain", importer: "cli", importPath: modulePath + "/internal/domain"},
+		{name: "install same layer", importer: "install", importPath: modulePath + "/internal/install/probe"},
+		{name: "install domain", importer: "install", importPath: modulePath + "/internal/domain", wantError: true},
+		{name: "install application", importer: "install", importPath: modulePath + "/internal/application", wantError: true},
+		{name: "cli install", importer: "cli", importPath: modulePath + "/internal/install"},
 		{name: "cli same layer", importer: "cli", importPath: modulePath + "/internal/cli/render"},
+		{name: "cli domain", importer: "cli", importPath: modulePath + "/internal/domain", wantError: true},
+		{name: "cli application", importer: "cli", importPath: modulePath + "/internal/application", wantError: true},
+		{name: "cli runtime", importer: "cli", importPath: modulePath + "/internal/runtime", wantError: true},
 		{name: "cli storage", importer: "cli", importPath: modulePath + "/internal/storage/sqlite", wantError: true},
 		{name: "cli transport", importer: "cli", importPath: modulePath + "/internal/transport/http", wantError: true},
 		{name: "cmd assembles cli", importer: "cmd", importPath: modulePath + "/internal/cli"},
@@ -206,6 +217,30 @@ func TestBoundaryPolicyExamples(t *testing.T) {
 			t.Errorf("layerFor(%q) = (%q, %t), want (%q, %t)", test.directory, gotLayer, gotKnown, test.wantLayer, test.wantKnown)
 		}
 	}
+
+	packageTests := []struct {
+		name       string
+		importer   string
+		importPath string
+		wantError  bool
+	}{
+		{name: "sqlite same package", importer: "internal/storage/sqlite", importPath: modulePath + "/internal/storage/sqlite/internal"},
+		{name: "sqlite postgres", importer: "internal/storage/sqlite", importPath: modulePath + "/internal/storage/postgres", wantError: true},
+		{name: "sqlite child postgres", importer: "internal/storage/sqlite/codec", importPath: modulePath + "/internal/storage/postgres", wantError: true},
+		{name: "sqlite postgres child", importer: "internal/storage/sqlite", importPath: modulePath + "/internal/storage/postgres/codec", wantError: true},
+		{name: "sqlite similarly named package", importer: "internal/storage/sqlite", importPath: modulePath + "/internal/storage/postgresql"},
+		{name: "similarly named importer", importer: "internal/storage/sqlite2", importPath: modulePath + "/internal/storage/postgres"},
+		{name: "other storage adapter postgres", importer: "internal/storage/memory", importPath: modulePath + "/internal/storage/postgres"},
+	}
+	for _, test := range packageTests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validatePackageImport(test.importer, test.importPath)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validatePackageImport(%q, %q) error = %v, wantError=%t",
+					test.importer, test.importPath, err, test.wantError)
+			}
+		})
+	}
 }
 
 func validateImport(importer, importPath string, standard map[string]bool) error {
@@ -237,12 +272,33 @@ func validateImport(importer, importPath string, standard map[string]bool) error
 		if imported != "domain" && imported != "application" && imported != importer {
 			return fmt.Errorf("%s may import inward layers or itself; found %s", importer, imported)
 		}
+	case "install":
+		if imported != "install" {
+			return fmt.Errorf("install may import only its own layer among Blackbird packages; found %s", imported)
+		}
+	case "cli":
+		if imported != "cli" && imported != "install" {
+			return fmt.Errorf("cli may import only its own layer and install among Blackbird packages; found %s", imported)
+		}
 	default:
 		if outwardLayers[imported] && importer != "runtime" && importer != "cmd" {
 			return fmt.Errorf("only runtime or cmd may assemble outward layer %s", imported)
 		}
 	}
 
+	return nil
+}
+
+func validatePackageImport(importer, importPath string) error {
+	const (
+		sqlite   = "internal/storage/sqlite"
+		postgres = modulePath + "/internal/storage/postgres"
+	)
+	fromSQLite := importer == sqlite || strings.HasPrefix(importer, sqlite+"/")
+	toPostgres := importPath == postgres || strings.HasPrefix(importPath, postgres+"/")
+	if fromSQLite && toPostgres {
+		return fmt.Errorf("sqlite cannot import the postgres adapter")
+	}
 	return nil
 }
 
