@@ -127,6 +127,18 @@ Git hooks are installed with `make hooks` (prek): a fast subset on pre-commit
 and the full `make check` on pre-push. They are not installed by cloning — run
 `make hooks` once per checkout.
 
+## Decision records
+
+`docs/adr/` holds the decisions that closed off a design space, in Nygard
+format, indexed in `docs/adr/README.md`. Read one when you need the *why*
+behind a boundary; this file and `README.md` cover the *what*.
+
+Invariants that are enforced executably do not get an ADR — the architecture
+test is its own record, and a prose copy beside it would only go stale. An ADR
+number cited from another repository is a promise: if an outside consumer names
+a Blackbird ADR that is not in that index, the citation is stale and the fix
+belongs in the index, not in a document written to make the number exist.
+
 ## Repository map
 
 Independently released components, each mapped to its own tag and changelog by
