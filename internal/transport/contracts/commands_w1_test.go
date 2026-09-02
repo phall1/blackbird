@@ -856,3 +856,84 @@ func TestValidateAggregateIDAcceptsEveryWorkPlaneKind(t *testing.T) {
 		t.Fatal("an unknown aggregate kind must not validate")
 	}
 }
+
+// TestCommandRejectionForwardsThePreciseDomainMessage pins the boundary between
+// the domain's message bound and the wire contract's stricter one. The domain
+// admits any non-blank, valid-UTF-8 string within maxErrorMessageBytes; the
+// ErrorDTO validator additionally forbids surrounding whitespace and control
+// characters. A message that fails the wire rule must fall back to the generic
+// per-code string, because an ErrorDTO that fails its own Validate reaches the
+// caller as an internal failure — strictly worse than a generic message.
+//
+// Length is deliberately absent from the table: domain.NewCommandError enforces
+// the same bound, so an oversize message cannot be constructed to test with.
+// The helper still checks it, because the two bounds are only equal today.
+func TestCommandRejectionForwardsThePreciseDomainMessage(t *testing.T) {
+	t.Parallel()
+	generic := commandFailureMessage(domain.ErrorCodeForbidden)
+	for name, testCase := range map[string]struct {
+		message string
+		want    string
+	}{
+		"precise message travels":           {message: "membership capabilities exceed delegator ceiling", want: "membership capabilities exceed delegator ceiling"},
+		"surrounding whitespace falls back": {message: "  padded rejection  ", want: generic},
+		"control character falls back":      {message: "line\nbreak", want: generic},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rejection, err := domain.NewCommandError(domain.ErrorCodeForbidden, testCase.message, nil)
+			if err != nil {
+				// The domain refuses only what it refuses; a case the domain
+				// itself rejects cannot exercise the transport's stricter rule.
+				t.Fatalf("domain rejected the fixture message: %v", err)
+			}
+			if got := commandRejectionMessage(rejection); got != testCase.want {
+				t.Fatalf("message = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestCommandRejectionDTOCarriesTheDomainMessage proves the forwarded message
+// survives ErrorDTO.Validate rather than only the helper in isolation, and that
+// a sentinel error with no message of its own still yields a valid envelope.
+func TestCommandRejectionDTOCarriesTheDomainMessage(t *testing.T) {
+	t.Parallel()
+	commandID, err := domain.NewCommandID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceID, err := domain.NewWorkspaceID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := CommandMetadataDTO{RequestID: "req-rejection-1", CommandID: commandID, IdempotencyKey: "idem-rejection-1"}
+	scope := &ResourceScopeDTO{Type: domain.AggregateKindWorkspace, ID: workspaceID.String()}
+
+	precise, err := domain.NewCommandError(domain.ErrorCodeForbidden, "owner membership lacks required administration capabilities", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure, err := commandRejectionDTO("req-rejection-1", precise, metadata, "workspace:create", scope)
+	if err != nil {
+		t.Fatalf("a precise domain message must survive ErrorDTO validation: %v", err)
+	}
+	if failure.Message != "owner membership lacks required administration capabilities" {
+		t.Fatalf("message = %q, want the domain's own text", failure.Message)
+	}
+
+	var sentinel *domain.CommandError
+	if !errors.As(domain.ErrForbidden, &sentinel) {
+		t.Fatal("the forbidden sentinel must be a command error")
+	}
+	if sentinel.Message() != "" {
+		t.Skip("the forbidden sentinel now carries a message; the fallback needs a different witness")
+	}
+	failure, err = commandRejectionDTO("req-rejection-1", sentinel, metadata, "workspace:create", scope)
+	if err != nil {
+		t.Fatalf("a messageless sentinel must still produce a valid envelope: %v", err)
+	}
+	if failure.Message != commandFailureMessage(domain.ErrorCodeForbidden) {
+		t.Fatalf("message = %q, want the generic fallback", failure.Message)
+	}
+}

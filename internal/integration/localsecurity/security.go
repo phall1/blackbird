@@ -67,6 +67,81 @@ var (
 	ErrSecurityDependency  = errors.New("local security dependency unavailable")
 )
 
+// deniedAuthorizationMessage is the only authorization text this boundary emits
+// to a caller. It is deliberately uniform across every predicate: a caller that
+// could tell "no such device" from "membership suspended" could map the
+// installation's identity graph one denied request at a time.
+const deniedAuthorizationMessage = "the identity is not authorized for this command"
+
+// DenialReason names the authorization predicate that refused a request.
+//
+// It is operator-facing, not caller-facing. The reason travels in the error
+// chain and becomes the denial audit row's safe reason, where an operator can
+// read it; the caller receives only the code and the uniform message above.
+type DenialReason string
+
+const (
+	DenialAuthorizationUnavailable DenialReason = "authorization_unavailable"
+	DenialAuthorityTimeAbsent      DenialReason = "authority_time_absent"
+	DenialRequestUnbound           DenialReason = "request_not_bound_to_command"
+	DenialPrincipalUnusable        DenialReason = "principal_unusable"
+	DenialDeviceUntrusted          DenialReason = "device_untrusted"
+	DenialGrantUnusable            DenialReason = "grant_unusable"
+	DenialWorkspaceUnusable        DenialReason = "workspace_unusable"
+	DenialMembershipUnusable       DenialReason = "membership_unusable"
+	DenialSessionUnusable          DenialReason = "actor_session_unusable"
+	DenialSessionReferencesStale   DenialReason = "session_references_stale"
+	DenialSessionDeviceStale       DenialReason = "session_device_stale"
+	DenialSessionGrantsStale       DenialReason = "session_grants_stale"
+	DenialCapabilitiesEmpty        DenialReason = "capabilities_empty"
+	DenialScopeUnsupported         DenialReason = "scope_unsupported"
+	DenialReplayNotResolved        DenialReason = "replay_not_resolved"
+)
+
+// AccessDenialError carries the predicate that actually refused a request. It
+// wraps ErrAccessDenied so every existing local check still matches, and it is
+// the cause of the caller-facing rejection rather than part of its message.
+type AccessDenialError struct{ reason DenialReason }
+
+func (denial *AccessDenialError) Reason() DenialReason {
+	if denial == nil {
+		return ""
+	}
+	return denial.reason
+}
+
+func (denial *AccessDenialError) Error() string {
+	if denial == nil || denial.reason == "" {
+		return ErrAccessDenied.Error()
+	}
+	return ErrAccessDenied.Error() + ": " + string(denial.reason)
+}
+
+func (denial *AccessDenialError) Unwrap() error { return ErrAccessDenied }
+
+// deniedAuthorization builds the caller-facing rejection for one denied
+// predicate. The code is load-bearing twice over: transports map it to 403
+// rather than a retryable 500, and the application layer will only record a
+// denial audit row for a code it recognizes as an authorization failure. A
+// bare sentinel here is silently reclassified as an internal error, which is
+// why every authorization refusal must travel as a *domain.CommandError.
+//
+// Exact-replay disclosure denials must be FORBIDDEN — the application layer
+// accepts no other code for that resolution — so a replay never reports
+// CAPABILITY_REQUIRED even when capabilities are what it lacks.
+func deniedAuthorization(replay bool, reason DenialReason) error {
+	code := domain.ErrorCodeForbidden
+	if !replay && reason == DenialCapabilitiesEmpty {
+		code = domain.ErrorCodeCapabilityRequired
+	}
+	denial := &AccessDenialError{reason: reason}
+	rejection, err := domain.NewCommandError(code, deniedAuthorizationMessage, denial)
+	if err != nil {
+		return denial
+	}
+	return rejection
+}
+
 var (
 	_ application.AuthenticationPreparer         = (*AuthenticationPreparer)(nil)
 	_ application.PolicyPreparer                 = (*PolicyPreparer)(nil)
@@ -297,153 +372,73 @@ func (authorization *LockedAuthorization) AuthorizeLocked(
 	return authorization.authorize(locked, authentication, policy, false)
 }
 
+// authorize projects the locked identity states onto the aggregates one
+// decision needs, then runs the authorization predicates in order. Each
+// predicate is independent and names the reason it refused, so a denial is
+// diagnosable from the audit row it produces rather than indistinguishable
+// from the thirty-odd other ways the same request could have failed.
 func (authorization *LockedAuthorization) authorize(
 	locked application.CommandContext,
 	authentication application.AuthenticationEvidence,
 	policy application.PreparedPolicy,
 	replay bool,
 ) (domain.IdentityAuthorization, error) {
-	if authorization == nil || authorization.assurance.String() == "" || policy.Revision().String() == "" || policy.Digest().IsZero() {
-		return domain.IdentityAuthorization{}, ErrAccessDenied
+	if authorization == nil || authorization.assurance.String() == "" ||
+		policy.Revision().String() == "" || policy.Digest().IsZero() {
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialAuthorizationUnavailable)
 	}
 	now, present := locked.AuthorityTime()
 	if replay {
 		now, present = locked.DisclosureTime()
 	}
 	if !present {
-		return domain.IdentityAuthorization{}, ErrAccessDenied
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialAuthorityTimeAbsent)
 	}
 	request := authentication.Request()
-	if request.VerifiedAt().After(now) || request.Scope() != locked.Spec().Scope() ||
-		request.Operation() != locked.Spec().CommandOperation() || request.PrincipalID() != locked.Spec().Authorship().PrincipalID() {
-		return domain.IdentityAuthorization{}, ErrAccessDenied
+	if !requestBoundToCommand(request, locked.Spec(), now) {
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialRequestUnbound)
 	}
-	states := locked.States()
-	var principal domain.PrincipalState
-	var workspace domain.WorkspaceState
-	var membership domain.MembershipState
-	var delegation domain.ActorDelegationState
-	var session domain.ActorSessionState
-	grants := make(map[domain.AggregateTarget]domain.GrantState)
-	devices := make(map[domain.DeviceID]domain.DeviceState)
-	actors := make(map[domain.ActorID]domain.ActorState)
-	for _, state := range states {
-		switch value := state.Value().(type) {
-		case domain.PrincipalState:
-			if value.ID() == request.PrincipalID() {
-				principal = value
-			}
-		case domain.DeviceState:
-			devices[value.ID()] = value
-		case domain.WorkspaceState:
-			if value.ID().String() == request.Scope().ID() {
-				workspace = value
-			}
-		case domain.MembershipState:
-			if value.PrincipalID() == request.PrincipalID() {
-				membership = value
-			}
-		case domain.ActorState:
-			actors[value.ID()] = value
-		case domain.ActorDelegationState:
-			if value.PrincipalID() == request.PrincipalID() {
-				delegation = value
-			}
-		case domain.ActorSessionState:
-			if id, _, ok := request.ActorSession(); ok && value.ID() == id {
-				session = value
-			}
-		case domain.GrantState:
-			grants[state.Target()] = value
-		}
+	projected := projectAuthorizationState(locked.States(), request)
+	if !projected.principalUsable(request) {
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialPrincipalUnusable)
 	}
-	if principal.IsZero() || principal.Status() != domain.PrincipalActive || principal.Version() != request.PrincipalRevision() {
-		return domain.IdentityAuthorization{}, ErrAccessDenied
+	installation := projected.principal.InstallationID()
+	deviceID, deviceTrust, deviceUsable := projected.deviceUsable(request, installation)
+	if !deviceUsable {
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialDeviceUntrusted)
 	}
-	installation := principal.InstallationID()
-	var deviceID domain.DeviceID
-	var deviceTrust domain.Version
-	if expectedID, expectedVersion, expectedTrust, expectedRevoke, fingerprint, hasDevice := request.Device(); hasDevice {
-		device, exists := devices[expectedID]
-		if !exists || device.Status() != domain.DeviceTrusted || device.PrincipalID() != request.PrincipalID() ||
-			device.InstallationID() != installation || device.Version() != expectedVersion ||
-			device.TrustRevision() != expectedTrust || device.RevocationRevision() != expectedRevoke ||
-			!device.AcceptsCredential(fingerprint, request.VerifiedAt()) {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
-		}
-		deviceID, deviceTrust = expectedID, expectedTrust
+	granted, hasGranted, grantsUsable := projected.grantedCapabilities(request, installation)
+	if !grantsUsable {
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialGrantUnusable)
 	}
 	capabilitySets := make([]domain.CapabilitySet, 0, 4)
-	grantCapabilities := make(map[domain.Capability]struct{})
-	for _, revision := range request.GrantRevisions() {
-		grant, exists := grants[revision.Target()]
-		if !exists || grant.Status() != domain.GrantActive || grant.Version() != revision.Version() ||
-			grant.PrincipalID() != request.PrincipalID() || grant.InstallationID() != installation ||
-			(!grant.WorkspaceID().IsZero() && grant.WorkspaceID().String() != request.Scope().ID()) {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
-		}
-		for _, capability := range grant.Capabilities().Values() {
-			grantCapabilities[capability] = struct{}{}
-		}
-	}
-	if len(grantCapabilities) > 0 {
-		values := make([]domain.Capability, 0, len(grantCapabilities))
-		for capability := range grantCapabilities {
-			values = append(values, capability)
-		}
-		combined, err := domain.NewCapabilitySet(values...)
-		if err != nil {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
-		}
-		capabilitySets = append(capabilitySets, combined)
+	if hasGranted {
+		capabilitySets = append(capabilitySets, granted)
 	}
 	assurance := authorization.assurance
 	if request.Scope().Kind() == domain.ScopeKindWorkspace {
-		if workspace.IsZero() || workspace.Status() != domain.WorkspaceActive || workspace.InstallationID() != installation ||
-			workspace.AuthorityID() != locked.Spec().AuthorityID() || workspace.AuthorityEpoch() != locked.Spec().RequestedEpoch() ||
-			workspace.PolicyRevision() != policy.Revision() {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
+		if !projected.workspaceUsable(locked.Spec(), policy, installation) {
+			return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialWorkspaceUnusable)
 		}
-		if !membership.IsZero() {
-			if membership.Status() != domain.MembershipActive || membership.WorkspaceID() != workspace.ID() {
-				return domain.IdentityAuthorization{}, ErrAccessDenied
+		// An absent membership is not a denial: installation-scoped grants can
+		// carry a principal into a workspace on their own.
+		if !projected.membership.IsZero() {
+			if !projected.membershipUsable() {
+				return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialMembershipUnusable)
 			}
-			capabilitySets = append(capabilitySets, membership.Capabilities())
+			capabilitySets = append(capabilitySets, projected.membership.Capabilities())
 		}
 	}
-	if sessionID, sessionVersion, hasSession := request.ActorSession(); hasSession {
-		if session.IsZero() || session.ID() != sessionID || session.Version() != sessionVersion ||
-			session.Status() != domain.ActorSessionActive || !now.Before(session.Binding().AbsoluteExpiry()) ||
-			session.Binding().PrincipalID() != request.PrincipalID() || session.Binding().WorkspaceID().String() != request.Scope().ID() ||
-			session.Binding().AuthorityID() != locked.Spec().AuthorityID() || session.Binding().AuthorityEpoch() != locked.Spec().RequestedEpoch() ||
-			session.Binding().PolicyRevision() != policy.Revision() || session.PresentationCredential().Audience() != request.Audience() {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
+	if _, _, hasSession := request.ActorSession(); hasSession {
+		if reason := projected.sessionDenial(request, locked.Spec(), policy, deviceID, now); reason != "" {
+			return domain.IdentityAuthorization{}, deniedAuthorization(replay, reason)
 		}
-		membershipRef := session.Binding().MembershipRevision()
-		delegationRef := session.Binding().DelegationRevision()
-		actor := actors[session.Binding().ActorID()]
-		if membership.IsZero() || membership.ID().String() != membershipRef.ID() || membership.Version() != membershipRef.Version() ||
-			delegation.IsZero() || delegation.ID().String() != delegationRef.ID() || delegation.Version() != delegationRef.Version() ||
-			delegation.Status() != domain.DelegationActive || actor.IsZero() || actor.Status() != domain.ActorActive ||
-			actor.ID() != delegation.ActorID() || delegation.MembershipID() != membership.ID() {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
-		}
-		if boundDevice, bound := session.Binding().DeviceRevision(); bound {
-			device, exists := devices[deviceID]
-			boundTrust, _ := session.Binding().DeviceTrustRevision()
-			if !exists || boundDevice.ID() != device.ID().String() || boundDevice.Version() != device.Version() || boundTrust != device.TrustRevision() {
-				return domain.IdentityAuthorization{}, ErrAccessDenied
-			}
-		}
-		if !sameAggregateRefs(session.Binding().GrantRevisions(), request.GrantRevisions()) {
-			return domain.IdentityAuthorization{}, ErrAccessDenied
-		}
-		capabilitySets = append(capabilitySets, delegation.Capabilities(), session.Capabilities())
-		assurance = session.Binding().AssuranceClass()
+		capabilitySets = append(capabilitySets, projected.delegation.Capabilities(), projected.session.Capabilities())
+		assurance = projected.session.Binding().AssuranceClass()
 	}
 	capabilities, err := intersectCapabilities(capabilitySets)
 	if err != nil {
-		return domain.IdentityAuthorization{}, ErrAccessDenied
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialCapabilitiesEmpty)
 	}
 	if request.Scope().Kind() == domain.ScopeKindInstallation {
 		return domain.NewIdentityAuthorization(
@@ -452,18 +447,217 @@ func (authorization *LockedAuthorization) authorize(
 		)
 	}
 	if request.Scope().Kind() != domain.ScopeKindWorkspace {
-		return domain.IdentityAuthorization{}, ErrAccessDenied
+		return domain.IdentityAuthorization{}, deniedAuthorization(replay, DenialScopeUnsupported)
 	}
 	if requestDevice, _, _, _, _, hasDevice := request.Device(); hasDevice {
 		return domain.NewDeviceBoundWorkspaceIdentityAuthorization(
-			locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation, workspace.ID(), request.PrincipalID(),
-			capabilities, policy.Revision(), assurance, now, authorization.maxSessionLifetime, requestDevice, deviceTrust,
+			locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation,
+			projected.workspace.ID(), request.PrincipalID(), capabilities, policy.Revision(),
+			assurance, now, authorization.maxSessionLifetime, requestDevice, deviceTrust,
 		)
 	}
 	return domain.NewWorkspaceIdentityAuthorization(
-		locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation, workspace.ID(), request.PrincipalID(),
-		capabilities, policy.Revision(), assurance, now, authorization.maxSessionLifetime,
+		locked.Spec().AuthorityID(), locked.Spec().RequestedEpoch(), installation,
+		projected.workspace.ID(), request.PrincipalID(), capabilities, policy.Revision(),
+		assurance, now, authorization.maxSessionLifetime,
 	)
+}
+
+// requestBoundToCommand rejects authentication evidence that was verified for a
+// different command, a different scope, a different principal, or after the
+// authority time this decision is being evaluated against.
+func requestBoundToCommand(
+	request application.AuthenticationRequest,
+	spec application.CommandSpec,
+	now time.Time,
+) bool {
+	return !request.VerifiedAt().After(now) && request.Scope() == spec.Scope() &&
+		request.Operation() == spec.CommandOperation() &&
+		request.PrincipalID() == spec.Authorship().PrincipalID()
+}
+
+// authorizationProjection is the locked state list reduced to the aggregates a
+// single authorization decision reads. Building it is the only pass over the
+// state list; every predicate below reads this value rather than re-scanning.
+type authorizationProjection struct {
+	principal  domain.PrincipalState
+	workspace  domain.WorkspaceState
+	membership domain.MembershipState
+	delegation domain.ActorDelegationState
+	session    domain.ActorSessionState
+	grants     map[domain.AggregateTarget]domain.GrantState
+	devices    map[domain.DeviceID]domain.DeviceState
+	actors     map[domain.ActorID]domain.ActorState
+}
+
+func projectAuthorizationState(
+	states []application.IdentityState,
+	request application.AuthenticationRequest,
+) authorizationProjection {
+	projected := authorizationProjection{
+		grants:  make(map[domain.AggregateTarget]domain.GrantState),
+		devices: make(map[domain.DeviceID]domain.DeviceState),
+		actors:  make(map[domain.ActorID]domain.ActorState),
+	}
+	for _, state := range states {
+		switch value := state.Value().(type) {
+		case domain.PrincipalState:
+			if value.ID() == request.PrincipalID() {
+				projected.principal = value
+			}
+		case domain.DeviceState:
+			projected.devices[value.ID()] = value
+		case domain.WorkspaceState:
+			if value.ID().String() == request.Scope().ID() {
+				projected.workspace = value
+			}
+		case domain.MembershipState:
+			if value.PrincipalID() == request.PrincipalID() {
+				projected.membership = value
+			}
+		case domain.ActorState:
+			projected.actors[value.ID()] = value
+		case domain.ActorDelegationState:
+			if value.PrincipalID() == request.PrincipalID() {
+				projected.delegation = value
+			}
+		case domain.ActorSessionState:
+			if id, _, ok := request.ActorSession(); ok && value.ID() == id {
+				projected.session = value
+			}
+		case domain.GrantState:
+			projected.grants[state.Target()] = value
+		}
+	}
+	return projected
+}
+
+func (projected authorizationProjection) principalUsable(request application.AuthenticationRequest) bool {
+	return !projected.principal.IsZero() && projected.principal.Status() == domain.PrincipalActive &&
+		projected.principal.Version() == request.PrincipalRevision()
+}
+
+// deviceUsable also reports the device identity the caller authenticated with,
+// because a workspace authorization is bound to that device and its trust
+// revision when the request presented one.
+func (projected authorizationProjection) deviceUsable(
+	request application.AuthenticationRequest,
+	installation domain.InstallationID,
+) (domain.DeviceID, domain.Version, bool) {
+	expectedID, expectedVersion, expectedTrust, expectedRevoke, fingerprint, hasDevice := request.Device()
+	if !hasDevice {
+		return domain.DeviceID{}, domain.Version{}, true
+	}
+	device, exists := projected.devices[expectedID]
+	if !exists || device.Status() != domain.DeviceTrusted || device.PrincipalID() != request.PrincipalID() ||
+		device.InstallationID() != installation || device.Version() != expectedVersion ||
+		device.TrustRevision() != expectedTrust || device.RevocationRevision() != expectedRevoke ||
+		!device.AcceptsCredential(fingerprint, request.VerifiedAt()) {
+		return domain.DeviceID{}, domain.Version{}, false
+	}
+	return expectedID, expectedTrust, true
+}
+
+// grantedCapabilities is the union of the capabilities the request's grants
+// carry. It reports whether any grant was presented at all, because a request
+// with no grants is not itself a denial: membership or delegation may still
+// supply a capability set.
+func (projected authorizationProjection) grantedCapabilities(
+	request application.AuthenticationRequest,
+	installation domain.InstallationID,
+) (domain.CapabilitySet, bool, bool) {
+	capabilities := make(map[domain.Capability]struct{})
+	for _, revision := range request.GrantRevisions() {
+		grant, exists := projected.grants[revision.Target()]
+		if !exists || grant.Status() != domain.GrantActive || grant.Version() != revision.Version() ||
+			grant.PrincipalID() != request.PrincipalID() || grant.InstallationID() != installation ||
+			(!grant.WorkspaceID().IsZero() && grant.WorkspaceID().String() != request.Scope().ID()) {
+			return domain.CapabilitySet{}, false, false
+		}
+		for _, capability := range grant.Capabilities().Values() {
+			capabilities[capability] = struct{}{}
+		}
+	}
+	if len(capabilities) == 0 {
+		return domain.CapabilitySet{}, false, true
+	}
+	values := make([]domain.Capability, 0, len(capabilities))
+	for capability := range capabilities {
+		values = append(values, capability)
+	}
+	combined, err := domain.NewCapabilitySet(values...)
+	if err != nil {
+		return domain.CapabilitySet{}, false, false
+	}
+	return combined, true, true
+}
+
+func (projected authorizationProjection) workspaceUsable(
+	spec application.CommandSpec,
+	policy application.PreparedPolicy,
+	installation domain.InstallationID,
+) bool {
+	return !projected.workspace.IsZero() && projected.workspace.Status() == domain.WorkspaceActive &&
+		projected.workspace.InstallationID() == installation &&
+		projected.workspace.AuthorityID() == spec.AuthorityID() &&
+		projected.workspace.AuthorityEpoch() == spec.RequestedEpoch() &&
+		projected.workspace.PolicyRevision() == policy.Revision()
+}
+
+func (projected authorizationProjection) membershipUsable() bool {
+	return projected.membership.Status() == domain.MembershipActive &&
+		projected.membership.WorkspaceID() == projected.workspace.ID()
+}
+
+// sessionDenial checks an actor session against the request, the command, and
+// the states the session was bound to when it was issued. It is three
+// predicates rather than one because they fail for genuinely different
+// operational reasons: a session that is no longer current, a session whose
+// membership, delegation or actor moved underneath it, and a session whose
+// device or grant set no longer matches the credential being presented.
+func (projected authorizationProjection) sessionDenial(
+	request application.AuthenticationRequest,
+	spec application.CommandSpec,
+	policy application.PreparedPolicy,
+	deviceID domain.DeviceID,
+	now time.Time,
+) DenialReason {
+	sessionID, sessionVersion, _ := request.ActorSession()
+	session := projected.session
+	if session.IsZero() || session.ID() != sessionID || session.Version() != sessionVersion ||
+		session.Status() != domain.ActorSessionActive || !now.Before(session.Binding().AbsoluteExpiry()) ||
+		session.Binding().PrincipalID() != request.PrincipalID() ||
+		session.Binding().WorkspaceID().String() != request.Scope().ID() ||
+		session.Binding().AuthorityID() != spec.AuthorityID() ||
+		session.Binding().AuthorityEpoch() != spec.RequestedEpoch() ||
+		session.Binding().PolicyRevision() != policy.Revision() ||
+		session.PresentationCredential().Audience() != request.Audience() {
+		return DenialSessionUnusable
+	}
+	membershipRef := session.Binding().MembershipRevision()
+	delegationRef := session.Binding().DelegationRevision()
+	actor := projected.actors[session.Binding().ActorID()]
+	if projected.membership.IsZero() || projected.membership.ID().String() != membershipRef.ID() ||
+		projected.membership.Version() != membershipRef.Version() ||
+		projected.delegation.IsZero() || projected.delegation.ID().String() != delegationRef.ID() ||
+		projected.delegation.Version() != delegationRef.Version() ||
+		projected.delegation.Status() != domain.DelegationActive || actor.IsZero() ||
+		actor.Status() != domain.ActorActive || actor.ID() != projected.delegation.ActorID() ||
+		projected.delegation.MembershipID() != projected.membership.ID() {
+		return DenialSessionReferencesStale
+	}
+	if boundDevice, bound := session.Binding().DeviceRevision(); bound {
+		device, exists := projected.devices[deviceID]
+		boundTrust, _ := session.Binding().DeviceTrustRevision()
+		if !exists || boundDevice.ID() != device.ID().String() || boundDevice.Version() != device.Version() ||
+			boundTrust != device.TrustRevision() {
+			return DenialSessionDeviceStale
+		}
+	}
+	if !sameAggregateRefs(session.Binding().GrantRevisions(), request.GrantRevisions()) {
+		return DenialSessionGrantsStale
+	}
+	return ""
 }
 
 func intersectCapabilities(sets []domain.CapabilitySet) (domain.CapabilitySet, error) {
@@ -514,7 +708,7 @@ func (authorization *ReplayAuthorization) AuthorizeReplay(
 ) (application.ReplayDisclosure, error) {
 	if authorization == nil || authorization.authorization == nil ||
 		locked.ReceiptResolution().Kind() != application.ReceiptExactReplay {
-		return "", ErrAccessDenied
+		return "", deniedAuthorization(true, DenialReplayNotResolved)
 	}
 	if _, err := authorization.authorization.authorize(locked, authentication, policy, true); err != nil {
 		return "", err
@@ -731,7 +925,8 @@ func (StrictDenialSecurityPolicy) DenialFollowUp(
 		return application.SecuritySpec{}, application.ErrInvalidSecuritySpec
 	}
 	spec := locked.Spec()
-	if locked.ReceiptResolution().Kind() != application.ReceiptAdmitted ||
+	resolution := locked.ReceiptResolution().Kind()
+	if (resolution != application.ReceiptAdmitted && resolution != application.ReceiptExactReplay) ||
 		spec.Authorship().PrincipalID() != authentication.PrincipalID() {
 		return application.SecuritySpec{}, application.ErrInvalidSecuritySpec
 	}
@@ -744,7 +939,7 @@ func (StrictDenialSecurityPolicy) DenialFollowUp(
 	if err != nil {
 		return application.SecuritySpec{}, err
 	}
-	class, reason, valid := safeDenialClassification(rejection)
+	class, reason, valid := safeDenialClassification(rejection, resolution)
 	if !valid {
 		return application.SecuritySpec{}, application.ErrInvalidSecuritySpec
 	}
@@ -761,18 +956,39 @@ func (StrictDenialSecurityPolicy) DenialFollowUp(
 	)
 }
 
-func safeDenialClassification(rejection *domain.CommandError) (application.CommandDenialClass, string, bool) {
+func safeDenialClassification(
+	rejection *domain.CommandError,
+	resolution application.ReceiptResolutionKind,
+) (application.CommandDenialClass, string, bool) {
 	if rejection == nil {
 		return "", "", false
 	}
 	switch rejection.Code() {
 	case domain.ErrorCodeUnauthenticated, domain.ErrorCodeSessionExpired:
-		return application.DenialAuthentication, "credential_rejected", true
+		return application.DenialAuthentication, denialAuditReason(rejection, "credential_rejected"), true
 	case domain.ErrorCodeForbidden, domain.ErrorCodeCapabilityRequired:
-		return application.DenialAuthorization, "authorization_denied", true
+		// A refused exact replay is a disclosure decision, not an admission
+		// decision, and the application layer accepts only that class for it.
+		if resolution == application.ReceiptExactReplay {
+			return application.DenialResultDisclosure, denialAuditReason(rejection, "result_disclosure_denied"), true
+		}
+		return application.DenialAuthorization, denialAuditReason(rejection, "authorization_denied"), true
 	default:
 		return "", "", false
 	}
+}
+
+// denialAuditReason prefers the predicate that actually refused the request.
+// The denial audit row is the operator's record and never reaches the caller,
+// so it carries the specific reason the caller-facing failure withholds. A
+// rejection raised outside this boundary names no predicate and keeps the
+// cataloged class reason.
+func denialAuditReason(rejection *domain.CommandError, cataloged string) string {
+	var denial *AccessDenialError
+	if errors.As(rejection, &denial) && denial.Reason() != "" {
+		return string(denial.Reason())
+	}
+	return cataloged
 }
 
 func ptrPolicyRevision(revision domain.PolicyRevision) *domain.PolicyRevision { return &revision }

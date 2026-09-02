@@ -52,6 +52,12 @@ const (
 	// by its kind, which is what the extra bytes cover.
 	maxLeaseSelectorPathBytes = application.MaxLeaseSelectorBytes
 	maxFenceConflictKeyBytes  = application.MaxLeaseSelectorBytes + 16
+
+	// maxErrorMessageBytes bounds ErrorDTO.Message. It matches the bound
+	// domain.NewCommandError enforces, so a domain message is short enough to
+	// travel; the wire rule is otherwise stricter, which is why a producer
+	// forwarding a domain message must validate rather than assume.
+	maxErrorMessageBytes = 512
 )
 
 type CommandResultMetadataDTO struct {
@@ -962,7 +968,7 @@ func (result ErrorDTO) Validate() error {
 	if result.Category != category {
 		return invalid("category", fmt.Sprintf("must equal %q for code %q", category, result.Code))
 	}
-	if err := validateText("message", result.Message, 512, true); err != nil {
+	if err := validateText("message", result.Message, maxErrorMessageBytes, true); err != nil {
 		return err
 	}
 	if result.Retryable != result.Code.DefaultRetryable() {

@@ -1321,8 +1321,15 @@ func (handler *ApplicationHandler) HandleRunStart(ctx context.Context, evidence 
 // DTO. Only codes whose evidence the transport can derive from the request
 // context are mapped; codes that require version/state evidence owned by the
 // application layer (STALE_VERSION, STATE_CONFLICT, NOT_FOUND, lease and fence
-// rejections) surface as internal failures until the application layer exposes
-// the rejection details it holds.
+// rejections) surface as internal failures.
+//
+// For the coordination codes the reason is no longer that the contract lacks a
+// schema — LEASE_CONFLICT, LEASE_EXPIRED and FENCE_REJECTED each have a frozen
+// typed evidence schema in outcomes.go. It is that nothing inward carries the
+// evidence: *domain.CommandError holds a code, a category, a message and a
+// conflict kind, so the holder, expiry and counters the storage layer knows are
+// interpolated into the message text and lost to the type system. Mapping those
+// codes here requires a structured carrier on the rejection first.
 func commandRejectionDTO(
 	requestID string,
 	rejection *domain.CommandError,
@@ -1335,7 +1342,7 @@ func commandRejectionDTO(
 	}
 	failure := &ErrorDTO{
 		Schema: SchemaError, RequestID: requestID, Code: rejection.Code(),
-		Category: rejection.Category(), Message: commandFailureMessage(rejection.Code()),
+		Category: rejection.Category(), Message: commandRejectionMessage(rejection),
 		Retryable: rejection.Retryable(),
 	}
 	switch rejection.Code() {
@@ -1378,6 +1385,30 @@ func commandRejectionDTO(
 		return nil, err
 	}
 	return failure, nil
+}
+
+// commandRejectionMessage prefers the domain's own failure text over the
+// per-code generic string: the domain constructs 85 precise messages and a
+// transport that discards them tells every caller the same thing about very
+// different failures.
+//
+// It is a preference rather than a substitution because the two bounds are not
+// the same. domain.NewCommandError admits any non-blank, valid-UTF-8 string up
+// to maxErrorMessageBytes, while the wire contract additionally forbids
+// surrounding whitespace and control characters. Forwarding blindly would turn
+// a typed rejection into a contract violation — an ErrorDTO that fails its own
+// Validate reaches the caller as an internal failure, which is strictly worse
+// than a generic message. The admissibility test therefore routes through the
+// validator ErrorDTO.Validate itself calls, so the two rules cannot drift.
+//
+// Sentinel domain errors carry no message at all, so the generic string remains
+// the floor rather than dead code.
+func commandRejectionMessage(rejection *domain.CommandError) string {
+	message := rejection.Message()
+	if message == "" || validateText("message", message, maxErrorMessageBytes, true) != nil {
+		return commandFailureMessage(rejection.Code())
+	}
+	return message
 }
 
 func commandFailureMessage(code domain.ErrorCode) string {

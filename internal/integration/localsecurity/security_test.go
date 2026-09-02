@@ -1417,3 +1417,1301 @@ func (store *fakeSecretStore) Delete(service, account string) error {
 	delete(store.values, service+"\x00"+account)
 	return nil
 }
+
+// authorizationInputs is the accepted identity graph behind one authorization
+// decision, held as the rehydration parameters each state is built from. Tests
+// copy an accepted fixture, spoil exactly one input, and assert the decision
+// that follows, so a refactor that moves a predicate shows up as a named
+// failure rather than as a silent change of meaning.
+type authorizationInputs struct {
+	now time.Time
+
+	installation  domain.InstallationID
+	authority     domain.AuthorityID
+	epoch         domain.AuthorityEpoch
+	clientID      domain.ClientInstanceID
+	workReference domain.WorkReferenceID
+	createdID     domain.PrincipalID
+
+	assurance      domain.AssuranceClass
+	guardPolicy    domain.PolicyRevision
+	preparedPolicy domain.PolicyRevision
+	policyDigest   application.Digest
+
+	principal  domain.PrincipalRehydrationParams
+	device     domain.DeviceRehydrationParams
+	grant      domain.GrantRehydrationParams
+	workspace  domain.WorkspaceRehydrationParams
+	membership domain.MembershipRehydrationParams
+	actor      domain.ActorRehydrationParams
+	delegation domain.ActorDelegationRehydrationParams
+	session    domain.ActorSessionRehydrationParams
+	binding    sessionBindingInputs
+	request    application.AuthenticationRequestParams
+
+	workspaceScoped bool
+	withDevice      bool
+	withGrant       bool
+	withMembership  bool
+	withSession     bool
+
+	// withoutAuthorityTime resolves the command as an integrity conflict, the
+	// only admitted-free resolution that carries no persisted authority time.
+	withoutAuthorityTime bool
+
+	// withoutPrincipal and withoutWorkspaceState drop a state the request still
+	// names, which is how a locked read that came back empty reaches authorize.
+	withoutPrincipal      bool
+	withoutWorkspaceState bool
+}
+
+// sessionBindingInputs are the session binding's ingredients rather than the
+// sealed value, because a binding that disagrees with the states around it is
+// exactly what several denials are about.
+type sessionBindingInputs struct {
+	authority   domain.AuthorityID
+	epoch       domain.AuthorityEpoch
+	workspace   domain.WorkspaceID
+	principal   domain.PrincipalID
+	actor       domain.ActorID
+	membership  domain.AggregateRef
+	delegation  domain.AggregateRef
+	device      *domain.AggregateRef
+	deviceTrust domain.Version
+	grants      []domain.AggregateRef
+	policy      domain.PolicyRevision
+	assurance   domain.AssuranceClass
+	issuedAt    time.Time
+	expiry      time.Time
+}
+
+type authorizationSubject struct {
+	locked         application.CommandContext
+	authentication application.AuthenticationEvidence
+	policy         application.PreparedPolicy
+	authorization  *LockedAuthorization
+}
+
+func authorizationID[ID any](t *testing.T, parse func(string) (ID, error), index int) ID {
+	t.Helper()
+	value, err := parse(proofUUID(index))
+	if err != nil {
+		t.Fatalf("parse identifier %d: %v", index, err)
+	}
+	return value
+}
+
+// acceptedWorkspaceAuthorization is the workspace-scoped graph every workspace
+// denial starts from: an active principal in a trusted device's installation,
+// one active grant, an active workspace and membership, and an active actor
+// session bound to all of them.
+func acceptedWorkspaceAuthorization(t *testing.T) authorizationInputs {
+	t.Helper()
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	installation := authorizationID(t, domain.ParseInstallationID, 200)
+	principal := authorizationID(t, domain.ParsePrincipalID, 201)
+	device := authorizationID(t, domain.ParseDeviceID, 202)
+	workspace := authorizationID(t, domain.ParseWorkspaceID, 203)
+	membership := authorizationID(t, domain.ParseMembershipID, 204)
+	grant := authorizationID(t, domain.ParseGrantID, 205)
+	actor := authorizationID(t, domain.ParseActorID, 206)
+	delegation := authorizationID(t, domain.ParseActorDelegationID, 207)
+	session := authorizationID(t, domain.ParseActorSessionID, 208)
+	authority := authorizationID(t, domain.ParseAuthorityID, 209)
+	epoch := authorizationID(t, domain.ParseAuthorityEpoch, 210)
+	activation := authorizationID(t, domain.ParseCeremonyID, 211)
+	client := authorizationID(t, domain.ParseClientInstanceID, 215)
+	workReference := authorizationID(t, domain.ParseWorkReferenceID, 217)
+
+	displayName, err := domain.NewDisplayName("Authorization Subject")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyReference, err := domain.NewPublicKeyReference("keyref:authorization-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias, err := domain.NewWorkspaceAlias("authorization-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := domain.NewActorProfile(displayName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := domain.NewClientMetadata("blackbird-test", "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := domain.NewPolicyRevision("authorization-policy:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assurance, err := domain.NewAssuranceClass("hardware_key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audience, err := domain.NewCredentialAudience("blackbird:local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := domain.NewCredentialDigest(sha256.Sum256([]byte("authorization device spki")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := domain.FingerprintCommand([]byte("authorization device pairing transcript"))
+	credential, err := domain.NewDeviceCredentialBinding(keyReference, fingerprint, transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialReference, err := domain.NewCredentialReference("presentation:authorization-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := domain.NewPresentationCredentialBinding(
+		fingerprint, credentialReference, audience, domain.PresentationCredentialVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities, err := domain.NewCapabilitySet(
+		domain.WorkspaceOwnerCapability(), domain.MembershipAdminCapability(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationChallenge, err := domain.RehydrateCeremonyChallenge(domain.CeremonyChallengeRehydrationParams{
+		ID: activation, Purpose: domain.CeremonyPurposeDelegationActivation,
+		ProofDigest: domain.FingerprintCommand([]byte("delegation activation proof")),
+		ExpiresAt:   now.Add(time.Hour), Status: domain.CeremonyConsumed,
+		WorkspaceID: workspace, PrincipalID: principal, ActorID: actor, DelegationID: delegation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := application.NewAuditProvenanceEvidence(authority, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := domain.WorkspaceScope(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutated, err := domain.NewVersion(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := domain.InitialVersion()
+	membershipRef, err := domain.NewAggregateRef(membership, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegationRef, err := domain.NewAggregateRef(delegation, mutated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceRef, err := domain.NewAggregateRef(device, mutated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantRef, err := domain.NewAggregateRef(grant, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return authorizationInputs{
+		now: now, installation: installation, authority: authority, epoch: epoch,
+		clientID: client, workReference: workReference,
+		createdID:   authorizationID(t, domain.ParsePrincipalID, 218),
+		assurance:   assurance,
+		guardPolicy: policy, preparedPolicy: policy,
+		policyDigest: application.DigestBytes([]byte("authorization policy")),
+		principal: domain.PrincipalRehydrationParams{
+			ID: principal, InstallationID: installation, Kind: domain.PrincipalKindHuman,
+			DisplayName: displayName, PublicKeyReference: keyReference,
+			Status: domain.PrincipalActive, Version: initial,
+		},
+		device: domain.DeviceRehydrationParams{
+			ID: device, InstallationID: installation, PrincipalID: principal,
+			DisplayName: displayName, PublicKeyReference: keyReference,
+			Status: domain.DeviceTrusted, Version: mutated, TrustRevision: mutated,
+			RevocationRevision: initial, CredentialBinding: credential,
+			CredentialActivatedAt: now.Add(-time.Hour),
+		},
+		grant: domain.GrantRehydrationParams{
+			ID: grant, InstallationID: installation, PrincipalID: principal,
+			Status: domain.GrantActive, Version: initial, Capabilities: capabilities,
+		},
+		workspace: domain.WorkspaceRehydrationParams{
+			ID: workspace, InstallationID: installation, AuthorityID: authority, AuthorityEpoch: epoch,
+			Alias: alias, PolicyRevision: policy, Status: domain.WorkspaceActive, Version: initial,
+		},
+		membership: domain.MembershipRehydrationParams{
+			ID: membership, WorkspaceID: workspace, PrincipalID: principal,
+			Status: domain.MembershipActive, Version: initial, Capabilities: capabilities,
+		},
+		actor: domain.ActorRehydrationParams{
+			ID: actor, WorkspaceID: workspace, Kind: domain.ActorKindAgent,
+			Profile: profile, Status: domain.ActorActive, Version: initial,
+		},
+		delegation: domain.ActorDelegationRehydrationParams{
+			ID: delegation, WorkspaceID: workspace, PrincipalID: principal, ActorID: actor,
+			MembershipID: membership, Status: domain.DelegationActive, Version: mutated,
+			Capabilities: capabilities, ActivationChallenge: activationChallenge,
+		},
+		session: domain.ActorSessionRehydrationParams{
+			ID: session, ClientInstanceID: client, ClientMetadata: metadata,
+			Status: domain.ActorSessionActive, Version: initial, Capabilities: capabilities,
+			PresentationCredential: presentation,
+		},
+		binding: sessionBindingInputs{
+			authority: authority, epoch: epoch, workspace: workspace, principal: principal,
+			actor: actor, membership: membershipRef, delegation: delegationRef,
+			device: &deviceRef, deviceTrust: mutated, grants: []domain.AggregateRef{grantRef},
+			policy: policy, assurance: assurance,
+			issuedAt: now.Add(-time.Minute), expiry: now.Add(time.Hour),
+		},
+		request: application.AuthenticationRequestParams{
+			Operation: application.CommandObserveWorkRef, Scope: scope, PrincipalID: principal,
+			PrincipalRevision: initial, DeviceID: &device, DeviceRevision: mutated,
+			DeviceTrustRevision: mutated, DeviceRevokeRevision: initial, CredentialFingerprint: fingerprint,
+			ActorSessionID: &session, ActorSessionRevision: initial,
+			GrantRevisions: []domain.AggregateRef{grantRef},
+			ChannelBinding: application.DigestBytes([]byte("authorization channel")),
+			Audience:       audience, AuditProvenance: provenance, VerifiedAt: now.Add(-time.Second),
+		},
+		workspaceScoped: true, withDevice: true, withGrant: true,
+		withMembership: true, withSession: true,
+	}
+}
+
+// acceptedInstallationAuthorization is the installation-scoped graph: the same
+// principal and grant, no workspace, no device and no session, because the
+// installation-admin command contract admits exactly one principal and one
+// grant as authorization reads.
+func acceptedInstallationAuthorization(t *testing.T) authorizationInputs {
+	t.Helper()
+	inputs := acceptedWorkspaceAuthorization(t)
+	scope, err := domain.InstallationScope(inputs.installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs.workspaceScoped, inputs.withDevice, inputs.withMembership, inputs.withSession = false, false, false, false
+	inputs.request.Operation = application.CommandRegisterPrincipal
+	inputs.request.Scope = scope
+	inputs.request.DeviceID = nil
+	inputs.request.DeviceRevision = domain.Version{}
+	inputs.request.DeviceTrustRevision = domain.Version{}
+	inputs.request.DeviceRevokeRevision = domain.Version{}
+	inputs.request.CredentialFingerprint = domain.CredentialDigest{}
+	inputs.request.ActorSessionID = nil
+	inputs.request.ActorSessionRevision = domain.Version{}
+	return inputs
+}
+
+// lockedState pairs one rehydrated identity state with the versioned reference
+// the guard plan must declare for it, because the command context admits a
+// state only when the plan already named it at that exact version.
+type lockedState struct {
+	state application.IdentityState
+	ref   domain.AggregateRef
+}
+
+func (inputs authorizationInputs) states(t *testing.T) []lockedState {
+	t.Helper()
+	states := make([]lockedState, 0, 7)
+	add := func(value any, ref domain.AggregateRef, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("aggregate reference for %T: %v", value, err)
+		}
+		state, stateErr := application.NewIdentityState(value)
+		if stateErr != nil {
+			t.Fatalf("identity state %T: %v", value, stateErr)
+		}
+		states = append(states, lockedState{state: state, ref: ref})
+	}
+	if !inputs.withoutPrincipal {
+		principal, principalErr := domain.RehydratePrincipal(inputs.principal)
+		if principalErr != nil {
+			t.Fatalf("rehydrate principal: %v", principalErr)
+		}
+		ref, refErr := domain.NewAggregateRef(inputs.principal.ID, principal.Version())
+		add(principal, ref, refErr)
+	}
+	if inputs.withDevice {
+		device, deviceErr := domain.RehydrateDevice(inputs.device)
+		if deviceErr != nil {
+			t.Fatalf("rehydrate device: %v", deviceErr)
+		}
+		ref, refErr := domain.NewAggregateRef(inputs.device.ID, device.Version())
+		add(device, ref, refErr)
+	}
+	if inputs.withGrant {
+		grant, grantErr := domain.RehydrateGrant(inputs.grant)
+		if grantErr != nil {
+			t.Fatalf("rehydrate grant: %v", grantErr)
+		}
+		ref, refErr := domain.NewAggregateRef(inputs.grant.ID, grant.Version())
+		add(grant, ref, refErr)
+	}
+	if inputs.workspaceScoped && !inputs.withoutWorkspaceState {
+		workspace, workspaceErr := domain.RehydrateWorkspace(inputs.workspace)
+		if workspaceErr != nil {
+			t.Fatalf("rehydrate workspace: %v", workspaceErr)
+		}
+		ref, refErr := domain.NewAggregateRef(inputs.workspace.ID, workspace.Version())
+		add(workspace, ref, refErr)
+	}
+	if inputs.withMembership {
+		membership, membershipErr := domain.RehydrateMembership(inputs.membership)
+		if membershipErr != nil {
+			t.Fatalf("rehydrate membership: %v", membershipErr)
+		}
+		ref, refErr := domain.NewAggregateRef(inputs.membership.ID, membership.Version())
+		add(membership, ref, refErr)
+	}
+	if inputs.withSession {
+		actor, actorErr := domain.RehydrateActor(inputs.actor)
+		if actorErr != nil {
+			t.Fatalf("rehydrate actor: %v", actorErr)
+		}
+		actorRef, actorRefErr := domain.NewAggregateRef(inputs.actor.ID, actor.Version())
+		add(actor, actorRef, actorRefErr)
+		delegation, delegationErr := domain.RehydrateActorDelegation(inputs.delegation)
+		if delegationErr != nil {
+			t.Fatalf("rehydrate delegation: %v", delegationErr)
+		}
+		delegationRef, delegationRefErr := domain.NewAggregateRef(inputs.delegation.ID, delegation.Version())
+		add(delegation, delegationRef, delegationRefErr)
+		sessionParams := inputs.session
+		sessionParams.Binding = inputs.binding.build(t)
+		session, sessionErr := domain.RehydrateActorSession(sessionParams)
+		if sessionErr != nil {
+			t.Fatalf("rehydrate actor session: %v", sessionErr)
+		}
+		sessionRef, sessionRefErr := domain.NewAggregateRef(inputs.session.ID, session.Version())
+		add(session, sessionRef, sessionRefErr)
+	}
+	return states
+}
+
+func (binding sessionBindingInputs) build(t *testing.T) domain.SessionBinding {
+	t.Helper()
+	value, err := domain.NewSessionBinding(
+		binding.authority, binding.epoch, binding.workspace, binding.principal, binding.actor,
+		binding.membership, binding.delegation, binding.device, binding.deviceTrust,
+		binding.grants, binding.policy, binding.assurance, binding.issuedAt, binding.expiry,
+	)
+	if err != nil {
+		t.Fatalf("session binding: %v", err)
+	}
+	return value
+}
+
+func (inputs authorizationInputs) build(t *testing.T) authorizationSubject {
+	t.Helper()
+	locked := inputs.states(t)
+	spec := inputs.spec(t, locked)
+	guardEvidence, err := application.NewAppliedGuardEvidence(spec.Guards(), spec.Guards().Evidence())
+	if err != nil {
+		t.Fatalf("applied guard evidence: %v", err)
+	}
+	states := make([]application.IdentityState, 0, len(locked))
+	for _, entry := range locked {
+		states = append(states, entry.state)
+	}
+	resolution := application.AdmitReceipt()
+	timeEvidence, err := application.PersistedCommandAuthorityTime(inputs.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inputs.withoutAuthorityTime {
+		states = nil
+		resolution, err = application.ConflictReceipt(application.ReceiptIntegrityConflict, domain.ReceiptID{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		timeEvidence, err = application.ReadOnlyDisclosureTime(inputs.now, inputs.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	commandContext, err := application.NewCommandContext(spec, timeEvidence, states, resolution, guardEvidence)
+	if err != nil {
+		t.Fatalf("command context: %v", err)
+	}
+	request, err := application.NewAuthenticationRequest(inputs.request)
+	if err != nil {
+		t.Fatalf("authentication request: %v", err)
+	}
+	authentication, err := application.NewAuthenticationEvidence(request)
+	if err != nil {
+		t.Fatalf("authentication evidence: %v", err)
+	}
+	policy, err := application.NewPreparedPolicy(inputs.preparedPolicy, inputs.policyDigest)
+	if err != nil {
+		t.Fatalf("prepared policy: %v", err)
+	}
+	authorization, err := NewLockedAuthorization(inputs.assurance, domain.MaxActorSessionLifetime)
+	if err != nil {
+		t.Fatalf("locked authorization: %v", err)
+	}
+	return authorizationSubject{
+		locked: commandContext, authentication: authentication, policy: policy, authorization: authorization,
+	}
+}
+
+func (inputs authorizationInputs) spec(t *testing.T, locked []lockedState) application.CommandSpec {
+	t.Helper()
+	operation := application.CommandObserveWorkRef
+	if !inputs.workspaceScoped {
+		operation = application.CommandRegisterPrincipal
+	}
+	name, err := domain.NewOperationName(string(operation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, err := application.NewOperationMajor(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := domain.NewIdempotencyKey("authorization-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := inputs.commandScope(t)
+	receipt := inputs.receiptIdentity(t, scope, name, key)
+	authorship, err := application.AuthorityAuthorship(inputs.principal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := application.NewGuardGeneration(11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epochGuard, err := application.CurrentAuthorityEpochGuard(scope, inputs.authority, inputs.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyGuard, err := application.PolicyRevisionGuard(scope, inputs.guardPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principalTarget, err := domain.NewAggregateTarget(inputs.principal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizations := make([]domain.AggregateRef, 0, len(locked))
+	for _, entry := range locked {
+		authorizations = append(authorizations, entry.ref)
+	}
+	planParams := application.CommandGuardPlanParams{
+		AdmissionScope: scope, AdmissionGeneration: generation,
+		Evidence:      []application.EvidenceGuard{epochGuard, policyGuard},
+		Authorization: authorizations,
+		Disclosure:    []domain.AggregateTarget{principalTarget},
+	}
+	factType := domain.EventTypeWorkRefObserved
+	origin, err := domain.NewAggregateRef(inputs.workReference, domain.InitialVersion())
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsule := application.NotApplicableRecoveryCapsulePlan()
+	if !inputs.workspaceScoped {
+		factType = domain.EventTypePrincipalRegistered
+		mutationTarget, targetErr := domain.NewAggregateTarget(inputs.createdID)
+		if targetErr != nil {
+			t.Fatal(targetErr)
+		}
+		planParams.Disclosure = append(planParams.Disclosure, mutationTarget)
+		origin, err = domain.NewAggregateRef(inputs.createdID, domain.InitialVersion())
+		if err != nil {
+			t.Fatal(err)
+		}
+		grantTarget, targetErr := domain.NewAggregateTarget(inputs.grant.ID)
+		if targetErr != nil {
+			t.Fatal(targetErr)
+		}
+		ceiling, ceilingErr := application.CapabilityCeilingGuard(
+			grantTarget, application.DigestBytes([]byte("grant ceiling")),
+		)
+		if ceilingErr != nil {
+			t.Fatal(ceilingErr)
+		}
+		planParams.Evidence = append(planParams.Evidence, inputs.lifecycleGuards(t, locked)...)
+		planParams.Evidence = append(planParams.Evidence, ceiling)
+	}
+	mutation, err := domain.ExpectAggregateAbsent(inputs.workReference)
+	if !inputs.workspaceScoped {
+		mutation, err = domain.ExpectAggregateAbsent(inputs.createdID)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	planParams.Mutations = []domain.AggregateExpectation{mutation}
+	plan, err := application.NewCommandGuardPlan(planParams)
+	if err != nil {
+		t.Fatalf("guard plan: %v", err)
+	}
+	if !inputs.workspaceScoped {
+		capsule, err = application.PrepareRecoveryCapsulePlan(stubCapsuleSigner{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	fact, err := application.NewFactExpectation(
+		authorizationID(t, domain.ParseEventID, 216), factType, origin,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := application.NewCommandSpec(application.CommandSpecParams{
+		Scope: scope, AuthorityID: inputs.authority, RequestedEpoch: inputs.epoch,
+		CommandID: authorizationID(t, domain.ParseCommandID, 212),
+		ReceiptID: authorizationID(t, domain.ParseReceiptID, 213),
+		Operation: name, OperationMajor: major, ReceiptIdentity: receipt,
+		RequestFingerprint: domain.FingerprintCommand([]byte("authorization fixture command")),
+		Authorship:         authorship,
+		CorrelationID:      authorizationID(t, domain.ParseCorrelationID, 214),
+		AuthorityTimeClass: application.AuthorityTimeOrdinary, RecoveryCapsule: capsule,
+		Guards: plan, ExpectedFacts: []application.FactExpectation{fact},
+	})
+	if err != nil {
+		t.Fatalf("command spec: %v", err)
+	}
+	return spec
+}
+
+func (inputs authorizationInputs) commandScope(t *testing.T) domain.AuthorityScope {
+	t.Helper()
+	if inputs.workspaceScoped {
+		scope, err := domain.WorkspaceScope(inputs.workspace.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return scope
+	}
+	scope, err := domain.InstallationScope(inputs.installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scope
+}
+
+func (inputs authorizationInputs) receiptIdentity(
+	t *testing.T,
+	scope domain.AuthorityScope,
+	name domain.OperationName,
+	key domain.IdempotencyKey,
+) application.ReceiptIdentity {
+	t.Helper()
+	if !inputs.workspaceScoped {
+		receipt, err := application.InstallationAdminReceiptIdentity(
+			inputs.installation, inputs.principal.ID, inputs.clientID, name, key,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return receipt
+	}
+	workspace, err := domain.ParseWorkspaceID(scope.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	idempotency, err := domain.NewIdempotencyScope(workspace, inputs.principal.ID, inputs.clientID, name, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := application.OrdinaryReceiptIdentity(idempotency)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
+}
+
+func (inputs authorizationInputs) lifecycleGuards(
+	t *testing.T,
+	locked []lockedState,
+) []application.EvidenceGuard {
+	t.Helper()
+	statuses := map[domain.AggregateKind]string{
+		domain.AggregateKindPrincipal: string(inputs.principal.Status),
+		domain.AggregateKindGrant:     string(inputs.grant.Status),
+	}
+	guards := make([]application.EvidenceGuard, 0, len(locked))
+	for _, entry := range locked {
+		status, known := statuses[entry.state.Target().Kind()]
+		if !known {
+			continue
+		}
+		guard, err := application.LifecycleStatusGuard(entry.state.Target(), status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		guards = append(guards, guard)
+	}
+	return guards
+}
+
+// stubCapsuleSigner satisfies the recovery-capsule plan for command specs that
+// declare one. Authorization never signs, so the key identity is enough.
+type stubCapsuleSigner struct{}
+
+func (stubCapsuleSigner) KeyID() string { return "ed25519:authorization-fixture" }
+
+func (stubCapsuleSigner) Ed25519PublicKey() ed25519.PublicKey {
+	seed := sha256.Sum256([]byte("authorization fixture capsule key"))
+	return ed25519.NewKeyFromSeed(seed[:]).Public().(ed25519.PublicKey)
+}
+
+func (stubCapsuleSigner) SignRecoveryCapsule(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("authorization fixture never signs")
+}
+
+func TestAuthorizeLockedGrantsScopedIdentityAuthorization(t *testing.T) {
+	t.Parallel()
+
+	installationInputs := acceptedInstallationAuthorization(t)
+	installation := installationInputs.build(t)
+	granted, err := installation.authorization.AuthorizeLocked(
+		installation.locked, installation.authentication, installation.policy,
+	)
+	if err != nil {
+		t.Fatalf("installation AuthorizeLocked: %v", err)
+	}
+	if granted.InstallationID() != installationInputs.installation ||
+		granted.PrincipalID() != installationInputs.principal.ID ||
+		!granted.WorkspaceID().IsZero() || granted.PolicyRevision() != installationInputs.preparedPolicy ||
+		granted.AssuranceClass() != installationInputs.assurance {
+		t.Fatalf("installation authorization = %+v", granted)
+	}
+	if _, _, bound := granted.AuthenticatedDevice(); bound {
+		t.Fatal("installation-scoped authorization reported an authenticated device")
+	}
+
+	workspaceInputs := acceptedWorkspaceAuthorization(t)
+	workspace := workspaceInputs.build(t)
+	granted, err = workspace.authorization.AuthorizeLocked(
+		workspace.locked, workspace.authentication, workspace.policy,
+	)
+	if err != nil {
+		t.Fatalf("workspace AuthorizeLocked: %v", err)
+	}
+	if granted.WorkspaceID() != workspaceInputs.workspace.ID ||
+		granted.InstallationID() != workspaceInputs.installation ||
+		granted.PrincipalID() != workspaceInputs.principal.ID ||
+		granted.AssuranceClass() != workspaceInputs.binding.assurance {
+		t.Fatalf("workspace authorization = %+v", granted)
+	}
+	device, trust, bound := granted.AuthenticatedDevice()
+	if !bound || device != workspaceInputs.device.ID || trust != workspaceInputs.device.TrustRevision {
+		t.Fatalf("device binding = (%v, %v, %v)", device, trust, bound)
+	}
+	// The session narrows the identity to the capabilities every set shares.
+	for _, capability := range granted.Capabilities().Values() {
+		if !workspaceInputs.grant.Capabilities.Contains(capability) {
+			t.Fatalf("granted capability %q is outside the installation grant", capability)
+		}
+	}
+
+	unbound := acceptedWorkspaceAuthorization(t)
+	unbound.withDevice, unbound.withSession = false, false
+	unbound.request.DeviceID = nil
+	unbound.request.DeviceRevision = domain.Version{}
+	unbound.request.DeviceTrustRevision = domain.Version{}
+	unbound.request.DeviceRevokeRevision = domain.Version{}
+	unbound.request.CredentialFingerprint = domain.CredentialDigest{}
+	unbound.request.ActorSessionID = nil
+	unbound.request.ActorSessionRevision = domain.Version{}
+	subject := unbound.build(t)
+	granted, err = subject.authorization.AuthorizeLocked(subject.locked, subject.authentication, subject.policy)
+	if err != nil {
+		t.Fatalf("device-free workspace AuthorizeLocked: %v", err)
+	}
+	if _, _, bound := granted.AuthenticatedDevice(); bound {
+		t.Fatal("device-free request produced a device-bound authorization")
+	}
+	if granted.AssuranceClass() != unbound.assurance {
+		t.Fatalf("session-free assurance = %v, want the configured class", granted.AssuranceClass())
+	}
+}
+
+// TestAuthorizeLockedDeniesEveryUnsatisfiedPredicate pins one denial per
+// authorization predicate. Each case spoils exactly one input of an otherwise
+// accepted graph, so a predicate that stops being checked shows up here as a
+// request that is suddenly authorized.
+func TestAuthorizeLockedDeniesEveryUnsatisfiedPredicate(t *testing.T) {
+	t.Parallel()
+
+	otherPrincipal := authorizationID(t, domain.ParsePrincipalID, 250)
+	otherInstallation := authorizationID(t, domain.ParseInstallationID, 251)
+	otherWorkspace := authorizationID(t, domain.ParseWorkspaceID, 252)
+	otherAuthority := authorizationID(t, domain.ParseAuthorityID, 253)
+	otherEpoch := authorizationID(t, domain.ParseAuthorityEpoch, 254)
+	otherActor := authorizationID(t, domain.ParseActorID, 255)
+	otherMembership := authorizationID(t, domain.ParseMembershipID, 256)
+	otherRevision, err := domain.NewPolicyRevision("authorization-policy:v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherAudience, err := domain.NewCredentialAudience("blackbird:other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFingerprint, err := domain.NewCredentialDigest(sha256.Sum256([]byte("other device spki")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disjoint, err := domain.NewCapabilitySet(domain.DevicePairCapability())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated, err := domain.NewVersion(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := domain.NewVersion(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installationScope, err := domain.InstallationScope(
+		authorizationID(t, domain.ParseInstallationID, 200),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spoilers := map[string]authorizationSpoiler{
+		"authority time absent": {reason: DenialAuthorityTimeAbsent, spoil: func(inputs *authorizationInputs) {
+			inputs.withoutAuthorityTime = true
+		}},
+		"authentication verified after authority time": {reason: DenialRequestUnbound, spoil: func(inputs *authorizationInputs) {
+			inputs.request.VerifiedAt = inputs.now.Add(time.Hour)
+		}},
+		"authentication bound to another scope": {reason: DenialRequestUnbound, spoil: func(inputs *authorizationInputs) {
+			inputs.request.Scope = installationScope
+		}},
+		"authentication bound to another operation": {reason: DenialRequestUnbound, spoil: func(inputs *authorizationInputs) {
+			inputs.request.Operation = application.CommandActivateObjective
+		}},
+		"authentication bound to another principal": {reason: DenialRequestUnbound, spoil: func(inputs *authorizationInputs) {
+			inputs.request.PrincipalID = otherPrincipal
+		}},
+		"principal state absent": {reason: DenialPrincipalUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.withoutPrincipal = true
+		}},
+		"principal suspended": {reason: DenialPrincipalUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.principal.Status = domain.PrincipalSuspended
+			inputs.principal.Version = mutated
+			inputs.request.PrincipalRevision = mutated
+		}},
+		"principal revision stale": {reason: DenialPrincipalUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.principal.Version = mutated
+		}},
+		"device state absent": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.withDevice = false
+		}},
+		"device suspended": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.device.Status = domain.DeviceSuspended
+		}},
+		"device belongs to another principal": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.device.PrincipalID = otherPrincipal
+		}},
+		"device belongs to another installation": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.device.InstallationID = otherInstallation
+		}},
+		"device revision stale": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.request.DeviceRevision = advanced
+		}},
+		"device trust revision stale": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.request.DeviceTrustRevision = advanced
+		}},
+		"device revocation revision stale": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.request.DeviceRevokeRevision = mutated
+		}},
+		"device credential not accepted": {reason: DenialDeviceUntrusted, spoil: func(inputs *authorizationInputs) {
+			inputs.request.CredentialFingerprint = otherFingerprint
+		}},
+		"grant state absent": {reason: DenialGrantUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.withGrant = false
+		}},
+		"grant revoked": {reason: DenialGrantUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.grant.Status = domain.GrantRevoked
+			inputs.grant.Version = mutated
+			inputs.refreshGrantRevision(t, mutated)
+		}},
+		"grant revision stale": {reason: DenialGrantUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.grant.Version = mutated
+		}},
+		"grant belongs to another principal": {reason: DenialGrantUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.grant.PrincipalID = otherPrincipal
+		}},
+		"grant belongs to another installation": {reason: DenialGrantUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.grant.InstallationID = otherInstallation
+		}},
+		"grant scoped to another workspace": {reason: DenialGrantUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.grant.WorkspaceID = otherWorkspace
+		}},
+		"workspace state absent": {reason: DenialWorkspaceUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.withoutWorkspaceState = true
+		}},
+		"workspace suspended": {reason: DenialWorkspaceUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.workspace.Status = domain.WorkspaceSuspended
+			inputs.workspace.Version = mutated
+		}},
+		"workspace belongs to another installation": {reason: DenialWorkspaceUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.workspace.InstallationID = otherInstallation
+		}},
+		"workspace under another authority": {reason: DenialWorkspaceUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.workspace.AuthorityID = otherAuthority
+		}},
+		"workspace under another epoch": {reason: DenialWorkspaceUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.workspace.AuthorityEpoch = otherEpoch
+		}},
+		"workspace policy revision differs from prepared policy": {reason: DenialWorkspaceUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.preparedPolicy = otherRevision
+		}},
+		"membership suspended": {reason: DenialMembershipUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.membership.Status = domain.MembershipSuspended
+			inputs.membership.Version = mutated
+		}},
+		"membership in another workspace": {reason: DenialMembershipUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.membership.WorkspaceID = otherWorkspace
+		}},
+		"actor session state absent": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.withSession = false
+		}},
+		"actor session revision stale": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.session.Version = mutated
+		}},
+		"actor session ended": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.session.Status = domain.ActorSessionEnded
+			inputs.session.Version = mutated
+			inputs.request.ActorSessionRevision = mutated
+		}},
+		"actor session past absolute expiry": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.expiry = inputs.now
+		}},
+		"session bound to another principal": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.principal = otherPrincipal
+		}},
+		"session bound to another workspace": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.workspace = otherWorkspace
+		}},
+		"session bound to another authority": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.authority = otherAuthority
+		}},
+		"session bound to another epoch": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.epoch = otherEpoch
+		}},
+		"session bound to another policy revision": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.policy = otherRevision
+		}},
+		"presentation credential issued for another audience": {reason: DenialSessionUnusable, spoil: func(inputs *authorizationInputs) {
+			inputs.request.Audience = otherAudience
+		}},
+		"session membership reference stale": {reason: DenialSessionReferencesStale, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.membership = mustRef(t, inputs.membership.ID, mutated)
+		}},
+		"session delegation reference stale": {reason: DenialSessionReferencesStale, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.delegation = mustRef(t, inputs.delegation.ID, domain.InitialVersion())
+		}},
+		"session delegation revoked": {reason: DenialSessionReferencesStale, spoil: func(inputs *authorizationInputs) {
+			inputs.delegation.Status = domain.DelegationRevoked
+		}},
+		"session actor absent": {reason: DenialSessionReferencesStale, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.actor = otherActor
+		}},
+		"session actor suspended": {reason: DenialSessionReferencesStale, spoil: func(inputs *authorizationInputs) {
+			inputs.actor.Status = domain.ActorSuspended
+			inputs.actor.Version = mutated
+		}},
+		"delegation attached to another membership": {reason: DenialSessionReferencesStale, spoil: func(inputs *authorizationInputs) {
+			inputs.delegation.MembershipID = otherMembership
+		}},
+		"session device reference stale": {reason: DenialSessionDeviceStale, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.device = mustRefPointer(t, inputs.device.ID, advanced)
+		}},
+		"session device trust revision stale": {reason: DenialSessionDeviceStale, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.deviceTrust = advanced
+		}},
+		"session grant references differ from the request": {reason: DenialSessionGrantsStale, spoil: func(inputs *authorizationInputs) {
+			inputs.binding.grants = nil
+		}},
+		"capability intersection empty": {reason: DenialCapabilitiesEmpty, spoil: func(inputs *authorizationInputs) {
+			inputs.membership.Capabilities = disjoint
+		}},
+	}
+
+	for name, spoiler := range spoilers {
+		t.Run(name, func(t *testing.T) {
+			inputs := acceptedWorkspaceAuthorization(t)
+			spoiler.spoil(&inputs)
+			subject := inputs.build(t)
+			granted, authorizeErr := subject.authorization.AuthorizeLocked(
+				subject.locked, subject.authentication, subject.policy,
+			)
+			if !errors.Is(authorizeErr, ErrAccessDenied) {
+				t.Fatalf("AuthorizeLocked error = %v, granted %+v", authorizeErr, granted)
+			}
+			var denial *AccessDenialError
+			if !errors.As(authorizeErr, &denial) || denial.Reason() != spoiler.reason {
+				t.Fatalf("denial reason = %q, want %q", denial.Reason(), spoiler.reason)
+			}
+			// A denial must reach the transport as an authorization failure.
+			// A bare sentinel is reclassified as a retryable INTERNAL, which
+			// tells the agent to retry a request that can never succeed.
+			var rejection *domain.CommandError
+			if !errors.As(authorizeErr, &rejection) {
+				t.Fatalf("denial is not a domain command error: %v", authorizeErr)
+			}
+			wantCode := domain.ErrorCodeForbidden
+			if spoiler.reason == DenialCapabilitiesEmpty {
+				wantCode = domain.ErrorCodeCapabilityRequired
+			}
+			if rejection.Code() != wantCode || rejection.Category() != domain.ErrorCategoryAuthorization ||
+				rejection.Retryable() {
+				t.Fatalf("rejection = (%s, %s, retryable %t)",
+					rejection.Code(), rejection.Category(), rejection.Retryable())
+			}
+			if strings.Contains(rejection.Message(), string(spoiler.reason)) {
+				t.Fatalf("caller-facing message disclosed the denial predicate: %q", rejection.Message())
+			}
+		})
+	}
+}
+
+// authorizationSpoiler is one accepted input made unacceptable, together with
+// the predicate that must be the one to notice.
+type authorizationSpoiler struct {
+	reason DenialReason
+	spoil  func(*authorizationInputs)
+}
+
+func TestAuthorizeLockedDeniesUnusableDependencies(t *testing.T) {
+	t.Parallel()
+
+	inputs := acceptedWorkspaceAuthorization(t)
+	subject := inputs.build(t)
+	assurance, err := domain.NewAssuranceClass("hardware_key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := application.NewPreparedPolicy(inputs.preparedPolicy, inputs.policyDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]struct {
+		authorization *LockedAuthorization
+		policy        application.PreparedPolicy
+	}{
+		"nil authorization":        {authorization: nil, policy: prepared},
+		"unconfigured assurance":   {authorization: &LockedAuthorization{}, policy: prepared},
+		"unprepared policy":        {authorization: subject.authorization, policy: application.PreparedPolicy{}},
+		"configured but no policy": {authorization: &LockedAuthorization{assurance: assurance}, policy: application.PreparedPolicy{}},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := test.authorization.AuthorizeLocked(
+				subject.locked, subject.authentication, test.policy,
+			); !errors.Is(err, ErrAccessDenied) {
+				t.Fatalf("AuthorizeLocked error = %v", err)
+			}
+		})
+	}
+
+	if _, err := NewReplayAuthorization(nil); !errors.Is(err, ErrSecurityDependency) {
+		t.Fatalf("NewReplayAuthorization(nil) error = %v", err)
+	}
+	replay, err := NewReplayAuthorization(subject.authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An admitted command is not an exact replay, so disclosure is refused
+	// before any identity state is read.
+	for name, disclosure := range map[string]*ReplayAuthorization{
+		"admitted command": replay,
+		"uninitialized":    nil,
+	} {
+		t.Run("replay refused: "+name, func(t *testing.T) {
+			_, replayErr := disclosure.AuthorizeReplay(subject.locked, subject.authentication, subject.policy)
+			if !errors.Is(replayErr, ErrAccessDenied) {
+				t.Fatalf("AuthorizeReplay error = %v", replayErr)
+			}
+			// The application layer accepts only FORBIDDEN for an exact-replay
+			// resolution, so a disclosure refusal must never report
+			// CAPABILITY_REQUIRED.
+			var rejection *domain.CommandError
+			if !errors.As(replayErr, &rejection) || rejection.Code() != domain.ErrorCodeForbidden {
+				t.Fatalf("AuthorizeReplay rejection = %v", replayErr)
+			}
+		})
+	}
+}
+
+func TestIntersectCapabilitiesKeepsOnlySharedCapabilities(t *testing.T) {
+	t.Parallel()
+
+	owner, err := domain.NewCapabilitySet(
+		domain.WorkspaceOwnerCapability(), domain.MembershipAdminCapability(), domain.ActorAdminCapability(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated, err := domain.NewCapabilitySet(
+		domain.MembershipAdminCapability(), domain.ActorAdminCapability(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := domain.NewCapabilitySet(domain.ActorAdminCapability())
+	if err != nil {
+		t.Fatal(err)
+	}
+	disjoint, err := domain.NewCapabilitySet(domain.DevicePairCapability())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shared, err := intersectCapabilities([]domain.CapabilitySet{owner, delegated, session})
+	if err != nil {
+		t.Fatalf("intersectCapabilities: %v", err)
+	}
+	if len(shared.Values()) != 1 || !shared.Contains(domain.ActorAdminCapability()) {
+		t.Fatalf("intersection = %v", shared.Values())
+	}
+	if _, err := intersectCapabilities(nil); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("empty set list error = %v", err)
+	}
+	if _, err := intersectCapabilities([]domain.CapabilitySet{owner, disjoint}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("disjoint intersection error = %v", err)
+	}
+}
+
+func TestSameAggregateRefsComparesOrderAndLength(t *testing.T) {
+	t.Parallel()
+
+	grant := authorizationID(t, domain.ParseGrantID, 205)
+	other := authorizationID(t, domain.ParseGrantID, 260)
+	first := mustRef(t, grant, domain.InitialVersion())
+	second := mustRef(t, other, domain.InitialVersion())
+	advanced, err := domain.NewVersion(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := mustRef(t, grant, advanced)
+
+	if !sameAggregateRefs(nil, nil) {
+		t.Fatal("two empty reference lists compared unequal")
+	}
+	if !sameAggregateRefs([]domain.AggregateRef{first, second}, []domain.AggregateRef{first, second}) {
+		t.Fatal("identical reference lists compared unequal")
+	}
+	if sameAggregateRefs([]domain.AggregateRef{first}, []domain.AggregateRef{first, second}) {
+		t.Fatal("reference lists of different length compared equal")
+	}
+	if sameAggregateRefs([]domain.AggregateRef{first}, []domain.AggregateRef{rotated}) {
+		t.Fatal("reference lists at different versions compared equal")
+	}
+}
+
+func mustRef(t *testing.T, id interface{ String() string }, version domain.Version) domain.AggregateRef {
+	t.Helper()
+	var (
+		ref domain.AggregateRef
+		err error
+	)
+	switch value := id.(type) {
+	case domain.MembershipID:
+		ref, err = domain.NewAggregateRef(value, version)
+	case domain.ActorDelegationID:
+		ref, err = domain.NewAggregateRef(value, version)
+	case domain.DeviceID:
+		ref, err = domain.NewAggregateRef(value, version)
+	case domain.GrantID:
+		ref, err = domain.NewAggregateRef(value, version)
+	default:
+		t.Fatalf("unsupported reference identifier %T", id)
+	}
+	if err != nil {
+		t.Fatalf("aggregate reference: %v", err)
+	}
+	return ref
+}
+
+func mustRefPointer(t *testing.T, id interface{ String() string }, version domain.Version) *domain.AggregateRef {
+	t.Helper()
+	ref := mustRef(t, id, version)
+	return &ref
+}
+
+// refreshGrantRevision keeps the request and the session binding pointing at the
+// grant's current version, so a case about the grant's status is not decided by
+// a version mismatch it did not intend.
+func (inputs *authorizationInputs) refreshGrantRevision(t *testing.T, version domain.Version) {
+	t.Helper()
+	ref := mustRef(t, inputs.grant.ID, version)
+	inputs.request.GrantRevisions = []domain.AggregateRef{ref}
+	inputs.binding.grants = []domain.AggregateRef{ref}
+}
+
+// TestStrictDenialPolicyRecordsThePredicateThatRefused proves the two halves of
+// the disclosure decision at once: the caller-facing rejection stays generic,
+// while the durable denial audit row an operator reads names the predicate.
+func TestStrictDenialPolicyRecordsThePredicateThatRefused(t *testing.T) {
+	t.Parallel()
+
+	inputs := acceptedWorkspaceAuthorization(t)
+	inputs.membership.Status = domain.MembershipSuspended
+	mutated, err := domain.NewVersion(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs.membership.Version = mutated
+	subject := inputs.build(t)
+	_, authorizeErr := subject.authorization.AuthorizeLocked(
+		subject.locked, subject.authentication, subject.policy,
+	)
+	var rejection *domain.CommandError
+	if !errors.As(authorizeErr, &rejection) {
+		t.Fatalf("AuthorizeLocked error = %v", authorizeErr)
+	}
+
+	security, err := StrictDenialSecurityPolicy{}.DenialFollowUp(
+		subject.locked, subject.authentication, subject.policy, rejection,
+	)
+	if err != nil {
+		t.Fatalf("DenialFollowUp: %v", err)
+	}
+	draft, present := security.CommandDenial()
+	if !present {
+		t.Fatal("denial follow-up produced no command denial draft")
+	}
+	if draft.Class() != application.DenialAuthorization {
+		t.Fatalf("denial class = %q", draft.Class())
+	}
+	if draft.SafeReason() != string(DenialMembershipUnusable) {
+		t.Fatalf("denial reason = %q, want %q", draft.SafeReason(), DenialMembershipUnusable)
+	}
+	if security.Operation() != application.SecurityRecordCommandDenial ||
+		security.Scope() != subject.locked.Spec().Scope() {
+		t.Fatalf("security spec = (%v, %v)", security.Operation(), security.Scope())
+	}
+
+	// A rejection raised outside this boundary names no predicate and keeps the
+	// cataloged class reason rather than inventing one.
+	cataloged, err := domain.NewCommandError(domain.ErrorCodeForbidden, "domain transition refused", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	security, err = StrictDenialSecurityPolicy{}.DenialFollowUp(
+		subject.locked, subject.authentication, subject.policy, cataloged,
+	)
+	if err != nil {
+		t.Fatalf("DenialFollowUp for a cataloged rejection: %v", err)
+	}
+	draft, _ = security.CommandDenial()
+	if draft.SafeReason() != "authorization_denied" {
+		t.Fatalf("cataloged denial reason = %q", draft.SafeReason())
+	}
+}
+
+func TestStrictDenialPolicyRejectsUnusableFollowUps(t *testing.T) {
+	t.Parallel()
+
+	inputs := acceptedWorkspaceAuthorization(t)
+	subject := inputs.build(t)
+	forbidden, err := domain.NewCommandError(domain.ErrorCodeForbidden, "denied", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notFound, err := domain.NewCommandError(domain.ErrorCodeNotFound, "absent", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := domain.ParsePrincipalID(proofUUID(270))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := application.NewAuditProvenanceEvidence(inputs.authority, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := application.NewAuthenticationEvidence(other, (*domain.DeviceID)(nil), provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]struct {
+		authentication application.AuthenticationEvidence
+		policy         application.PreparedPolicy
+		rejection      *domain.CommandError
+	}{
+		"no rejection":            {subject.authentication, subject.policy, nil},
+		"unprepared policy":       {subject.authentication, application.PreparedPolicy{}, forbidden},
+		"unattributed principal":  {application.AuthenticationEvidence{}, subject.policy, forbidden},
+		"another principal":       {foreign, subject.policy, forbidden},
+		"uncataloged denial code": {subject.authentication, subject.policy, notFound},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := (StrictDenialSecurityPolicy{}).DenialFollowUp(
+				subject.locked, test.authentication, test.policy, test.rejection,
+			); !errors.Is(err, application.ErrInvalidSecuritySpec) {
+				t.Fatalf("DenialFollowUp error = %v", err)
+			}
+		})
+	}
+}
+
+func TestAccessDenialNamesThePredicateAndStaysMatchable(t *testing.T) {
+	t.Parallel()
+
+	denial := &AccessDenialError{reason: DenialDeviceUntrusted}
+	if !errors.Is(denial, ErrAccessDenied) {
+		t.Fatal("a named denial no longer matches the local access sentinel")
+	}
+	if denial.Reason() != DenialDeviceUntrusted ||
+		!strings.Contains(denial.Error(), string(DenialDeviceUntrusted)) ||
+		!strings.Contains(denial.Error(), ErrAccessDenied.Error()) {
+		t.Fatalf("denial text = %q", denial.Error())
+	}
+	var unnamed *AccessDenialError
+	if unnamed.Reason() != "" || unnamed.Error() != ErrAccessDenied.Error() {
+		t.Fatalf("unnamed denial = (%q, %q)", unnamed.Reason(), unnamed.Error())
+	}
+	if (&AccessDenialError{}).Error() != ErrAccessDenied.Error() {
+		t.Fatal("a denial with no predicate did not fall back to the sentinel text")
+	}
+}
+
+func TestStrictDenialPolicyClassifiesAuthenticationFailures(t *testing.T) {
+	t.Parallel()
+
+	inputs := acceptedWorkspaceAuthorization(t)
+	subject := inputs.build(t)
+	for name, code := range map[string]domain.ErrorCode{
+		"unauthenticated": domain.ErrorCodeUnauthenticated,
+		"session expired": domain.ErrorCodeSessionExpired,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rejection, err := domain.NewCommandError(code, "credential refused", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			security, err := StrictDenialSecurityPolicy{}.DenialFollowUp(
+				subject.locked, subject.authentication, subject.policy, rejection,
+			)
+			if err != nil {
+				t.Fatalf("DenialFollowUp: %v", err)
+			}
+			draft, present := security.CommandDenial()
+			if !present || draft.Class() != application.DenialAuthentication ||
+				draft.SafeReason() != "credential_rejected" {
+				t.Fatalf("denial draft = (%v, %q, %q)", present, draft.Class(), draft.SafeReason())
+			}
+		})
+	}
+}
