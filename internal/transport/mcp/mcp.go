@@ -672,9 +672,12 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 func coordinationTool[Input, Output any](server *sdkmcp.Server, logger *slog.Logger, tool *sdkmcp.Tool,
 	handle func(context.Context, Input) (Output, error),
 ) {
-	tool.OutputSchema = coordinationOutputSchema[Output]()
 	name := tool.Name
-	sdkmcp.AddTool(server, tool, func(ctx context.Context, _ *sdkmcp.CallToolRequest, input Input) (*sdkmcp.CallToolResult, any, error) {
+	// The concrete Output type would make the SDK infer and publish a full
+	// outputSchema for every tool. Results are already serialized into both
+	// structuredContent and the text fallback, so advertise only the input
+	// contract and keep the repeated result shapes out of every tools/list.
+	sdkmcp.AddTool[Input, any](server, tool, func(ctx context.Context, _ *sdkmcp.CallToolRequest, input Input) (*sdkmcp.CallToolResult, any, error) {
 		output, err := handle(ctx, input)
 		if err == nil {
 			return nil, output, nil
@@ -688,21 +691,6 @@ func coordinationTool[Input, Output any](server *sdkmcp.Server, logger *slog.Log
 		return &sdkmcp.CallToolResult{IsError: true,
 			Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: failure.Code + ": " + failure.Message}}}, failure, nil
 	})
-}
-
-// coordinationOutputSchema publishes the success and failure shapes as
-// alternatives. They are disjoint by construction -- each requires properties
-// the other does not have -- so exactly one branch ever matches.
-func coordinationOutputSchema[Output any]() *jsonschema.Schema {
-	success, err := jsonschema.For[Output](nil)
-	if err != nil {
-		panic(fmt.Sprintf("infer local coordination output schema: %v", err))
-	}
-	failure, err := jsonschema.For[coordinationFailureOutput](nil)
-	if err != nil {
-		panic(fmt.Sprintf("infer local coordination failure schema: %v", err))
-	}
-	return &jsonschema.Schema{Type: "object", OneOf: []*jsonschema.Schema{success, failure}}
 }
 
 // coordinationFailure maps a coordination error the way the loopback HTTP

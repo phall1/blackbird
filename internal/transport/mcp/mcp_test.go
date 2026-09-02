@@ -513,6 +513,17 @@ func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
 	if len(listed) != len(coordinationToolNames) {
 		t.Fatalf("coordination surface = %d tools, want %d: %v", len(listed), len(coordinationToolNames), listed)
 	}
+	discovery, err := json.Marshal(tools)
+	if err != nil {
+		t.Fatalf("marshal coordination tools/list: %v", err)
+	}
+	if bytes.Contains(discovery, []byte(`"outputSchema"`)) {
+		t.Fatalf("coordination tools/list publishes redundant output schemas: %d bytes", len(discovery))
+	}
+	const maxCoordinationDiscoveryBytes = 32 << 10
+	if len(discovery) > maxCoordinationDiscoveryBytes {
+		t.Fatalf("coordination tools/list = %d bytes, want at most %d", len(discovery), maxCoordinationDiscoveryBytes)
+	}
 	// Resources are a fixed pair of URIs rather than a per-request token cost, so
 	// withholding the tools must not withhold them.
 	if _, err := client.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCurrentContext}); err != nil {
@@ -1124,20 +1135,12 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		t.Errorf("selector kind enum = %#v, want exact and subtree", kinds)
 	}
 
-	// agent_register is the one tool whose result an agent must act on, so what
-	// it returns has to be discoverable rather than learned by calling it.
+	// agent_register is the one tool whose result an agent must act on, so its
+	// description still names the state it returns even though repeated output
+	// schemas are deliberately omitted from discovery.
 	register := tools[ToolAgentRegister]
 	if !strings.Contains(register.Description, "reservations") {
 		t.Errorf("agent_register description does not mention the reservations it returns: %q", register.Description)
-	}
-	registerOutput, err := json.Marshal(register.OutputSchema)
-	if err != nil {
-		t.Fatalf("marshal agent_register output schema: %v", err)
-	}
-	for _, field := range []string{"held_reservations", "inbox", "open_conversations", "other_agents", "expires_in_ms"} {
-		if !bytes.Contains(registerOutput, []byte(`"`+field+`"`)) {
-			t.Errorf("agent_register output schema omits %q: %s", field, registerOutput)
-		}
 	}
 
 	// The wait ceiling is published as well as enforced, so a client discovers
@@ -1168,38 +1171,12 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	if modes := waitDecoded.Properties.Mode.Enum; !reflect.DeepEqual(modes, []any{"shared", "exclusive"}) {
 		t.Errorf("wait mode enum = %#v, want shared and exclusive", modes)
 	}
-	// The two new answers are only useful if an agent can tell what they carry
-	// without calling them: who holds a path, and for how much longer.
-	statusOutput, err := json.Marshal(tools[ToolReservationsStatus].OutputSchema)
-	if err != nil {
-		t.Fatalf("marshal reservations_status output schema: %v", err)
-	}
-	for _, field := range []string{"holder_agent_name", "expires_in_ms", "mode", "truncated"} {
-		if !bytes.Contains(statusOutput, []byte(`"`+field+`"`)) {
-			t.Errorf("reservations_status output schema omits %q: %s", field, statusOutput)
-		}
-	}
-	waitOutput, err := json.Marshal(wait.OutputSchema)
-	if err != nil {
-		t.Fatalf("marshal wait output schema: %v", err)
-	}
-	for _, field := range []string{"reason", "blockers", "pending_deliveries"} {
-		if !bytes.Contains(waitOutput, []byte(`"`+field+`"`)) {
-			t.Errorf("wait output schema omits %q: %s", field, waitOutput)
-		}
-	}
-	// Every coordination tool publishes the failure shape alongside its answer,
-	// so the fields an agent has to branch on are discoverable rather than
-	// learned by provoking a failure.
+	// Output shapes are repeated in every discovery response but add no runtime
+	// capability: the SDK still emits structuredContent and its JSON text
+	// fallback. Keeping them nil is the wire-size contract this test protects.
 	for _, name := range coordinationToolNames {
-		encoded, err := json.Marshal(tools[name].OutputSchema)
-		if err != nil {
-			t.Fatalf("marshal %s output schema: %v", name, err)
-		}
-		for _, field := range []string{"code", "request_id", "retryable"} {
-			if !bytes.Contains(encoded, []byte(`"`+field+`"`)) {
-				t.Errorf("%s output schema omits the failure field %q: %s", name, field, encoded)
-			}
+		if tools[name].OutputSchema != nil {
+			t.Errorf("%s publishes a redundant output schema", name)
 		}
 	}
 
