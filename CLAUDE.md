@@ -328,7 +328,7 @@ broken:
   grep -n 'tokens INTEGER' internal/storage/sqlite/migrations/0007_telemetry.sql
   ```
 
-The read side is one MCP tool, `blackbird_spend_report`, registered only when a
+The read side is folded into `blackbird_status` with `spend: true` when a
 telemetry reader is composed. Adding a second tool for a question a `dimension`
 value already answers spends every session's tool-list budget for nothing.
 

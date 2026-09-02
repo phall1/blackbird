@@ -1376,7 +1376,7 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 		if errors.Is(agentErr, sql.ErrNoRows) {
 			if registrationToken != "" {
 				return coordinationError(domain.ErrorCodeUnauthenticated,
-					"registration token names no existing agent; call blackbird_agent_register without registration_token to create it")
+					"registration token names no existing agent; call blackbird_join without registration_token to create it")
 			}
 			issuedToken, err = newLocalCoordinationToken()
 			if err != nil {
@@ -1440,7 +1440,7 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (application.LocalAgentSession, error) {
 	if token == "" || len(token) > maxLocalAgentTokenBytes {
 		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
-			"agent token is missing or too long; call blackbird_agent_register to get the current token")
+			"agent token is missing or too long; call blackbird_join to get the current token")
 	}
 	digest := sha256.Sum256([]byte(token))
 	if err := ctx.Err(); err != nil {
@@ -1471,7 +1471,7 @@ func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (a
 		&actorText, &sessionText, &epochText, &started, &lastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
-			"agent token was not found; call blackbird_agent_register to start or resume this agent")
+			"agent token was not found; call blackbird_join to start or resume this agent")
 	}
 	if err != nil {
 		return application.LocalAgentSession{}, err

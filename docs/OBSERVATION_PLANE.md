@@ -180,7 +180,7 @@ faked — this is the one adapter that reports no latency.
 
 ## Reading it back
 
-One MCP tool, `blackbird_spend_report`, and no other read surface. There is no
+One optional rollup on `blackbird_status` (`spend: true`), and no separate telemetry tool. There is no
 CLI, no dashboard, and no row feed — the plane is written by processes and read
 by agents, and an agent asking what it spent wants a handful of totals it can
 act on, not a page of observations it has to add up in its own context.

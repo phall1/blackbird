@@ -22,18 +22,28 @@ import (
 )
 
 const (
-	ToolAgentRegister        = "blackbird_agent_register"
-	ToolAgentsList           = "blackbird_agents_list"
-	ToolConversationOpen     = "blackbird_conversation_open"
-	ToolMessageSend          = "blackbird_message_send"
-	ToolInboxFetch           = "blackbird_inbox_fetch"
-	ToolThreadFetch          = "blackbird_thread_fetch"
-	ToolMessageFact          = "blackbird_message_fact"
-	ToolReservationAcquire   = "blackbird_reservation_acquire"
-	ToolReservationChange    = "blackbird_reservation_change"
-	ToolReservationsStatus   = "blackbird_reservations_status"
-	ToolWait                 = "blackbird_wait"
-	ToolWorkReferenceObserve = "blackbird_work_reference_observe"
+	ToolJoin    = "blackbird_join"
+	ToolClaim   = "blackbird_claim"
+	ToolRelease = "blackbird_release"
+	ToolStatus  = "blackbird_status"
+	ToolSay     = "blackbird_say"
+	ToolRead    = "blackbird_read"
+	ToolAck     = "blackbird_ack"
+	ToolWait    = "blackbird_wait"
+
+	// Internal source aliases keep the old handler tests readable while the MCP
+	// server publishes only the eight names above.
+	ToolAgentRegister        = ToolJoin
+	ToolAgentsList           = ToolStatus
+	ToolConversationOpen     = ToolSay
+	ToolMessageSend          = ToolSay
+	ToolInboxFetch           = ToolRead
+	ToolThreadFetch          = ToolRead
+	ToolMessageFact          = ToolAck
+	ToolReservationAcquire   = ToolClaim
+	ToolReservationChange    = ToolClaim
+	ToolReservationsStatus   = ToolStatus
+	ToolWorkReferenceObserve = ToolStatus
 
 	ResourceCoordinationProtocol = "blackbird://coordination/protocol"
 	mediaTypeMarkdown            = "text/markdown"
@@ -72,10 +82,8 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	}
 	sdk.AddReceivingMiddleware(logToolFailures(logger, dependencies.Metrics))
 	registerCoordinationProtocol(sdk)
-	registerCoordinationTools(sdk, dependencies.Coordination, dependencies.WorkReferences, logger)
-	if !isNil(dependencies.Observations) {
-		registerSpendTool(sdk, dependencies.Coordination, dependencies.Observations, logger)
-	}
+	registerAgentNativeTools(sdk, dependencies.Coordination, dependencies.Observations,
+		dependencies.WorkReferences, logger)
 	return server, nil
 }
 
@@ -165,7 +173,7 @@ type agentSessionOutput struct {
 	SessionID         string                    `json:"session_id"`
 	RegistrationToken string                    `json:"registration_token,omitempty"`
 	HeldReservations  []heldReservationOutput   `json:"held_reservations" jsonschema:"Reservations this agent still holds. Renew or release one by sending back its exact selector set."`
-	Inbox             inboxSummaryOutput        `json:"inbox" jsonschema:"Mailbox counts over the whole inbox, with the most recent pending deliveries; blackbird_inbox_fetch serves the rest."`
+	Inbox             inboxSummaryOutput        `json:"inbox" jsonschema:"Mailbox counts over the whole inbox, with the most recent pending deliveries; blackbird_read serves the rest."`
 	OpenConversations []agentConversationOutput `json:"open_conversations" jsonschema:"Open conversations this agent opened, wrote to, or was addressed in, most recent first."`
 	OtherAgents       []agentPeerOutput         `json:"other_agents" jsonschema:"Other agents with a live session in this repository right now."`
 }
@@ -204,10 +212,6 @@ type agentPeerOutput struct {
 type tokenInput struct {
 	AgentToken string `json:"agent_token"`
 }
-type observeWorkReferenceInput struct {
-	AgentToken string `json:"agent_token" jsonschema:"The registration_token returned by blackbird_agent_register for this repository."`
-	ObjectID   string `json:"object_id" jsonschema:"Issue identifier owned by the repository's work tracker."`
-}
 type activeAgentOutput struct {
 	Name       string `json:"name"`
 	ActorID    string `json:"actor_id"`
@@ -226,13 +230,13 @@ type conversationOutput struct {
 	ConversationID string `json:"conversation_id"`
 	Topic          string `json:"topic" jsonschema:"Topic the conversation was opened with, which is the stored one rather than what this call asked for when reused is true."`
 	Slug           string `json:"slug,omitempty"`
-	Reused         bool   `json:"reused" jsonschema:"True when this slug already named a conversation and that one was returned. Read the thread with blackbird_thread_fetch before writing to it: it may already carry replies you have never seen."`
+	Reused         bool   `json:"reused" jsonschema:"True when this slug already named a conversation and that one was returned. Read the thread with blackbird_read before writing to it: it may already carry replies you have never seen."`
 	OpenedAt       string `json:"opened_at"`
 }
 type sendMessageInput struct {
 	AgentToken              string   `json:"agent_token"`
-	ConversationID          string   `json:"conversation_id" jsonschema:"Conversation returned by blackbird_conversation_open."`
-	To                      []string `json:"to" jsonschema:"Recipient agent names as registered, not actor IDs; blackbird_agents_list reports them."`
+	ConversationID          string   `json:"conversation_id" jsonschema:"Conversation returned by blackbird_say."`
+	To                      []string `json:"to" jsonschema:"Recipient agent names as registered, not actor IDs; blackbird_status reports them."`
 	Subject                 string   `json:"subject" jsonschema:"One line naming what this message is about."`
 	Body                    string   `json:"body" jsonschema:"The message itself. Say what you did, what you need, and which paths are involved; the recipient may have none of your context."`
 	ReplyToMessageID        string   `json:"reply_to_message_id,omitempty" jsonschema:"Message this answers, from an inbox or thread fetch. Omit only when starting a new exchange."`
@@ -261,12 +265,6 @@ type fetchInboxInput struct {
 	UnreadOnly bool   `json:"unread_only,omitempty" jsonschema:"Return only messages this agent has not marked read."`
 	After      uint64 `json:"after,omitempty" jsonschema:"Resume after this position, from a previous page's next. Zero starts at the beginning."`
 	Limit      uint16 `json:"limit,omitempty"`
-}
-type fetchThreadInput struct {
-	AgentToken     string `json:"agent_token"`
-	ConversationID string `json:"conversation_id" jsonschema:"Conversation to read, as returned by blackbird_conversation_open."`
-	After          uint64 `json:"after,omitempty" jsonschema:"Resume after this position, from a previous page's next. Zero starts at the beginning."`
-	Limit          uint16 `json:"limit,omitempty"`
 }
 type messagePageOutput struct {
 	Messages []messageOutput `json:"messages"`
@@ -323,7 +321,7 @@ type reservationsStatusOutput struct {
 // the daemon, so a caller with a skewed clock still waits the right amount.
 type reservationHolderOutput struct {
 	LeaseID         string                     `json:"lease_id"`
-	HolderAgentName string                     `json:"holder_agent_name" jsonschema:"Registered name of the agent holding this lease. Address it with blackbird_message_send. Empty only when the holder registered no name, in which case holder_actor_id is its whole identity."`
+	HolderAgentName string                     `json:"holder_agent_name" jsonschema:"Registered name of the agent holding this lease. Address it with blackbird_say. Empty only when the holder registered no name, in which case holder_actor_id is its whole identity."`
 	HolderActorID   string                     `json:"holder_actor_id"`
 	Mode            string                     `json:"mode" jsonschema:"shared or exclusive. A shared lease blocks only an exclusive acquisition; an exclusive one blocks every overlapping acquisition."`
 	Selectors       []reservationSelectorInput `json:"selectors" jsonschema:"Paths this lease covers."`
@@ -339,7 +337,7 @@ type coordinationWaitInput struct {
 type coordinationWaitOutput struct {
 	Reason            string                    `json:"reason" jsonschema:"Which condition ended the wait: path_free, mail_arrived, or deadline. Branch on this rather than on the other fields."`
 	WaitedMS          int64                     `json:"waited_ms"`
-	PendingDeliveries int                       `json:"pending_deliveries" jsonschema:"Unread deliveries in your inbox when the wait ended; read them with blackbird_inbox_fetch."`
+	PendingDeliveries int                       `json:"pending_deliveries" jsonschema:"Unread deliveries in your inbox when the wait ended; read them with blackbird_read."`
 	Blockers          []reservationHolderOutput `json:"blockers" jsonschema:"Leases still covering path when the wait ended. Empty on path_free; on deadline these are the holders to negotiate with."`
 }
 
@@ -371,157 +369,6 @@ type blockedError struct {
 
 func (blocked *blockedError) Error() string { return blocked.cause.Error() }
 func (blocked *blockedError) Unwrap() error { return blocked.cause }
-
-func registerCoordinationTools(
-	server *sdkmcp.Server,
-	store application.LocalCoordinationStore,
-	workReferences application.WorkReferenceObserver,
-	logger *slog.Logger,
-) {
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolAgentRegister,
-		Description: "Call this first. Read blackbird://coordination/protocol for the complete workflow. " +
-			"Start or resume a durable local agent session for a repository key and agent name. " +
-			"The result reports the state already bound to this agent: the reservations it still holds and " +
-			"the time left on each, its unread and unacknowledged mail, its open conversations, and the other " +
-			"agents present. A resuming agent must act on the reservations it is handed back."},
-		func(ctx context.Context, input registerAgentInput) (agentSessionOutput, error) {
-			token := ""
-			if input.RegistrationToken != nil {
-				token = *input.RegistrationToken
-			}
-			session, issued, err := store.RegisterLocalAgent(ctx, input.ProjectKey, input.AgentName, token)
-			if err != nil {
-				return agentSessionOutput{}, err
-			}
-			snapshot, err := store.LocalAgentSnapshot(ctx, session)
-			if err != nil {
-				return agentSessionOutput{}, err
-			}
-			return localAgentSessionOutput(session, issued, snapshot), nil
-		})
-	if !isNil(workReferences) {
-		coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolWorkReferenceObserve,
-			Description: "Observe one provider-owned work item for the caller's repository. " +
-				"The result is a read-only citation; Blackbird does not own or mutate tracker state."},
-			func(ctx context.Context, input observeWorkReferenceInput) (application.WorkReference, error) {
-				session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-				if err != nil {
-					return application.WorkReference{}, err
-				}
-				return workReferences.ObserveWorkReference(ctx, session.ProjectKey, input.ObjectID)
-			})
-	}
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolAgentsList,
-		Description: "List agent sessions active in the caller's repository. Use it to learn the names " +
-			"blackbird_message_send addresses; use blackbird_reservations_status to learn what they are holding.",
-		InputSchema: coordinationInputSchema[tokenInput]()},
-		func(ctx context.Context, input tokenInput) (activeAgentsOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return activeAgentsOutput{}, err
-			}
-			agents, err := store.ListActiveLocalAgents(ctx, session)
-			if err != nil {
-				return activeAgentsOutput{}, err
-			}
-			output := activeAgentsOutput{Agents: make([]activeAgentOutput, 0, len(agents))}
-			for _, agent := range agents {
-				output.Agents = append(output.Agents, activeAgentOutput{Name: agent.Name, ActorID: agent.ActorID.String(),
-					SessionID: agent.SessionID.String(), LastSeenAt: agent.LastSeenAt.Format(time.RFC3339Nano)})
-			}
-			return output, nil
-		})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolConversationOpen,
-		Description: "Open a durable conversation in the caller's repository, one per work item. " +
-			"Pass a slug to make it findable again: reopening the same slug returns the same conversation " +
-			"rather than a second one, which is how an agent that restarted or was compacted rejoins the " +
-			"thread instead of stranding every reply its teammates already wrote. Check reused in the result.",
-		InputSchema: coordinationInputSchema[openConversationInput]()},
-		func(ctx context.Context, input openConversationInput) (conversationOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return conversationOutput{}, err
-			}
-			id, err := domain.NewConversationID()
-			if err != nil {
-				return conversationOutput{}, err
-			}
-			value, err := store.OpenConversation(ctx, application.OpenConversationParams{ConversationID: id,
-				WorkspaceID: session.WorkspaceID, RunID: session.RunID, OpenedBy: session.ActorID,
-				OpenedBySession: session.ActorSessionID, Topic: input.Topic, Slug: input.Slug})
-			if err != nil {
-				return conversationOutput{}, err
-			}
-			// The caller never sees the identifier this call proposed, so the
-			// store's "a reused open returns a different ID" signal has to be
-			// read here or it reaches nobody.
-			return conversationOutput{ConversationID: value.ID().String(), Topic: value.Topic(), Slug: value.Slug(),
-				Reused: value.ID() != id, OpenedAt: value.OpenedAt().Format(time.RFC3339Nano)}, nil
-		})
-	messageInputSchema := coordinationInputSchema[sendMessageInput](func(properties map[string]*jsonschema.Schema) {
-		properties["acknowledgement_required"].Default = json.RawMessage("false")
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolMessageSend,
-		Description: "Send a durable message to named agents inside a conversation. Set reply_to_message_id " +
-			"when continuing an exchange so the thread stays readable as one story; omit it only to raise " +
-			"something new. Recipients are the names blackbird_agents_list reports. Set acknowledgement_required " +
-			"only when your work cannot proceed until the recipient confirms this exact body -- recording that " +
-			"acknowledgement is theirs to do, never yours.",
-		InputSchema: messageInputSchema},
-		func(ctx context.Context, input sendMessageInput) (messageOutput, error) {
-			return sendLocalMessage(ctx, store, input)
-		})
-	inboxInputSchema := coordinationInputSchema[fetchInboxInput](func(properties map[string]*jsonschema.Schema) {
-		properties["unread_only"].Default = json.RawMessage("false")
-		properties["after"].Default = json.RawMessage("0")
-		setPageLimitSchema(properties["limit"])
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolInboxFetch,
-		Description: "Read the messages addressed to you. Use unread_only for what still needs attention and " +
-			"omit it to re-read what you have already handled; page with next from the previous answer. Record " +
-			"what you acted on with blackbird_message_fact kind=read, or the same messages come back forever. " +
-			"To wait for mail rather than poll for it, use blackbird_wait.",
-		InputSchema: inboxInputSchema},
-		func(ctx context.Context, input fetchInboxInput) (messagePageOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return messagePageOutput{}, err
-			}
-			page, err := store.Inbox(ctx, application.InboxQuery{WorkspaceID: session.WorkspaceID, Recipient: session.ActorID,
-				After: input.After, Limit: input.Limit, UnreadOnly: input.UnreadOnly})
-			if err != nil {
-				return messagePageOutput{}, err
-			}
-			return coordinationPageOutput(page), nil
-		})
-	threadInputSchema := coordinationInputSchema[fetchThreadInput](func(properties map[string]*jsonschema.Schema) {
-		properties["after"].Default = json.RawMessage("0")
-		setPageLimitSchema(properties["limit"])
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolThreadFetch,
-		Description: "Read one conversation in order, from a position you pass. Prefer it over " +
-			"blackbird_inbox_fetch when you need the context around a message rather than what is waiting for " +
-			"you: it shows the whole exchange, including messages addressed to someone else.",
-		InputSchema: threadInputSchema},
-		func(ctx context.Context, input fetchThreadInput) (messagePageOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return messagePageOutput{}, err
-			}
-			conversation, err := domain.ParseConversationID(input.ConversationID)
-			if err != nil {
-				return messagePageOutput{}, application.ErrInvalidCoordination
-			}
-			page, err := store.Thread(ctx, application.ThreadQuery{WorkspaceID: session.WorkspaceID, ConversationID: conversation,
-				Viewer: session.ActorID, After: input.After, Limit: input.Limit})
-			if err != nil {
-				return messagePageOutput{}, err
-			}
-			return coordinationPageOutput(page), nil
-		})
-	registerDeliveryFactTool(server, logger, store)
-	registerReservationTools(server, store, logger)
-}
 
 // coordinationTool registers one local-coordination tool with the failure path
 // every agent-facing tool needs. Handing the SDK a raw Go error flattens it to a
@@ -741,157 +588,6 @@ func localMessageOutput(message application.Message) messageOutput {
 	return result
 }
 
-func registerDeliveryFactTool(server *sdkmcp.Server, logger *slog.Logger,
-	store application.LocalCoordinationStore) {
-	inputSchema := coordinationInputSchema[messageFactInput](func(properties map[string]*jsonschema.Schema) {
-		properties["kind"].Enum = []any{string(application.DeliveryRead), string(application.DeliveryAcknowledged)}
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolMessageFact,
-		Description: "Record a fact about your own message delivery. kind=read clears it from unread inbox " +
-			"results without promising anything about the body. kind=acknowledged confirms the exact stored body " +
-			"when the sender required a commitment and marks it read at the same time. Never record a fact for " +
-			"another agent.", InputSchema: inputSchema},
-		func(ctx context.Context, input messageFactInput) (deliveryFactOutput, error) {
-			kind := application.DeliveryFactKind(input.Kind)
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return deliveryFactOutput{}, err
-			}
-			messageID, err := domain.ParseMessageID(input.MessageID)
-			if err != nil {
-				return deliveryFactOutput{}, application.ErrInvalidCoordination
-			}
-			params := application.RecordDeliveryFactParams{WorkspaceID: session.WorkspaceID, MessageID: messageID,
-				Recipient: session.ActorID, ActorSessionID: &session.ActorSessionID, Kind: kind}
-			if kind == application.DeliveryAcknowledged {
-				// An acknowledgement is a promise about the exact stored body, so the
-				// digest is read back from the message rather than taken on trust.
-				message, findErr := store.GetVisibleMessage(ctx, session.WorkspaceID, session.ActorID, messageID)
-				if findErr != nil {
-					return deliveryFactOutput{}, findErr
-				}
-				params.MessageDigest = message.Digest()
-			}
-			delivery, err := store.RecordDeliveryFact(ctx, params)
-			if err != nil {
-				return deliveryFactOutput{}, err
-			}
-			_, read := delivery.ReadAt()
-			_, acknowledged := delivery.AcknowledgedAt()
-			return deliveryFactOutput{MessageID: input.MessageID, Read: read, Acknowledged: acknowledged}, nil
-		})
-}
-
-func registerReservationTools(server *sdkmcp.Server, store application.LocalCoordinationStore, logger *slog.Logger) {
-	acquireInputSchema := coordinationInputSchema[reservationAcquireInput](func(properties map[string]*jsonschema.Schema) {
-		properties["mode"].Default = json.RawMessage(`"exclusive"`)
-		properties["mode"].Enum = []any{string(application.LeaseShared), string(application.LeaseExclusive)}
-		setSelectorKindSchema(properties["selectors"].Items.Properties["kind"])
-		setTTLSchema(properties["ttl_seconds"])
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationAcquire,
-		Description: "Claim shared or exclusive file reservations before editing, naming the narrowest paths " +
-			"that cover the work. A LEASE_CONFLICT failure carries the blocking holders and how long they have " +
-			"left: wait for one with blackbird_wait, negotiate with blackbird_message_send, or narrow to a " +
-			"disjoint path. Never widen a selector to get past a conflict. Use blackbird_reservation_change to " +
-			"release as soon as the edit lands or to renew before the lease expires.",
-		InputSchema: acquireInputSchema},
-		func(ctx context.Context, input reservationAcquireInput) (reservationOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return reservationOutput{}, err
-			}
-			selectors, err := reservationSelectors(input.Selectors)
-			if err != nil {
-				return reservationOutput{}, err
-			}
-			leaseID, err := domain.NewLeaseID()
-			if err != nil {
-				return reservationOutput{}, err
-			}
-			mode := application.LeaseMode(input.Mode)
-			lease, err := store.AcquireLease(ctx, application.AcquireLeaseParams{LeaseID: leaseID,
-				WorkspaceID: session.WorkspaceID, Holder: session.ActorID, HolderSession: session.ActorSessionID,
-				AuthorityEpoch: session.AuthorityEpoch, Mode: mode, Selectors: selectors,
-				TTL: time.Duration(input.TTLSeconds) * time.Second})
-			if err != nil {
-				return reservationOutput{}, describeLeaseConflict(ctx, store, session, mode, selectors, err)
-			}
-			return localReservationOutput(lease), nil
-		})
-	changeInputSchema := coordinationInputSchema[reservationChangeInput](func(properties map[string]*jsonschema.Schema) {
-		properties["action"].Enum = []any{"renew", "release"}
-		setSelectorKindSchema(properties["selectors"].Items.Properties["kind"])
-		setChangeTTLSchema(properties["ttl_seconds"])
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationChange,
-		Description: "Renew or release a reservation you already hold by sending its exact selector set. " +
-			"action=renew extends work that outlives its lease; action=release gives it up immediately and must " +
-			"omit ttl_seconds. Partial selector sets are rejected so one path cannot release a multi-path claim.",
-		InputSchema: changeInputSchema},
-		func(ctx context.Context, input reservationChangeInput) (reservationOutput, error) {
-			return changeLocalReservation(ctx, store, input)
-		})
-	statusInputSchema := coordinationInputSchema[reservationsStatusInput](func(properties map[string]*jsonschema.Schema) {
-		setPageLimitSchema(properties["limit"])
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationsStatus,
-		Description: "Report which file reservations are active in this repository right now: the holder's " +
-			"agent name, the paths, the mode, and the time left on each lease. This is the answer to \"who is " +
-			"blocking me\" -- pass the path you wanted to see only the leases covering it. It reads and returns " +
-			"immediately: use blackbird_wait instead when you mean to queue behind a lease, and this when you " +
-			"mean to decide whom to talk to or what else to work on first.",
-		InputSchema: statusInputSchema},
-		func(ctx context.Context, input reservationsStatusInput) (reservationsStatusOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return reservationsStatusOutput{}, err
-			}
-			page, err := store.LocalAgentReservations(ctx, session, application.AdminReservationsQuery{
-				State: application.AdminReservationActive, Path: input.Path, Limit: input.Limit})
-			if err != nil {
-				return reservationsStatusOutput{}, err
-			}
-			return reservationsStatusOutput{Reservations: reservationHolders(page.Reservations),
-				Truncated: page.Truncated}, nil
-		})
-	waitInputSchema := coordinationInputSchema[coordinationWaitInput](func(properties map[string]*jsonschema.Schema) {
-		properties["await_mail"].Default = json.RawMessage("false")
-		properties["mode"].Default = json.RawMessage(`"exclusive"`)
-		properties["mode"].Enum = []any{string(application.LeaseShared), string(application.LeaseExclusive)}
-		setWaitTimeoutSchema(properties["timeout_seconds"])
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolWait,
-		Description: "Wait until a path stops being reserved, until mail arrives for you, or until the timeout " +
-			"-- whichever comes first -- and report which in reason. Prefer it over calling " +
-			"blackbird_reservation_acquire again in a loop after a LEASE_CONFLICT, and over re-fetching your " +
-			"inbox while a handoff is outstanding. Set path, await_mail, or both; a call that sets neither is " +
-			"rejected. On path_free acquire straight away, because another agent may be waiting on the same " +
-			"path; on mail_arrived read the inbox; on deadline the blockers are still reported, so message a " +
-			"holder or work elsewhere rather than waiting again.",
-		InputSchema: waitInputSchema},
-		func(ctx context.Context, input coordinationWaitInput) (coordinationWaitOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return coordinationWaitOutput{}, err
-			}
-			result, err := store.AwaitCoordination(ctx, session, application.CoordinationWaitRequest{
-				Path: input.Path, Mode: application.LeaseMode(input.Mode), AwaitMail: input.AwaitMail,
-				Timeout: boundedWaitTimeout(input.TimeoutSeconds)})
-			if err != nil {
-				return coordinationWaitOutput{}, err
-			}
-			return coordinationWaitOutput{Reason: string(result.Reason), WaitedMS: result.WaitedMS,
-				PendingDeliveries: result.PendingDeliveries,
-				Blockers:          reservationHolders(result.Blockers)}, nil
-		})
-}
-
-// boundedWaitTimeout clamps the budget at the transport edge as well as in the
-// store. A schema maximum binds only a client that validates against it, and
-// this hold is on the daemon's own goroutine and on the caller's turn: a wait
-// that outlives the client's request timeout is indistinguishable from a hung
-// daemon. Zero, and anything beyond the ceiling, asks for the ceiling.
 func boundedWaitTimeout(seconds uint32) time.Duration {
 	requested := time.Duration(seconds) * time.Second
 	if requested <= 0 || requested > application.MaxCoordinationWait {
@@ -964,7 +660,7 @@ func reservationHolder(reservation application.AdminReservation) reservationHold
 // value as registration_token and every other tool reads it back as
 // agent_token, so without this a first call is a guaranteed schema rejection
 // whose message never mentions the other name.
-const agentTokenDescription = "The registration_token returned by blackbird_agent_register (same value, different field name)."
+const agentTokenDescription = "The registration_token returned by blackbird_join (same value, different field name)."
 
 func coordinationInputSchema[Input any](configure ...func(map[string]*jsonschema.Schema)) *jsonschema.Schema {
 	schema, err := jsonschema.For[Input](nil)
@@ -998,15 +694,6 @@ func setPageLimitSchema(schema *jsonschema.Schema) {
 func setTTLSchema(schema *jsonschema.Schema) {
 	schema.Description = "How long the reservation lasts before it lapses on its own. Prefer a span the work really needs: everything overlapping it waits out the remainder if you abandon it."
 	schema.Default = json.RawMessage(strconv.Itoa(defaultReservationTTLSeconds))
-	schema.Minimum = jsonschema.Ptr(float64(1))
-	schema.Maximum = jsonschema.Ptr(application.MaxLeaseTTL.Seconds())
-}
-
-// A combined renew/release input cannot publish a TTL default: SDK defaulting
-// would attach it to release calls too, turning every valid release into an
-// invalid one. The handler applies the same default only after seeing renew.
-func setChangeTTLSchema(schema *jsonschema.Schema) {
-	schema.Description = "New lifetime for action=renew; omit it for action=release. An omitted renew uses 3600 seconds."
 	schema.Minimum = jsonschema.Ptr(float64(1))
 	schema.Maximum = jsonschema.Ptr(application.MaxLeaseTTL.Seconds())
 }
@@ -1092,13 +779,13 @@ func (server *Server) HTTPHandler(options *sdkmcp.StreamableHTTPOptions) stdhttp
 
 const coordinationProtocol = `# Blackbird coordination protocol
 
-1. Call blackbird_agent_register with a repository key and stable agent name. Persist its registration_token. On restart, call it again with that token and act on every reservation, message, and conversation returned in the snapshot. Pass the same value as agent_token to every other tool.
-2. Before editing, call blackbird_reservation_acquire with the narrowest exact files or subtree and an honest TTL. Shared claims coexist; an exclusive claim conflicts with every overlap.
-3. Use one blackbird_conversation_open slug per work item. Address peers by the names from blackbird_agents_list. Read mail with blackbird_inbox_fetch or blackbird_thread_fetch and record only your own delivery facts with blackbird_message_fact.
-4. On LEASE_CONFLICT, never retry blindly or widen the claim. Use the returned blockers or blackbird_reservations_status, then message the holder, narrow to a disjoint path, or call blackbird_wait once and reacquire when it returns path_free.
-5. Before expiry, call blackbird_reservation_change with action=renew and the exact selector set. As soon as the edit is done, call it with action=release. Claim generations are informational, never credentials.
+1. Call blackbird_join with a repository key and stable agent name. Persist its registration_token. On restart, join again with that token and act on the returned claims, inbox, conversations, and peers.
+2. Before editing, call blackbird_claim with the narrowest exact files or subtree and an honest TTL. A LEASE_CONFLICT is an ok=false result: use blocked_by and options instead of retrying blindly or widening the claim.
+3. Use blackbird_status to inspect peers and claims. It can also observe one work reference or include a spend rollup without adding tools.
+4. Use blackbird_say to open or rejoin one slugged thread and send durable mail. Use blackbird_read for inbox or thread reads and blackbird_ack for your own read or acknowledged facts.
+5. Use blackbird_wait once rather than polling. Renew with the same blackbird_claim selector set before expiry, then call blackbird_release with that exact set as soon as the edit lands.
 
-Failures are structured. Branch on code and retryable; quote request_id in bug reports. Acknowledging a handoff is the recipient's action, never the sender's.
+Failures are structured. Branch on code and retryable; quote request_id in bug reports. Claim generations are informational, never credentials.
 `
 
 // registerCoordinationProtocol exposes the workflow before registration, when

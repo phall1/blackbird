@@ -92,33 +92,27 @@ refuses any host that is not loopback, since every request carries that token.
 
 ## Daily Use
 
-Start with `blackbird_agent_register`, passing an absolute repository path as
+Start with `blackbird_join`, passing an absolute repository path as
 `project_key` and a stable `agent_name`. Retain the returned
 `registration_token` to resume the same identity after process or machine
 restarts.
 
-The daily-use MCP tools are:
+The MCP surface is exactly eight tools: `blackbird_join`, `blackbird_claim`,
+`blackbird_release`, `blackbird_status`, `blackbird_say`, `blackbird_read`,
+`blackbird_ack`, and `blackbird_wait`. Status also accepts optional work-item
+and spend queries instead of advertising specialist tools.
 
-- `blackbird_agent_register` and `blackbird_agents_list`;
-- `blackbird_conversation_open` and `blackbird_message_send`, whose optional
-  `reply_to_message_id` keeps replies threaded;
-- `blackbird_inbox_fetch`, `blackbird_thread_fetch`, and
-  `blackbird_message_fact`, whose `kind` is `read` or `acknowledged`; and
-- `blackbird_reservation_acquire`, `blackbird_reservation_change`,
-  `blackbird_reservations_status`, and `blackbird_wait`.
+All tools except initial join authenticate with the returned `agent_token`.
+Claim the narrowest relevant paths before editing, use one conversation per
+work item, acknowledge required handoffs, and release exact selector sets when
+work completes.
 
-All tools except initial registration authenticate with the returned
-`agent_token`. Reserve the narrowest relevant paths before editing, use one
-conversation per work item, acknowledge required handoffs, and release
-reservations when work completes.
-
-A refused reservation does not have to end in a retry loop. The
-`LEASE_CONFLICT` failure names the agents holding the path and when their
-leases expire, `blackbird_reservations_status` answers the same question at any
-time, and `blackbird_wait` parks until the path frees or mail arrives, up to a
-server-enforced ceiling the tool schema publishes. It returns why it woke --
-`path_free`, `mail_arrived`, or `deadline` -- so a caller that ran out of budget
-still learns who to talk to rather than guessing.
+A refused claim is a normal `ok:false` result, not a retry-loop error. Its
+`blocked_by` and `options` identify the holder and the useful next actions;
+`blackbird_status` answers the same question at any time, and `blackbird_wait`
+parks until the path frees or mail arrives. It returns `path_free`,
+`mail_arrived`, or `deadline`, so a caller that ran out of budget still learns
+what happened.
 
 ## Delivery modes
 

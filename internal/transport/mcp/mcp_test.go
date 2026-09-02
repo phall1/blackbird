@@ -22,9 +22,8 @@ import (
 )
 
 var coordinationToolNames = []string{
-	ToolAgentRegister, ToolAgentsList, ToolConversationOpen, ToolMessageSend,
-	ToolInboxFetch, ToolThreadFetch, ToolMessageFact, ToolReservationAcquire,
-	ToolReservationChange, ToolReservationsStatus, ToolWait, ToolWorkReferenceObserve,
+	ToolJoin, ToolClaim, ToolRelease, ToolStatus,
+	ToolSay, ToolRead, ToolAck, ToolWait,
 }
 
 func TestNewServerRequiresCompleteComposition(t *testing.T) {
@@ -44,54 +43,54 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	client, closeMCP := connect(t, server)
 	assertCoordinationToolSchemas(t, client)
 
-	alice := callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
-	bob := callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob"})
+	alice := callCoord[agentSessionOutput](t, client, ToolJoin, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
+	bob := callCoord[agentSessionOutput](t, client, ToolJoin, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob"})
 	if alice.RegistrationToken == "" || bob.RegistrationToken == "" {
 		t.Fatal("new registrations did not issue bearer tokens")
 	}
-	agents := callCoord[activeAgentsOutput](t, client, ToolAgentsList, tokenInput{AgentToken: alice.RegistrationToken})
+	agents := callCoord[activeAgentsOutput](t, client, ToolStatus, tokenInput{AgentToken: alice.RegistrationToken})
 	if len(agents.Agents) != 2 || agents.Agents[0].Name != "alice" || agents.Agents[1].Name != "bob" {
 		t.Fatalf("active agents = %+v", agents.Agents)
 	}
-	conversation := callCoord[conversationOutput](t, client, ToolConversationOpen,
+	conversation := callCoord[conversationOutput](t, client, ToolSay,
 		openConversationInput{AgentToken: alice.RegistrationToken, Topic: "restart handoff"})
-	message := callCoord[messageOutput](t, client, ToolMessageSend, sendMessageInput{AgentToken: alice.RegistrationToken,
+	message := callCoord[messageOutput](t, client, ToolSay, sendMessageInput{AgentToken: alice.RegistrationToken,
 		ConversationID: conversation.ConversationID, To: []string{"bob"}, Subject: "handoff", Body: "durable payload",
 		AcknowledgementRequired: true})
-	inbox := callCoord[messagePageOutput](t, client, ToolInboxFetch,
+	inbox := callCoord[messagePageOutput](t, client, ToolRead,
 		fetchInboxInput{AgentToken: bob.RegistrationToken, UnreadOnly: true, Limit: 32})
 	if len(inbox.Messages) != 1 || inbox.Messages[0].MessageID != message.MessageID {
 		t.Fatalf("bob inbox = %+v", inbox)
 	}
-	read := callCoord[deliveryFactOutput](t, client, ToolMessageFact,
+	read := callCoord[deliveryFactOutput](t, client, ToolAck,
 		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID, Kind: "read"})
-	ack := callCoord[deliveryFactOutput](t, client, ToolMessageFact,
+	ack := callCoord[deliveryFactOutput](t, client, ToolAck,
 		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID, Kind: "acknowledged"})
 	if !read.Read || !ack.Read || !ack.Acknowledged {
 		t.Fatalf("read/ack = %+v / %+v", read, ack)
 	}
-	assertCoordinationInputRejected(t, client, ToolMessageFact,
+	assertCoordinationInputRejected(t, client, ToolAck,
 		messageFactInput{AgentToken: bob.RegistrationToken, MessageID: message.MessageID, Kind: "accepted"})
 	// Acknowledgement resolves the digest from the single stored message, so a
 	// message the caller cannot see fails outright instead of being searched for.
-	assertCoordinationInputRejected(t, client, ToolMessageFact, messageFactInput{
+	assertCoordinationInputRejected(t, client, ToolAck, messageFactInput{
 		AgentToken: bob.RegistrationToken, MessageID: "01b8e094-9888-7000-8000-0000000000ff", Kind: "acknowledged"})
-	if unread := callCoord[messagePageOutput](t, client, ToolInboxFetch,
+	if unread := callCoord[messagePageOutput](t, client, ToolRead,
 		fetchInboxInput{AgentToken: bob.RegistrationToken, UnreadOnly: true, Limit: 32}); len(unread.Messages) != 0 {
 		t.Fatalf("read message remained unread: %+v", unread)
 	}
-	if all := callCoord[messagePageOutput](t, client, ToolInboxFetch,
+	if all := callCoord[messagePageOutput](t, client, ToolRead,
 		map[string]any{"agent_token": bob.RegistrationToken}); len(all.Messages) != 1 {
 		t.Fatalf("all inbox omitted read message: %+v", all)
 	}
-	reply := callCoord[messageOutput](t, client, ToolMessageSend, map[string]any{
+	reply := callCoord[messageOutput](t, client, ToolSay, map[string]any{
 		"agent_token": bob.RegistrationToken, "conversation_id": conversation.ConversationID, "to": []string{"alice"},
 		"subject": "re: handoff", "body": "received", "reply_to_message_id": message.MessageID,
 	})
 	if reply.ReplyTo != message.MessageID {
 		t.Fatalf("reply = %+v", reply)
 	}
-	lease := callCoord[reservationOutput](t, client, ToolReservationAcquire, map[string]any{
+	lease := callCoord[reservationOutput](t, client, ToolClaim, map[string]any{
 		"agent_token": alice.RegistrationToken,
 		"selectors":   []reservationSelectorInput{{Kind: "subtree", Path: "src"}},
 	})
@@ -115,7 +114,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	// Registration is where a restarted agent learns what it still holds. The
 	// daemon rebinds these leases to the new session either way; saying nothing
 	// about them is how an exclusive reservation gets abandoned for its TTL.
-	resumed := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+	resumed := callCoord[agentSessionOutput](t, client, ToolJoin,
 		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice", RegistrationToken: &aliceToken})
 	if resumed.RegistrationToken != "" {
 		t.Fatal("resuming a registered name issued a second token")
@@ -138,47 +137,52 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if len(resumed.OtherAgents) != 1 || resumed.OtherAgents[0].Name != "bob" {
 		t.Fatalf("resumed roster = %+v, want the other agent present", resumed.OtherAgents)
 	}
-	resumedBob := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+	resumedBob := callCoord[agentSessionOutput](t, client, ToolJoin,
 		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob", RegistrationToken: &bobToken})
 	if len(resumedBob.HeldReservations) != 0 {
 		t.Fatalf("bob holds no reservation but was handed %+v", resumedBob.HeldReservations)
 	}
-	renewed := callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{
-		"agent_token": aliceToken, "selectors": lease.Selectors, "action": "renew",
+	renewed := callCoord[reservationOutput](t, client, ToolClaim, map[string]any{
+		"agent_token": aliceToken, "selectors": lease.Selectors,
 	})
-	if renewed.LeaseID != lease.LeaseID {
-		t.Fatalf("renewed lease = %+v", renewed)
+	if renewed.LeaseID == "" || renewed.Selectors[0].ClaimGeneration <= lease.Selectors[0].ClaimGeneration {
+		t.Fatalf("renewed claim = %+v", renewed)
 	}
-	thread := callCoord[messagePageOutput](t, client, ToolThreadFetch, map[string]any{
+	thread := callCoord[messagePageOutput](t, client, ToolRead, map[string]any{
 		"agent_token": aliceToken, "conversation_id": conversation.ConversationID,
 	})
 	if len(thread.Messages) != 2 || thread.Messages[0].Body != "durable payload" || !thread.Messages[0].Deliveries[0].Acknowledged ||
 		thread.Messages[1].ReplyTo != message.MessageID {
 		t.Fatalf("durable thread = %+v", thread)
 	}
-	conflict, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolReservationAcquire,
+	conflict, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolClaim,
 		Arguments: reservationAcquireInput{AgentToken: bobToken, Mode: "exclusive", TTLSeconds: 3600,
 			Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}}})
 	if err != nil {
 		t.Fatalf("reservation conflict call: %v", err)
 	}
-	if !conflict.IsError || !strings.Contains(strings.ToLower(conflict.Content[0].(*sdkmcp.TextContent).Text), "lease") {
-		t.Fatalf("overlapping reservation did not conflict: %+v", conflict)
+	if conflict.IsError {
+		t.Fatalf("claim conflict must be a normal result: %+v", conflict)
 	}
-	assertCoordinationInputRejected(t, client, ToolInboxFetch, map[string]any{"agent_token": aliceToken, "limit": 0})
-	assertCoordinationInputRejected(t, client, ToolReservationAcquire, map[string]any{"agent_token": bobToken,
+	var blocked claimOutput
+	encoded, _ := json.Marshal(conflict.StructuredContent)
+	if json.Unmarshal(encoded, &blocked) != nil || blocked.OK || blocked.BlockedBy == nil {
+		t.Fatalf("overlapping claim result = %+v", conflict.StructuredContent)
+	}
+	assertCoordinationInputRejected(t, client, ToolRead, map[string]any{"agent_token": aliceToken, "limit": 0})
+	assertCoordinationInputRejected(t, client, ToolClaim, map[string]any{"agent_token": bobToken,
 		"mode": "invalid", "selectors": []reservationSelectorInput{{Kind: "exact", Path: "other.go"}}})
-	assertCoordinationInputRejected(t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
-		"selectors": renewed.Selectors, "action": "renew", "ttl_seconds": 0})
-	assertCoordinationInputRejected(t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
-		"selectors": renewed.Selectors, "action": "release", "ttl_seconds": 1})
-	callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
-		"selectors": renewed.Selectors, "action": "release"})
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
+	assertCoordinationInputRejected(t, client, ToolClaim, map[string]any{"agent_token": aliceToken,
+		"selectors": renewed.Selectors, "ttl_seconds": 0})
+	assertCoordinationInputRejected(t, client, ToolRelease, map[string]any{"agent_token": aliceToken,
+		"selectors": renewed.Selectors, "ttl_seconds": 1})
+	callCoord[reservationOutput](t, client, ToolRelease, map[string]any{"agent_token": aliceToken,
+		"selectors": renewed.Selectors})
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "exclusive", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: aliceToken,
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{AgentToken: aliceToken,
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "docs"}}})
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "docs/guide.md"}}})
 }
 
@@ -192,11 +196,12 @@ func TestWorkReferenceObservationUsesAuthenticatedProject(t *testing.T) {
 	client, closeMCP := connect(t, newTestServer(t, store))
 	defer closeMCP()
 
-	session := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+	session := callCoord[agentSessionOutput](t, client, ToolJoin,
 		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
-	observed := callCoord[application.WorkReference](t, client, ToolWorkReferenceObserve,
-		observeWorkReferenceInput{AgentToken: session.RegistrationToken, ObjectID: "blackbird-a1u.10"})
-	if observed.Project != "/workspace/repo" || observed.ObjectID != "blackbird-a1u.10" ||
+	status := callCoord[statusOutput](t, client, ToolStatus,
+		statusInput{AgentToken: session.RegistrationToken, ObjectID: "blackbird-a1u.10"})
+	observed := status.WorkReference
+	if observed == nil || observed.Project != "/workspace/repo" || observed.ObjectID != "blackbird-a1u.10" ||
 		observed.Provider != "test" || observed.Fields.Title != "Observed work" {
 		t.Fatalf("observed work reference = %+v", observed)
 	}
@@ -245,7 +250,7 @@ func TestCoordinationSurfaceAndProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{ToolAgentRegister, ToolReservationAcquire, ToolConversationOpen, ToolMessageFact, "LEASE_CONFLICT"} {
+	for _, required := range []string{ToolJoin, ToolClaim, ToolSay, ToolAck, "LEASE_CONFLICT"} {
 		if !strings.Contains(protocol.Contents[0].Text, required) {
 			t.Errorf("protocol missing %q", required)
 		}
@@ -276,12 +281,12 @@ func TestMCPMiddlewareRecordsToolOutcomeAndLeaseContention(t *testing.T) {
 	next := func(context.Context, string, sdkmcp.Request) (sdkmcp.Result, error) {
 		return &sdkmcp.CallToolResult{IsError: true, StructuredContent: json.RawMessage(failure)}, nil
 	}
-	request := &sdkmcp.CallToolRequest{Params: &sdkmcp.CallToolParamsRaw{Name: ToolReservationAcquire}}
+	request := &sdkmcp.CallToolRequest{Params: &sdkmcp.CallToolParamsRaw{Name: ToolClaim}}
 	if _, err := logToolFailures(slog.New(slog.DiscardHandler), observation)(next)(
 		context.Background(), "tools/call", request); err != nil {
 		t.Fatal(err)
 	}
-	if observation.operation != "mcp "+ToolReservationAcquire ||
+	if observation.operation != "mcp "+ToolClaim ||
 		observation.outcome != string(domain.ErrorCodeLeaseConflict) || observation.conflicts != 1 {
 		t.Fatalf("observation = %+v", observation)
 	}
@@ -308,7 +313,7 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 	defer closeMCP()
 
 	const secret = "bbm_00000000000000000000000000000000"
-	result, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolReservationAcquire,
+	result, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolClaim,
 		Arguments: reservationAcquireInput{AgentToken: secret, Mode: "exclusive", TTLSeconds: 60,
 			Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}}})
 	if err != nil {
@@ -318,7 +323,7 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 		t.Fatal("an unknown agent token was accepted")
 	}
 	logged := sink.String()
-	if !strings.Contains(logged, ToolReservationAcquire) || !strings.Contains(logged, "tool failed") ||
+	if !strings.Contains(logged, ToolClaim) || !strings.Contains(logged, "tool failed") ||
 		!strings.Contains(logged, string(domain.ErrorCodeUnauthenticated)) {
 		t.Fatalf("failure log = %q, want the tool name, the failure and its code", logged)
 	}
@@ -343,7 +348,7 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 
 	// A successful call is not noise: only failures earn a record.
 	sink.Reset()
-	callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+	callCoord[agentSessionOutput](t, client, ToolJoin,
 		registerAgentInput{ProjectKey: "/workspace/logged", AgentName: "alice"})
 	if logged := sink.String(); logged != "" {
 		t.Fatalf("successful call logged %q", logged)
@@ -359,23 +364,22 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 func TestCoordinationFailuresCarryTheirCodeAndTheirBlockers(t *testing.T) {
 	t.Parallel()
 	client, alice, bob := newCoordinationSession(t, "failures.db")
-	held := callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+	held := callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 
-	conflict := callCoordFailure(t, client, ToolReservationAcquire, reservationAcquireInput{
+	conflict := callCoord[claimOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: bob, Mode: "exclusive", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "src"}}})
-	if conflict.Code != string(domain.ErrorCodeLeaseConflict) || conflict.Category != string(domain.ErrorCategoryConflict) ||
-		conflict.Conflict != string(domain.ConflictLease) || !conflict.Retryable {
-		t.Fatalf("lease conflict = %+v, want a retryable machine-readable LEASE_CONFLICT", conflict)
+	if conflict.OK || conflict.BlockedBy == nil || len(conflict.Options) != 4 {
+		t.Fatalf("claim conflict = %+v, want a normal blocked result", conflict)
 	}
 	if len(conflict.Blockers) != 1 || conflict.Blockers[0].HolderAgentName != "alice" ||
 		conflict.Blockers[0].LeaseID != held.LeaseID || conflict.Blockers[0].Mode != "exclusive" {
 		t.Fatalf("conflict blockers = %+v, want the lease alice holds", conflict.Blockers)
 	}
-	if conflict.Blockers[0].ExpiresInMS <= 0 || conflict.RetryAfterMS != conflict.Blockers[0].ExpiresInMS {
-		t.Fatalf("conflict retry advice = %d, blocker = %+v", conflict.RetryAfterMS, conflict.Blockers[0])
+	if conflict.Blockers[0].ExpiresInMS <= 0 {
+		t.Fatalf("conflict blocker = %+v, want time left", conflict.Blockers[0])
 	}
 	if len(conflict.Blockers[0].Selectors) != 1 || conflict.Blockers[0].Selectors[0].Path != "src/main.go" {
 		t.Fatalf("blocker selectors = %+v, want the path that overlapped", conflict.Blockers[0].Selectors)
@@ -383,23 +387,23 @@ func TestCoordinationFailuresCarryTheirCodeAndTheirBlockers(t *testing.T) {
 
 	// An agent's own lease never blocks it, so widening a reservation it already
 	// holds must not report the agent to itself as a blocker.
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 
-	unauthenticated := callCoordFailure(t, client, ToolAgentsList, tokenInput{AgentToken: "bbm_" + strings.Repeat("0", 32)})
+	unauthenticated := callCoordFailure(t, client, ToolStatus, tokenInput{AgentToken: "bbm_" + strings.Repeat("0", 32)})
 	if unauthenticated.Code != string(domain.ErrorCodeUnauthenticated) || unauthenticated.Retryable ||
 		len(unauthenticated.Blockers) != 0 {
 		t.Fatalf("unauthenticated failure = %+v, want a terminal UNAUTHENTICATED with no blockers", unauthenticated)
 	}
-	invalid := callCoordFailure(t, client, ToolThreadFetch, map[string]any{
+	invalid := callCoordFailure(t, client, ToolRead, map[string]any{
 		"agent_token": bob, "conversation_id": "not-a-conversation"})
 	if invalid.Code != string(domain.ErrorCodeInvalidArgument) || invalid.Category != string(domain.ErrorCategoryValidation) ||
 		invalid.Retryable {
 		t.Fatalf("invalid request failure = %+v, want a terminal INVALID_ARGUMENT", invalid)
 	}
-	partial := callCoordFailure(t, client, ToolReservationChange, map[string]any{"agent_token": alice,
-		"selectors": []reservationSelectorInput{{Kind: "subtree", Path: "src"}}, "action": "release"})
+	partial := callCoordFailure(t, client, ToolRelease, map[string]any{"agent_token": alice,
+		"selectors": []reservationSelectorInput{{Kind: "subtree", Path: "src"}}})
 	if partial.Code != string(domain.ErrorCodeInvalidArgument) || !strings.Contains(partial.Message, "exactly match") {
 		t.Fatalf("partial release = %+v, want precise exact-set guidance", partial)
 	}
@@ -414,16 +418,16 @@ func TestCoordinationFailuresCarryTheirCodeAndTheirBlockers(t *testing.T) {
 func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
 	t.Parallel()
 	client, alice, bob := newCoordinationSession(t, "status.db")
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: bob, Mode: "shared", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "docs"}}})
 
 	// A subtree path is covered on directory boundaries, so asking about a file
 	// inside it has to find the lease over the directory.
-	covered := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
+	covered := callCoord[reservationsStatusOutput](t, client, ToolStatus,
 		reservationsStatusInput{AgentToken: alice, Path: "docs/guide.md"})
 	if len(covered.Reservations) != 1 || covered.Reservations[0].HolderAgentName != "bob" ||
 		covered.Reservations[0].Mode != "shared" || covered.Reservations[0].ExpiresInMS <= 0 {
@@ -432,7 +436,7 @@ func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
 	if covered.Reservations[0].HolderActorID == "" || covered.Truncated {
 		t.Fatalf("status entry = %+v", covered.Reservations[0])
 	}
-	all := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
+	all := callCoord[reservationsStatusOutput](t, client, ToolStatus,
 		reservationsStatusInput{AgentToken: bob})
 	if len(all.Reservations) != 2 {
 		t.Fatalf("unfiltered status = %+v, want both leases including the caller's own", all.Reservations)
@@ -446,12 +450,12 @@ func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
 	if generation == 0 {
 		t.Fatalf("exclusive claim status omitted claim_generation: %+v", all.Reservations)
 	}
-	free := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
+	free := callCoord[reservationsStatusOutput](t, client, ToolStatus,
 		reservationsStatusInput{AgentToken: bob, Path: "internal/other.go"})
 	if len(free.Reservations) != 0 {
 		t.Fatalf("status for an unheld path = %+v", free.Reservations)
 	}
-	assertCoordinationInputRejected(t, client, ToolReservationsStatus, map[string]any{"agent_token": alice, "limit": 0})
+	assertCoordinationInputRejected(t, client, ToolStatus, map[string]any{"agent_token": alice, "limit": 0})
 }
 
 // TestWaitReportsWhichConditionEndedIt covers the tool that turns a refusal into
@@ -461,7 +465,7 @@ func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
 func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 	t.Parallel()
 	client, alice, bob := newCoordinationSession(t, "wait.db")
-	held := callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+	held := callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 
@@ -473,15 +477,15 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 	}
 	// A holder that gave up its lease is not a blocker any more, and the waiter
 	// has to be told so rather than sitting out the rest of its budget.
-	callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{
-		"agent_token": alice, "selectors": held.Selectors, "action": "release"})
+	callCoord[reservationOutput](t, client, ToolRelease, map[string]any{
+		"agent_token": alice, "selectors": held.Selectors})
 	freed := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 30})
 	if freed.Reason != string(application.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
 		t.Fatalf("wait on a freed path = %+v", freed)
 	}
 	// A shared reader waits only for exclusive writers, and never for itself.
-	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+	callCoord[reservationOutput](t, client, ToolClaim, reservationAcquireInput{
 		AgentToken: bob, Mode: "shared", TTLSeconds: 300,
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 	shared := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
@@ -537,32 +541,32 @@ func TestBoundedWaitTimeoutClampsWhateverTheCallerAsksFor(t *testing.T) {
 func TestConversationSlugReopensTheSameThread(t *testing.T) {
 	t.Parallel()
 	client, alice, bob := newCoordinationSession(t, "slug.db")
-	opened := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+	opened := callCoord[conversationOutput](t, client, ToolSay, openConversationInput{
 		AgentToken: alice, Topic: "auth refactor", Slug: "auth-refactor"})
 	if opened.Reused || opened.Slug != "auth-refactor" || opened.ConversationID == "" {
 		t.Fatalf("first open = %+v, want a fresh conversation under the slug", opened)
 	}
-	reopened := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+	reopened := callCoord[conversationOutput](t, client, ToolSay, openConversationInput{
 		AgentToken: alice, Topic: "something else entirely", Slug: "auth-refactor"})
 	if !reopened.Reused || reopened.ConversationID != opened.ConversationID || reopened.Topic != opened.Topic {
 		t.Fatalf("reopen = %+v, want the stored conversation %+v", reopened, opened)
 	}
 	// The slug is per repository rather than per agent: finding a teammate's
 	// thread is the whole reason to name one.
-	joined := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+	joined := callCoord[conversationOutput](t, client, ToolSay, openConversationInput{
 		AgentToken: bob, Topic: "auth refactor", Slug: "auth-refactor"})
 	if !joined.Reused || joined.ConversationID != opened.ConversationID {
 		t.Fatalf("teammate open = %+v, want the same conversation", joined)
 	}
-	callCoord[messageOutput](t, client, ToolMessageSend, sendMessageInput{AgentToken: bob,
+	callCoord[messageOutput](t, client, ToolSay, sendMessageInput{AgentToken: bob,
 		ConversationID: joined.ConversationID, To: []string{"alice"}, Subject: "found it", Body: "in the same thread"})
-	thread := callCoord[messagePageOutput](t, client, ToolThreadFetch, map[string]any{
+	thread := callCoord[messagePageOutput](t, client, ToolRead, map[string]any{
 		"agent_token": alice, "conversation_id": opened.ConversationID})
 	if len(thread.Messages) != 1 {
 		t.Fatalf("thread after a reopen = %+v", thread.Messages)
 	}
 	// A conversation nobody has to find again still opens without a slug.
-	anonymous := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+	anonymous := callCoord[conversationOutput](t, client, ToolSay, openConversationInput{
 		AgentToken: alice, Topic: "one-off"})
 	if anonymous.Reused || anonymous.Slug != "" || anonymous.ConversationID == opened.ConversationID {
 		t.Fatalf("unslugged open = %+v", anonymous)
@@ -675,9 +679,9 @@ func newCoordinationSession(t *testing.T, name string) (*sdkmcp.ClientSession, s
 	server := newTestServer(t, store)
 	client, closeMCP := connect(t, server)
 	t.Cleanup(closeMCP)
-	alice := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+	alice := callCoord[agentSessionOutput](t, client, ToolJoin,
 		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
-	bob := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+	bob := callCoord[agentSessionOutput](t, client, ToolJoin,
 		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob"})
 	return client, alice.RegistrationToken, bob.RegistrationToken
 }
@@ -745,12 +749,11 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		tools[tool.Name] = *tool
 	}
 	expectedDefaults := map[string]map[string]any{
-		ToolMessageSend:        {"acknowledgement_required": false},
-		ToolInboxFetch:         {"unread_only": false, "after": float64(0), "limit": float64(50)},
-		ToolThreadFetch:        {"after": float64(0), "limit": float64(50)},
-		ToolReservationAcquire: {"mode": "exclusive", "ttl_seconds": float64(3600)},
-		ToolReservationsStatus: {"limit": float64(50)},
-		ToolWait:               {"await_mail": false, "mode": "exclusive", "timeout_seconds": float64(60)},
+		ToolSay:    {"acknowledgement_required": false},
+		ToolRead:   {"unread_only": false, "after": float64(0), "limit": float64(50)},
+		ToolClaim:  {"mode": "exclusive", "ttl_seconds": float64(3600)},
+		ToolStatus: {"limit": float64(50)},
+		ToolWait:   {"await_mail": false, "mode": "exclusive", "timeout_seconds": float64(60)},
 	}
 	for toolName, defaults := range expectedDefaults {
 		tool, ok := tools[toolName]
@@ -838,7 +841,7 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 
 	// The slug is the property a compacted agent cannot infer, so it has to be
 	// stated where the agent looks rather than in a commit message.
-	open := tools[ToolConversationOpen]
+	open := tools[ToolSay]
 	openSchema, err := json.Marshal(open.InputSchema)
 	if err != nil {
 		t.Fatalf("marshal conversation_open schema: %v", err)
@@ -862,7 +865,7 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 			openDecoded.Properties.Slug.Description)
 	}
 
-	acquire := tools[ToolReservationAcquire]
+	acquire := tools[ToolClaim]
 	acquireSchema, err := json.Marshal(acquire.InputSchema)
 	if err != nil {
 		t.Fatalf("marshal acquire schema: %v", err)
@@ -887,7 +890,7 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		t.Errorf("selector kind enum = %#v, want exact and subtree", kinds)
 	}
 
-	factSchema, err := json.Marshal(tools[ToolMessageFact].InputSchema)
+	factSchema, err := json.Marshal(tools[ToolAck].InputSchema)
 	if err != nil {
 		t.Fatalf("marshal message fact schema: %v", err)
 	}
@@ -908,12 +911,12 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	// agent_register is the one tool whose result an agent must act on, so its
 	// description still names the state it returns even though repeated output
 	// schemas are deliberately omitted from discovery.
-	register := tools[ToolAgentRegister]
-	if !strings.Contains(register.Description, "reservations") {
-		t.Errorf("agent_register description does not mention the reservations it returns: %q", register.Description)
+	register := tools[ToolJoin]
+	if !strings.Contains(register.Description, "claims") {
+		t.Errorf("join description does not mention the claims it returns: %q", register.Description)
 	}
 	if !strings.Contains(register.Description, ResourceCoordinationProtocol) {
-		t.Errorf("agent_register description does not point new agents to the protocol: %q", register.Description)
+		t.Errorf("join description does not point new agents to the protocol: %q", register.Description)
 	}
 
 	// The wait ceiling is published as well as enforced, so a client discovers
@@ -953,29 +956,28 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		}
 	}
 
-	change := tools[ToolReservationChange]
-	encoded, err := json.Marshal(change.InputSchema)
+	releaseSchema, err := json.Marshal(tools[ToolRelease].InputSchema)
 	if err != nil {
-		t.Fatalf("marshal reservation change schema: %v", err)
+		t.Fatalf("marshal release schema: %v", err)
 	}
-	var changeDecoded struct {
-		Properties struct {
-			Action struct {
-				Enum []any `json:"enum"`
-			} `json:"action"`
-			TTLSeconds struct {
-				Default any `json:"default"`
-			} `json:"ttl_seconds"`
-		} `json:"properties"`
+	if bytes.Contains(releaseSchema, []byte(`"action"`)) || bytes.Contains(releaseSchema, []byte(`"ttl_seconds"`)) {
+		t.Fatalf("release schema carries claim-only fields: %s", releaseSchema)
 	}
-	if err := json.Unmarshal(encoded, &changeDecoded); err != nil {
-		t.Fatalf("decode reservation change schema: %v", err)
+
+	if len(tools) != 8 {
+		t.Fatalf("published %d tools, want exactly eight", len(tools))
 	}
-	if actions := changeDecoded.Properties.Action.Enum; !reflect.DeepEqual(actions, []any{"renew", "release"}) {
-		t.Errorf("reservation action enum = %#v, want renew and release", actions)
+	for _, name := range coordinationToolNames {
+		if _, ok := tools[name]; !ok {
+			t.Errorf("missing agent-native tool %q", name)
+		}
 	}
-	if changeDecoded.Properties.TTLSeconds.Default != nil {
-		t.Fatalf("reservation change ttl default would leak into release: %#v", changeDecoded.Properties.TTLSeconds.Default)
+	discovery, err := json.Marshal(result.Tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery) > 16_000 {
+		t.Fatalf("tool discovery is %d bytes, want <= 16000", len(discovery))
 	}
 }
 

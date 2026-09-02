@@ -1,13 +1,7 @@
 package mcp
 
 import (
-	"context"
-	"encoding/json"
-	"log/slog"
 	"time"
-
-	"github.com/google/jsonschema-go/jsonschema"
-	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/phall1/blackbird/internal/application"
 )
@@ -20,15 +14,7 @@ import (
 // answers just as well. It is also registered only when a telemetry reader is
 // composed, so a daemon that collects nothing does not advertise a tool that
 // can only answer zero.
-const ToolSpendReport = "blackbird_spend_report"
-
-type spendReportInput struct {
-	AgentToken string `json:"agent_token"`
-	Dimension  string `json:"dimension,omitempty" jsonschema:"How to group the rollup. model, agent, and harness answer where the tokens went; span_kind and span_name answer where the time went, and report durations with zero tokens because a span has none. Defaults to model."`
-	SinceHours uint32 `json:"since_hours,omitempty" jsonschema:"How far back to look. Defaults to 24 and is capped at 720; a larger value is clamped rather than rejected."`
-	MineOnly   bool   `json:"mine_only,omitempty" jsonschema:"Report only your own spend rather than the whole project's. This is how you answer what your own session has cost."`
-	Limit      uint16 `json:"limit,omitempty" jsonschema:"How many groups to return, largest first. Defaults to 10, capped at 50; the report says whether more existed."`
-}
+const ToolSpendReport = ToolStatus
 
 type spendGroupOutput struct {
 	Key          string `json:"key" jsonschema:"The model, agent name, harness, span kind, or span name. Empty means the agent that spent this has since been deleted; the spend still happened."`
@@ -58,49 +44,6 @@ type spendReportOutput struct {
 	Groups    []spendGroupOutput `json:"groups"`
 	Totals    spendGroupOutput   `json:"totals" jsonschema:"Totals over the whole window, not merely the groups returned, so they stay honest when truncated is true."`
 	Truncated bool               `json:"truncated" jsonschema:"More groups existed than limit allowed. The groups returned are the largest ones."`
-}
-
-func registerSpendTool(server *sdkmcp.Server, store application.LocalCoordinationStore,
-	observations application.TelemetryReader, logger *slog.Logger) {
-	schema := coordinationInputSchema[spendReportInput](func(properties map[string]*jsonschema.Schema) {
-		properties["dimension"].Default = json.RawMessage(`"model"`)
-		properties["dimension"].Enum = []any{
-			string(application.SpendByModel), string(application.SpendByAgent),
-			string(application.SpendByHarness), string(application.SpendBySpanKind),
-			string(application.SpendBySpanName),
-		}
-	})
-	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolSpendReport,
-		Description: "Report where this project's tokens and time went, grouped and ranked. Use it to answer " +
-			"what a session has cost before starting expensive work, which model or agent is consuming the " +
-			"budget, and -- with span_kind or span_name -- which activity is actually taking the wall clock. " +
-			"It returns totals, never individual calls, because a page of raw observations would cost more " +
-			"context than the answer is worth. The report always covers your own project; set mine_only to " +
-			"narrow it to yourself. An empty report means nothing was recorded in the window, not that " +
-			"nothing was spent.",
-		InputSchema: schema},
-		func(ctx context.Context, input spendReportInput) (spendReportOutput, error) {
-			session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
-			if err != nil {
-				return spendReportOutput{}, err
-			}
-			query := application.SpendQuery{
-				Dimension: application.SpendDimension(input.Dimension),
-				MineOnly:  input.MineOnly,
-				Limit:     input.Limit,
-			}
-			if query.Dimension == "" {
-				query.Dimension = application.SpendByModel
-			}
-			if input.SinceHours > 0 {
-				query.Since = time.Now().UTC().Add(-time.Duration(input.SinceHours) * time.Hour)
-			}
-			report, err := observations.SpendReport(ctx, session, query)
-			if err != nil {
-				return spendReportOutput{}, err
-			}
-			return spendReportPayload(report), nil
-		})
 }
 
 func spendReportPayload(report application.SpendReport) spendReportOutput {

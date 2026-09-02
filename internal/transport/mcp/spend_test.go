@@ -41,35 +41,23 @@ func listedTools(t *testing.T, server *Server) map[string]bool {
 	return listed
 }
 
-// A daemon that collects nothing must not spend every client's tool-list budget
-// advertising a report it can only answer with zeros.
-func TestSpendToolIsAbsentWithoutAnObservationReader(t *testing.T) {
+func TestSpendReportDoesNotAddANinthTool(t *testing.T) {
 	t.Parallel()
 	server, err := NewServer(Dependencies{Coordination: spendStore(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if listedTools(t, server)[ToolSpendReport] {
-		t.Fatal("the spend tool must not be listed when no reader is composed")
-	}
-}
-
-func TestSpendToolIsListedWhenAReaderIsComposed(t *testing.T) {
-	t.Parallel()
-	store := spendStore(t)
-	server, err := NewServer(Dependencies{Coordination: store, Observations: store})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !listedTools(t, server)[ToolSpendReport] {
-		t.Fatal("the spend tool must be listed once a reader is composed")
+	tools := listedTools(t, server)
+	if !tools[ToolStatus] || len(tools) != 8 {
+		t.Fatalf("tools=%v, want spend folded into the eight-tool status surface", tools)
 	}
 }
 
 func callSpend(t *testing.T, client *sdkmcp.ClientSession, input map[string]any) spendReportOutput {
 	t.Helper()
+	input["spend"] = true
 	result, err := client.CallTool(context.Background(),
-		&sdkmcp.CallToolParams{Name: ToolSpendReport, Arguments: input})
+		&sdkmcp.CallToolParams{Name: ToolStatus, Arguments: input})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,11 +68,14 @@ func callSpend(t *testing.T, client *sdkmcp.ClientSession, input map[string]any)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var report spendReportOutput
-	if err := json.Unmarshal(encoded, &report); err != nil {
+	var status statusOutput
+	if err := json.Unmarshal(encoded, &status); err != nil {
 		t.Fatal(err)
 	}
-	return report
+	if status.SpendReport == nil {
+		t.Fatal("status omitted requested spend report")
+	}
+	return *status.SpendReport
 }
 
 func TestSpendToolReportsTokensAndDefaultsToModel(t *testing.T) {
@@ -156,7 +147,7 @@ func TestSpendToolRejectsAnUnknownDimension(t *testing.T) {
 	defer closeMCP()
 
 	result, err := client.CallTool(ctx, &sdkmcp.CallToolParams{
-		Name: ToolSpendReport, Arguments: map[string]any{"agent_token": token, "dimension": "vibes"},
+		Name: ToolStatus, Arguments: map[string]any{"agent_token": token, "spend": true, "dimension": "vibes"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +168,7 @@ func TestSpendToolRequiresAValidAgentToken(t *testing.T) {
 	defer closeMCP()
 
 	result, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{
-		Name: ToolSpendReport, Arguments: map[string]any{"agent_token": "bbm_not_a_real_token"},
+		Name: ToolStatus, Arguments: map[string]any{"agent_token": "bbm_not_a_real_token", "spend": true},
 	})
 	if err != nil {
 		t.Fatal(err)

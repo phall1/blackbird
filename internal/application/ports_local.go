@@ -32,7 +32,7 @@ type LocalAgentSnapshot struct {
 // MaxLocalAgentSnapshotItems bounds the lists whose full contents an agent can
 // fetch for itself. This projection is spent from every client's context window
 // on every registration, so it carries enough to know something is waiting and
-// stops there; blackbird_inbox_fetch and blackbird_thread_fetch carry the rest.
+// stops there; blackbird_read and blackbird_read carry the rest.
 const MaxLocalAgentSnapshotItems = 5
 
 // LocalAgentReservation is one lease the registering agent still holds.

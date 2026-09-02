@@ -127,7 +127,7 @@ func TestLocalAgentTokenFailuresNameTheRemedy(t *testing.T) {
 		{name: "missing agent token", call: func() error {
 			_, err := store.AuthenticateLocalAgent(ctx, "")
 			return err
-		}, want: "blackbird_agent_register"},
+		}, want: "blackbird_join"},
 		{name: "unknown agent token", call: func() error {
 			_, err := store.AuthenticateLocalAgent(ctx, "bbm_nothing")
 			return err
