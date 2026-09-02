@@ -56,8 +56,8 @@ func (store *Store) AdminOverview(ctx context.Context) (application.AdminOvervie
 			(SELECT count(*) FROM message_deliveries WHERE read_at_us IS NULL),
 			(SELECT count(*) FROM message_deliveries
 			   WHERE acknowledgement_required = 1 AND acknowledged_at_us IS NULL),
-			(SELECT count(*) FROM leases WHERE status = 'active' AND expires_at_us > ?),
-			(SELECT count(*) FROM leases WHERE status = 'active' AND expires_at_us <= ?),
+			(SELECT count(*) FROM leases AS l WHERE 1 = 1`+adminReservationActive+`),
+			(SELECT count(*) FROM leases AS l WHERE 1 = 1`+adminReservationExpired+`),
 			(SELECT count(*) FROM coordination_events)`, cutoff, nowMicros, nowMicros).Scan(
 			&overview.Projects, &overview.Agents, &overview.ActiveAgents, &overview.Conversations,
 			&overview.Messages, &overview.Deliveries, &overview.UnreadDeliveries, &overview.UnackedDeliveries,
@@ -503,6 +503,25 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 // query on "a/f" covers "a/f" and "a/f/g" but never the sibling "a/foo". LIKE
 // is unusable for it: a selector path may legitimately contain % or _, and the
 // escaping that would fix that is a second place for the boundary rule to rot.
+// A reservation's bucket is a fact about the lease, not about whether the
+// expiry reaper has visited it yet. AcquireLease retires expired leases in its
+// workspace and epoch to 'released', so a lease nobody released changes rows
+// the moment some unrelated agent acquires one — and classifying on status
+// alone would move it from "expired" to "released" for that reason, hiding the
+// abandoned reservations an operator is looking for and inflating the released
+// count with corpses.
+//
+// The timestamps separate the two, and they are the only thing that does: an
+// explicit release is stamped strictly before the deadline, because changeLease
+// refuses one after it, while the reaper stamps at or after the deadline by
+// construction. The three predicates below are therefore disjoint and total
+// over every lease row, and each is stable across a reap.
+const (
+	adminReservationActive   = ` AND l.status = 'active' AND l.expires_at_us > ?`
+	adminReservationExpired  = ` AND ((l.status = 'active' AND l.expires_at_us <= ?) OR (l.status = 'released' AND l.released_at_us >= l.expires_at_us))`
+	adminReservationReleased = ` AND l.status = 'released' AND l.released_at_us < l.expires_at_us`
+)
+
 const adminSelectorCoversPath = ` AND EXISTS (SELECT 1 FROM lease_selectors AS sel
 	WHERE sel.lease_id = l.lease_id AND (sel.selector_path = ?
 	  OR substr(?, 1, length(sel.selector_path) + 1) = sel.selector_path || '/'
@@ -524,13 +543,13 @@ func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.Adm
 	arguments := []any{query.ProjectKey, query.ProjectKey, query.AgentName, query.AgentName}
 	switch state {
 	case application.AdminReservationActive:
-		statement += ` AND l.status = 'active' AND l.expires_at_us > ?`
+		statement += adminReservationActive
 		arguments = append(arguments, nowMicros)
 	case application.AdminReservationExpired:
-		statement += ` AND l.status = 'active' AND l.expires_at_us <= ?`
+		statement += adminReservationExpired
 		arguments = append(arguments, nowMicros)
 	case application.AdminReservationReleased:
-		statement += ` AND l.status = 'released'`
+		statement += adminReservationReleased
 	case application.AdminReservationAll:
 	}
 	if query.Mode != "" {

@@ -1042,3 +1042,97 @@ func ageAdminConversation(t *testing.T, store *Store, conversation domain.Conver
 		t.Fatal(err)
 	}
 }
+
+// TestAdminReservationBucketsSurviveTheExpiryReaper pins the classification
+// against AcquireLease's reaper. The reaper retires expired leases in a
+// workspace and epoch to 'released', so a bucket decided on status alone would
+// move an abandoned reservation from "expired" to "released" the moment some
+// unrelated agent acquired a lease — hiding exactly the reservations an
+// operator runs this listing to find, and telling doctor's expired-reservation
+// check that an abandoned workspace is clean.
+//
+// The assertion is that each lease sits in the same bucket before and after the
+// reap, and that the abandoned one never counts as released.
+func TestAdminReservationBucketsSurviveTheExpiryReaper(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	alice := registerAdminAgent(t, store, adminProjectA, "alice")
+	live := acquireAdminLease(t, store, alice, "docs/live.md")
+	releasedEarly := acquireAdminLease(t, store, alice, "docs/released.md")
+	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{
+		LeaseID: releasedEarly.ID(), HolderSession: alice.ActorSessionID,
+		AuthorityEpoch: alice.AuthorityEpoch, Fences: releasedEarly.Fences(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Expiry is staged last: every AcquireLease in this workspace and epoch runs
+	// the reaper, so a lease expired before one would already have been retired
+	// and the pre-reap stage would assert nothing.
+	abandoned := acquireAdminLease(t, store, alice, "docs/abandoned.md")
+	expireAdminLease(t, store, abandoned.ID())
+
+	bucketOf := func(t *testing.T, lease domain.LeaseID) application.AdminReservationState {
+		t.Helper()
+		var found application.AdminReservationState
+		for _, state := range []application.AdminReservationState{
+			application.AdminReservationActive,
+			application.AdminReservationExpired,
+			application.AdminReservationReleased,
+		} {
+			page, err := store.ListAdminReservations(context.Background(),
+				application.AdminReservationsQuery{State: state})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, reservation := range page.Reservations {
+				if reservation.LeaseID != lease {
+					continue
+				}
+				if found != "" {
+					t.Fatalf("lease %s appears in both %s and %s; the buckets must be disjoint",
+						lease, found, state)
+				}
+				found = state
+			}
+		}
+		if found == "" {
+			t.Fatalf("lease %s appears in no bucket; the buckets must be total", lease)
+		}
+		return found
+	}
+
+	assertBuckets := func(t *testing.T, stage string) {
+		t.Helper()
+		for lease, want := range map[domain.LeaseID]application.AdminReservationState{
+			live.ID():          application.AdminReservationActive,
+			abandoned.ID():     application.AdminReservationExpired,
+			releasedEarly.ID(): application.AdminReservationReleased,
+		} {
+			if got := bucketOf(t, lease); got != want {
+				t.Fatalf("%s: lease %s is %s, want %s", stage, lease, got, want)
+			}
+		}
+		overview, err := store.AdminOverview(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if overview.ExpiredReservations != 1 {
+			t.Fatalf("%s: overview expired=%d, want 1", stage, overview.ExpiredReservations)
+		}
+	}
+
+	assertBuckets(t, "before the reap")
+
+	// Any acquisition in this workspace and epoch runs the reaper.
+	acquireAdminLease(t, store, alice, "docs/unrelated.md")
+	var status string
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT status FROM leases WHERE lease_id = ?`, abandoned.ID().String()).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "released" {
+		t.Fatalf("the reaper did not retire the abandoned lease: status=%q", status)
+	}
+
+	assertBuckets(t, "after the reap")
+}

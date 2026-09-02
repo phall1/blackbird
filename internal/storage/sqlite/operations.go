@@ -603,8 +603,13 @@ func streamHead(ctx context.Context, tx *sql.Tx, workspace domain.WorkspaceID, e
 	var digestBytes []byte
 	err := tx.QueryRowContext(ctx, `SELECT next_sequence, retained_from_sequence, head_digest FROM authority_streams
 		WHERE scope_kind = 'workspace' AND scope_id = ? AND authority_epoch = ?`, workspace.String(), epoch.String()).Scan(&next, &retained, &digestBytes)
-	if err != nil || next == 0 || retained == 0 || retained > next || len(digestBytes) != sha256.Size {
+	if err != nil {
 		return 0, [sha256.Size]byte{}, 0, fmt.Errorf("read SQLite workspace stream head: %w", err)
+	}
+	// A head that violates its own invariants is corruption, not a read
+	// failure; the collapsed form reported it as one and wrapped a nil error.
+	if next == 0 || retained == 0 || retained > next || len(digestBytes) != sha256.Size {
+		return 0, [sha256.Size]byte{}, 0, application.ErrInvalidQuery
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], digestBytes)
@@ -673,7 +678,13 @@ func validateEventCursor(ctx context.Context, tx *sql.Tx, cursor application.Eve
 	if decodeErr != nil || len(digestBytes) != sha256.Size {
 		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorInvalid, "event cursor digest is invalid")
 	}
+	// A missing journal row is evidence about the cursor; a failing read is
+	// evidence about the database, and telling the caller to discard a valid
+	// cursor because a query timed out costs it the position it had.
 	want, err := digestBeforeSequence(ctx, tx, workspace, epoch, wire.Sequence+1)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, [sha256.Size]byte{}, err
+	}
 	if err != nil || !bytes.Equal(want[:], digestBytes) {
 		return 0, [sha256.Size]byte{}, queryError(domain.ErrorCodeCursorInvalid, "event cursor does not match the workspace journal")
 	}
@@ -1044,7 +1055,15 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 		}
 		if params.ReplyTo != nil {
 			var parentConversation string
-			if err := tx.QueryRowContext(ctx, `SELECT conversation_id FROM messages WHERE message_id = ?`, params.ReplyTo.String()).Scan(&parentConversation); err != nil || parentConversation != params.ConversationID.String() {
+			// A missing row means the caller named a reply target that does not
+			// exist; any other failure is the database, and reporting it as an
+			// invalid argument sends the caller to fix a correct request.
+			replyErr := tx.QueryRowContext(ctx, `SELECT conversation_id FROM messages WHERE message_id = ?`,
+				params.ReplyTo.String()).Scan(&parentConversation)
+			if replyErr != nil && !errors.Is(replyErr, sql.ErrNoRows) {
+				return fmt.Errorf("read SQLite reply target: %w", replyErr)
+			}
+			if replyErr != nil || parentConversation != params.ConversationID.String() {
 				return application.ErrInvalidCoordination
 			}
 		}
@@ -1066,7 +1085,10 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 			return fmt.Errorf("insert SQLite message: %w", err)
 		}
 		position, err := insert.LastInsertId()
-		if err != nil || position <= 0 {
+		if err != nil {
+			return fmt.Errorf("read SQLite message position: %w", err)
+		}
+		if position <= 0 {
 			return application.ErrInvalidCoordination
 		}
 		deliveries := make([]application.Delivery, 0, len(params.Recipients))
@@ -1130,7 +1152,7 @@ func (store *Store) GetVisibleMessage(ctx context.Context, workspace domain.Work
 	if conversationErr != nil || authorErr != nil {
 		return application.Message{}, application.ErrInvalidCoordination
 	}
-	deliveries, err := store.loadVisibleDeliveries(ctx, messageID, author, viewer)
+	deliveries, err := loadVisibleDeliveries(ctx, store.db, messageID, author, viewer)
 	if err != nil {
 		return application.Message{}, err
 	}
@@ -1155,6 +1177,15 @@ func (store *Store) Thread(ctx context.Context, query application.ThreadQuery) (
 
 func (store *Store) loadMessages(ctx context.Context, workspace domain.WorkspaceID, conversation domain.ConversationID,
 	viewer domain.ActorID, after uint64, limit uint16, inbox, unreadOnly bool) (application.CoordinationPage, error) {
+	// The page, its deliveries and the journal head are read from one snapshot.
+	// The cursor advance below is only sound if no message can commit between
+	// reading the page and reading the head, which a read-only transaction
+	// guarantees; SQLite defers its BEGIN, so no writer waits on this.
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return application.CoordinationPage{}, fmt.Errorf("begin SQLite coordination message read: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	base := `SELECT DISTINCT message.message_id, message.conversation_id, message.author_actor_id, message.subject,
 		message.body, message.reply_to_message_id, message.sent_at_us, message.position FROM messages AS message
 		LEFT JOIN message_deliveries AS own ON own.message_id = message.message_id AND own.recipient_actor_id = ?
@@ -1171,7 +1202,7 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 	}
 	base += ` ORDER BY message.position LIMIT ?`
 	args = append(args, int(limit)+1)
-	rows, err := store.db.QueryContext(ctx, base, args...)
+	rows, err := tx.QueryContext(ctx, base, args...)
 	if err != nil {
 		return application.CoordinationPage{}, fmt.Errorf("query SQLite coordination messages: %w", err)
 	}
@@ -1199,6 +1230,11 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 	if err := rows.Err(); err != nil {
 		return application.CoordinationPage{}, err
 	}
+	// The delivery and head reads below share this transaction's single
+	// connection, so the page statement is finished with first.
+	if err := rows.Close(); err != nil {
+		return application.CoordinationPage{}, err
+	}
 	result := make([]application.Message, 0, len(values))
 	for _, value := range values {
 		messageID, e1 := domain.ParseMessageID(value.message)
@@ -1207,7 +1243,7 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		if e1 != nil || e2 != nil || e3 != nil {
 			return application.CoordinationPage{}, application.ErrInvalidCoordination
 		}
-		deliveries, err := store.loadVisibleDeliveries(ctx, messageID, author, viewer)
+		deliveries, err := loadVisibleDeliveries(ctx, tx, messageID, author, viewer)
 		if err != nil {
 			return application.CoordinationPage{}, err
 		}
@@ -1231,11 +1267,31 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 	if len(result) != 0 {
 		next = result[len(result)-1].Position()
 	}
+	if !hasMore {
+		// A page that ran out of rows before its limit scanned the journal to
+		// its head, so every position at or below that head has already been
+		// judged against this viewer and the cursor may skip the ones the
+		// filter rejected. That is sound because message.position is an
+		// AUTOINCREMENT rowid assigned at insert, messages are immutable, and a
+		// message's deliveries are written by the transaction that inserts it:
+		// a row this scan rejected can never become visible later, and every
+		// message committed after this snapshot takes a strictly greater
+		// position. Leaving the cursor where it was instead makes a quiet agent
+		// rescan every message the workspace has accumulated on every poll.
+		var head uint64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM messages`).Scan(&head); err != nil {
+			return application.CoordinationPage{}, fmt.Errorf("read SQLite coordination message head: %w", err)
+		}
+		if head > next {
+			next = head
+		}
+	}
 	return application.NewCoordinationPage(result, next, hasMore)
 }
 
-func (store *Store) loadVisibleDeliveries(ctx context.Context, message domain.MessageID, author, viewer domain.ActorID) ([]application.Delivery, error) {
-	rows, err := store.db.QueryContext(ctx, `SELECT recipient_actor_id, recipient_kind, acknowledgement_required,
+func loadVisibleDeliveries(ctx context.Context, query coordinationQuery, message domain.MessageID,
+	author, viewer domain.ActorID) ([]application.Delivery, error) {
+	rows, err := query.QueryContext(ctx, `SELECT recipient_actor_id, recipient_kind, acknowledgement_required,
 		available_at_us, read_at_us, acknowledged_at_us FROM message_deliveries WHERE message_id = ?
 		AND (? = ? OR recipient_kind <> 'bcc' OR recipient_actor_id = ?) ORDER BY recipient_kind, recipient_actor_id`,
 		message.String(), viewer.String(), author.String(), viewer.String())
@@ -1381,14 +1437,27 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		if err := requireCurrentLeaseEpoch(ctx, tx, params.WorkspaceID, params.AuthorityEpoch); err != nil {
 			return err
 		}
-		type existingSelector struct {
-			lease, mode, kind, value string
-			expires                  int64
+		// Expiry is a state transition, not a filter. Nothing else retires a
+		// lease, so an agent that crashed leaves its row 'active' forever: every
+		// later acquisition pays to read and parse the corpse, and every
+		// reservation listing reports work nobody is doing. Reaping here rides
+		// the write lock this transaction already holds and costs one statement.
+		if _, err := tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ?
+			WHERE workspace_id = ? AND authority_epoch = ? AND status = 'active' AND expires_at_us <= ?`,
+			timeMicros(now), params.WorkspaceID.String(), params.AuthorityEpoch.String(), timeMicros(now)); err != nil {
+			return fmt.Errorf("reap expired SQLite leases: %w", err)
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT lease.lease_id, lease.mode, selector.selector_kind, selector.selector_path, lease.expires_at_us
+		type existingSelector struct {
+			lease, holder, mode string
+			selector            application.LeaseSelector
+			expires             int64
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT lease.lease_id, lease.holder_actor_id, lease.mode,
+			selector.selector_kind, selector.selector_path, lease.expires_at_us
 			FROM leases AS lease JOIN lease_selectors AS selector USING(lease_id)
-			WHERE lease.workspace_id = ? AND lease.authority_epoch = ? AND lease.status = 'active'`,
-			params.WorkspaceID.String(), params.AuthorityEpoch.String())
+			WHERE lease.workspace_id = ? AND lease.authority_epoch = ? AND lease.status = 'active'
+			AND lease.expires_at_us > ?`,
+			params.WorkspaceID.String(), params.AuthorityEpoch.String(), timeMicros(now))
 		if err != nil {
 			return err
 		}
@@ -1396,7 +1465,15 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		var existing []existingSelector
 		for rows.Next() {
 			var value existingSelector
-			if err := rows.Scan(&value.lease, &value.mode, &value.kind, &value.value, &value.expires); err != nil {
+			var kind, selectorPath string
+			if err := rows.Scan(&value.lease, &value.holder, &value.mode, &kind, &selectorPath, &value.expires); err != nil {
+				return err
+			}
+			// Parsed once per stored selector rather than once per requested
+			// selector per stored selector, which is what the overlap loop below
+			// would otherwise pay for.
+			value.selector, err = application.NewLeaseSelector(application.LeaseSelectorKind(kind), selectorPath)
+			if err != nil {
 				return err
 			}
 			existing = append(existing, value)
@@ -1408,16 +1485,15 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		for _, requested := range params.Selectors {
 			keys[requested.Key()] = struct{}{}
 			for _, prior := range existing {
-				selector, parseErr := application.NewLeaseSelector(application.LeaseSelectorKind(prior.kind), prior.value)
-				if parseErr != nil {
-					return parseErr
-				}
-				if !application.LeaseSelectorsOverlap(requested, selector) {
+				if !application.LeaseSelectorsOverlap(requested, prior.selector) {
 					continue
 				}
-				keys[selector.Key()] = struct{}{}
-				if prior.expires > timeMicros(now) && (params.Mode == application.LeaseExclusive || application.LeaseMode(prior.mode) == application.LeaseExclusive) {
-					return coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictLease, "an active overlapping lease exists")
+				keys[prior.selector.Key()] = struct{}{}
+				if params.Mode == application.LeaseExclusive || application.LeaseMode(prior.mode) == application.LeaseExclusive {
+					return coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictLease,
+						fmt.Sprintf("an active overlapping %s lease exists: lease %s held by actor %s over %s %s, free in %s",
+							prior.mode, prior.lease, prior.holder, prior.selector.Kind(), evidenceText(prior.selector.Path()),
+							microsTime(prior.expires).Sub(now).Round(time.Millisecond)))
 				}
 			}
 		}
@@ -1506,15 +1582,20 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 			return coordinationError(domain.ErrorCodeForbidden, "lease belongs to another holder")
 		}
 		if lease.AuthorityEpoch() != params.AuthorityEpoch {
-			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease authority epoch is stale")
+			return staleEpochError("lease", lease.AuthorityEpoch().String(), params.AuthorityEpoch.String())
 		}
 		if err := requireCurrentLeaseEpoch(ctx, tx, lease.WorkspaceID(), params.AuthorityEpoch); err != nil {
 			return err
 		}
-		if !equalFences(lease.Fences(), params.Fences) {
-			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease fence is stale")
+		if divergence, equal := compareFences(lease.Fences(), params.Fences); !equal {
+			return staleFenceError(divergence)
 		}
-		if _, released := lease.ReleasedAt(); released {
+		// A lease reaped for expiry is 'released' as well, so the idempotent
+		// answer belongs only to a lease released while it was still live. The
+		// timestamps separate them: an explicit release is only ever stamped
+		// before the deadline, because this function rejects one after it.
+		releasedAt, released := lease.ReleasedAt()
+		if released && releasedAt.Before(lease.ExpiresAt()) {
 			result = lease
 			return nil
 		}
@@ -1522,8 +1603,9 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 		if err != nil {
 			return err
 		}
-		if !now.Before(lease.ExpiresAt()) {
-			return coordinationConflict(domain.ErrorCodeLeaseExpired, domain.ConflictLeaseTerminal, "lease has expired")
+		if released || !now.Before(lease.ExpiresAt()) {
+			return coordinationConflict(domain.ErrorCodeLeaseExpired, domain.ConflictLeaseTerminal,
+				fmt.Sprintf("lease has expired: lease %s expired at %s", params.LeaseID, instantEvidence(lease.ExpiresAt())))
 		}
 		if release {
 			if _, err := tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ? WHERE lease_id = ? AND status = 'active'`, timeMicros(now), params.LeaseID.String()); err != nil {
@@ -1561,39 +1643,76 @@ func (store *Store) ValidateFence(ctx context.Context, leaseID domain.LeaseID, e
 	if leaseID.IsZero() || epoch.IsZero() {
 		return application.ErrInvalidCoordination
 	}
-	lease, err := loadLease(ctx, store.db, leaseID)
+	// Authority is decided from one snapshot. Read outside a transaction and the
+	// lease, the workspace epoch and each fence counter arrive from whichever
+	// pooled connection is free, so an acquisition that supersedes the fence
+	// lands between two of the reads and the caller is told it still holds
+	// authority it has already lost. Read-only means SQLite defers the BEGIN, so
+	// this neither takes the write lock nor blocks one.
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin SQLite fence validation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	lease, err := loadLease(ctx, tx, leaseID)
 	if err != nil {
 		return err
 	}
-	if lease.AuthorityEpoch() != epoch || !equalFences(lease.Fences(), fences) {
-		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease fence is stale")
+	if lease.AuthorityEpoch() != epoch {
+		return staleEpochError("lease", lease.AuthorityEpoch().String(), epoch.String())
 	}
-	if err := requireCurrentLeaseEpoch(ctx, store.db, lease.WorkspaceID(), epoch); err != nil {
+	if divergence, equal := compareFences(lease.Fences(), fences); !equal {
+		return staleFenceError(divergence)
+	}
+	if err := requireCurrentLeaseEpoch(ctx, tx, lease.WorkspaceID(), epoch); err != nil {
 		return err
 	}
-	now, err := sqliteNow(ctx, store.db)
+	now, err := sqliteNow(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if _, released := lease.ReleasedAt(); released || !now.Before(lease.ExpiresAt()) {
-		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease is not active")
+	if releasedAt, released := lease.ReleasedAt(); released {
+		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+			fmt.Sprintf("lease is not active: lease %s was released at %s", leaseID, instantEvidence(releasedAt)))
+	}
+	if !now.Before(lease.ExpiresAt()) {
+		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+			fmt.Sprintf("lease is not active: lease %s expired at %s", leaseID, instantEvidence(lease.ExpiresAt())))
 	}
 	for _, fence := range fences {
 		var current uint64
-		if err := store.db.QueryRowContext(ctx, `SELECT counter FROM lease_fence_counters WHERE workspace_id = ? AND authority_epoch = ? AND conflict_key = ?`,
-			lease.WorkspaceID().String(), epoch.String(), fence.ConflictKey()).Scan(&current); err != nil || current != fence.Counter() {
-			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "lease fence has been superseded")
+		counterErr := tx.QueryRowContext(ctx, `SELECT counter FROM lease_fence_counters WHERE workspace_id = ? AND authority_epoch = ? AND conflict_key = ?`,
+			lease.WorkspaceID().String(), epoch.String(), fence.ConflictKey()).Scan(&current)
+		// Only a missing counter row is evidence about the fence. Any other
+		// failure -- a busy timeout, a cancelled context, an I/O error -- is the
+		// database being unavailable, and reporting it as a rejected fence tells
+		// the agent to abandon a reservation it still holds.
+		if counterErr != nil && !errors.Is(counterErr, sql.ErrNoRows) {
+			return fmt.Errorf("read SQLite lease fence counter: %w", counterErr)
+		}
+		if errors.Is(counterErr, sql.ErrNoRows) {
+			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+				fmt.Sprintf("lease fence has been superseded: conflict key %s no longer has a counter, request supplied %d",
+					evidenceText(fence.ConflictKey()), fence.Counter()))
+		}
+		if current != fence.Counter() {
+			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+				fmt.Sprintf("lease fence has been superseded: conflict key %s now stands at %d, request supplied %d",
+					evidenceText(fence.ConflictKey()), current, fence.Counter()))
 		}
 	}
 	return nil
 }
 
-type leaseQuery interface {
+// coordinationQuery is satisfied by both the pool and a transaction, so a
+// coordination read can be served from a caller's snapshot instead of silently
+// opening its own on another pooled connection.
+type coordinationQuery interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func loadLease(ctx context.Context, query leaseQuery, id domain.LeaseID) (application.Lease, error) {
+func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) (application.Lease, error) {
 	var workspaceText, holderText, sessionText, epochText, mode, status string
 	var acquired, expires int64
 	var released sql.NullInt64
@@ -1663,20 +1782,80 @@ func loadLease(ctx context.Context, query leaseQuery, id domain.LeaseID) (applic
 	return application.NewLeaseView(params)
 }
 
-func equalFences(left, right []application.Fence) bool {
-	if len(left) != len(right) {
-		return false
+// fenceDivergence is the first place two fence sets differ: the conflict key
+// that diverged, the counter the daemon holds for it, and the counter the
+// caller supplied. A zero counter means that side does not carry the key at
+// all, which is what separates a caller holding a stale fence from one holding
+// a fence it never had.
+type fenceDivergence struct {
+	conflictKey string
+	held        uint64
+	supplied    uint64
+}
+
+// compareFences reports whether two fence sets match and, when they do not,
+// where. A bare bool answer throws away the only fact that lets a caller act:
+// which reservation moved out from under it.
+func compareFences(held, supplied []application.Fence) (fenceDivergence, bool) {
+	ordered := func(fences []application.Fence) []application.Fence {
+		result := append([]application.Fence(nil), fences...)
+		sort.Slice(result, func(i, j int) bool { return result[i].ConflictKey() < result[j].ConflictKey() })
+		return result
 	}
-	left = append([]application.Fence(nil), left...)
-	right = append([]application.Fence(nil), right...)
-	sort.Slice(left, func(i, j int) bool { return left[i].ConflictKey() < left[j].ConflictKey() })
-	sort.Slice(right, func(i, j int) bool { return right[i].ConflictKey() < right[j].ConflictKey() })
-	for index := range left {
-		if left[index].ConflictKey() != right[index].ConflictKey() || left[index].Counter() != right[index].Counter() {
-			return false
+	left, right := ordered(held), ordered(supplied)
+	for index := 0; index < len(left) || index < len(right); index++ {
+		switch {
+		case index >= len(right):
+			return fenceDivergence{conflictKey: left[index].ConflictKey(), held: left[index].Counter()}, false
+		case index >= len(left):
+			return fenceDivergence{conflictKey: right[index].ConflictKey(), supplied: right[index].Counter()}, false
+		case left[index].ConflictKey() < right[index].ConflictKey():
+			return fenceDivergence{conflictKey: left[index].ConflictKey(), held: left[index].Counter()}, false
+		case left[index].ConflictKey() > right[index].ConflictKey():
+			return fenceDivergence{conflictKey: right[index].ConflictKey(), supplied: right[index].Counter()}, false
+		case left[index].Counter() != right[index].Counter():
+			return fenceDivergence{conflictKey: left[index].ConflictKey(), held: left[index].Counter(),
+				supplied: right[index].Counter()}, false
 		}
 	}
-	return true
+	return fenceDivergence{}, true
+}
+
+func staleFenceError(divergence fenceDivergence) error {
+	return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+		fmt.Sprintf("lease fence is stale: conflict key %s stands at %d, request supplied %d",
+			evidenceText(divergence.conflictKey), divergence.held, divergence.supplied))
+}
+
+func staleEpochError(scope, current, supplied string) error {
+	return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+		fmt.Sprintf("%s authority epoch is stale: %s holds %s, request supplied %s", scope, scope,
+			evidenceText(current), evidenceText(supplied)))
+}
+
+// maxEvidenceTextBytes bounds one interpolated fact. A selector path or a
+// conflict key runs to thousands of bytes while a command error message is
+// capped at 512, and an over-long message is rejected by the constructor --
+// which would leave the caller with no message at all rather than a long one.
+const maxEvidenceTextBytes = 120
+
+func evidenceText(value string) string {
+	if len(value) <= maxEvidenceTextBytes {
+		return value
+	}
+	trimmed := value[:maxEvidenceTextBytes]
+	for len(trimmed) > 0 {
+		last, size := utf8.DecodeLastRuneInString(trimmed)
+		if last != utf8.RuneError || size > 1 {
+			break
+		}
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed + "..."
+}
+
+func instantEvidence(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func appendCoordinationEvent(ctx context.Context, tx *sql.Tx, workspace domain.WorkspaceID, actor domain.ActorID,
@@ -1860,7 +2039,7 @@ func requireCurrentLeaseEpoch(ctx context.Context, query interface {
 		return err
 	}
 	if current != epoch.String() {
-		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence, "workspace authority epoch is stale")
+		return staleEpochError("workspace", current, epoch.String())
 	}
 	return nil
 }
