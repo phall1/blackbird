@@ -20,8 +20,9 @@ The released product includes:
   idempotent MCP client configuration; and
 - reproducible native releases for Apple Silicon macOS and amd64/arm64 Linux.
 
-SQLite is the supported daily-use backend. PostgreSQL remains explicit and
-fail-closed for coordination operations that have not landed there yet.
+SQLite is the only storage backend. The daemon's `--storage` flag survives with
+that single legal value so an already-installed service definition keeps
+working; `ls internal/storage/` is the current adapter set.
 
 ## Install
 
@@ -97,11 +98,12 @@ reservations when work completes.
 
 ## OpenCode Push Delivery
 
-The `blackbird-opencode` package is an OpenCode V2 plugin that turns durable
-`message.available` events into queued, resumable OpenCode session prompts. It
-uses SSE only as a low-latency wake signal, catches up from the SQLite event
-journal after every reconnect, resolves each message through a privacy-checked
-endpoint, and does not mark or acknowledge mail on the agent's behalf.
+The `blackbird-opencode` package appends each durable `message.available` event
+to an OpenCode session transcript without spending an agent turn — the message
+is persisted and visible, and no agent loop is scheduled to answer it. It uses
+SSE only as a low-latency wake signal, catches up from the SQLite event journal
+after every reconnect, resolves each message through a privacy-checked endpoint,
+and does not mark or acknowledge mail on the agent's behalf.
 
 Add it to OpenCode's `plugins` configuration with an absolute repository path:
 
@@ -109,7 +111,7 @@ Add it to OpenCode's `plugins` configuration with an absolute repository path:
 {
   "plugins": [
     {
-      "package": "blackbird-opencode@0.1.2",
+      "package": "blackbird-opencode@0.1.3",
       "options": {
         "baseUrl": "http://127.0.0.1:8080",
         "projectKey": "~/workspace/project",
@@ -119,6 +121,14 @@ Add it to OpenCode's `plugins` configuration with an absolute repository path:
     }
   ]
 }
+```
+
+Every version pinned in a delivery example on this page is the one this
+repository shipped when the example was written; release-please bumps each
+package on its own tag, so read the current set rather than those lines:
+
+```sh
+jq -r '"\(.name)@\(.version)"' packages/*/package.json
 ```
 
 OpenCode installs the package and its production dependencies in its isolated
@@ -132,7 +142,7 @@ with private directory and file permissions.
 session and injects durable messages as ordered follow-ups:
 
 ```sh
-pi install npm:blackbird-pi@0.1.0
+pi install npm:blackbird-pi@0.1.1
 ```
 
 ## Claude Code Delivery

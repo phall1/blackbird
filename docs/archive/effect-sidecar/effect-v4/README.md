@@ -1,5 +1,8 @@
 # Effect v4 implementation overlay
 
+> **ARCHIVED — this is not a description of the running system.** Nothing in this
+> overlay was implemented. See [the archive README](../../README.md).
+
 > **Authority:** Experimental implementation decision overlay  
 > **Status:** Time-stamped reference baseline; re-evaluate before coding  
 > **Parent:** [Language-neutral specification](../README.md)

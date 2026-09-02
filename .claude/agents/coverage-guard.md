@@ -55,11 +55,8 @@ remembered baseline:
 go test -cover ./... 2>&1 | grep coverage | sort -t: -k2 -n
 ```
 
-Two standing exceptions to weigh before proposing work:
+One standing exception to weigh before proposing work:
 
-- **The PostgreSQL adapter is deliberately low.** It is explicit and fail-closed
-  for coordination operations that have not landed there. Do not chase it, and
-  never write a test that makes an unimplemented Postgres path look supported.
 - **Some surfaces need a live dependency** to test honestly. If covering
   something would require faking a guarantee the code does not provide, say so
   and move on — that is a finding, not a gap to fill.

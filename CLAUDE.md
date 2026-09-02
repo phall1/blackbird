@@ -212,10 +212,16 @@ an inversion rather than an exemption.
   analyzer set. Do not disable a linter to make an error go away, and do not add
   `//nolint` without a reason that would survive review — fix the finding.
 - Imports are grouped with `goimports` using this module as the local prefix.
-- SQLite is the supported daily-use backend. PostgreSQL is explicit and
-  fail-closed for coordination operations that have not landed there yet; do not
-  paper over a Postgres gap to make a test pass, and do not write tests that
-  make an unimplemented Postgres path look supported.
+- **SQLite is the only storage backend.** There is no second adapter to keep
+  fail-closed, and no test should imply one. The `--storage` flag was narrowed
+  rather than removed, so every invocation that ever worked still works and only
+  the value that never worked in production is rejected. Derive both rather than
+  trusting this line:
+
+  ```sh
+  ls internal/storage/
+  grep -n 'Storage.*enum:' internal/cli/daemon.go
+  ```
 
 ## Running the daemon
 

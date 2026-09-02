@@ -5,7 +5,7 @@ GOLANGCI_LINT ?= golangci-lint
 PREK ?= uvx prek
 GOVULNCHECK_VERSION ?= v1.6.0
 BLACKBIRD_DB ?= $(HOME)/.local/share/blackbird/blackbird.db
-COVERAGE_FLOOR ?= 65.0
+COVERAGE_FLOOR ?= 72.0
 
 format:
 	$(GOLANGCI_LINT) fmt

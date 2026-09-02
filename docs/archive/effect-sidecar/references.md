@@ -9,17 +9,17 @@ Links are relative to this standalone Blackbird repository unless explicitly ide
 
 These are implementation evidence only and may evolve:
 
-- [`internal/domain`](../../internal/domain/) — typed IDs, states and transitions.
-- [`internal/application`](../../internal/application/) — command/UoW contracts and orchestration.
-- [`internal/transport/contracts/operations.go`](../../internal/transport/contracts/operations.go) — strict canonical operation inventory.
-- [`internal/runtime/production.go`](../../internal/runtime/production.go) — production composition and fail-closed boundaries.
-- [`internal/storage/sqlite/migrations`](../../internal/storage/sqlite/migrations/) — SQLite migrations.
-- [`internal/storage/postgres/migrations`](../../internal/storage/postgres/migrations/) — PostgreSQL migrations.
-- [`internal/storage/sqlite/crash_test.go`](../../internal/storage/sqlite/crash_test.go) — subprocess/WAL crash evidence pattern.
-- [`internal/storage/sqlite/backup.go`](../../internal/storage/sqlite/backup.go) — online backup/restore reference.
-- [`internal/integration/beads/beads.go`](../../internal/integration/beads/beads.go) — narrow provider adapter.
-- [`packages/opencode-plugin`](../../packages/opencode-plugin/) — durable catch-up/wake-only push integration.
-- [Repository README](../../README.md) — released product description; lower semantic authority than contracts/code/evidence.
+- [`internal/domain`](../../../internal/domain/) — typed IDs, states and transitions.
+- [`internal/application`](../../../internal/application/) — command/UoW contracts and orchestration.
+- [`internal/transport/contracts/operations.go`](../../../internal/transport/contracts/operations.go) — strict canonical operation inventory.
+- [`internal/runtime/production.go`](../../../internal/runtime/production.go) — production composition and fail-closed boundaries.
+- [`internal/storage/sqlite/migrations`](../../../internal/storage/sqlite/migrations/) — SQLite migrations.
+- [`internal/storage/postgres/migrations`](../../../internal/storage/postgres/migrations/) — PostgreSQL migrations.
+- [`internal/storage/sqlite/crash_test.go`](../../../internal/storage/sqlite/crash_test.go) — subprocess/WAL crash evidence pattern.
+- [`internal/storage/sqlite/backup.go`](../../../internal/storage/sqlite/backup.go) — online backup/restore reference.
+- [`internal/integration/beads/beads.go`](../../../internal/integration/beads/beads.go) — narrow provider adapter.
+- [`packages/opencode-plugin`](../../../packages/opencode-plugin/) — durable catch-up/wake-only push integration.
+- [Repository README](../../../README.md) — released product description; lower semantic authority than contracts/code/evidence.
 
 ## External accepted architecture corpus used during authorship
 

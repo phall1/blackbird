@@ -1,5 +1,10 @@
 # Effect Sidecar engineering specification
 
+> **ARCHIVED — this is not a description of the running system.** This tree specifies
+> a TypeScript/Effect sidecar that was never implemented; its outbox, projector, and
+> event-journal machinery do not exist in this repository. It is retained only to explain
+> the shape of the Go domain model. See [the archive README](../README.md).
+
 > **Authority:** Proposed specification index and navigation guide  
 > **Status:** Proposed experimental sidecar design; not a Blackbird replacement  
 > **Implementation authorization:** Disposable E0 investigations only; no product implementation until the acceptance manifest is approved  
