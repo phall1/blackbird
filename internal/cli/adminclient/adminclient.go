@@ -75,6 +75,13 @@ func New(handshakePath, address string) *Client {
 // Kong parses anything, so this is how a flag the user typed reaches it.
 func (client *Client) SetAddress(address string) { client.Address = address }
 
+// Health reports what an unauthenticated liveness and readiness probe found. It
+// returns the probe's error alongside the facts it did gather rather than
+// folding the error into Detail: a caller reading only the value cannot tell a
+// daemon that answered "not ready" from one that never answered, and diagnosing
+// the second as the first sends the user to the database holding a connection
+// error. The returned Health still carries the address and Reachable, so a
+// caller that only wants to know where a daemon would be keeps that.
 func (client *Client) Health(ctx context.Context) (cli.Health, error) {
 	address, _, err := client.discover()
 	if err != nil && address == "" {
@@ -88,7 +95,7 @@ func (client *Client) Health(ctx context.Context) (cli.Health, error) {
 	}
 	if err := client.fetch(ctx, address, pathHealth, nil, "", &live); err != nil {
 		health.Detail = err.Error()
-		return health, nil
+		return health, err
 	}
 	health.Reachable = true
 	health.Version = live.Version
@@ -99,7 +106,7 @@ func (client *Client) Health(ctx context.Context) (cli.Health, error) {
 	}
 	if err := client.fetch(ctx, address, pathReady, nil, "", &ready); err != nil {
 		health.Detail = err.Error()
-		return health, nil
+		return health, err
 	}
 	health.Ready = ready.Status == "ready"
 	health.SchemaVersion = ready.SchemaVersion

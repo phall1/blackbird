@@ -95,8 +95,10 @@ func TestHealthReportsAReachableDaemonWithFailingStorage(t *testing.T) {
 
 	client := New(writeHandshake(t, addressOf(t, server), "bba_token"), "")
 	health, err := client.Health(context.Background())
-	if err != nil {
-		t.Fatalf("Health() = %v", err)
+	// The readiness probe was refused, so the caller is told the probe did not
+	// complete — and still reads that the daemon itself answered.
+	if err == nil {
+		t.Fatal("Health() = nil, want the refusal reported")
 	}
 	if !health.Reachable || health.Ready {
 		t.Fatalf("health = %#v, want reachable but not ready", health)
@@ -106,16 +108,24 @@ func TestHealthReportsAReachableDaemonWithFailingStorage(t *testing.T) {
 	}
 }
 
+// A refused connection must reach the caller as an error. Returning nil made a
+// dead daemon indistinguishable from a live one whose storage had failed, and
+// doctor diagnosed it as the second: it printed the connection error under
+// "daemon answered but storage is unavailable" and sent the user to inspect the
+// database schema.
 func TestHealthOnConnectionRefused(t *testing.T) {
 	t.Parallel()
 
 	client := New(writeHandshake(t, "127.0.0.1:1", "bba_token"), "")
 	health, err := client.Health(context.Background())
-	if err != nil {
-		t.Fatalf("Health() = %v", err)
+	if err == nil {
+		t.Fatal("Health() = nil, want the failed probe reported as an error")
 	}
 	if health.Reachable || health.Detail == "" {
 		t.Fatalf("health = %#v", health)
+	}
+	if health.Address != "127.0.0.1:1" {
+		t.Fatalf("health.Address = %q, want the address the probe used", health.Address)
 	}
 }
 

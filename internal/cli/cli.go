@@ -14,6 +14,7 @@ import (
 
 	"github.com/phall1/blackbird/internal/cli/konghelp"
 	"github.com/phall1/blackbird/internal/cli/render"
+	"github.com/phall1/blackbird/internal/install"
 )
 
 const (
@@ -53,6 +54,8 @@ type CLI struct {
 	Install   InstallCmd   `cmd:"" group:"manage" help:"Install the per-user service, updater, and MCP client entries."`
 	Update    UpdateCmd    `cmd:"" group:"manage" help:"Upgrade Blackbird through Homebrew and converge the service."`
 	Uninstall UninstallCmd `cmd:"" group:"manage" help:"Stop and remove the service and updater. Data is retained."`
+	Backup    BackupCmd    `cmd:"" group:"manage" help:"Take a verified online snapshot of the database."`
+	Restore   RestoreCmd   `cmd:"" group:"manage" help:"Rebuild a database from a verified snapshot. Requires a stopped daemon."`
 
 	Completion CompletionCmd `cmd:"" group:"shell" help:"Print a shell completion script."`
 	Version    VersionCmd    `cmd:"" group:"shell" help:"Print build identity."`
@@ -215,7 +218,7 @@ func grammarVars(deps Dependencies) map[string]string {
 		defaults.HTTPAddress = defaultHTTPAddress
 	}
 	if defaults.MCPAddress == "" {
-		defaults.MCPAddress = "127.0.0.1:8081"
+		defaults.MCPAddress = install.MCPAddress
 	}
 	if defaults.ShutdownTimeout <= 0 {
 		defaults.ShutdownTimeout = 30 * time.Second

@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -122,7 +123,7 @@ func daemonDefaults(injected *blackbirdruntime.Config, stateDir string) cli.Daem
 		SQLitePath:      defaultDatabasePath(),
 		StateDir:        stateDir,
 		HTTPAddress:     "127.0.0.1:8080",
-		MCPAddress:      "127.0.0.1:8081",
+		MCPAddress:      install.MCPAddress,
 		ShutdownTimeout: 30 * time.Second,
 	}
 	if injected == nil {
@@ -319,6 +320,13 @@ func (readerAdapter) Inspect(ctx context.Context, path string, deep bool) (cli.D
 // while the daemon answers; this timeout is the second line of that defence.
 type maintenanceAdapter struct{}
 
+// The backup and restore commands reach these two methods by asserting
+// cli.SnapshotPort on the maintenance adapter, so a signature that drifts out
+// of the interface does not fail to compile — it silently turns both commands
+// into "this build cannot take a backup". This assertion is what makes that a
+// build failure instead.
+var _ cli.SnapshotPort = maintenanceAdapter{}
+
 const maintenanceBusyTimeout = 2 * time.Second
 
 func (maintenanceAdapter) Reclaim(ctx context.Context, path string, plan cli.ReclaimPlan) (cli.Reclaimed, error) {
@@ -360,6 +368,58 @@ func (maintenanceAdapter) Reclaim(ctx context.Context, path string, plan cli.Rec
 		return cli.Reclaimed{}, err
 	}
 	return cli.Reclaimed{BeforeBytes: before, AfterBytes: after, WALBytes: walAfter}, nil
+}
+
+// Backup and Restore complete cli.SnapshotPort. They hang off the maintenance
+// adapter rather than a Dependencies field of their own because that is the
+// adapter that already owns writing to the database file; a binary without
+// them is exactly the binary whose backup command should report it cannot take
+// one, which is what the type assertion in the CLI arranges.
+//
+// Both publish the manifest sidecar beside the file they write. The port's
+// contract is that neither operation leaves a snapshot that cannot be restored,
+// and a snapshot without its manifest is precisely that.
+func (maintenanceAdapter) Backup(ctx context.Context, source, target string) (cli.BackupRecord, error) {
+	manifest, err := sqlite.BackupFile(ctx, source, target)
+	if err != nil {
+		return cli.BackupRecord{}, err
+	}
+	if err := sqlite.WriteBackupManifest(target, manifest); err != nil {
+		return cli.BackupRecord{}, err
+	}
+	return snapshotRecord(target, manifest), nil
+}
+
+func (maintenanceAdapter) Restore(ctx context.Context, source, target string) (cli.BackupRecord, error) {
+	manifest, err := sqlite.ReadBackupManifest(source)
+	if err != nil {
+		return cli.BackupRecord{}, err
+	}
+	restored, err := sqlite.Restore(ctx, source, manifest, target)
+	if err != nil {
+		return cli.BackupRecord{}, err
+	}
+	// The restored file is itself a database, so it gets its own manifest:
+	// without one it could never be backed up or restored again, which would
+	// make recovery a one-way door.
+	if err := sqlite.WriteBackupManifest(target, restored); err != nil {
+		return cli.BackupRecord{}, err
+	}
+	return snapshotRecord(target, restored), nil
+}
+
+func snapshotRecord(path string, manifest sqlite.BackupManifest) cli.BackupRecord {
+	return cli.BackupRecord{
+		Path:             path,
+		ManifestPath:     sqlite.BackupManifestPath(path),
+		FormatVersion:    manifest.FormatVersion,
+		CreatedAt:        manifest.CreatedAt.Format(time.RFC3339Nano),
+		DatabaseBytes:    manifest.DatabaseBytes,
+		DatabaseSHA256:   hex.EncodeToString(manifest.DatabaseSHA256[:]),
+		SchemaVersion:    manifest.SchemaVersion,
+		SQLiteVersion:    manifest.SQLiteVersion,
+		AuthorityStreams: len(manifest.AuthorityStreams),
+	}
 }
 
 func openForMaintenance(ctx context.Context, path string) (*sql.DB, error) {

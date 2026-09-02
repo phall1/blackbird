@@ -522,24 +522,74 @@ func TestDoctorAggregatesCheckStatuses(t *testing.T) {
 	}
 }
 
-func TestDoctorDetectsSchemaMismatch(t *testing.T) {
+// TestDoctorSeparatesTheSchemaMismatchDirections pins that a schema version is
+// not one condition with one remedy. The daemon climbs a migration ladder when
+// it opens the database, so a version behind this binary heals on the next
+// start; doctor reads the file read-only and is therefore the one observer that
+// sees the un-migrated state. Failing there would send the user to an update
+// with nothing to install and hold --strict red over a condition nothing is
+// wrong with. The other three directions are real failures, and each needs a
+// different answer.
+func TestDoctorSeparatesTheSchemaMismatchDirections(t *testing.T) {
 	t.Parallel()
 
-	database := healthyDatabase()
-	database.SchemaVersion = 3
-	database.Supported = false
+	for name, test := range map[string]struct {
+		schemaVersion int
+		applicationID int
+		wantCode      int
+		wantStrict    int
+		wantRemedy    string
+	}{
+		"behind the binary migrates itself": {
+			schemaVersion: 3, wantCode: ExitOK, wantStrict: ExitDegraded,
+			wantRemedy: "blackbird install",
+		},
+		"ahead of the binary needs an update": {
+			schemaVersion: 5, wantCode: ExitDegraded, wantStrict: ExitDegraded,
+			wantRemedy: "blackbird update",
+		},
+		"off the ladder needs a restore": {
+			schemaVersion: 0, wantCode: ExitDegraded, wantStrict: ExitDegraded,
+			wantRemedy: "blackbird restore",
+		},
+		"a foreign application id is not ours": {
+			schemaVersion: 4, applicationID: 12345, wantCode: ExitDegraded, wantStrict: ExitDegraded,
+			wantRemedy: "not a Blackbird database",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			database := healthyDatabase()
+			database.SchemaVersion = test.schemaVersion
+			database.Supported = false
+			if test.applicationID != 0 {
+				database.ApplicationID = test.applicationID
+			}
 
-	deps := dependencies(t)
-	deps.Product = &fakeProduct{}
-	deps.Admin = &fakeAdmin{health: Health{Reachable: true, Ready: true}}
-	deps.Store = &fakeStore{database: database}
+			deps := dependencies(t)
+			deps.Product = &fakeProduct{}
+			deps.Admin = &fakeAdmin{health: Health{Reachable: true, Ready: true}}
+			deps.Store = &fakeStore{database: database}
 
-	result := runCLI(t, deps, []string{"doctor"})
-	if result.code != ExitDegraded {
-		t.Fatalf("code = %d, want %d", result.code, ExitDegraded)
-	}
-	if !strings.Contains(result.stdout, "schema_version=3") || !strings.Contains(result.stdout, "want=4") {
-		t.Fatalf("stdout = %q, want both versions named", result.stdout)
+			result := runCLI(t, deps, []string{"doctor"})
+			if result.code != test.wantCode {
+				t.Fatalf("code = %d, want %d; stdout=%q", result.code, test.wantCode, result.stdout)
+			}
+			if !strings.Contains(result.stdout, "schema_version="+itoa(test.schemaVersion)) ||
+				!strings.Contains(result.stdout, "want=4") {
+				t.Fatalf("stdout = %q, want both versions named", result.stdout)
+			}
+			// The renderer wraps a remedy across lines, so match against the
+			// collapsed text rather than let a line break hide the phrase.
+			if !strings.Contains(strings.Join(strings.Fields(result.stdout), " "), test.wantRemedy) {
+				t.Fatalf("stdout = %q, want the remedy to name %q", result.stdout, test.wantRemedy)
+			}
+
+			strict := runCLI(t, deps, []string{"doctor", "--strict"})
+			if strict.code != test.wantStrict {
+				t.Fatalf("strict code = %d, want %d", strict.code, test.wantStrict)
+			}
+		})
 	}
 }
 

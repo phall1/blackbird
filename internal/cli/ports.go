@@ -249,6 +249,13 @@ type EventsPage struct {
 // method is one authenticated GET; a nil AdminPort means the CLI was assembled
 // without a client and every command that needs one exits ExitUnavailable.
 type AdminPort interface {
+	// Health probes liveness and readiness. It returns an error whenever the
+	// probe did not complete — nothing answered, or the daemon refused the
+	// request — and the Health value still carries what was learned before
+	// that, notably the address and Reachable. Callers rely on the error to
+	// separate "no daemon answered" from "the daemon answered that it is not
+	// ready"; an implementation that folds the failure into Detail and returns
+	// nil makes the two indistinguishable.
 	Health(ctx context.Context) (Health, error)
 	Identity(ctx context.Context) (Identity, error)
 	Overview(ctx context.Context) (Overview, error)

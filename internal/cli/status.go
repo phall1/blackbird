@@ -122,6 +122,13 @@ func (cmd *StatusCmd) collect(ctx context.Context, console *Console) (statusRepo
 			if staleRead(database) {
 				report.Problems = append(report.Problems, staleReadProblem)
 			}
+			// Only once nothing is serving: the flag is unclean by design for
+			// as long as a daemon holds the database open, and naming that as a
+			// problem is what taught readers to ignore this section.
+			if database.Present && !database.CleanShutdown &&
+				!daemonServing(report.Health, report.Legacy, report.Undiscovered) {
+				report.Problems = append(report.Problems, cleanShutdownProblem)
+			}
 			report.Database = database
 		}
 	} else {
@@ -166,7 +173,7 @@ func drawStatus(doc *render.Document, report statusReport) {
 
 	doc.Blank()
 	doc.Heading("Database")
-	doc.Fields(render.Fields{Indent: 2, Items: databaseFields(report.Database)})
+	doc.Fields(render.Fields{Indent: 2, Items: databaseFields(report)})
 
 	if len(report.Problems) > 0 {
 		doc.Blank()
@@ -208,7 +215,8 @@ func daemonFields(report statusReport) []render.Field {
 	}
 }
 
-func databaseFields(database Database) []render.Field {
+func databaseFields(report statusReport) []render.Field {
+	database := report.Database
 	if !database.Present {
 		return []render.Field{
 			{Key: "path", Value: orAbsent(database.Path)},
@@ -219,6 +227,7 @@ func databaseFields(database Database) []render.Field {
 	if !database.Supported {
 		schema = render.RoleError
 	}
+	serving := daemonServing(report.Health, report.Legacy, report.Undiscovered)
 	return []render.Field{
 		{Key: "path", Value: orAbsent(database.Path)},
 		{Key: "read", Value: readModeSummary(database), Role: readModeRole(database)},
@@ -226,7 +235,49 @@ func databaseFields(database Database) []render.Field {
 		{Key: "wal", Value: render.Bytes(database.WALBytes)},
 		{Key: "schema", Value: schemaSummary(database), Role: schema},
 		{Key: "journal", Value: orAbsent(database.JournalMode)},
-		{Key: "clean-shutdown", Value: yesNo(database.CleanShutdown)},
+		{Key: "clean-shutdown", Value: cleanShutdownSummary(database, serving),
+			Role: cleanShutdownRole(database, serving)},
+	}
+}
+
+// daemonServing reports that something is answering as the daemon, in any of
+// the three shapes a probe can find one: current, an older protocol, or serving
+// without a discovery record.
+func daemonServing(health Health, legacy, undiscovered bool) bool {
+	return health.Reachable || legacy || undiscovered
+}
+
+// The clean-shutdown flag is cleared for as long as the daemon holds the
+// database open, so a bare "no" beside a running daemon reads as a crash that
+// has not happened. The flag only diagnoses anything once nothing is serving,
+// which is exactly when it says the last daemon left without closing up.
+const (
+	cleanShutdownWhileServing = "no (expected while the daemon holds the database open)"
+
+	cleanShutdownDetail  = "no daemon is answering, so the last one exited without closing the database"
+	cleanShutdownProblem = "the database was not closed cleanly: " + cleanShutdownDetail
+	cleanShutdownRemedy  = "run \"blackbird logs --stream=err\" to read why the last daemon exited"
+)
+
+func cleanShutdownSummary(database Database, serving bool) string {
+	switch {
+	case database.CleanShutdown:
+		return yesNo(true)
+	case serving:
+		return cleanShutdownWhileServing
+	default:
+		return yesNo(false)
+	}
+}
+
+func cleanShutdownRole(database Database, serving bool) render.Role {
+	switch {
+	case database.CleanShutdown:
+		return render.RoleOK
+	case serving:
+		return render.RoleMuted
+	default:
+		return render.RoleWarn
 	}
 }
 
@@ -356,20 +407,25 @@ func inspectDaemon(ctx context.Context, console *Console, admin AdminPort) daemo
 func daemonServes(ctx context.Context, console *Console, path string) (bool, string) {
 	health := Health{}
 	if admin, err := console.admin(); err == nil {
-		if reported, probeErr := admin.Health(ctx); probeErr == nil {
-			health = reported
-			if reported.Reachable {
-				identity, identityErr := admin.Identity(ctx)
-				// Only a database the daemon positively names, and that is not
-				// this one, clears the guard. Not knowing means assuming the worst.
-				if identityErr != nil || identity.DatabasePath == "" {
-					return true, "it answers " + livenessPath
-				}
-				if samePath(identity.DatabasePath, path) {
-					return true, "it has " + path + " open"
-				}
-				return false, ""
+		// The probe's error is deliberately ignored here. A daemon that answered
+		// the liveness path holds the database whether or not it went on to
+		// report itself ready, and the facts are worth keeping either way:
+		// Health carries the address from the handshake record, and falling back
+		// to the configured default would ask a different port whether this
+		// database is in use.
+		reported, _ := admin.Health(ctx)
+		health = reported
+		if reported.Reachable {
+			identity, identityErr := admin.Identity(ctx)
+			// Only a database the daemon positively names, and that is not
+			// this one, clears the guard. Not knowing means assuming the worst.
+			if identityErr != nil || identity.DatabasePath == "" {
+				return true, "it answers " + livenessPath
 			}
+			if samePath(identity.DatabasePath, path) {
+				return true, "it has " + path + " open"
+			}
+			return false, ""
 		}
 	}
 	if !samePath(console.Deps.Defaults.SQLitePath, path) {

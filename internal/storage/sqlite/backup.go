@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,27 +35,27 @@ var (
 // BackupManifest contains only facts derived from a completed database
 // snapshot, apart from CreatedAt, which records when that snapshot completed.
 type BackupManifest struct {
-	FormatVersion    int
-	CreatedAt        time.Time
-	DatabaseBytes    int64
-	DatabaseSHA256   [sha256.Size]byte
-	ApplicationID    int
-	SchemaVersion    int
-	SchemaChecksum   [sha256.Size]byte
-	SQLiteVersion    string
-	SQLiteSourceID   string
-	AuthorityStreams []BackupAuthorityStream
+	FormatVersion    int                     `json:"format_version"`
+	CreatedAt        time.Time               `json:"created_at"`
+	DatabaseBytes    int64                   `json:"database_bytes"`
+	DatabaseSHA256   [sha256.Size]byte       `json:"database_sha256"`
+	ApplicationID    int                     `json:"application_id"`
+	SchemaVersion    int                     `json:"schema_version"`
+	SchemaChecksum   [sha256.Size]byte       `json:"schema_checksum"`
+	SQLiteVersion    string                  `json:"sqlite_version"`
+	SQLiteSourceID   string                  `json:"sqlite_source_id"`
+	AuthorityStreams []BackupAuthorityStream `json:"authority_streams,omitempty"`
 }
 
 // BackupAuthorityStream identifies one authority cursor captured in a backup.
 type BackupAuthorityStream struct {
-	ScopeKind            string
-	ScopeID              string
-	AuthorityID          string
-	AuthorityEpoch       string
-	RetainedFromSequence int64
-	EventHighWater       int64
-	EventHighWaterDigest [sha256.Size]byte
+	ScopeKind            string            `json:"scope_kind"`
+	ScopeID              string            `json:"scope_id"`
+	AuthorityID          string            `json:"authority_id"`
+	AuthorityEpoch       string            `json:"authority_epoch"`
+	RetainedFromSequence int64             `json:"retained_from_sequence"`
+	EventHighWater       int64             `json:"event_high_water"`
+	EventHighWaterDigest [sha256.Size]byte `json:"event_high_water_digest"`
 }
 
 type onlineBackuper interface {
@@ -71,6 +73,36 @@ type backupPublishHookKey struct{}
 // database or WAL files. Failed snapshots remain under an unpublished partial
 // name for diagnosis and are never promoted to target.
 func (store *Store) Backup(ctx context.Context, target string) (BackupManifest, error) {
+	return backupFrom(ctx, store.db, target)
+}
+
+// BackupFile snapshots a database this process has not opened as a Store.
+//
+// It exists for the command line, which takes a backup of the database a
+// running daemon owns. Reaching that database through Open would apply
+// migrations and claim the runtime row — writes to a file another process is
+// serving from — so the source is opened read-only here instead. SQLite's
+// online backup API only ever reads the source, so read-only is not a
+// restriction on the operation, it is the whole requirement.
+//
+// Restore needs no equivalent, because Restore is already a package-level
+// function: it writes a fresh target and never touches a live database.
+func BackupFile(ctx context.Context, source, target string) (manifest BackupManifest, finalErr error) {
+	if !filepath.IsAbs(source) || filepath.Clean(source) != source {
+		return BackupManifest{}, fmt.Errorf("%w: source path must be clean and absolute", ErrInvalidBackup)
+	}
+	db, err := openBackupDatabase(source, true)
+	if err != nil {
+		return BackupManifest{}, fmt.Errorf("open %s read-only for backup: %w", source, err)
+	}
+	defer func() { finalErr = errors.Join(finalErr, db.Close()) }()
+	return backupFrom(ctx, db, target)
+}
+
+// backupFrom is the one publish path both entry points take, so a snapshot
+// taken by the daemon and one taken by the command line cannot differ in what
+// they verify before promoting a partial.
+func backupFrom(ctx context.Context, db *sql.DB, target string) (BackupManifest, error) {
 	if err := validateFreshTarget(target); err != nil {
 		return BackupManifest{}, err
 	}
@@ -78,7 +110,7 @@ func (store *Store) Backup(ctx context.Context, target string) (BackupManifest, 
 	if err != nil {
 		return BackupManifest{}, err
 	}
-	if err := onlineBackup(ctx, store.db, partial); err != nil {
+	if err := onlineBackup(ctx, db, partial); err != nil {
 		return BackupManifest{}, fmt.Errorf("online SQLite backup retained at %s: %w", partial, err)
 	}
 	if err := os.Chmod(partial, 0o600); err != nil {
@@ -182,6 +214,155 @@ func Restore(ctx context.Context, backupPath string, manifest BackupManifest, ta
 		return BackupManifest{}, err
 	}
 	return restored, nil
+}
+
+// backupManifestSuffix names the sidecar published beside a snapshot. Restore
+// checks a snapshot against a manifest it did not derive from that snapshot, so
+// a snapshot standing alone on disk cannot be restored by this package at all.
+const backupManifestSuffix = ".manifest.json"
+
+// BackupManifestPath names the manifest belonging to the snapshot at path.
+func BackupManifestPath(snapshot string) string {
+	return snapshot + backupManifestSuffix
+}
+
+// WriteBackupManifest publishes a snapshot's manifest through the same
+// reserve-then-rename path the snapshot itself takes. A manifest written in
+// place would, if the process died mid-write, leave a truncated sidecar that
+// makes an otherwise intact snapshot unrestorable; here a death leaves an
+// unpublished partial and the snapshot stays without a manifest, which is the
+// state the operator can still recover from by taking the backup again.
+func WriteBackupManifest(snapshot string, manifest BackupManifest) error {
+	target := BackupManifestPath(snapshot)
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode SQLite backup manifest: %w", err)
+	}
+	partial, err := reservePartialTarget(target)
+	if err != nil {
+		return err
+	}
+	if err := fillManifestPartial(partial, append(encoded, '\n')); err != nil {
+		return err
+	}
+	if err := renameNoReplace(partial, target); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w (manifest retained at %s)", ErrTargetExists, partial)
+		}
+		return fmt.Errorf("publish SQLite backup manifest (manifest retained at %s): %w", partial, err)
+	}
+	if err := syncPath(filepath.Dir(target)); err != nil {
+		return fmt.Errorf("SQLite backup manifest published but directory sync failed: %w", err)
+	}
+	return nil
+}
+
+// ReadBackupManifest loads the manifest published beside a snapshot. It proves
+// nothing about the snapshot: this is the expectation VerifyBackup and Restore
+// check the snapshot against, and it is untrusted until they have.
+func ReadBackupManifest(snapshot string) (BackupManifest, error) {
+	path := BackupManifestPath(snapshot)
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		return BackupManifest{}, fmt.Errorf("read SQLite backup manifest %s: %w", path, err)
+	}
+	var manifest BackupManifest
+	if err := json.Unmarshal(encoded, &manifest); err != nil {
+		return BackupManifest{}, errors.Join(ErrInvalidBackup,
+			fmt.Errorf("decode SQLite backup manifest %s: %w", path, err))
+	}
+	return manifest, nil
+}
+
+func fillManifestPartial(partial string, encoded []byte) (finalErr error) {
+	file, err := os.OpenFile(partial, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open SQLite backup manifest partial %s: %w", partial, err)
+	}
+	defer func() { finalErr = errors.Join(finalErr, file.Close()) }()
+	if _, err := file.Write(encoded); err != nil {
+		return fmt.Errorf("write SQLite backup manifest partial %s: %w", partial, err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync SQLite backup manifest partial %s: %w", partial, err)
+	}
+	return nil
+}
+
+// MarshalJSON carries the digests as hex. encoding/json renders a fixed-size
+// byte array as that many separate numbers, and the manifest is an artifact an
+// operator reads and compares against a checksum by eye. The local defined type
+// sheds these methods, so every other field keeps its own tag.
+func (manifest BackupManifest) MarshalJSON() ([]byte, error) {
+	type wire BackupManifest
+	return json.Marshal(struct {
+		wire
+		DatabaseSHA256 string `json:"database_sha256"`
+		SchemaChecksum string `json:"schema_checksum"`
+	}{
+		wire:           wire(manifest),
+		DatabaseSHA256: hex.EncodeToString(manifest.DatabaseSHA256[:]),
+		SchemaChecksum: hex.EncodeToString(manifest.SchemaChecksum[:]),
+	})
+}
+
+func (manifest *BackupManifest) UnmarshalJSON(encoded []byte) error {
+	type wire BackupManifest
+	decoded := struct {
+		wire
+		DatabaseSHA256 string `json:"database_sha256"`
+		SchemaChecksum string `json:"schema_checksum"`
+	}{}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return err
+	}
+	*manifest = BackupManifest(decoded.wire)
+	if err := decodeBackupDigest(decoded.DatabaseSHA256, &manifest.DatabaseSHA256); err != nil {
+		return fmt.Errorf("decode manifest database digest: %w", err)
+	}
+	if err := decodeBackupDigest(decoded.SchemaChecksum, &manifest.SchemaChecksum); err != nil {
+		return fmt.Errorf("decode manifest schema checksum: %w", err)
+	}
+	return nil
+}
+
+func (stream BackupAuthorityStream) MarshalJSON() ([]byte, error) {
+	type wire BackupAuthorityStream
+	return json.Marshal(struct {
+		wire
+		EventHighWaterDigest string `json:"event_high_water_digest"`
+	}{
+		wire:                 wire(stream),
+		EventHighWaterDigest: hex.EncodeToString(stream.EventHighWaterDigest[:]),
+	})
+}
+
+func (stream *BackupAuthorityStream) UnmarshalJSON(encoded []byte) error {
+	type wire BackupAuthorityStream
+	decoded := struct {
+		wire
+		EventHighWaterDigest string `json:"event_high_water_digest"`
+	}{}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return err
+	}
+	*stream = BackupAuthorityStream(decoded.wire)
+	if err := decodeBackupDigest(decoded.EventHighWaterDigest, &stream.EventHighWaterDigest); err != nil {
+		return fmt.Errorf("decode manifest authority stream digest: %w", err)
+	}
+	return nil
+}
+
+func decodeBackupDigest(encoded string, target *[sha256.Size]byte) error {
+	raw, err := hex.DecodeString(encoded)
+	if err != nil {
+		return err
+	}
+	if len(raw) != sha256.Size {
+		return fmt.Errorf("digest is %d bytes, want %d", len(raw), sha256.Size)
+	}
+	copy(target[:], raw)
+	return nil
 }
 
 func onlineBackup(ctx context.Context, db *sql.DB, target string) (finalErr error) {

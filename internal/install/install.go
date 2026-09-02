@@ -25,13 +25,23 @@ const (
 	piLabel               = "com.phall1.blackbird.pi"
 	updaterLabel          = "com.phall1.blackbird.update"
 	formula               = "phall1/tap/blackbird"
-	mcpURL                = "http://127.0.0.1:8081"
+	mcpURL                = "http://" + MCPAddress
 	codexStart            = "# BEGIN BLACKBIRD MCP (managed by blackbird)"
 	codexEnd              = "# END BLACKBIRD MCP (managed by blackbird)"
 	defaultUpdateInterval = 6 * time.Hour
 	minimumUpdateInterval = time.Hour
 	maximumUpdateInterval = 24 * time.Hour
 	updaterPath           = "/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin"
+
+	// MCPAddress is where the installed daemon serves MCP, and therefore the
+	// address install writes into every client's configuration.
+	//
+	// It is exported because it is a shared fact rather than an install detail:
+	// the daemon's own listener default and doctor's drift check must name the
+	// same host and port, or install writes an entry pointing at a port nothing
+	// listens on and doctor reports every client as drifted. One constant is the
+	// only arrangement in which that cannot happen.
+	MCPAddress = "127.0.0.1:8081"
 
 	// HandshakeFileName is the daemon discovery record the runtime writes into
 	// the state directory and the CLI reads back.

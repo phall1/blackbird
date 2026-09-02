@@ -611,3 +611,56 @@ func (manager *fakeProductManager) ServiceArgv() []string {
 }
 
 func (manager *fakeProductManager) StateDir() string { return "/state/blackbird" }
+
+// TestBackupAndRestoreRoundTripInTheShippedBinary is the wiring test for
+// cli.SnapshotPort. The CLI reaches backup and restore by asserting that
+// interface on the maintenance adapter, so an unwired binary does not fail to
+// build — both commands simply report they cannot take a snapshot. Only a round
+// trip through the real command grammar distinguishes a wired binary from that,
+// which is why this test drives the commands rather than the adapter.
+func TestBackupAndRestoreRoundTripInTheShippedBinary(t *testing.T) {
+	t.Parallel()
+
+	source := blackbirdDatabase(t)
+	snapshot := filepath.Join(t.TempDir(), "snapshot.db")
+
+	var stdout, stderr bytes.Buffer
+	code := executeWithManager(context.Background(),
+		[]string{"backup", "--out", snapshot, "--json", "--db", source},
+		&stdout, &stderr, nil, nil, &fakeProductManager{})
+	if code != cli.ExitOK {
+		t.Fatalf("backup = %d, want %d; stderr=%q", code, cli.ExitOK, stderr.String())
+	}
+
+	// The manifest is the half that makes a snapshot restorable at all, so a
+	// backup that published only the database file is a failed backup even
+	// though the command succeeded.
+	manifestPath := sqlite.BackupManifestPath(snapshot)
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("backup published no manifest sidecar: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"database_sha256"`) {
+		t.Fatalf("stdout = %q, want the snapshot digest", stdout.String())
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored.db")
+	stdout.Reset()
+	stderr.Reset()
+	code = executeWithManager(context.Background(),
+		[]string{"restore", "--from", snapshot, "--to", restored, "--json", "--db", source},
+		&stdout, &stderr, nil, nil, &fakeProductManager{})
+	if code != cli.ExitOK {
+		t.Fatalf("restore = %d, want %d; stderr=%q", code, cli.ExitOK, stderr.String())
+	}
+	if _, err := os.Stat(sqlite.BackupManifestPath(restored)); err != nil {
+		t.Fatalf("restore published no manifest beside the restored database: %v", err)
+	}
+
+	// A restored database that cannot itself be backed up would make recovery a
+	// one-way door, so the round trip is only closed if the restored file is a
+	// usable source in turn.
+	second := filepath.Join(t.TempDir(), "second.db")
+	if _, err := sqlite.BackupFile(context.Background(), restored, second); err != nil {
+		t.Fatalf("the restored database is not itself backupable: %v", err)
+	}
+}
