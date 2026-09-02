@@ -128,6 +128,16 @@ export interface SupervisorDependencies {
   readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>
 }
 
+import {
+  TelemetryEmitter,
+  boundedRawUsage,
+  emitterFor,
+  errorKindForMessage,
+  normalizeOpenCodeTokens,
+  outcomeForMessage,
+  publishEmitter,
+} from "./telemetry.js"
+
 interface ResolvedOptions {
   readonly baseUrl: URL
   readonly projectKey: string
@@ -419,6 +429,17 @@ export async function runSupervisor(
     }
   }
   if (token === undefined) return
+  // The observation plane shares this supervisor's token and lifetime. It is
+  // published for the `event` hook to find, because OpenCode delivers hooks to
+  // the plugin instance while the token is only ever known in here.
+  let releaseTelemetry: (() => void) | undefined
+  if (process.env["BLACKBIRD_OPENCODE_TELEMETRY"] !== "0") {
+    releaseTelemetry = publishEmitter(
+      supervisorKey(options),
+      new TelemetryEmitter({ baseUrl: options.baseUrl, token, fetch: dependencies.fetch }),
+    )
+    signal.addEventListener("abort", () => { releaseTelemetry?.() }, { once: true })
+  }
   const delivered = new Set(state.delivered)
   const sessionQueues = new Map<string, Promise<void>>()
 
@@ -558,6 +579,55 @@ function releaseSupervisor(key: string, supervisor: SharedSupervisor): () => Pro
   }
 }
 
+export function supervisorKey(options: ResolvedOptions): string {
+  return `${options.baseUrl.toString()}\0${options.projectKey}\0${options.agentName}\0${options.stateDir}`
+}
+
+/**
+ * Records one finished assistant message on the observation plane.
+ *
+ * Exported for tests, and deliberately total: every path that cannot produce a
+ * well-formed observation returns rather than throwing, because this runs
+ * inside OpenCode's event dispatch and a throw here would surface as a plugin
+ * fault during someone's turn.
+ */
+export function recordAssistantMessage(key: string, event: unknown): void {
+  const emitter = emitterFor(key)
+  if (!emitter) return
+  const properties = (event as { properties?: unknown }).properties
+  const info = (properties as { info?: unknown } | undefined)?.info
+  const message = info as {
+    id?: unknown; sessionID?: unknown; role?: unknown; modelID?: unknown; providerID?: unknown
+    tokens?: unknown; error?: unknown; time?: { created?: unknown; completed?: unknown }
+  } | undefined
+  if (!message || message.role !== "assistant") return
+  // An in-flight message has no completion time yet. Recording it now would
+  // store a zero-duration call and then record it again when it finishes.
+  const completed = message.time?.completed
+  if (typeof completed !== "number") return
+  const created = typeof message.time?.created === "number" ? message.time.created : completed
+  const id = typeof message.id === "string" ? message.id : ""
+  const model = typeof message.modelID === "string" ? message.modelID : ""
+  const provider = typeof message.providerID === "string" ? message.providerID : ""
+  if (id === "" || model === "" || provider === "") return
+  const errorKind = errorKindForMessage(message.error)
+  const rawUsage = boundedRawUsage(message.tokens)
+  emitter.record({
+    dedupe_key: id,
+    harness: "opencode",
+    provider,
+    model,
+    operation: "chat",
+    usage: normalizeOpenCodeTokens(message.tokens as never),
+    outcome: outcomeForMessage(message.error),
+    started_at: new Date(created).toISOString(),
+    duration_ms: Math.max(0, completed - created),
+    ...(typeof message.sessionID === "string" ? { harness_session: message.sessionID } : {}),
+    ...(errorKind !== undefined ? { error_kind: errorKind } : {}),
+    ...(rawUsage !== undefined ? { raw_usage: rawUsage } : {}),
+  })
+}
+
 const plugin: PluginModule = {
   id: "phall1.blackbird",
   // Not `async`: registering the supervisor is synchronous, and the supervisor
@@ -566,13 +636,23 @@ const plugin: PluginModule = {
     const raw = pluginOptions ?? {}
     const options = resolveOptions(raw)
     const session = createSessionClient(input.client)
-    const key = `${options.baseUrl.toString()}\0${options.projectKey}\0${options.agentName}\0${options.stateDir}`
+    const key = supervisorKey(options)
     const release = acquireSupervisor(key, (signal) => runSupervisor(session, raw, signal).catch((error: unknown) => {
       if (!signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
     }))
     // OpenCode tears a plugin down through the returned hooks, so the shared
     // supervisor's reference release has to hang off `dispose`.
-    return Promise.resolve({ dispose: release })
+    return Promise.resolve({
+      dispose: release,
+      // message.updated fires repeatedly while a response streams; only the
+      // completed one is recorded, and the daemon deduplicates on the message
+      // id if a shared supervisor causes it to arrive twice.
+      event: async (input: { event: unknown }): Promise<void> => {
+        if ((input.event as { type?: unknown }).type !== "message.updated") return
+        recordAssistantMessage(key, input.event)
+        return Promise.resolve()
+      },
+    })
   },
 }
 
