@@ -558,6 +558,10 @@ func TestCoordinationFailureMapsEveryShapeOfError(t *testing.T) {
 	if sentinel.Code != string(domain.ErrorCodeNotFound) || sentinel.Message == "" || sentinel.Retryable {
 		t.Fatalf("sentinel failure = %+v, want NOT_FOUND with a message", sentinel)
 	}
+	invalid := coordinationFailure("req_invalid", invalidInput("lease_id must be a valid UUID"))
+	if invalid.Code != string(domain.ErrorCodeInvalidArgument) || invalid.Message != "lease_id must be a valid UUID" || invalid.Retryable {
+		t.Fatalf("invalid failure = %+v, want precise argument guidance", invalid)
+	}
 }
 
 // TestSoonestExpiryAdvisesTheShortestWaitThatCanClear covers the retry advice.

@@ -49,6 +49,10 @@ type MetricsObserver interface {
 
 type Dependencies struct {
 	Coordination application.LocalCoordinationStore
+	// Observations is optional. When it is absent the spend tool is not
+	// registered at all, so a daemon that collects no telemetry spends none of
+	// its clients' tool-list budget advertising a report it cannot produce.
+	Observations application.TelemetryReader
 	Logger       *slog.Logger
 	Metrics      MetricsObserver
 }
@@ -70,6 +74,9 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	sdk.AddReceivingMiddleware(logToolFailures(logger, dependencies.Metrics))
 	registerCoordinationProtocol(sdk)
 	registerCoordinationTools(sdk, dependencies.Coordination, logger)
+	if !isNil(dependencies.Observations) {
+		registerSpendTool(sdk, dependencies.Coordination, dependencies.Observations, logger)
+	}
 	return server, nil
 }
 
@@ -541,11 +548,21 @@ func coordinationTool[Input, Output any](server *sdkmcp.Server, logger *slog.Log
 // posture; an invalid request is an argument failure; anything else is
 // internal and says nothing further, because whatever it is was not meant to
 // leave the daemon.
+type invalidCoordinationInputError struct{ message string }
+
+func (failure *invalidCoordinationInputError) Error() string { return failure.message }
+func (failure *invalidCoordinationInputError) Unwrap() error {
+	return application.ErrInvalidCoordination
+}
+
+func invalidInput(message string) error { return &invalidCoordinationInputError{message: message} }
+
 func coordinationFailure(requestID string, err error) coordinationFailureOutput {
 	failure := coordinationFailureOutput{RequestID: requestID, Code: string(domain.ErrorCodeInternal),
 		Category: string(domain.ErrorCategoryInternal), Message: "request could not be completed",
 		Retryable: domain.ErrorCodeInternal.DefaultRetryable()}
 	var commandError *domain.CommandError
+	var invalidInputError *invalidCoordinationInputError
 	switch {
 	case errors.As(err, &commandError):
 		failure.Code, failure.Category = string(commandError.Code()), string(commandError.Category())
@@ -557,6 +574,9 @@ func coordinationFailure(requestID string, err error) coordinationFailureOutput 
 		if conflict, isConflict := commandError.ConflictKind(); isConflict {
 			failure.Conflict = string(conflict)
 		}
+	case errors.As(err, &invalidInputError):
+		failure.Code, failure.Category = string(domain.ErrorCodeInvalidArgument), string(domain.ErrorCategoryValidation)
+		failure.Message, failure.Retryable = invalidInputError.message, false
 	case errors.Is(err, application.ErrInvalidCoordination):
 		failure.Code, failure.Category = string(domain.ErrorCodeInvalidArgument), string(domain.ErrorCategoryValidation)
 		failure.Message, failure.Retryable = "coordination request is invalid", false
@@ -998,7 +1018,7 @@ func setWaitTimeoutSchema(schema *jsonschema.Schema) {
 func changeLocalReservation(ctx context.Context, store application.LocalCoordinationStore,
 	input reservationChangeInput) (reservationOutput, error) {
 	if input.Action == "release" && input.TTLSeconds != 0 {
-		return reservationOutput{}, application.ErrInvalidCoordination
+		return reservationOutput{}, invalidInput("ttl_seconds must be omitted when action is release")
 	}
 	if input.Action == "renew" && input.TTLSeconds == 0 {
 		input.TTLSeconds = defaultReservationTTLSeconds
@@ -1009,13 +1029,13 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	}
 	leaseID, err := domain.ParseLeaseID(input.LeaseID)
 	if err != nil {
-		return reservationOutput{}, application.ErrInvalidCoordination
+		return reservationOutput{}, invalidInput("lease_id must be a valid UUID")
 	}
 	fences := make([]application.Fence, 0, len(input.Fences))
-	for _, raw := range input.Fences {
+	for index, raw := range input.Fences {
 		fence, fenceErr := application.NewFence(raw.ConflictKey, raw.Counter)
 		if fenceErr != nil {
-			return reservationOutput{}, fenceErr
+			return reservationOutput{}, invalidInput(fmt.Sprintf("fences[%d] must contain a non-empty conflict_key and a counter from 1 to %d", index, application.MaxCanonicalInteger))
 		}
 		fences = append(fences, fence)
 	}
@@ -1028,7 +1048,7 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	case "release":
 		lease, err = store.ReleaseLease(ctx, params)
 	default:
-		return reservationOutput{}, application.ErrInvalidCoordination
+		return reservationOutput{}, invalidInput("action must be renew or release")
 	}
 	if err != nil {
 		return reservationOutput{}, err
