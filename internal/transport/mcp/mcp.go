@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	stdhttp "net/http"
 	"net/url"
 	"reflect"
@@ -99,6 +100,11 @@ type Dependencies struct {
 	EventsSync                contracts.EventsSyncHandler
 	Coordination              application.LocalCoordinationStore
 
+	// Logger receives one record per failed tool call: the tool's name and the
+	// failure the caller was already given. A nil Logger is silent rather than a
+	// composition error, so a test can exercise a tool without a log sink.
+	Logger *slog.Logger
+
 	// ExposeIdentityPlane registers the W0/W1 identity and work tools on this
 	// transport. It defaults to false because MCP carries no place to attach a
 	// verified ingress credential, so every one of those tools answers
@@ -130,6 +136,15 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 		PageSize:     64,
 	})
 	server := &Server{Server: sdk}
+	logger := dependencies.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	// One middleware covers every tool on this transport, including the ones the
+	// SDK synthesizes a failure result for, and it reads only the tool name and
+	// the failure text -- so a bearer token or a message body in the arguments
+	// can never reach a log line by way of a new tool nobody remembered to wire.
+	sdk.AddReceivingMiddleware(logToolFailures(logger))
 	if dependencies.ExposeIdentityPlane {
 		registerIdentityPlaneTools(sdk, dependencies)
 	}
@@ -138,6 +153,43 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 		registerCoordinationTools(sdk, dependencies.Coordination)
 	}
 	return server, nil
+}
+
+// logToolFailures records the operation and cause behind every failed tool
+// call. A typed tool handler's error never reaches the middleware as an error:
+// the SDK turns it into a result carrying IsError, so both shapes are checked.
+func logToolFailures(logger *slog.Logger) sdkmcp.Middleware {
+	return func(next sdkmcp.MethodHandler) sdkmcp.MethodHandler {
+		return func(ctx context.Context, method string, request sdkmcp.Request) (sdkmcp.Result, error) {
+			result, err := next(ctx, method, request)
+			call, isCall := request.(*sdkmcp.CallToolRequest)
+			if !isCall || call.Params == nil {
+				return result, err
+			}
+			if err != nil {
+				logger.Error("mcp tool failed", slog.String("tool", call.Params.Name), slog.Any("error", err))
+				return result, err
+			}
+			outcome, isToolResult := result.(*sdkmcp.CallToolResult)
+			if isToolResult && outcome != nil && outcome.IsError {
+				logger.Error("mcp tool failed", slog.String("tool", call.Params.Name),
+					slog.String("error", toolFailureText(outcome)))
+			}
+			return result, err
+		}
+	}
+}
+
+// toolFailureText reads the message the caller was already shown. Structured
+// content is deliberately not read: it is the tool's own output shape, and a
+// future tool could carry something there that does not belong in a log.
+func toolFailureText(result *sdkmcp.CallToolResult) string {
+	for _, content := range result.Content {
+		if text, ok := content.(*sdkmcp.TextContent); ok {
+			return text.Text
+		}
+	}
+	return "tool reported an error with no message"
 }
 
 // registerIdentityPlaneTools publishes the W0/W1 ceremonies as MCP tools. Only
@@ -206,13 +258,58 @@ type registerAgentInput struct {
 	AgentName         string  `json:"agent_name"`
 	RegistrationToken *string `json:"registration_token,omitempty" jsonschema:"Existing token required when restarting a registered name. Every other tool takes this same value as agent_token."`
 }
+
+// agentSessionOutput answers a registration with the state registration itself
+// rebound. Identifiers alone told a resuming agent nothing it could act on: its
+// still-active leases had just been moved onto the new session and went
+// unmentioned, so an agent that restarted or was compacted held an exclusive
+// reservation it could neither renew nor release, and everyone else waited out
+// its TTL. Every duration here is computed by the daemon, so nothing in this
+// result has to be compared against the client's own clock.
 type agentSessionOutput struct {
-	ProjectKey        string `json:"project_key"`
-	AgentName         string `json:"agent_name"`
-	WorkspaceID       string `json:"workspace_id"`
-	ActorID           string `json:"actor_id"`
-	SessionID         string `json:"session_id"`
-	RegistrationToken string `json:"registration_token,omitempty"`
+	ProjectKey        string                    `json:"project_key"`
+	AgentName         string                    `json:"agent_name"`
+	WorkspaceID       string                    `json:"workspace_id"`
+	ActorID           string                    `json:"actor_id"`
+	SessionID         string                    `json:"session_id"`
+	RegistrationToken string                    `json:"registration_token,omitempty"`
+	HeldReservations  []heldReservationOutput   `json:"held_reservations" jsonschema:"Reservations this agent still holds, now bound to this session. Renew or release each one with the lease_id and fences given here, or it blocks other agents until it expires."`
+	Inbox             inboxSummaryOutput        `json:"inbox" jsonschema:"Mailbox counts over the whole inbox, with the most recent pending deliveries; blackbird_inbox_fetch serves the rest."`
+	OpenConversations []agentConversationOutput `json:"open_conversations" jsonschema:"Open conversations this agent opened, wrote to, or was addressed in, most recent first."`
+	OtherAgents       []agentPeerOutput         `json:"other_agents" jsonschema:"Other agents with a live session in this repository right now."`
+}
+type heldReservationOutput struct {
+	LeaseID     string                     `json:"lease_id"`
+	Mode        string                     `json:"mode"`
+	Selectors   []reservationSelectorInput `json:"selectors"`
+	Fences      []fenceOutput              `json:"fences"`
+	ExpiresInMS int64                      `json:"expires_in_ms" jsonschema:"Milliseconds left on this lease, measured by the daemon. Negative means it is already overdue."`
+}
+type inboxSummaryOutput struct {
+	Unread               int               `json:"unread"`
+	NeedsAcknowledgement int               `json:"needs_acknowledgement"`
+	Recent               []inboxItemOutput `json:"recent"`
+}
+type inboxItemOutput struct {
+	MessageID               string `json:"message_id"`
+	ConversationID          string `json:"conversation_id"`
+	From                    string `json:"from"`
+	Subject                 string `json:"subject"`
+	Read                    bool   `json:"read"`
+	AcknowledgementRequired bool   `json:"acknowledgement_required"`
+	Acknowledged            bool   `json:"acknowledged"`
+	SentMSAgo               int64  `json:"sent_ms_ago"`
+}
+type agentConversationOutput struct {
+	ConversationID   string `json:"conversation_id"`
+	Topic            string `json:"topic"`
+	Messages         int    `json:"messages"`
+	LastMessageMSAgo int64  `json:"last_message_ms_ago"`
+}
+type agentPeerOutput struct {
+	Name          string `json:"name"`
+	ActorID       string `json:"actor_id"`
+	LastSeenMSAgo int64  `json:"last_seen_ms_ago"`
 }
 type tokenInput struct {
 	AgentToken string `json:"agent_token"`
@@ -329,7 +426,11 @@ type reservationOutput struct {
 }
 
 func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoordinationStore) {
-	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentRegister, Description: "Start or resume a durable local agent session for a repository key and agent name."},
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentRegister,
+		Description: "Start or resume a durable local agent session for a repository key and agent name. " +
+			"The result reports the state already bound to this agent: the reservations it still holds and " +
+			"the time left on each, its unread and unacknowledged mail, its open conversations, and the other " +
+			"agents present. A resuming agent must act on the reservations it is handed back."},
 		func(ctx context.Context, _ *sdkmcp.CallToolRequest, input registerAgentInput) (*sdkmcp.CallToolResult, agentSessionOutput, error) {
 			token := ""
 			if input.RegistrationToken != nil {
@@ -339,9 +440,11 @@ func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoo
 			if err != nil {
 				return nil, agentSessionOutput{}, err
 			}
-			return nil, agentSessionOutput{ProjectKey: session.ProjectKey, AgentName: session.AgentName,
-				WorkspaceID: session.WorkspaceID.String(), ActorID: session.ActorID.String(), SessionID: session.ActorSessionID.String(),
-				RegistrationToken: issued}, nil
+			snapshot, err := store.LocalAgentSnapshot(ctx, session)
+			if err != nil {
+				return nil, agentSessionOutput{}, err
+			}
+			return nil, localAgentSessionOutput(session, issued, snapshot), nil
 		})
 	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: ToolAgentsList, Description: "List agent sessions active in the caller's repository.",
 		InputSchema: coordinationInputSchema[tokenInput]()},
@@ -481,6 +584,61 @@ func sendLocalMessage(ctx context.Context, store application.LocalCoordinationSt
 		return messageOutput{}, err
 	}
 	return localMessageOutput(message), nil
+}
+
+// localAgentSessionOutput turns every instant in the snapshot into an age
+// measured by the daemon. An absolute timestamp would make the client's own
+// clock part of the answer, and a compacted agent restarting on a machine whose
+// clock has drifted would read a live reservation as long expired.
+func localAgentSessionOutput(session application.LocalAgentSession, issued string,
+	snapshot application.LocalAgentSnapshot) agentSessionOutput {
+	output := agentSessionOutput{ProjectKey: session.ProjectKey, AgentName: session.AgentName,
+		WorkspaceID: session.WorkspaceID.String(), ActorID: session.ActorID.String(),
+		SessionID: session.ActorSessionID.String(), RegistrationToken: issued,
+		HeldReservations: make([]heldReservationOutput, 0, len(snapshot.Reservations)),
+		Inbox: inboxSummaryOutput{Unread: snapshot.Inbox.UnreadDeliveries,
+			NeedsAcknowledgement: snapshot.Inbox.UnackedDeliveries,
+			Recent:               make([]inboxItemOutput, 0, len(snapshot.Inbox.Recent))},
+		OpenConversations: make([]agentConversationOutput, 0, len(snapshot.Conversations)),
+		OtherAgents:       make([]agentPeerOutput, 0, len(snapshot.Peers))}
+	for _, reservation := range snapshot.Reservations {
+		held := heldReservationOutput{LeaseID: reservation.LeaseID.String(), Mode: string(reservation.Mode),
+			ExpiresInMS: reservation.ExpiresInMS, Selectors: []reservationSelectorInput{}, Fences: []fenceOutput{}}
+		for _, selector := range reservation.Selectors {
+			held.Selectors = append(held.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path()})
+		}
+		for _, fence := range reservation.Fences {
+			held.Fences = append(held.Fences, fenceOutput{ConflictKey: fence.ConflictKey(), Counter: fence.Counter()})
+		}
+		output.HeldReservations = append(output.HeldReservations, held)
+	}
+	for _, item := range snapshot.Inbox.Recent {
+		output.Inbox.Recent = append(output.Inbox.Recent, inboxItemOutput{MessageID: item.MessageID.String(),
+			ConversationID: item.ConversationID.String(), From: item.AuthorAgentName, Subject: item.Subject,
+			Read: item.Read, AcknowledgementRequired: item.AcknowledgementRequired, Acknowledged: item.Acknowledged,
+			SentMSAgo: elapsedMS(snapshot.ObservedAtUS, item.SentAtUS)})
+	}
+	for _, conversation := range snapshot.Conversations {
+		output.OpenConversations = append(output.OpenConversations, agentConversationOutput{
+			ConversationID: conversation.ConversationID.String(), Topic: conversation.Topic,
+			Messages:         conversation.Messages,
+			LastMessageMSAgo: elapsedMS(snapshot.ObservedAtUS, conversation.LastMessageAtUS)})
+	}
+	for _, peer := range snapshot.Peers {
+		output.OtherAgents = append(output.OtherAgents, agentPeerOutput{Name: peer.Name, ActorID: peer.ActorID.String(),
+			LastSeenMSAgo: elapsedMS(snapshot.ObservedAtUS, application.MicrosFromTime(peer.LastSeenAt))})
+	}
+	return output
+}
+
+// elapsedMS reports how long before the snapshot an instant fell. A zero
+// instant means "absent" in every projection that feeds this, and reporting the
+// whole Unix epoch for it would be worse than reporting nothing.
+func elapsedMS(observedAtUS, instantUS int64) int64 {
+	if instantUS == 0 {
+		return 0
+	}
+	return (observedAtUS - instantUS) / 1000
 }
 
 func coordinationPageOutput(page application.CoordinationPage) messagePageOutput {

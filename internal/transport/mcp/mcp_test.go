@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -396,8 +398,37 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	client, closeMCP = connect(t, server)
 	defer closeMCP()
 	aliceToken, bobToken := alice.RegistrationToken, bob.RegistrationToken
-	callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice", RegistrationToken: &aliceToken})
-	callCoord[agentSessionOutput](t, client, ToolAgentRegister, registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob", RegistrationToken: &bobToken})
+	// Registration is where a restarted agent learns what it still holds. The
+	// daemon rebinds these leases to the new session either way; saying nothing
+	// about them is how an exclusive reservation gets abandoned for its TTL.
+	resumed := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice", RegistrationToken: &aliceToken})
+	if resumed.RegistrationToken != "" {
+		t.Fatal("resuming a registered name issued a second token")
+	}
+	if len(resumed.HeldReservations) != 1 || resumed.HeldReservations[0].LeaseID != lease.LeaseID {
+		t.Fatalf("resumed reservations = %+v, want the lease held across the restart", resumed.HeldReservations)
+	}
+	if resumed.HeldReservations[0].ExpiresInMS <= 0 || len(resumed.HeldReservations[0].Fences) == 0 ||
+		len(resumed.HeldReservations[0].Selectors) != 1 || resumed.HeldReservations[0].Selectors[0].Path != "src" {
+		t.Fatalf("resumed reservation = %+v, want the time left, the fences and the selectors",
+			resumed.HeldReservations[0])
+	}
+	if resumed.Inbox.Unread != 1 || len(resumed.Inbox.Recent) != 1 || resumed.Inbox.Recent[0].From != "bob" {
+		t.Fatalf("resumed inbox = %+v, want bob's unread reply", resumed.Inbox)
+	}
+	if len(resumed.OpenConversations) != 1 || resumed.OpenConversations[0].ConversationID != conversation.ConversationID ||
+		resumed.OpenConversations[0].Messages != 2 {
+		t.Fatalf("resumed conversations = %+v", resumed.OpenConversations)
+	}
+	if len(resumed.OtherAgents) != 1 || resumed.OtherAgents[0].Name != "bob" {
+		t.Fatalf("resumed roster = %+v, want the other agent present", resumed.OtherAgents)
+	}
+	resumedBob := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob", RegistrationToken: &bobToken})
+	if len(resumedBob.HeldReservations) != 0 {
+		t.Fatalf("bob holds no reservation but was handed %+v", resumedBob.HeldReservations)
+	}
 	renewed := callCoord[reservationOutput](t, client, ToolReservationRenew, map[string]any{
 		"agent_token": aliceToken, "lease_id": lease.LeaseID, "fences": lease.Fences,
 	})
@@ -474,6 +505,88 @@ func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
 	if !binder.called.Load() {
 		t.Fatal("resource did not resolve the bound actor session")
 	}
+}
+
+// TestMCPToolFailuresReachTheLoggerWithoutArguments covers the transport's only
+// diagnostic. MCP had no logger at all, so a coordination tool that failed left
+// nothing behind; and the arguments it fails on carry the agent's bearer token,
+// which is why the record is built from the tool name and the failure text the
+// caller already has rather than from the request.
+func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
+	t.Parallel()
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "logging.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	sink := &lockedBuffer{}
+	server, err := NewServer(Dependencies{
+		Logger:        slog.New(slog.NewJSONHandler(sink, nil)),
+		Authenticator: testMCPAuthenticator{}, CurrentSession: &testSessionBinder{session: parseSession(t)},
+		Coordination:          store,
+		InstallationBootstrap: &testHandlers{}, PrincipalRegister: &testHandlers{},
+		DevicePairingBegin: &testHandlers{}, DevicePair: &testHandlers{}, WorkspaceCreate: &testHandlers{},
+		WorkspaceMemberInvite: &testHandlers{}, WorkspaceMembershipAccept: &testHandlers{},
+		ActorCreate: &testHandlers{}, ActorDelegationPropose: &testHandlers{}, ActorDelegationActivate: &testHandlers{},
+		SessionStart: &testHandlers{}, WorkRefObserve: &testHandlers{}, ObjectiveAndWorkCreate: &testHandlers{},
+		ObjectiveActivate: &testHandlers{}, RunPlanWithBindings: &testHandlers{}, RunJoin: &testHandlers{},
+		RunStart: &testHandlers{}, ContextGet: &testHandlers{}, EventsSync: &testHandlers{},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client, closeMCP := connect(t, server)
+	defer closeMCP()
+
+	const secret = "bbm_00000000000000000000000000000000"
+	result, err := client.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolReservationAcquire,
+		Arguments: reservationAcquireInput{AgentToken: secret, Mode: "exclusive", TTLSeconds: 60,
+			Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}}})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("an unknown agent token was accepted")
+	}
+	logged := sink.String()
+	if !strings.Contains(logged, ToolReservationAcquire) || !strings.Contains(logged, "mcp tool failed") {
+		t.Fatalf("failure log = %q, want the tool name and the failure", logged)
+	}
+	if strings.Contains(logged, secret) {
+		t.Fatalf("failure log carried the caller's token: %q", logged)
+	}
+
+	// A successful call is not noise: only failures earn a record.
+	sink.Reset()
+	callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+		registerAgentInput{ProjectKey: "/workspace/logged", AgentName: "alice"})
+	if logged := sink.String(); logged != "" {
+		t.Fatalf("successful call logged %q", logged)
+	}
+}
+
+// lockedBuffer is written from the server's goroutine and read from the test's.
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (sink *lockedBuffer) Write(payload []byte) (int, error) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.buffer.Write(payload)
+}
+
+func (sink *lockedBuffer) String() string {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.buffer.String()
+}
+
+func (sink *lockedBuffer) Reset() {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	sink.buffer.Reset()
 }
 
 func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) {
@@ -573,6 +686,22 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	}
 	if kinds := acquireDecoded.Properties.Selectors.Items.Properties.Kind.Enum; !reflect.DeepEqual(kinds, []any{"exact", "subtree"}) {
 		t.Errorf("selector kind enum = %#v, want exact and subtree", kinds)
+	}
+
+	// agent_register is the one tool whose result an agent must act on, so what
+	// it returns has to be discoverable rather than learned by calling it.
+	register := tools[ToolAgentRegister]
+	if !strings.Contains(register.Description, "reservations") {
+		t.Errorf("agent_register description does not mention the reservations it returns: %q", register.Description)
+	}
+	registerOutput, err := json.Marshal(register.OutputSchema)
+	if err != nil {
+		t.Fatalf("marshal agent_register output schema: %v", err)
+	}
+	for _, field := range []string{"held_reservations", "inbox", "open_conversations", "other_agents", "expires_in_ms"} {
+		if !bytes.Contains(registerOutput, []byte(`"`+field+`"`)) {
+			t.Errorf("agent_register output schema omits %q: %s", field, registerOutput)
+		}
 	}
 
 	release := tools[ToolReservationRelease]

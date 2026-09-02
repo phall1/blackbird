@@ -71,8 +71,9 @@ func TestExecuteReturnsErrorWhenVersionCannotBeWritten(t *testing.T) {
 func TestExecuteInjectsNonSecretConfiguration(t *testing.T) {
 	t.Parallel()
 
+	injectedPath := filepath.Join(t.TempDir(), "injected.db")
 	injected := blackbirdruntime.Config{
-		Storage: blackbirdruntime.StorageSQLite, SQLitePath: "injected.db",
+		Storage: blackbirdruntime.StorageSQLite, SQLitePath: injectedPath,
 		HTTPAddress: "127.0.0.1:9000", MCPAddress: "127.0.0.1:9001",
 	}
 	var got blackbirdruntime.Config
@@ -81,12 +82,12 @@ func TestExecuteInjectsNonSecretConfiguration(t *testing.T) {
 		return cancelledRunner{}, nil
 	}
 	code := executeConfigured(context.Background(), []string{
-		"--storage=postgres", "--http-address=127.0.0.1:9100",
+		"--http-address=127.0.0.1:9100",
 	}, ioDiscard{}, ioDiscard{}, &injected, factory)
 	if code != cli.ExitOK {
 		t.Fatalf("executeConfigured() = %d, want %d", code, cli.ExitOK)
 	}
-	if got.Storage != blackbirdruntime.StoragePostgreSQL || got.SQLitePath != "injected.db" ||
+	if got.Storage != blackbirdruntime.StorageSQLite || got.SQLitePath != injectedPath ||
 		got.HTTPAddress != "127.0.0.1:9100" || got.MCPAddress != "127.0.0.1:9001" {
 		t.Fatalf("config = %#v", got)
 	}
@@ -151,10 +152,13 @@ func TestInstalledServiceArgvParses(t *testing.T) {
 	}
 }
 
-func TestExecuteDoesNotAcceptSecretsOnCommandLine(t *testing.T) {
+// TestExecuteRejectsUnknownFlags keeps the daemon's flag set closed: the
+// installed service definition is argv, so a flag the grammar does not declare
+// must fail loudly at parse time rather than being silently ignored.
+func TestExecuteRejectsUnknownFlags(t *testing.T) {
 	t.Parallel()
 
-	for _, argument := range []string{"--dsn=postgres://secret", "--postgres-password=secret", "--migration-dsn=postgres://secret"} {
+	for _, argument := range []string{"--dsn=x", "--database-password=x", "--migration-dsn=x"} {
 		var stderr bytes.Buffer
 		if code := execute(context.Background(), []string{argument}, ioDiscard{}, &stderr); code != cli.ExitUsage {
 			t.Fatalf("execute(%q) = %d, want %d", argument, code, cli.ExitUsage)
