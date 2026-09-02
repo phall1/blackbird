@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.0...opencode-plugin-v0.2.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **packages:** gate every plugin on the same audit level ([f8f6d64](https://github.com/phall1/blackbird/commit/f8f6d644aae81598f12573e0750f1d798df19f04))
+
 ## [0.2.0](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.1.3...opencode-plugin-v0.2.0) (2026-09-02)
 
 
