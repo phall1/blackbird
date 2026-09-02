@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/transport/metrics"
 )
@@ -18,75 +18,75 @@ import (
 const adminTestToken = "bba_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 type stubAdminStore struct {
-	identity      application.AdminStorageIdentity
-	overview      application.AdminOverview
-	projects      application.AdminProjectsPage
-	agents        application.AdminAgentsPage
-	inbox         application.AdminInboxPage
-	conversations application.AdminConversationsPage
-	reservations  application.AdminReservationsPage
-	forcedLease   application.Lease
-	events        application.AdminEventsPage
+	identity      coordination.AdminStorageIdentity
+	overview      coordination.AdminOverview
+	projects      coordination.AdminProjectsPage
+	agents        coordination.AdminAgentsPage
+	inbox         coordination.AdminInboxPage
+	conversations coordination.AdminConversationsPage
+	reservations  coordination.AdminReservationsPage
+	forcedLease   coordination.Lease
+	events        coordination.AdminEventsPage
 	schemaVersion int
 	err           error
 
 	forcedLeaseID domain.LeaseID
 
-	agentsQuery        application.AdminAgentsQuery
-	inboxQuery         application.AdminInboxQuery
-	conversationsQuery application.AdminConversationsQuery
-	reservationsQuery  application.AdminReservationsQuery
-	eventsQuery        application.AdminEventsQuery
+	agentsQuery        coordination.AdminAgentsQuery
+	inboxQuery         coordination.AdminInboxQuery
+	conversationsQuery coordination.AdminConversationsQuery
+	reservationsQuery  coordination.AdminReservationsQuery
+	eventsQuery        coordination.AdminEventsQuery
 }
 
 func (store *stubAdminStore) CheckReadiness(context.Context) (int, error) {
 	return store.schemaVersion, store.err
 }
 
-func (store *stubAdminStore) AdminStorageIdentity(context.Context) (application.AdminStorageIdentity, error) {
+func (store *stubAdminStore) AdminStorageIdentity(context.Context) (coordination.AdminStorageIdentity, error) {
 	return store.identity, store.err
 }
 
-func (store *stubAdminStore) AdminOverview(context.Context) (application.AdminOverview, error) {
+func (store *stubAdminStore) AdminOverview(context.Context) (coordination.AdminOverview, error) {
 	return store.overview, store.err
 }
 
-func (store *stubAdminStore) ListAdminProjects(context.Context) (application.AdminProjectsPage, error) {
+func (store *stubAdminStore) ListAdminProjects(context.Context) (coordination.AdminProjectsPage, error) {
 	return store.projects, store.err
 }
 
 func (store *stubAdminStore) ListAdminAgents(_ context.Context,
-	query application.AdminAgentsQuery) (application.AdminAgentsPage, error) {
+	query coordination.AdminAgentsQuery) (coordination.AdminAgentsPage, error) {
 	store.agentsQuery = query
 	return store.agents, store.err
 }
 
 func (store *stubAdminStore) AdminInbox(_ context.Context,
-	query application.AdminInboxQuery) (application.AdminInboxPage, error) {
+	query coordination.AdminInboxQuery) (coordination.AdminInboxPage, error) {
 	store.inboxQuery = query
 	return store.inbox, store.err
 }
 
 func (store *stubAdminStore) ListAdminConversations(_ context.Context,
-	query application.AdminConversationsQuery) (application.AdminConversationsPage, error) {
+	query coordination.AdminConversationsQuery) (coordination.AdminConversationsPage, error) {
 	store.conversationsQuery = query
 	return store.conversations, store.err
 }
 
 func (store *stubAdminStore) ListAdminReservations(_ context.Context,
-	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
+	query coordination.AdminReservationsQuery) (coordination.AdminReservationsPage, error) {
 	store.reservationsQuery = query
 	return store.reservations, store.err
 }
 
 func (store *stubAdminStore) ForceReleaseAdminReservation(_ context.Context,
-	leaseID domain.LeaseID) (application.Lease, error) {
+	leaseID domain.LeaseID) (coordination.Lease, error) {
 	store.forcedLeaseID = leaseID
 	return store.forcedLease, store.err
 }
 
 func (store *stubAdminStore) ListAdminEvents(_ context.Context,
-	query application.AdminEventsQuery) (application.AdminEventsPage, error) {
+	query coordination.AdminEventsQuery) (coordination.AdminEventsPage, error) {
 	store.eventsQuery = query
 	return store.events, store.err
 }
@@ -240,10 +240,10 @@ func TestLocalAdminRejectsInvalidQueryParameters(t *testing.T) {
 		{name: "padded reservation path", target: PathLocalAdminReservations + "?path=%20internal%2Fapp.go",
 			status: stdhttp.StatusBadRequest},
 		{name: "oversized reservation path", target: PathLocalAdminReservations + "?path=" +
-			strings.Repeat("x", application.MaxLeaseSelectorBytes+1), status: stdhttp.StatusBadRequest},
+			strings.Repeat("x", coordination.MaxLeaseSelectorBytes+1), status: stdhttp.StatusBadRequest},
 		{name: "reservation path", target: PathLocalAdminReservations + "?path=internal%2Fapp.go", status: stdhttp.StatusOK},
 		{name: "oversized project key", target: PathLocalAdminAgents + "?project_key=" +
-			strings.Repeat("x", application.MaxCoordinationKeyBytes+1), status: stdhttp.StatusBadRequest},
+			strings.Repeat("x", coordination.MaxCoordinationKeyBytes+1), status: stdhttp.StatusBadRequest},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -272,26 +272,26 @@ func TestLocalAdminPassesQueriesThroughUnchanged(t *testing.T) {
 	if response := serveAdmin(handler, PathLocalAdminAgents); response.Code != stdhttp.StatusOK {
 		t.Fatalf("agents status=%d", response.Code)
 	}
-	if store.agentsQuery != (application.AdminAgentsQuery{}) {
+	if store.agentsQuery != (coordination.AdminAgentsQuery{}) {
 		t.Fatalf("absent parameters must reach storage as zero values: %+v", store.agentsQuery)
 	}
 	if response := serveAdmin(handler, PathLocalAdminAgents+"?project_key=/repo&agent=alice&limit=7"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("agents status=%d", response.Code)
 	}
-	if store.agentsQuery != (application.AdminAgentsQuery{ProjectKey: "/repo", AgentName: "alice", Limit: 7}) {
+	if store.agentsQuery != (coordination.AdminAgentsQuery{ProjectKey: "/repo", AgentName: "alice", Limit: 7}) {
 		t.Fatalf("agents query=%+v", store.agentsQuery)
 	}
 	if response := serveAdmin(handler, PathLocalAdminReservations); response.Code != stdhttp.StatusOK {
 		t.Fatalf("reservations status=%d", response.Code)
 	}
-	if store.reservationsQuery.State != application.AdminReservationAll {
+	if store.reservationsQuery.State != coordination.AdminReservationAll {
 		t.Fatalf("absent state must normalize to all: %+v", store.reservationsQuery)
 	}
 	if response := serveAdmin(handler, PathLocalAdminEvents+"?type=message.available&agent=bob"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("events status=%d", response.Code)
 	}
-	if store.eventsQuery != (application.AdminEventsQuery{AgentName: "bob",
-		EventType: application.CoordinationEventMessageAvailable}) {
+	if store.eventsQuery != (coordination.AdminEventsQuery{AgentName: "bob",
+		EventType: coordination.CoordinationEventMessageAvailable}) {
 		t.Fatalf("events query=%+v", store.eventsQuery)
 	}
 }
@@ -307,34 +307,34 @@ func TestLocalAdminPassesFilterPredicatesToTheStore(t *testing.T) {
 	if response := serveAdmin(handler, PathLocalAdminAgents+"?active=true&limit=25"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("agents status=%d body=%s", response.Code, response.Body.String())
 	}
-	if store.agentsQuery != (application.AdminAgentsQuery{ActiveOnly: true, Limit: 25}) {
+	if store.agentsQuery != (coordination.AdminAgentsQuery{ActiveOnly: true, Limit: 25}) {
 		t.Fatalf("agents query=%+v", store.agentsQuery)
 	}
 	if response := serveAdmin(handler,
 		PathLocalAdminInbox+"?project_key=/repo&unacked=true&limit=25"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("inbox status=%d body=%s", response.Code, response.Body.String())
 	}
-	if store.inboxQuery != (application.AdminInboxQuery{ProjectKey: "/repo", UnackedOnly: true, Limit: 25}) {
+	if store.inboxQuery != (coordination.AdminInboxQuery{ProjectKey: "/repo", UnackedOnly: true, Limit: 25}) {
 		t.Fatalf("inbox query=%+v", store.inboxQuery)
 	}
 	if response := serveAdmin(handler, PathLocalAdminInbox+"?project_key=/repo&unread=true"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("inbox status=%d body=%s", response.Code, response.Body.String())
 	}
-	if store.inboxQuery != (application.AdminInboxQuery{ProjectKey: "/repo", UnreadOnly: true}) {
+	if store.inboxQuery != (coordination.AdminInboxQuery{ProjectKey: "/repo", UnreadOnly: true}) {
 		t.Fatalf("inbox query=%+v", store.inboxQuery)
 	}
 	if response := serveAdmin(handler, PathLocalAdminConversations+"?open=true"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("conversations status=%d body=%s", response.Code, response.Body.String())
 	}
-	if store.conversationsQuery != (application.AdminConversationsQuery{OpenOnly: true}) {
+	if store.conversationsQuery != (coordination.AdminConversationsQuery{OpenOnly: true}) {
 		t.Fatalf("conversations query=%+v", store.conversationsQuery)
 	}
 	if response := serveAdmin(handler,
 		PathLocalAdminReservations+"?mode=shared&path=internal%2Fapp.go"); response.Code != stdhttp.StatusOK {
 		t.Fatalf("reservations status=%d body=%s", response.Code, response.Body.String())
 	}
-	if store.reservationsQuery != (application.AdminReservationsQuery{State: application.AdminReservationAll,
-		Mode: application.LeaseShared, Path: "internal/app.go"}) {
+	if store.reservationsQuery != (coordination.AdminReservationsQuery{State: coordination.AdminReservationAll,
+		Mode: coordination.LeaseShared, Path: "internal/app.go"}) {
 		t.Fatalf("reservations query=%+v", store.reservationsQuery)
 	}
 	if response := serveAdmin(handler, PathLocalAdminReservations+"?mode=any"); response.Code != stdhttp.StatusOK {
@@ -456,7 +456,7 @@ func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 		if page.Summaries[1].UnreadDeliveries != 0 || page.Summaries[1].OldestUnreadAt != "" {
 			t.Fatalf("agent without mail must report zero: %+v", page.Summaries[1])
 		}
-		if page.Pending[0].Subject != "handoff" || page.Pending[0].Kind != string(application.RecipientBcc) ||
+		if page.Pending[0].Subject != "handoff" || page.Pending[0].Kind != string(coordination.RecipientBcc) ||
 			page.Pending[0].Read || !page.Pending[0].AckRequired ||
 			page.Pending[0].RecipientActorID != fixture.actorID.String() ||
 			page.Pending[0].SentAt != fixture.createdAt {
@@ -467,7 +467,7 @@ func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 	t.Run("conversations", func(t *testing.T) {
 		var page localAdminConversationsPage
 		decodeAdmin(t, handler, PathLocalAdminConversations, &page)
-		if len(page.Conversations) != 1 || page.Conversations[0].Status != string(application.AdminConversationOpen) ||
+		if len(page.Conversations) != 1 || page.Conversations[0].Status != string(coordination.AdminConversationOpen) ||
 			page.Conversations[0].Topic != "CLI overhaul" || page.Conversations[0].Messages != 12 ||
 			page.Conversations[0].LastMessageSubject != "handoff" {
 			t.Fatalf("conversations=%+v", page)
@@ -481,11 +481,11 @@ func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 			t.Fatalf("reservations=%+v", page)
 		}
 		reservation := page.Reservations[0]
-		if reservation.State != string(application.AdminReservationExpired) || !reservation.Expired ||
-			reservation.ExpiresInMS != -120000 || reservation.Mode != string(application.LeaseExclusive) ||
+		if reservation.State != string(coordination.AdminReservationExpired) || !reservation.Expired ||
+			reservation.ExpiresInMS != -120000 || reservation.Mode != string(coordination.LeaseExclusive) ||
 			reservation.ReleasedAt != "" || len(reservation.Selectors) != 2 ||
-			reservation.Selectors[0] != (localAdminSelector{Kind: string(application.LeaseSelectorExact), Path: "internal/app.go"}) ||
-			reservation.Selectors[1].Kind != string(application.LeaseSelectorSubtree) {
+			reservation.Selectors[0] != (localAdminSelector{Kind: string(coordination.LeaseSelectorExact), Path: "internal/app.go"}) ||
+			reservation.Selectors[1].Kind != string(coordination.LeaseSelectorSubtree) {
 			t.Fatalf("reservation=%+v", reservation)
 		}
 	})
@@ -494,7 +494,7 @@ func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 		var page localAdminEventsPage
 		decodeAdmin(t, handler, PathLocalAdminEvents, &page)
 		if len(page.Events) != 2 || page.Events[0].Position != 106 ||
-			page.Events[0].Type != string(application.CoordinationEventMessageAvailable) ||
+			page.Events[0].Type != string(coordination.CoordinationEventMessageAvailable) ||
 			string(page.Events[0].Payload) != `{"message_id":"m"}` ||
 			page.Events[0].AgentName != "alice" || page.Events[0].OccurredAt != fixture.observedAt {
 			t.Fatalf("events=%+v", page)
@@ -540,7 +540,7 @@ func TestLocalAdminStoreErrorsBecomeProblemDocuments(t *testing.T) {
 		status int
 		code   domain.ErrorCode
 	}{
-		{name: "invalid coordination", target: PathLocalAdminOverview, err: application.ErrInvalidCoordination,
+		{name: "invalid coordination", target: PathLocalAdminOverview, err: coordination.ErrInvalidCoordination,
 			status: stdhttp.StatusBadRequest, code: domain.ErrorCodeInvalidArgument},
 		{name: "opaque failure", target: PathLocalAdminEvents, err: errAdminTestOpaque,
 			status: stdhttp.StatusInternalServerError, code: domain.ErrorCodeInternal},
@@ -591,8 +591,8 @@ func newAdminFixture(t *testing.T) adminFixture {
 	t.Helper()
 	observed := time.Date(2026, time.August, 15, 9, 41, 2, 113000000, time.UTC)
 	created := observed.Add(-time.Hour)
-	observedUS := application.MicrosFromTime(observed)
-	createdUS := application.MicrosFromTime(created)
+	observedUS := coordination.MicrosFromTime(observed)
+	createdUS := coordination.MicrosFromTime(created)
 	workspaceID, err := domain.NewWorkspaceID()
 	if err != nil {
 		t.Fatal(err)
@@ -625,11 +625,11 @@ func newAdminFixture(t *testing.T) adminFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exact, err := application.NewLeaseSelector(application.LeaseSelectorExact, "internal/app.go")
+	exact, err := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, "internal/app.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	subtree, err := application.NewLeaseSelector(application.LeaseSelectorSubtree, "internal/transport")
+	subtree, err := coordination.NewLeaseSelector(coordination.LeaseSelectorSubtree, "internal/transport")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,62 +641,62 @@ func newAdminFixture(t *testing.T) adminFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	forcedLease, err := application.NewLeaseView(application.LeaseViewParams{LeaseID: leaseID,
+	forcedLease, err := coordination.NewLeaseView(coordination.LeaseViewParams{LeaseID: leaseID,
 		WorkspaceID: workspaceID, Holder: actorID, HolderSession: sessionID, AuthorityEpoch: epoch,
-		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{exact},
+		Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{exact},
 		AcquiredAt: created, ExpiresAt: observed.Add(time.Hour), ReleasedAt: &observed})
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := &stubAdminStore{
 		schemaVersion: 4,
-		identity: application.AdminStorageIdentity{StorageBackend: "sqlite", DatabasePath: "/state/blackbird.db",
+		identity: coordination.AdminStorageIdentity{StorageBackend: "sqlite", DatabasePath: "/state/blackbird.db",
 			SchemaVersion: 4, ObservedAtUS: observedUS},
-		overview: application.AdminOverview{Projects: 2, Agents: 47, ActiveAgents: 3, Conversations: 19, Messages: 27,
+		overview: coordination.AdminOverview{Projects: 2, Agents: 47, ActiveAgents: 3, Conversations: 19, Messages: 27,
 			Deliveries: 39, UnreadDeliveries: 29, UnackedDeliveries: 6, ExpiredReservations: 9,
 			CoordinationEvents: 106, ObservedAtUS: observedUS},
-		projects: application.AdminProjectsPage{ObservedAtUS: observedUS, Projects: []application.AdminProject{
+		projects: coordination.AdminProjectsPage{ObservedAtUS: observedUS, Projects: []coordination.AdminProject{
 			{ProjectKey: "/Users/phall/workspace/blackbird", WorkspaceID: workspaceID, RunID: runID, Agents: 30,
 				ActiveAgents: 2, Conversations: 11, CreatedAtUS: createdUS, LastEventAtUS: observedUS},
 			{ProjectKey: "/Users/phall/dotfiles", WorkspaceID: workspaceID, Agents: 1, CreatedAtUS: createdUS},
 		}},
-		agents: application.AdminAgentsPage{ObservedAtUS: observedUS, Truncated: true, Agents: []application.AdminAgent{
+		agents: coordination.AdminAgentsPage{ObservedAtUS: observedUS, Truncated: true, Agents: []coordination.AdminAgent{
 			{ProjectKey: "/repo", AgentName: "alice", ActorID: actorID, SessionID: sessionID, Active: true,
 				CreatedAtUS: createdUS, StartedAtUS: createdUS, LastSeenAtUS: observedUS, UnreadDeliveries: 4,
 				UnackedDeliveries: 1, ActiveLeases: 2},
 			{ProjectKey: "/repo", AgentName: "bob", ActorID: otherActorID, CreatedAtUS: createdUS},
 		}},
-		inbox: application.AdminInboxPage{ProjectKey: "/repo", ObservedAtUS: observedUS, Truncated: true,
-			Summaries: []application.AdminInboxSummary{
+		inbox: coordination.AdminInboxPage{ProjectKey: "/repo", ObservedAtUS: observedUS, Truncated: true,
+			Summaries: []coordination.AdminInboxSummary{
 				{ProjectKey: "/repo", AgentName: "alice", ActorID: actorID, UnreadDeliveries: 4,
 					UnackedDeliveries: 1, OldestUnreadAtUS: createdUS},
 				{ProjectKey: "/repo", AgentName: "bob", ActorID: otherActorID},
 			},
-			Pending: []application.AdminInboxItem{{MessageID: messageID, ConversationID: conversationID,
+			Pending: []coordination.AdminInboxItem{{MessageID: messageID, ConversationID: conversationID,
 				ProjectKey: "/repo", RecipientAgentName: "alice", RecipientActorID: actorID,
 				AuthorAgentName: "bob", AuthorActorID: otherActorID, Subject: "handoff",
-				Kind: application.RecipientBcc, AcknowledgementRequired: true, SentAtUS: createdUS}}},
-		conversations: application.AdminConversationsPage{ObservedAtUS: observedUS,
-			Conversations: []application.AdminConversation{{ConversationID: conversationID, WorkspaceID: workspaceID,
-				ProjectKey: "/repo", Topic: "CLI overhaul", Status: application.AdminConversationOpen,
+				Kind: coordination.RecipientBcc, AcknowledgementRequired: true, SentAtUS: createdUS}}},
+		conversations: coordination.AdminConversationsPage{ObservedAtUS: observedUS,
+			Conversations: []coordination.AdminConversation{{ConversationID: conversationID, WorkspaceID: workspaceID,
+				ProjectKey: "/repo", Topic: "CLI overhaul", Status: coordination.AdminConversationOpen,
 				OpenedByAgentName: "alice", OpenedByActorID: actorID, Messages: 12, Participants: 3,
 				UnreadDeliveries: 2, OpenedAtUS: createdUS, LastMessageAtUS: observedUS,
 				LastMessageAuthor: "bob", LastMessageSubject: "handoff"}}},
 		forcedLease: forcedLease,
-		reservations: application.AdminReservationsPage{ObservedAtUS: observedUS,
-			Reservations: []application.AdminReservation{{LeaseID: leaseID, ProjectKey: "/repo",
+		reservations: coordination.AdminReservationsPage{ObservedAtUS: observedUS,
+			Reservations: []coordination.AdminReservation{{LeaseID: leaseID, ProjectKey: "/repo",
 				WorkspaceID: workspaceID, HolderAgentName: "alice", HolderActorID: actorID,
-				HolderSessionID: sessionID, Mode: application.LeaseExclusive,
-				State: application.AdminReservationExpired, Expired: true,
-				Selectors:    []application.LeaseSelector{exact, subtree},
-				AcquiredAtUS: createdUS, ExpiresAtUS: application.MicrosFromTime(observed.Add(-2 * time.Minute)),
+				HolderSessionID: sessionID, Mode: coordination.LeaseExclusive,
+				State: coordination.AdminReservationExpired, Expired: true,
+				Selectors:    []coordination.LeaseSelector{exact, subtree},
+				AcquiredAtUS: createdUS, ExpiresAtUS: coordination.MicrosFromTime(observed.Add(-2 * time.Minute)),
 				ExpiresInMS: -120000}}},
-		events: application.AdminEventsPage{ObservedAtUS: observedUS, Events: []application.AdminEvent{
+		events: coordination.AdminEventsPage{ObservedAtUS: observedUS, Events: []coordination.AdminEvent{
 			{Position: 106, ProjectKey: "/repo", WorkspaceID: workspaceID, AgentName: "alice", ActorID: actorID,
-				EventType: application.CoordinationEventMessageAvailable, SubjectID: messageID.String(),
+				EventType: coordination.CoordinationEventMessageAvailable, SubjectID: messageID.String(),
 				Payload: []byte(`{"message_id":"m"}`), OccurredAtUS: observedUS},
 			{Position: 105, ProjectKey: "/repo", WorkspaceID: workspaceID, ActorID: otherActorID,
-				EventType: application.CoordinationEventLeaseReleased, SubjectID: leaseID.String(),
+				EventType: coordination.CoordinationEventLeaseReleased, SubjectID: leaseID.String(),
 				OccurredAtUS: createdUS},
 		}},
 	}
@@ -704,7 +704,7 @@ func newAdminFixture(t *testing.T) adminFixture {
 		leaseID: leaseID, observedAt: observed.Format(time.RFC3339Nano), createdAt: created.Format(time.RFC3339Nano)}
 }
 
-func newAdminTestHandler(t *testing.T, store application.LocalAdminStore,
+func newAdminTestHandler(t *testing.T, store coordination.LocalAdminStore,
 	registries ...*metrics.Registry) stdhttp.Handler {
 	t.Helper()
 	var metrics *metrics.Registry

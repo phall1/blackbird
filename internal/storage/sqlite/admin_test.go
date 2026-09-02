@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -110,17 +110,17 @@ func TestListAdminAgentsIncludesOfflineAgentsAndDeliveryCounts(t *testing.T) {
 	conversation := openAdminConversation(t, store, alice, "release")
 	sendAdminMessage(t, store, alice, conversation, "first", true, bob.ActorID)
 	endAdminSession(t, store, bob)
-	ageAdminSession(t, store, carol, application.LocalAgentActiveWindow+time.Minute)
+	ageAdminSession(t, store, carol, coordination.LocalAgentActiveWindow+time.Minute)
 	lease := acquireAdminLease(t, store, alice, "docs/live.md")
 
-	page, err := store.ListAdminAgents(context.Background(), application.AdminAgentsQuery{ProjectKey: adminProjectA})
+	page, err := store.ListAdminAgents(context.Background(), coordination.AdminAgentsQuery{ProjectKey: adminProjectA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Agents) != 3 || page.Truncated {
 		t.Fatalf("agents=%d truncated=%v", len(page.Agents), page.Truncated)
 	}
-	byName := map[string]application.AdminAgent{}
+	byName := map[string]coordination.AdminAgent{}
 	for _, agent := range page.Agents {
 		byName[agent.AgentName] = agent
 	}
@@ -154,14 +154,14 @@ func TestListAdminAgentsFiltersAndTruncates(t *testing.T) {
 
 	for _, testCase := range []struct {
 		name      string
-		query     application.AdminAgentsQuery
+		query     coordination.AdminAgentsQuery
 		want      []string
 		truncated bool
 	}{
-		{name: "every project", query: application.AdminAgentsQuery{}, want: []string{"alice", "bob", "carol"}},
-		{name: "one project", query: application.AdminAgentsQuery{ProjectKey: adminProjectB}, want: []string{"carol"}},
-		{name: "one agent", query: application.AdminAgentsQuery{AgentName: "bob"}, want: []string{"bob"}},
-		{name: "truncated", query: application.AdminAgentsQuery{Limit: 2}, want: []string{"alice", "bob"}, truncated: true},
+		{name: "every project", query: coordination.AdminAgentsQuery{}, want: []string{"alice", "bob", "carol"}},
+		{name: "one project", query: coordination.AdminAgentsQuery{ProjectKey: adminProjectB}, want: []string{"carol"}},
+		{name: "one agent", query: coordination.AdminAgentsQuery{AgentName: "bob"}, want: []string{"bob"}},
+		{name: "truncated", query: coordination.AdminAgentsQuery{Limit: 2}, want: []string{"alice", "bob"}, truncated: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -195,11 +195,11 @@ func TestAdminInboxSummarizesUnreadUnacknowledgedAndZeroDeliveryAgents(t *testin
 	sendAdminMessage(t, store, alice, conversation, "second", false, bob.ActorID)
 	readAdminDelivery(t, store, bob, first)
 
-	page, err := store.AdminInbox(context.Background(), application.AdminInboxQuery{ProjectKey: adminProjectA})
+	page, err := store.AdminInbox(context.Background(), coordination.AdminInboxQuery{ProjectKey: adminProjectA})
 	if err != nil {
 		t.Fatal(err)
 	}
-	summaries := map[string]application.AdminInboxSummary{}
+	summaries := map[string]coordination.AdminInboxSummary{}
 	for _, summary := range page.Summaries {
 		summaries[summary.AgentName] = summary
 	}
@@ -229,26 +229,26 @@ func TestAdminInboxPendingHidesOtherRecipientsBlindCopies(t *testing.T) {
 	charlie := registerAdminAgent(t, store, adminProjectA, "charlie")
 	conversation := openAdminConversation(t, store, alice, "release")
 	sendAdminMessageWithKinds(t, store, alice, conversation, "confidential", false,
-		map[domain.ActorID]application.RecipientKind{
-			bob.ActorID:     application.RecipientTo,
-			charlie.ActorID: application.RecipientBcc,
+		map[domain.ActorID]coordination.RecipientKind{
+			bob.ActorID:     coordination.RecipientTo,
+			charlie.ActorID: coordination.RecipientBcc,
 		})
 
 	bobPage, err := store.AdminInbox(context.Background(),
-		application.AdminInboxQuery{ProjectKey: adminProjectA, AgentName: "bob"})
+		coordination.AdminInboxQuery{ProjectKey: adminProjectA, AgentName: "bob"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(bobPage.Pending) != 1 || bobPage.Pending[0].RecipientAgentName != "bob" ||
-		bobPage.Pending[0].Kind != application.RecipientTo {
+		bobPage.Pending[0].Kind != coordination.RecipientTo {
 		t.Fatalf("bob pending=%+v", bobPage.Pending)
 	}
 	charliePage, err := store.AdminInbox(context.Background(),
-		application.AdminInboxQuery{ProjectKey: adminProjectA, AgentName: "charlie"})
+		coordination.AdminInboxQuery{ProjectKey: adminProjectA, AgentName: "charlie"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(charliePage.Pending) != 1 || charliePage.Pending[0].Kind != application.RecipientBcc ||
+	if len(charliePage.Pending) != 1 || charliePage.Pending[0].Kind != coordination.RecipientBcc ||
 		charliePage.Pending[0].RecipientActorID != charlie.ActorID {
 		t.Fatalf("charlie pending=%+v", charliePage.Pending)
 	}
@@ -269,7 +269,7 @@ func TestAdminInboxTruncatesAtLimit(t *testing.T) {
 	}
 
 	truncated, err := store.AdminInbox(context.Background(),
-		application.AdminInboxQuery{ProjectKey: adminProjectA, Limit: 2})
+		coordination.AdminInboxQuery{ProjectKey: adminProjectA, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestAdminInboxTruncatesAtLimit(t *testing.T) {
 		t.Fatalf("truncated page=%+v", truncated)
 	}
 	whole, err := store.AdminInbox(context.Background(),
-		application.AdminInboxQuery{ProjectKey: adminProjectA, Limit: 3})
+		coordination.AdminInboxQuery{ProjectKey: adminProjectA, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,8 +290,8 @@ func TestAdminInboxRequiresProjectKey(t *testing.T) {
 	t.Parallel()
 	store := newCoordinationStore(t)
 
-	if _, err := store.AdminInbox(context.Background(), application.AdminInboxQuery{}); !errors.Is(err,
-		application.ErrInvalidCoordination) {
+	if _, err := store.AdminInbox(context.Background(), coordination.AdminInboxQuery{}); !errors.Is(err,
+		coordination.ErrInvalidCoordination) {
 		t.Fatalf("missing project key error=%v", err)
 	}
 }
@@ -319,8 +319,8 @@ func TestForceReleaseAdminReservationClearsLeaseAndRecordsForcedFact(t *testing.
 		t.Fatalf("acquire after force release: %v", err)
 	}
 
-	events, err := store.ListAdminEvents(ctx, application.AdminEventsQuery{
-		EventType: application.CoordinationEventLeaseReleased})
+	events, err := store.ListAdminEvents(ctx, coordination.AdminEventsQuery{
+		EventType: coordination.CoordinationEventLeaseReleased})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,27 +343,27 @@ func TestForceReleaseAdminReservationClearsLeaseAndRecordsForcedFact(t *testing.
 	if !ok || !repeatedAt.Equal(releasedAt) {
 		t.Fatalf("repeated release instant=%v present=%v, want %v", repeatedAt, ok, releasedAt)
 	}
-	events, err = store.ListAdminEvents(ctx, application.AdminEventsQuery{
-		EventType: application.CoordinationEventLeaseReleased})
+	events, err = store.ListAdminEvents(ctx, coordination.AdminEventsQuery{
+		EventType: coordination.CoordinationEventLeaseReleased})
 	if err != nil || len(events.Events) != 1 {
 		t.Fatalf("repeated release events=%d error=%v, want one", len(events.Events), err)
 	}
 }
 
-func acquireAdminLeaseParams(t *testing.T, holder application.LocalAgentSession,
-	path string) application.AcquireLeaseParams {
+func acquireAdminLeaseParams(t *testing.T, holder coordination.LocalAgentSession,
+	path string) coordination.AcquireLeaseParams {
 	t.Helper()
 	leaseID, err := domain.NewLeaseID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, err := application.NewLeaseSelector(application.LeaseSelectorExact, path)
+	selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return application.AcquireLeaseParams{LeaseID: leaseID, WorkspaceID: holder.WorkspaceID,
+	return coordination.AcquireLeaseParams{LeaseID: leaseID, WorkspaceID: holder.WorkspaceID,
 		Holder: holder.ActorID, HolderSession: holder.ActorSessionID, AuthorityEpoch: holder.AuthorityEpoch,
-		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour}
+		Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{selector}, TTL: time.Hour}
 }
 
 func TestListAdminReservationsDerivesExpiryFromStorageClock(t *testing.T) {
@@ -374,27 +374,27 @@ func TestListAdminReservationsDerivesExpiryFromStorageClock(t *testing.T) {
 	stale := acquireAdminLease(t, store, alice, "docs/stale.md")
 	expireAdminLease(t, store, stale.ID())
 
-	page, err := store.ListAdminReservations(context.Background(), application.AdminReservationsQuery{})
+	page, err := store.ListAdminReservations(context.Background(), coordination.AdminReservationsQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Reservations) != 2 || page.ObservedAtUS <= 0 {
 		t.Fatalf("page=%+v", page)
 	}
-	states := map[domain.LeaseID]application.AdminReservation{}
+	states := map[domain.LeaseID]coordination.AdminReservation{}
 	for _, reservation := range page.Reservations {
 		states[reservation.LeaseID] = reservation
 	}
-	if states[live.ID()].State != application.AdminReservationActive || states[live.ID()].Expired ||
+	if states[live.ID()].State != coordination.AdminReservationActive || states[live.ID()].Expired ||
 		states[live.ID()].ExpiresInMS <= 0 {
 		t.Fatalf("live reservation=%+v", states[live.ID()])
 	}
-	if states[stale.ID()].State != application.AdminReservationExpired || !states[stale.ID()].Expired ||
+	if states[stale.ID()].State != coordination.AdminReservationExpired || !states[stale.ID()].Expired ||
 		states[stale.ID()].ExpiresInMS >= 0 {
 		t.Fatalf("stale reservation=%+v", states[stale.ID()])
 	}
 	if states[live.ID()].HolderAgentName != "alice" || states[live.ID()].ProjectKey != adminProjectA ||
-		states[live.ID()].Mode != application.LeaseExclusive ||
+		states[live.ID()].Mode != coordination.LeaseExclusive ||
 		states[live.ID()].HolderActorID != alice.ActorID {
 		t.Fatalf("holder attribution=%+v", states[live.ID()])
 	}
@@ -410,16 +410,16 @@ func TestListAdminReservationsFiltersStateInSQL(t *testing.T) {
 	stale := acquireAdminLease(t, store, alice, "docs/stale.md")
 	expireAdminLease(t, store, stale.ID())
 
-	page, err := store.ListAdminReservations(context.Background(), application.AdminReservationsQuery{
-		State: application.AdminReservationExpired, Limit: 1})
+	page, err := store.ListAdminReservations(context.Background(), coordination.AdminReservationsQuery{
+		State: coordination.AdminReservationExpired, Limit: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Reservations) != 1 || page.Reservations[0].LeaseID != stale.ID() || page.Truncated {
 		t.Fatalf("expired page=%+v", page)
 	}
-	active, err := store.ListAdminReservations(context.Background(), application.AdminReservationsQuery{
-		State: application.AdminReservationActive, ProjectKey: adminProjectB})
+	active, err := store.ListAdminReservations(context.Background(), coordination.AdminReservationsQuery{
+		State: coordination.AdminReservationActive, ProjectKey: adminProjectB})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +434,7 @@ func TestListAdminReservationsReturnsSelectorsInOrdinalOrder(t *testing.T) {
 	alice := registerAdminAgent(t, store, adminProjectA, "alice")
 	acquireAdminLease(t, store, alice, "docs/a.md", "docs/b.md", "docs/c.md")
 
-	page, err := store.ListAdminReservations(context.Background(), application.AdminReservationsQuery{
+	page, err := store.ListAdminReservations(context.Background(), coordination.AdminReservationsQuery{
 		AgentName: "alice"})
 	if err != nil {
 		t.Fatal(err)
@@ -444,7 +444,7 @@ func TestListAdminReservationsReturnsSelectorsInOrdinalOrder(t *testing.T) {
 	}
 	for index, want := range []string{"docs/a.md", "docs/b.md", "docs/c.md"} {
 		selector := page.Reservations[0].Selectors[index]
-		if selector.Path() != want || selector.Kind() != application.LeaseSelectorExact {
+		if selector.Path() != want || selector.Kind() != coordination.LeaseSelectorExact {
 			t.Fatalf("selector %d=%+v want %q", index, selector, want)
 		}
 	}
@@ -457,10 +457,10 @@ func TestListAdminReservationsRejectsInvalidStateAndNormalizesZero(t *testing.T)
 	acquireAdminLease(t, store, alice, "docs/live.md")
 
 	if _, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{State: "bogus"}); !errors.Is(err, application.ErrInvalidCoordination) {
+		coordination.AdminReservationsQuery{State: "bogus"}); !errors.Is(err, coordination.ErrInvalidCoordination) {
 		t.Fatalf("invalid state error=%v", err)
 	}
-	page, err := store.ListAdminReservations(context.Background(), application.AdminReservationsQuery{})
+	page, err := store.ListAdminReservations(context.Background(), coordination.AdminReservationsQuery{})
 	if err != nil || len(page.Reservations) != 1 {
 		t.Fatalf("zero-value state page=%+v error=%v", page, err)
 	}
@@ -476,11 +476,11 @@ func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 	message := sendAdminMessage(t, store, alice, conversation, "fanout", false, bob.ActorID, charlie.ActorID)
 	acquireAdminLease(t, store, alice, "docs/live.md")
 
-	page, err := store.ListAdminEvents(context.Background(), application.AdminEventsQuery{})
+	page, err := store.ListAdminEvents(context.Background(), coordination.AdminEventsQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Events) != 2 || page.Events[0].EventType != application.CoordinationEventLeaseAcquired {
+	if len(page.Events) != 2 || page.Events[0].EventType != coordination.CoordinationEventLeaseAcquired {
 		t.Fatalf("events=%+v", page.Events)
 	}
 	for index := 1; index < len(page.Events); index++ {
@@ -488,8 +488,8 @@ func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 			t.Fatalf("positions are not descending: %+v", page.Events)
 		}
 	}
-	available, err := store.ListAdminEvents(context.Background(), application.AdminEventsQuery{
-		EventType: application.CoordinationEventMessageAvailable})
+	available, err := store.ListAdminEvents(context.Background(), coordination.AdminEventsQuery{
+		EventType: coordination.CoordinationEventMessageAvailable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +502,7 @@ func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 		t.Fatalf("event=%+v", event)
 	}
 	if _, err := store.ListAdminEvents(context.Background(),
-		application.AdminEventsQuery{EventType: "bogus"}); !errors.Is(err, application.ErrInvalidCoordination) {
+		coordination.AdminEventsQuery{EventType: "bogus"}); !errors.Is(err, coordination.ErrInvalidCoordination) {
 		t.Fatalf("invalid event type error=%v", err)
 	}
 }
@@ -518,7 +518,7 @@ func TestListAdminConversationsSummarizesThread(t *testing.T) {
 	readAdminDelivery(t, store, bob, last)
 
 	page, err := store.ListAdminConversations(context.Background(),
-		application.AdminConversationsQuery{ProjectKey: adminProjectA})
+		coordination.AdminConversationsQuery{ProjectKey: adminProjectA})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +527,7 @@ func TestListAdminConversationsSummarizesThread(t *testing.T) {
 	}
 	summary := page.Conversations[0]
 	if summary.ConversationID != conversation || summary.Topic != "release" ||
-		summary.Status != application.AdminConversationOpen || summary.ProjectKey != adminProjectA {
+		summary.Status != coordination.AdminConversationOpen || summary.ProjectKey != adminProjectA {
 		t.Fatalf("summary=%+v", summary)
 	}
 	if summary.Messages != 2 || summary.Participants != 2 || summary.UnreadDeliveries != 1 {
@@ -538,7 +538,7 @@ func TestListAdminConversationsSummarizesThread(t *testing.T) {
 		t.Fatalf("summary attribution=%+v", summary)
 	}
 	single, err := store.ListAdminConversations(context.Background(),
-		application.AdminConversationsQuery{ConversationID: conversation})
+		coordination.AdminConversationsQuery{ConversationID: conversation})
 	if err != nil || len(single.Conversations) != 1 {
 		t.Fatalf("single conversation page=%+v error=%v", single, err)
 	}
@@ -547,8 +547,8 @@ func TestListAdminConversationsSummarizesThread(t *testing.T) {
 func TestAdminQueriesRejectInvalidFilters(t *testing.T) {
 	t.Parallel()
 	store := newCoordinationStore(t)
-	oversized := string(make([]byte, application.MaxCoordinationKeyBytes+1))
-	overLimit := uint16(application.MaxQueryPageSize + 1)
+	oversized := string(make([]byte, coordination.MaxCoordinationKeyBytes+1))
+	overLimit := uint16(coordination.MaxQueryPageSize + 1)
 
 	for _, testCase := range []struct {
 		name string
@@ -556,42 +556,42 @@ func TestAdminQueriesRejectInvalidFilters(t *testing.T) {
 	}{
 		{name: "agents project key", call: func() error {
 			_, err := store.ListAdminAgents(context.Background(),
-				application.AdminAgentsQuery{ProjectKey: oversized})
+				coordination.AdminAgentsQuery{ProjectKey: oversized})
 			return err
 		}},
 		{name: "agents limit", call: func() error {
-			_, err := store.ListAdminAgents(context.Background(), application.AdminAgentsQuery{Limit: overLimit})
+			_, err := store.ListAdminAgents(context.Background(), coordination.AdminAgentsQuery{Limit: overLimit})
 			return err
 		}},
 		{name: "inbox agent name", call: func() error {
 			_, err := store.AdminInbox(context.Background(),
-				application.AdminInboxQuery{ProjectKey: adminProjectA, AgentName: " bob "})
+				coordination.AdminInboxQuery{ProjectKey: adminProjectA, AgentName: " bob "})
 			return err
 		}},
 		{name: "inbox limit", call: func() error {
 			_, err := store.AdminInbox(context.Background(),
-				application.AdminInboxQuery{ProjectKey: adminProjectA, Limit: overLimit})
+				coordination.AdminInboxQuery{ProjectKey: adminProjectA, Limit: overLimit})
 			return err
 		}},
 		{name: "conversations project key", call: func() error {
 			_, err := store.ListAdminConversations(context.Background(),
-				application.AdminConversationsQuery{ProjectKey: oversized})
+				coordination.AdminConversationsQuery{ProjectKey: oversized})
 			return err
 		}},
 		{name: "reservations limit", call: func() error {
 			_, err := store.ListAdminReservations(context.Background(),
-				application.AdminReservationsQuery{Limit: overLimit})
+				coordination.AdminReservationsQuery{Limit: overLimit})
 			return err
 		}},
 		{name: "events project key", call: func() error {
 			_, err := store.ListAdminEvents(context.Background(),
-				application.AdminEventsQuery{ProjectKey: oversized})
+				coordination.AdminEventsQuery{ProjectKey: oversized})
 			return err
 		}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			if err := testCase.call(); !errors.Is(err, application.ErrInvalidCoordination) {
+			if err := testCase.call(); !errors.Is(err, coordination.ErrInvalidCoordination) {
 				t.Fatalf("error=%v", err)
 			}
 		})
@@ -639,7 +639,7 @@ func TestAdminStorageIdentityReportsBackendAndPath(t *testing.T) {
 	}
 }
 
-func registerAdminAgent(t *testing.T, store *Store, projectKey, name string) application.LocalAgentSession {
+func registerAdminAgent(t *testing.T, store *Store, projectKey, name string) coordination.LocalAgentSession {
 	t.Helper()
 	session, _, err := store.RegisterLocalAgent(context.Background(), projectKey, name, "")
 	if err != nil {
@@ -648,14 +648,14 @@ func registerAdminAgent(t *testing.T, store *Store, projectKey, name string) app
 	return session
 }
 
-func openAdminConversation(t *testing.T, store *Store, opener application.LocalAgentSession,
+func openAdminConversation(t *testing.T, store *Store, opener coordination.LocalAgentSession,
 	topic string) domain.ConversationID {
 	t.Helper()
 	conversationID, err := domain.NewConversationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{
+	if _, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{
 		ConversationID: conversationID, WorkspaceID: opener.WorkspaceID, RunID: opener.RunID,
 		OpenedBy: opener.ActorID, OpenedBySession: opener.ActorSessionID, Topic: topic,
 	}); err != nil {
@@ -664,34 +664,34 @@ func openAdminConversation(t *testing.T, store *Store, opener application.LocalA
 	return conversationID
 }
 
-func sendAdminMessage(t *testing.T, store *Store, author application.LocalAgentSession,
+func sendAdminMessage(t *testing.T, store *Store, author coordination.LocalAgentSession,
 	conversation domain.ConversationID, subject string, acknowledgementRequired bool,
-	recipients ...domain.ActorID) application.Message {
+	recipients ...domain.ActorID) coordination.Message {
 	t.Helper()
-	kinds := make(map[domain.ActorID]application.RecipientKind, len(recipients))
+	kinds := make(map[domain.ActorID]coordination.RecipientKind, len(recipients))
 	for _, recipient := range recipients {
-		kinds[recipient] = application.RecipientTo
+		kinds[recipient] = coordination.RecipientTo
 	}
 	return sendAdminMessageWithKinds(t, store, author, conversation, subject, acknowledgementRequired, kinds)
 }
 
-func sendAdminMessageWithKinds(t *testing.T, store *Store, author application.LocalAgentSession,
+func sendAdminMessageWithKinds(t *testing.T, store *Store, author coordination.LocalAgentSession,
 	conversation domain.ConversationID, subject string, acknowledgementRequired bool,
-	kinds map[domain.ActorID]application.RecipientKind) application.Message {
+	kinds map[domain.ActorID]coordination.RecipientKind) coordination.Message {
 	t.Helper()
 	messageID, err := domain.NewMessageID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	recipients := make([]application.Recipient, 0, len(kinds))
+	recipients := make([]coordination.Recipient, 0, len(kinds))
 	for actor, kind := range kinds {
-		recipient, recipientErr := application.NewRecipient(actor, kind)
+		recipient, recipientErr := coordination.NewRecipient(actor, kind)
 		if recipientErr != nil {
 			t.Fatal(recipientErr)
 		}
 		recipients = append(recipients, recipient)
 	}
-	message, err := store.SendMessage(context.Background(), application.SendMessageParams{
+	message, err := store.SendMessage(context.Background(), coordination.SendMessageParams{
 		MessageID: messageID, ConversationID: conversation, WorkspaceID: author.WorkspaceID,
 		Author: author.ActorID, AuthorSession: author.ActorSessionID, Subject: subject,
 		Body: "body of " + subject, Recipients: recipients,
@@ -703,40 +703,40 @@ func sendAdminMessageWithKinds(t *testing.T, store *Store, author application.Lo
 	return message
 }
 
-func readAdminDelivery(t *testing.T, store *Store, recipient application.LocalAgentSession,
-	message application.Message) {
+func readAdminDelivery(t *testing.T, store *Store, recipient coordination.LocalAgentSession,
+	message coordination.Message) {
 	t.Helper()
 	session := recipient.ActorSessionID
-	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{
+	if _, err := store.RecordDeliveryFact(context.Background(), coordination.RecordDeliveryFactParams{
 		WorkspaceID: recipient.WorkspaceID, MessageID: message.ID(), Recipient: recipient.ActorID,
-		ActorSessionID: &session, Kind: application.DeliveryRead,
+		ActorSessionID: &session, Kind: coordination.DeliveryRead,
 	}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func acquireAdminLease(t *testing.T, store *Store, holder application.LocalAgentSession,
-	paths ...string) application.Lease {
+func acquireAdminLease(t *testing.T, store *Store, holder coordination.LocalAgentSession,
+	paths ...string) coordination.Lease {
 	t.Helper()
-	return acquireAdminLeaseAs(t, store, holder, application.LeaseExclusive, time.Hour, paths...)
+	return acquireAdminLeaseAs(t, store, holder, coordination.LeaseExclusive, time.Hour, paths...)
 }
 
-func acquireAdminLeaseAs(t *testing.T, store *Store, holder application.LocalAgentSession,
-	mode application.LeaseMode, ttl time.Duration, paths ...string) application.Lease {
+func acquireAdminLeaseAs(t *testing.T, store *Store, holder coordination.LocalAgentSession,
+	mode coordination.LeaseMode, ttl time.Duration, paths ...string) coordination.Lease {
 	t.Helper()
 	leaseID, err := domain.NewLeaseID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	selectors := make([]application.LeaseSelector, 0, len(paths))
+	selectors := make([]coordination.LeaseSelector, 0, len(paths))
 	for _, path := range paths {
-		selector, selectorErr := application.NewLeaseSelector(application.LeaseSelectorExact, path)
+		selector, selectorErr := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, path)
 		if selectorErr != nil {
 			t.Fatal(selectorErr)
 		}
 		selectors = append(selectors, selector)
 	}
-	lease, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{
+	lease, err := store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{
 		LeaseID: leaseID, WorkspaceID: holder.WorkspaceID, Holder: holder.ActorID,
 		HolderSession: holder.ActorSessionID, AuthorityEpoch: holder.AuthorityEpoch,
 		Mode: mode, Selectors: selectors, TTL: ttl,
@@ -763,7 +763,7 @@ func expireAdminLease(t *testing.T, store *Store, lease domain.LeaseID) {
 	}
 }
 
-func endAdminSession(t *testing.T, store *Store, session application.LocalAgentSession) {
+func endAdminSession(t *testing.T, store *Store, session coordination.LocalAgentSession) {
 	t.Helper()
 	if _, err := store.db.ExecContext(context.Background(),
 		`UPDATE coordination_agent_sessions SET ended_at_us = last_seen_at_us WHERE session_id = ?`,
@@ -772,7 +772,7 @@ func endAdminSession(t *testing.T, store *Store, session application.LocalAgentS
 	}
 }
 
-func ageAdminSession(t *testing.T, store *Store, session application.LocalAgentSession, age time.Duration) {
+func ageAdminSession(t *testing.T, store *Store, session coordination.LocalAgentSession, age time.Duration) {
 	t.Helper()
 	aged := timeMicros(time.Now().UTC().Add(-age))
 	if _, err := store.db.ExecContext(context.Background(),
@@ -796,7 +796,7 @@ func TestAdminInboxFiltersPendingBeforeLimit(t *testing.T) {
 		name      string
 		matching  []delivery
 		head      []delivery
-		query     application.AdminInboxQuery
+		query     coordination.AdminInboxQuery
 		want      []string
 		truncated bool
 	}{
@@ -805,7 +805,7 @@ func TestAdminInboxFiltersPendingBeforeLimit(t *testing.T) {
 			matching: []delivery{{subject: "unread-1"}, {subject: "unread-2"}, {subject: "unread-3"}},
 			head: []delivery{{subject: "read-1", ackNeeded: true, read: true},
 				{subject: "read-2", ackNeeded: true, read: true}},
-			query:     application.AdminInboxQuery{UnreadOnly: true, Limit: 2},
+			query:     coordination.AdminInboxQuery{UnreadOnly: true, Limit: 2},
 			want:      []string{"unread-3", "unread-2"},
 			truncated: true,
 		},
@@ -814,7 +814,7 @@ func TestAdminInboxFiltersPendingBeforeLimit(t *testing.T) {
 			matching: []delivery{{subject: "unacked-1", ackNeeded: true}, {subject: "unacked-2", ackNeeded: true},
 				{subject: "unacked-3", ackNeeded: true}},
 			head:      []delivery{{subject: "no-ack-1"}, {subject: "no-ack-2"}},
-			query:     application.AdminInboxQuery{UnackedOnly: true, Limit: 2},
+			query:     coordination.AdminInboxQuery{UnackedOnly: true, Limit: 2},
 			want:      []string{"unacked-3", "unacked-2"},
 			truncated: true,
 		},
@@ -823,7 +823,7 @@ func TestAdminInboxFiltersPendingBeforeLimit(t *testing.T) {
 			matching: []delivery{{subject: "both-1", ackNeeded: true}, {subject: "both-2", ackNeeded: true},
 				{subject: "both-3", ackNeeded: true}},
 			head:      []delivery{{subject: "read-1", ackNeeded: true, read: true}, {subject: "no-ack-1"}},
-			query:     application.AdminInboxQuery{UnreadOnly: true, UnackedOnly: true, Limit: 2},
+			query:     coordination.AdminInboxQuery{UnreadOnly: true, UnackedOnly: true, Limit: 2},
 			want:      []string{"both-3", "both-2"},
 			truncated: true,
 		},
@@ -831,14 +831,14 @@ func TestAdminInboxFiltersPendingBeforeLimit(t *testing.T) {
 			name:     "whole filtered page is not truncated",
 			matching: []delivery{{subject: "unread-1"}, {subject: "unread-2"}},
 			head:     []delivery{{subject: "read-1", ackNeeded: true, read: true}},
-			query:    application.AdminInboxQuery{UnreadOnly: true, Limit: 2},
+			query:    coordination.AdminInboxQuery{UnreadOnly: true, Limit: 2},
 			want:     []string{"unread-2", "unread-1"},
 		},
 		{
 			name:     "no predicate keeps every pending delivery",
 			matching: []delivery{{subject: "unread-1"}},
 			head:     []delivery{{subject: "read-1", ackNeeded: true, read: true}},
-			query:    application.AdminInboxQuery{Limit: 2},
+			query:    coordination.AdminInboxQuery{Limit: 2},
 			want:     []string{"read-1", "unread-1"},
 		},
 	} {
@@ -888,10 +888,10 @@ func TestListAdminAgentsFiltersActiveBeforeLimit(t *testing.T) {
 	registerAdminAgent(t, store, adminProjectA, "zzb-live")
 	registerAdminAgent(t, store, adminProjectA, "zzc-live")
 	endAdminSession(t, store, ended)
-	ageAdminSession(t, store, stale, application.LocalAgentActiveWindow+time.Minute)
+	ageAdminSession(t, store, stale, coordination.LocalAgentActiveWindow+time.Minute)
 
 	page, err := store.ListAdminAgents(context.Background(),
-		application.AdminAgentsQuery{ProjectKey: adminProjectA, ActiveOnly: true, Limit: 2})
+		coordination.AdminAgentsQuery{ProjectKey: adminProjectA, ActiveOnly: true, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -900,7 +900,7 @@ func TestListAdminAgentsFiltersActiveBeforeLimit(t *testing.T) {
 		t.Fatalf("active page=%+v", page)
 	}
 	whole, err := store.ListAdminAgents(context.Background(),
-		application.AdminAgentsQuery{ProjectKey: adminProjectA, ActiveOnly: true, Limit: 3})
+		coordination.AdminAgentsQuery{ProjectKey: adminProjectA, ActiveOnly: true, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +913,7 @@ func TestListAdminAgentsFiltersActiveBeforeLimit(t *testing.T) {
 		}
 	}
 	unfiltered, err := store.ListAdminAgents(context.Background(),
-		application.AdminAgentsQuery{ProjectKey: adminProjectA})
+		coordination.AdminAgentsQuery{ProjectKey: adminProjectA})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -939,7 +939,7 @@ func TestListAdminConversationsFiltersOpenBeforeLimit(t *testing.T) {
 	}
 
 	page, err := store.ListAdminConversations(context.Background(),
-		application.AdminConversationsQuery{ProjectKey: adminProjectA, OpenOnly: true, Limit: 2})
+		coordination.AdminConversationsQuery{ProjectKey: adminProjectA, OpenOnly: true, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -948,7 +948,7 @@ func TestListAdminConversationsFiltersOpenBeforeLimit(t *testing.T) {
 		t.Fatalf("open page=%+v", page)
 	}
 	whole, err := store.ListAdminConversations(context.Background(),
-		application.AdminConversationsQuery{ProjectKey: adminProjectA, OpenOnly: true, Limit: 3})
+		coordination.AdminConversationsQuery{ProjectKey: adminProjectA, OpenOnly: true, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,17 +956,17 @@ func TestListAdminConversationsFiltersOpenBeforeLimit(t *testing.T) {
 		t.Fatalf("whole open page=%+v", whole)
 	}
 	for _, conversation := range whole.Conversations {
-		if conversation.Status != application.AdminConversationOpen {
+		if conversation.Status != coordination.AdminConversationOpen {
 			t.Fatalf("closed conversation on an open-only page: %+v", conversation)
 		}
 	}
 	unfiltered, err := store.ListAdminConversations(context.Background(),
-		application.AdminConversationsQuery{ProjectKey: adminProjectA, Limit: 2})
+		coordination.AdminConversationsQuery{ProjectKey: adminProjectA, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !unfiltered.Truncated || len(unfiltered.Conversations) != 2 ||
-		unfiltered.Conversations[0].Status != application.AdminConversationClosed {
+		unfiltered.Conversations[0].Status != coordination.AdminConversationClosed {
 		t.Fatalf("unfiltered page=%+v", unfiltered)
 	}
 }
@@ -977,15 +977,15 @@ func TestListAdminReservationsFiltersModeBeforeLimit(t *testing.T) {
 	t.Parallel()
 	store := newCoordinationStore(t)
 	alice := registerAdminAgent(t, store, adminProjectA, "alice")
-	acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, 2*time.Hour, "x/1.go")
-	acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, 2*time.Hour, "x/2.go")
+	acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, 2*time.Hour, "x/1.go")
+	acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, 2*time.Hour, "x/2.go")
 	shared := map[domain.LeaseID]struct{}{}
 	for _, path := range []string{"s/1.go", "s/2.go", "s/3.go"} {
-		shared[acquireAdminLeaseAs(t, store, alice, application.LeaseShared, time.Hour, path).ID()] = struct{}{}
+		shared[acquireAdminLeaseAs(t, store, alice, coordination.LeaseShared, time.Hour, path).ID()] = struct{}{}
 	}
 
 	page, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{ProjectKey: adminProjectA, Mode: application.LeaseShared, Limit: 2})
+		coordination.AdminReservationsQuery{ProjectKey: adminProjectA, Mode: coordination.LeaseShared, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -993,7 +993,7 @@ func TestListAdminReservationsFiltersModeBeforeLimit(t *testing.T) {
 		t.Fatalf("shared page=%+v", page)
 	}
 	whole, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{ProjectKey: adminProjectA, Mode: application.LeaseShared, Limit: 3})
+		coordination.AdminReservationsQuery{ProjectKey: adminProjectA, Mode: coordination.LeaseShared, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1001,12 +1001,12 @@ func TestListAdminReservationsFiltersModeBeforeLimit(t *testing.T) {
 		t.Fatalf("whole shared page=%+v", whole)
 	}
 	for _, reservation := range whole.Reservations {
-		if _, ok := shared[reservation.LeaseID]; !ok || reservation.Mode != application.LeaseShared {
+		if _, ok := shared[reservation.LeaseID]; !ok || reservation.Mode != coordination.LeaseShared {
 			t.Fatalf("exclusive lease on a shared-only page: %+v", reservation)
 		}
 	}
 	exclusive, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{ProjectKey: adminProjectA, Mode: application.LeaseExclusive})
+		coordination.AdminReservationsQuery{ProjectKey: adminProjectA, Mode: coordination.LeaseExclusive})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1021,15 +1021,15 @@ func TestListAdminReservationsFiltersPathOnSeparatorBoundariesBeforeLimit(t *tes
 	t.Parallel()
 	store := newCoordinationStore(t)
 	alice := registerAdminAgent(t, store, adminProjectA, "alice")
-	sibling := acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, 2*time.Hour, "a/foo/x.go")
-	acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, 2*time.Hour, "b/y.go")
-	exact := acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, time.Hour, "a/f")
-	child := acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, time.Hour, "a/f/g.go")
-	ancestor := acquireAdminLeaseAs(t, store, alice, application.LeaseExclusive, time.Hour, "a")
+	sibling := acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, 2*time.Hour, "a/foo/x.go")
+	acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, 2*time.Hour, "b/y.go")
+	exact := acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, time.Hour, "a/f")
+	child := acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, time.Hour, "a/f/g.go")
+	ancestor := acquireAdminLeaseAs(t, store, alice, coordination.LeaseExclusive, time.Hour, "a")
 	covering := map[domain.LeaseID]struct{}{exact.ID(): {}, child.ID(): {}, ancestor.ID(): {}}
 
 	page, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{ProjectKey: adminProjectA, Path: "a/f", Limit: 2})
+		coordination.AdminReservationsQuery{ProjectKey: adminProjectA, Path: "a/f", Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,7 +1037,7 @@ func TestListAdminReservationsFiltersPathOnSeparatorBoundariesBeforeLimit(t *tes
 		t.Fatalf("path page=%+v", page)
 	}
 	whole, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{ProjectKey: adminProjectA, Path: "a/f", Limit: 3})
+		coordination.AdminReservationsQuery{ProjectKey: adminProjectA, Path: "a/f", Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1053,7 +1053,7 @@ func TestListAdminReservationsFiltersPathOnSeparatorBoundariesBeforeLimit(t *tes
 		}
 	}
 	sub, err := store.ListAdminReservations(context.Background(),
-		application.AdminReservationsQuery{ProjectKey: adminProjectA, Path: "a/foo"})
+		coordination.AdminReservationsQuery{ProjectKey: adminProjectA, Path: "a/foo"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1073,18 +1073,18 @@ func TestListAdminReservationsRejectsUnknownModeAndInvalidPath(t *testing.T) {
 
 	for _, testCase := range []struct {
 		name  string
-		query application.AdminReservationsQuery
+		query coordination.AdminReservationsQuery
 	}{
-		{name: "unknown mode", query: application.AdminReservationsQuery{Mode: "any"}},
-		{name: "empty-ish path", query: application.AdminReservationsQuery{Path: " "}},
-		{name: "padded path", query: application.AdminReservationsQuery{Path: " a/f "}},
-		{name: "oversized path", query: application.AdminReservationsQuery{
-			Path: string(make([]byte, application.MaxLeaseSelectorBytes+1))}},
+		{name: "unknown mode", query: coordination.AdminReservationsQuery{Mode: "any"}},
+		{name: "empty-ish path", query: coordination.AdminReservationsQuery{Path: " "}},
+		{name: "padded path", query: coordination.AdminReservationsQuery{Path: " a/f "}},
+		{name: "oversized path", query: coordination.AdminReservationsQuery{
+			Path: string(make([]byte, coordination.MaxLeaseSelectorBytes+1))}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			if _, err := store.ListAdminReservations(context.Background(), testCase.query); !errors.Is(err,
-				application.ErrInvalidCoordination) {
+				coordination.ErrInvalidCoordination) {
 				t.Fatalf("error=%v", err)
 			}
 		})
@@ -1124,7 +1124,7 @@ func TestAdminReservationBucketsSurviveTheExpiryReaper(t *testing.T) {
 	alice := registerAdminAgent(t, store, adminProjectA, "alice")
 	live := acquireAdminLease(t, store, alice, "docs/live.md")
 	releasedEarly := acquireAdminLease(t, store, alice, "docs/released.md")
-	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{
+	if _, err := store.ReleaseLease(context.Background(), coordination.ChangeLeaseParams{
 		WorkspaceID: alice.WorkspaceID, Holder: alice.ActorID, HolderSession: alice.ActorSessionID,
 		AuthorityEpoch: alice.AuthorityEpoch, Selectors: releasedEarly.Selectors(),
 	}); err != nil {
@@ -1136,16 +1136,16 @@ func TestAdminReservationBucketsSurviveTheExpiryReaper(t *testing.T) {
 	abandoned := acquireAdminLease(t, store, alice, "docs/abandoned.md")
 	expireAdminLease(t, store, abandoned.ID())
 
-	bucketOf := func(t *testing.T, lease domain.LeaseID) application.AdminReservationState {
+	bucketOf := func(t *testing.T, lease domain.LeaseID) coordination.AdminReservationState {
 		t.Helper()
-		var found application.AdminReservationState
-		for _, state := range []application.AdminReservationState{
-			application.AdminReservationActive,
-			application.AdminReservationExpired,
-			application.AdminReservationReleased,
+		var found coordination.AdminReservationState
+		for _, state := range []coordination.AdminReservationState{
+			coordination.AdminReservationActive,
+			coordination.AdminReservationExpired,
+			coordination.AdminReservationReleased,
 		} {
 			page, err := store.ListAdminReservations(context.Background(),
-				application.AdminReservationsQuery{State: state})
+				coordination.AdminReservationsQuery{State: state})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1168,10 +1168,10 @@ func TestAdminReservationBucketsSurviveTheExpiryReaper(t *testing.T) {
 
 	assertBuckets := func(t *testing.T, stage string) {
 		t.Helper()
-		for lease, want := range map[domain.LeaseID]application.AdminReservationState{
-			live.ID():          application.AdminReservationActive,
-			abandoned.ID():     application.AdminReservationExpired,
-			releasedEarly.ID(): application.AdminReservationReleased,
+		for lease, want := range map[domain.LeaseID]coordination.AdminReservationState{
+			live.ID():          coordination.AdminReservationActive,
+			abandoned.ID():     coordination.AdminReservationExpired,
+			releasedEarly.ID(): coordination.AdminReservationReleased,
 		} {
 			if got := bucketOf(t, lease); got != want {
 				t.Fatalf("%s: lease %s is %s, want %s", stage, lease, got, want)

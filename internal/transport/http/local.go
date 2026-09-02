@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -45,7 +46,7 @@ type TelemetryOffer interface {
 }
 
 type LocalDependencies struct {
-	Coordination application.LocalCoordinationStore
+	Coordination coordination.LocalCoordinationStore
 	// Telemetry is optional. A nil sink makes the ingest route answer
 	// DEPENDENCY_UNAVAILABLE instead of disappearing, so an adapter learns that
 	// this daemon does not collect rather than that it does not exist.
@@ -60,7 +61,7 @@ type LocalDependencies struct {
 }
 
 type localHandler struct {
-	coordination  application.LocalCoordinationStore
+	coordination  coordination.LocalCoordinationStore
 	telemetrySink TelemetryOffer
 	logger        *slog.Logger
 	pollInterval  time.Duration
@@ -94,11 +95,11 @@ type localRegisterResponse struct {
 }
 
 type localCoordinationEvent struct {
-	Type       application.CoordinationEventType `json:"type"`
-	Subject    string                            `json:"subject"`
-	Payload    json.RawMessage                   `json:"payload"`
-	OccurredAt string                            `json:"occurred_at"`
-	Cursor     string                            `json:"cursor"`
+	Type       coordination.CoordinationEventType `json:"type"`
+	Subject    string                             `json:"subject"`
+	Payload    json.RawMessage                    `json:"payload"`
+	OccurredAt string                             `json:"occurred_at"`
+	Cursor     string                             `json:"cursor"`
 }
 
 type localCoordinationConsumerAck struct {
@@ -281,7 +282,7 @@ func (handler *localHandler) message(writer stdhttp.ResponseWriter, request *std
 	writeLocalJSON(writer, stdhttp.StatusOK, localMessageOutput(message))
 }
 
-func localMessageOutput(message application.Message) localMessage {
+func localMessageOutput(message coordination.Message) localMessage {
 	digest := message.Digest()
 	result := localMessage{MessageID: message.ID().String(), ConversationID: message.ConversationID().String(),
 		AuthorActorID: message.Author().String(), Subject: message.Subject(), Body: message.Body(),
@@ -399,18 +400,18 @@ func (handler *localHandler) ackEvents(writer stdhttp.ResponseWriter, request *s
 			"request body does not match the coordination consumer acknowledgement schema")
 		return
 	}
-	consumer, err := application.NewCoordinationConsumerID(input.ConsumerID)
+	consumer, err := coordination.NewCoordinationConsumerID(input.ConsumerID)
 	if err != nil {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
 			"consumer_id must contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens")
 		return
 	}
-	cursor, err := application.NewCoordinationEventCursor(input.Cursor)
+	cursor, err := coordination.NewCoordinationEventCursor(input.Cursor)
 	if err != nil {
 		handler.fail(writer, request, "coordination.events.ack", err)
 		return
 	}
-	commit, err := application.NewCoordinationConsumerCommit(session.WorkspaceID, session.ActorID, consumer, cursor)
+	commit, err := coordination.NewCoordinationConsumerCommit(session.WorkspaceID, session.ActorID, consumer, cursor)
 	if err == nil {
 		err = handler.coordination.CommitCoordinationConsumer(request.Context(), commit)
 	}
@@ -449,7 +450,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 		return
 	}
 	// Validate the supplied cursor before committing an SSE response.
-	page, err := handler.sync(request, session, after, consumer, application.MaxQueryPageSize)
+	page, err := handler.sync(request, session, after, consumer, coordination.MaxQueryPageSize)
 	if err != nil {
 		handler.fail(writer, request, "coordination.events.stream", err)
 		return
@@ -482,7 +483,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 			}
 			cursor = next
 			if page.HasMore() {
-				page, err = handler.sync(request, session, cursor, "", application.MaxQueryPageSize)
+				page, err = handler.sync(request, session, cursor, "", coordination.MaxQueryPageSize)
 				if err != nil {
 					handler.logFailure(request, "coordination.events.stream", err)
 					return
@@ -498,7 +499,7 @@ func (handler *localHandler) stream(writer stdhttp.ResponseWriter, request *stdh
 				return
 			}
 		case <-poll.C:
-			page, err = handler.sync(request, session, cursor, "", application.MaxQueryPageSize)
+			page, err = handler.sync(request, session, cursor, "", coordination.MaxQueryPageSize)
 			if err != nil {
 				handler.logFailure(request, "coordination.events.stream", err)
 				return
@@ -519,45 +520,45 @@ func rejectQueryCredentials(writer stdhttp.ResponseWriter, values url.Values) bo
 	return true
 }
 
-func (handler *localHandler) authenticate(writer stdhttp.ResponseWriter, request *stdhttp.Request) (application.LocalAgentSession, bool) {
+func (handler *localHandler) authenticate(writer stdhttp.ResponseWriter, request *stdhttp.Request) (coordination.LocalAgentSession, bool) {
 	value := request.Header.Get("Authorization")
 	if len(request.Header.Values("Authorization")) != 1 || len(value) < 8 || !strings.EqualFold(value[:7], "Bearer ") ||
 		strings.TrimSpace(value[7:]) != value[7:] || strings.ContainsAny(value[7:], " \t\r\n") {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
 		writeLocalProblem(writer, stdhttp.StatusUnauthorized, domain.ErrorCodeUnauthenticated, "a valid bearer token is required")
-		return application.LocalAgentSession{}, false
+		return coordination.LocalAgentSession{}, false
 	}
 	session, err := handler.coordination.AuthenticateLocalAgent(request.Context(), value[7:])
 	if err != nil {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
 		handler.fail(writer, request, "agent.authenticate", err)
-		return application.LocalAgentSession{}, false
+		return coordination.LocalAgentSession{}, false
 	}
 	return session, true
 }
 
-func (handler *localHandler) sync(request *stdhttp.Request, session application.LocalAgentSession,
-	after, consumerText string, limit uint16) (application.CoordinationEventsPage, error) {
-	var cursor application.CoordinationEventCursor
+func (handler *localHandler) sync(request *stdhttp.Request, session coordination.LocalAgentSession,
+	after, consumerText string, limit uint16) (coordination.CoordinationEventsPage, error) {
+	var cursor coordination.CoordinationEventCursor
 	var err error
 	if after != "" {
-		cursor, err = application.NewCoordinationEventCursor(after)
+		cursor, err = coordination.NewCoordinationEventCursor(after)
 		if err != nil {
-			return application.CoordinationEventsPage{}, err
+			return coordination.CoordinationEventsPage{}, err
 		}
 	}
-	var query application.CoordinationEventsQuery
+	var query coordination.CoordinationEventsQuery
 	if consumerText != "" {
-		consumer, consumerErr := application.NewCoordinationConsumerID(consumerText)
+		consumer, consumerErr := coordination.NewCoordinationConsumerID(consumerText)
 		if consumerErr != nil {
-			return application.CoordinationEventsPage{}, consumerErr
+			return coordination.CoordinationEventsPage{}, consumerErr
 		}
-		query, err = application.NewCoordinationConsumerEventsQuery(session.WorkspaceID, session.ActorID, consumer, limit)
+		query, err = coordination.NewCoordinationConsumerEventsQuery(session.WorkspaceID, session.ActorID, consumer, limit)
 	} else {
-		query, err = application.NewCoordinationEventsQuery(session.WorkspaceID, session.ActorID, cursor, limit)
+		query, err = coordination.NewCoordinationEventsQuery(session.WorkspaceID, session.ActorID, cursor, limit)
 	}
 	if err != nil {
-		return application.CoordinationEventsPage{}, err
+		return coordination.CoordinationEventsPage{}, err
 	}
 	return handler.coordination.SyncCoordinationEvents(request.Context(), query)
 }
@@ -576,7 +577,7 @@ func localEventQuery(writer stdhttp.ResponseWriter, values url.Values, allowLimi
 		return "", "", 0, false
 	}
 	if consumer != "" {
-		if _, err := application.NewCoordinationConsumerID(consumer); err != nil {
+		if _, err := coordination.NewCoordinationConsumerID(consumer); err != nil {
 			writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
 				"consumer must contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens")
 			return "", "", 0, false
@@ -585,9 +586,9 @@ func localEventQuery(writer stdhttp.ResponseWriter, values url.Values, allowLimi
 	limit := uint16(localDefaultLimit)
 	if text := values.Get("limit"); text != "" {
 		parsed, err := strconv.ParseUint(text, 10, 16)
-		if err != nil || parsed == 0 || parsed > application.MaxQueryPageSize {
+		if err != nil || parsed == 0 || parsed > coordination.MaxQueryPageSize {
 			writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
-				fmt.Sprintf("limit must be from 1 through %d", application.MaxQueryPageSize))
+				fmt.Sprintf("limit must be from 1 through %d", coordination.MaxQueryPageSize))
 			return "", "", 0, false
 		}
 		limit = uint16(parsed)
@@ -698,7 +699,7 @@ func writeLocalError(writer stdhttp.ResponseWriter, err error) {
 		writeLocalProblem(writer, statusFor(commandError.Code()), commandError.Code(), commandError.Error())
 		return
 	}
-	if errors.Is(err, application.ErrInvalidCoordination) {
+	if errors.Is(err, coordination.ErrInvalidCoordination) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "coordination request is invalid")
 		return
 	}

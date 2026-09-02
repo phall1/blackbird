@@ -23,7 +23,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -141,14 +141,14 @@ func filesystemName(stat syscall.Statfs_t) string {
 // caller proposed. That difference is the caller's signal, and it is why the
 // proposed UUID is discarded rather than recorded anywhere -- a second identity
 // for one thread is exactly the failure the slug exists to prevent.
-func (store *Store) OpenConversation(ctx context.Context, params application.OpenConversationParams) (application.Conversation, error) {
-	var result application.Conversation
+func (store *Store) OpenConversation(ctx context.Context, params coordination.OpenConversationParams) (coordination.Conversation, error) {
+	var result coordination.Conversation
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		now, err := sqliteNow(ctx, tx)
 		if err != nil {
 			return err
 		}
-		result, err = application.NewConversation(params, now)
+		result, err = coordination.NewConversation(params, now)
 		if err != nil {
 			return err
 		}
@@ -182,7 +182,7 @@ func (store *Store) OpenConversation(ctx context.Context, params application.Ope
 // one, so a reopen reports the topic and opener the thread actually has instead
 // of whatever the returning caller happened to type this time.
 func conversationBySlug(ctx context.Context, tx *sql.Tx,
-	params application.OpenConversationParams) (application.Conversation, bool, error) {
+	params coordination.OpenConversationParams) (coordination.Conversation, bool, error) {
 	var conversationText, runText, openedByText, sessionText, topic string
 	var openedAt int64
 	err := tx.QueryRowContext(ctx, `SELECT conversation_id, run_id, opened_by_actor_id, opened_by_session_id,
@@ -190,32 +190,32 @@ func conversationBySlug(ctx context.Context, tx *sql.Tx,
 		params.WorkspaceID.String(), params.Slug).Scan(&conversationText, &runText, &openedByText, &sessionText,
 		&topic, &openedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return application.Conversation{}, false, nil
+		return coordination.Conversation{}, false, nil
 	}
 	if err != nil {
-		return application.Conversation{}, false, fmt.Errorf("read SQLite conversation slug: %w", err)
+		return coordination.Conversation{}, false, fmt.Errorf("read SQLite conversation slug: %w", err)
 	}
 	conversationID, e1 := domain.ParseConversationID(conversationText)
 	run, e2 := domain.ParseRunID(runText)
 	openedBy, e3 := domain.ParseActorID(openedByText)
 	openedBySession, e4 := domain.ParseActorSessionID(sessionText)
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-		return application.Conversation{}, false, application.ErrInvalidCoordination
+		return coordination.Conversation{}, false, coordination.ErrInvalidCoordination
 	}
-	stored, err := application.NewConversation(application.OpenConversationParams{ConversationID: conversationID,
+	stored, err := coordination.NewConversation(coordination.OpenConversationParams{ConversationID: conversationID,
 		WorkspaceID: params.WorkspaceID, RunID: run, OpenedBy: openedBy, OpenedBySession: openedBySession,
 		Topic: topic, Slug: params.Slug}, microsTime(openedAt))
 	if err != nil {
-		return application.Conversation{}, false, err
+		return coordination.Conversation{}, false, err
 	}
 	return stored, true, nil
 }
 
-func (store *Store) SendMessage(ctx context.Context, params application.SendMessageParams) (application.Message, error) {
-	if err := application.ValidateSendMessage(params); err != nil {
-		return application.Message{}, err
+func (store *Store) SendMessage(ctx context.Context, params coordination.SendMessageParams) (coordination.Message, error) {
+	if err := coordination.ValidateSendMessage(params); err != nil {
+		return coordination.Message{}, err
 	}
-	var result application.Message
+	var result coordination.Message
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		var status, workspace string
 		if err := tx.QueryRowContext(ctx, `SELECT status, workspace_id FROM conversations WHERE conversation_id = ?`,
@@ -241,14 +241,14 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 				return fmt.Errorf("read SQLite reply target: %w", replyErr)
 			}
 			if replyErr != nil || parentConversation != params.ConversationID.String() {
-				return application.ErrInvalidCoordination
+				return coordination.ErrInvalidCoordination
 			}
 		}
 		now, err := sqliteNow(ctx, tx)
 		if err != nil {
 			return err
 		}
-		digest := application.DigestBytes([]byte(params.Body))
+		digest := coordination.DigestBytes([]byte(params.Body))
 		var reply any
 		if params.ReplyTo != nil {
 			reply = params.ReplyTo.String()
@@ -266,9 +266,9 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 			return fmt.Errorf("read SQLite message position: %w", err)
 		}
 		if position <= 0 {
-			return application.ErrInvalidCoordination
+			return coordination.ErrInvalidCoordination
 		}
-		deliveries := make([]application.Delivery, 0, len(params.Recipients))
+		deliveries := make([]coordination.Delivery, 0, len(params.Recipients))
 		recipients := make([]domain.ActorID, 0, len(params.Recipients))
 		for _, recipient := range params.Recipients {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO message_deliveries(message_id, recipient_actor_id,
@@ -277,7 +277,7 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 				return fmt.Errorf("insert SQLite message delivery: %w", err)
 			}
 			recipients = append(recipients, recipient.ActorID())
-			delivery, _ := application.NewDeliveryView(recipient, params.AcknowledgementRequired, &now, nil, nil)
+			delivery, _ := coordination.NewDeliveryView(recipient, params.AcknowledgementRequired, &now, nil, nil)
 			deliveries = append(deliveries, delivery)
 		}
 		payload, payloadErr := coordinationPayload(map[string]any{"conversation_id": params.ConversationID.String(),
@@ -286,11 +286,11 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 			return payloadErr
 		}
 		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Author,
-			application.CoordinationEventMessageAvailable, params.MessageID.String(), now, payload,
+			coordination.CoordinationEventMessageAvailable, params.MessageID.String(), now, payload,
 			coordinationVisibilityRecipients, recipients); err != nil {
 			return err
 		}
-		result, err = application.NewMessageView(application.MessageViewParams{MessageID: params.MessageID,
+		result, err = coordination.NewMessageView(coordination.MessageViewParams{MessageID: params.MessageID,
 			ConversationID: params.ConversationID, WorkspaceID: params.WorkspaceID, Author: params.Author,
 			Subject: params.Subject, Body: params.Body, ReplyTo: params.ReplyTo, SentAt: now,
 			Position: uint64(position), Deliveries: deliveries})
@@ -299,17 +299,17 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 	return result, err
 }
 
-func (store *Store) Inbox(ctx context.Context, query application.InboxQuery) (application.CoordinationPage, error) {
-	if query.WorkspaceID.IsZero() || query.Recipient.IsZero() || query.Limit == 0 || query.Limit > application.MaxQueryPageSize {
-		return application.CoordinationPage{}, application.ErrInvalidCoordination
+func (store *Store) Inbox(ctx context.Context, query coordination.InboxQuery) (coordination.CoordinationPage, error) {
+	if query.WorkspaceID.IsZero() || query.Recipient.IsZero() || query.Limit == 0 || query.Limit > coordination.MaxQueryPageSize {
+		return coordination.CoordinationPage{}, coordination.ErrInvalidCoordination
 	}
 	return store.loadMessages(ctx, query.WorkspaceID, domain.ConversationID{}, query.Recipient, query.After, query.Limit, true, query.UnreadOnly)
 }
 
 func (store *Store) GetVisibleMessage(ctx context.Context, workspace domain.WorkspaceID, viewer domain.ActorID,
-	messageID domain.MessageID) (application.Message, error) {
+	messageID domain.MessageID) (coordination.Message, error) {
 	if workspace.IsZero() || viewer.IsZero() || messageID.IsZero() {
-		return application.Message{}, application.ErrInvalidCoordination
+		return coordination.Message{}, coordination.ErrInvalidCoordination
 	}
 	var conversationText, authorText, subject, body string
 	var reply sql.NullString
@@ -322,48 +322,48 @@ func (store *Store) GetVisibleMessage(ctx context.Context, workspace domain.Work
 		AND (message.author_actor_id = ? OR own.message_id IS NOT NULL)`, viewer.String(), messageID.String(),
 		workspace.String(), viewer.String()).Scan(&conversationText, &authorText, &subject, &body, &reply, &sent, &position)
 	if errors.Is(err, sql.ErrNoRows) {
-		return application.Message{}, coordinationError(domain.ErrorCodeNotFound, "message was not found")
+		return coordination.Message{}, coordinationError(domain.ErrorCodeNotFound, "message was not found")
 	}
 	if err != nil {
-		return application.Message{}, fmt.Errorf("query visible SQLite coordination message: %w", err)
+		return coordination.Message{}, fmt.Errorf("query visible SQLite coordination message: %w", err)
 	}
 	conversation, conversationErr := domain.ParseConversationID(conversationText)
 	author, authorErr := domain.ParseActorID(authorText)
 	if conversationErr != nil || authorErr != nil {
-		return application.Message{}, application.ErrInvalidCoordination
+		return coordination.Message{}, coordination.ErrInvalidCoordination
 	}
 	deliveries, err := loadVisibleDeliveries(ctx, store.db, messageID, author, viewer)
 	if err != nil {
-		return application.Message{}, err
+		return coordination.Message{}, err
 	}
-	params := application.MessageViewParams{MessageID: messageID, ConversationID: conversation, WorkspaceID: workspace,
+	params := coordination.MessageViewParams{MessageID: messageID, ConversationID: conversation, WorkspaceID: workspace,
 		Author: author, Subject: subject, Body: body, SentAt: microsTime(sent), Position: position, Deliveries: deliveries}
 	if reply.Valid {
 		replyID, parseErr := domain.ParseMessageID(reply.String)
 		if parseErr != nil {
-			return application.Message{}, parseErr
+			return coordination.Message{}, parseErr
 		}
 		params.ReplyTo = &replyID
 	}
-	return application.NewMessageView(params)
+	return coordination.NewMessageView(params)
 }
 
-func (store *Store) Thread(ctx context.Context, query application.ThreadQuery) (application.CoordinationPage, error) {
-	if query.WorkspaceID.IsZero() || query.ConversationID.IsZero() || query.Viewer.IsZero() || query.Limit == 0 || query.Limit > application.MaxQueryPageSize {
-		return application.CoordinationPage{}, application.ErrInvalidCoordination
+func (store *Store) Thread(ctx context.Context, query coordination.ThreadQuery) (coordination.CoordinationPage, error) {
+	if query.WorkspaceID.IsZero() || query.ConversationID.IsZero() || query.Viewer.IsZero() || query.Limit == 0 || query.Limit > coordination.MaxQueryPageSize {
+		return coordination.CoordinationPage{}, coordination.ErrInvalidCoordination
 	}
 	return store.loadMessages(ctx, query.WorkspaceID, query.ConversationID, query.Viewer, query.After, query.Limit, false, false)
 }
 
 func (store *Store) loadMessages(ctx context.Context, workspace domain.WorkspaceID, conversation domain.ConversationID,
-	viewer domain.ActorID, after uint64, limit uint16, inbox, unreadOnly bool) (application.CoordinationPage, error) {
+	viewer domain.ActorID, after uint64, limit uint16, inbox, unreadOnly bool) (coordination.CoordinationPage, error) {
 	// The page, its deliveries and the journal head are read from one snapshot.
 	// The cursor advance below is only sound if no message can commit between
 	// reading the page and reading the head, which a read-only transaction
 	// guarantees; SQLite defers its BEGIN, so no writer waits on this.
 	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return application.CoordinationPage{}, fmt.Errorf("begin SQLite coordination message read: %w", err)
+		return coordination.CoordinationPage{}, fmt.Errorf("begin SQLite coordination message read: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	base := `SELECT DISTINCT message.message_id, message.conversation_id, message.author_actor_id, message.subject,
@@ -384,7 +384,7 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 	args = append(args, int(limit)+1)
 	rows, err := tx.QueryContext(ctx, base, args...)
 	if err != nil {
-		return application.CoordinationPage{}, fmt.Errorf("query SQLite coordination messages: %w", err)
+		return coordination.CoordinationPage{}, fmt.Errorf("query SQLite coordination messages: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	type row struct {
@@ -399,7 +399,7 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		var value row
 		if err := rows.Scan(&value.message, &value.conversation, &value.author, &value.subject, &value.body,
 			&value.reply, &value.sent, &value.position); err != nil {
-			return application.CoordinationPage{}, err
+			return coordination.CoordinationPage{}, err
 		}
 		if len(values) == int(limit) {
 			hasMore = true
@@ -408,38 +408,38 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		values = append(values, value)
 	}
 	if err := rows.Err(); err != nil {
-		return application.CoordinationPage{}, err
+		return coordination.CoordinationPage{}, err
 	}
 	// The delivery and head reads below share this transaction's single
 	// connection, so the page statement is finished with first.
 	if err := rows.Close(); err != nil {
-		return application.CoordinationPage{}, err
+		return coordination.CoordinationPage{}, err
 	}
-	result := make([]application.Message, 0, len(values))
+	result := make([]coordination.Message, 0, len(values))
 	for _, value := range values {
 		messageID, e1 := domain.ParseMessageID(value.message)
 		conversationID, e2 := domain.ParseConversationID(value.conversation)
 		author, e3 := domain.ParseActorID(value.author)
 		if e1 != nil || e2 != nil || e3 != nil {
-			return application.CoordinationPage{}, application.ErrInvalidCoordination
+			return coordination.CoordinationPage{}, coordination.ErrInvalidCoordination
 		}
 		deliveries, err := loadVisibleDeliveries(ctx, tx, messageID, author, viewer)
 		if err != nil {
-			return application.CoordinationPage{}, err
+			return coordination.CoordinationPage{}, err
 		}
-		params := application.MessageViewParams{MessageID: messageID, ConversationID: conversationID, WorkspaceID: workspace,
+		params := coordination.MessageViewParams{MessageID: messageID, ConversationID: conversationID, WorkspaceID: workspace,
 			Author: author, Subject: value.subject, Body: value.body, SentAt: microsTime(value.sent), Position: value.position,
 			Deliveries: deliveries}
 		if value.reply.Valid {
 			id, parseErr := domain.ParseMessageID(value.reply.String)
 			if parseErr != nil {
-				return application.CoordinationPage{}, parseErr
+				return coordination.CoordinationPage{}, parseErr
 			}
 			params.ReplyTo = &id
 		}
-		message, err := application.NewMessageView(params)
+		message, err := coordination.NewMessageView(params)
 		if err != nil {
-			return application.CoordinationPage{}, err
+			return coordination.CoordinationPage{}, err
 		}
 		result = append(result, message)
 	}
@@ -460,17 +460,17 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		// rescan every message the workspace has accumulated on every poll.
 		var head uint64
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM messages`).Scan(&head); err != nil {
-			return application.CoordinationPage{}, fmt.Errorf("read SQLite coordination message head: %w", err)
+			return coordination.CoordinationPage{}, fmt.Errorf("read SQLite coordination message head: %w", err)
 		}
 		if head > next {
 			next = head
 		}
 	}
-	return application.NewCoordinationPage(result, next, hasMore)
+	return coordination.NewCoordinationPage(result, next, hasMore)
 }
 
 func loadVisibleDeliveries(ctx context.Context, query coordinationQuery, message domain.MessageID,
-	author, viewer domain.ActorID) ([]application.Delivery, error) {
+	author, viewer domain.ActorID) ([]coordination.Delivery, error) {
 	rows, err := query.QueryContext(ctx, `SELECT recipient_actor_id, recipient_kind, acknowledgement_required,
 		available_at_us, read_at_us, acknowledged_at_us FROM message_deliveries WHERE message_id = ?
 		AND (? = ? OR recipient_kind <> 'bcc' OR recipient_actor_id = ?) ORDER BY recipient_kind, recipient_actor_id`,
@@ -479,7 +479,7 @@ func loadVisibleDeliveries(ctx context.Context, query coordinationQuery, message
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var result []application.Delivery
+	var result []coordination.Delivery
 	for rows.Next() {
 		var actorText, kind string
 		var required bool
@@ -491,11 +491,11 @@ func loadVisibleDeliveries(ctx context.Context, query coordinationQuery, message
 		if err != nil {
 			return nil, err
 		}
-		recipient, err := application.NewRecipient(actor, application.RecipientKind(kind))
+		recipient, err := coordination.NewRecipient(actor, coordination.RecipientKind(kind))
 		if err != nil {
 			return nil, err
 		}
-		delivery, err := application.NewDeliveryView(recipient, required, nullableTime(available), nullableTime(read), nullableTime(acknowledged))
+		delivery, err := coordination.NewDeliveryView(recipient, required, nullableTime(available), nullableTime(read), nullableTime(acknowledged))
 		if err != nil {
 			return nil, err
 		}
@@ -512,18 +512,18 @@ func nullableTime(value sql.NullInt64) *time.Time {
 	return &result
 }
 
-func (store *Store) RecordDeliveryFact(ctx context.Context, params application.RecordDeliveryFactParams) (application.Delivery, error) {
+func (store *Store) RecordDeliveryFact(ctx context.Context, params coordination.RecordDeliveryFactParams) (coordination.Delivery, error) {
 	if params.WorkspaceID.IsZero() || params.MessageID.IsZero() || params.Recipient.IsZero() ||
-		params.Kind != application.DeliveryAvailable && params.Kind != application.DeliveryRead && params.Kind != application.DeliveryAcknowledged {
-		return application.Delivery{}, application.ErrInvalidCoordination
+		params.Kind != coordination.DeliveryAvailable && params.Kind != coordination.DeliveryRead && params.Kind != coordination.DeliveryAcknowledged {
+		return coordination.Delivery{}, coordination.ErrInvalidCoordination
 	}
-	if params.Kind != application.DeliveryAvailable && (params.ActorSessionID == nil || params.ActorSessionID.IsZero()) {
-		return application.Delivery{}, application.ErrInvalidCoordination
+	if params.Kind != coordination.DeliveryAvailable && (params.ActorSessionID == nil || params.ActorSessionID.IsZero()) {
+		return coordination.Delivery{}, coordination.ErrInvalidCoordination
 	}
-	if params.Kind == application.DeliveryAcknowledged && params.MessageDigest.IsZero() {
-		return application.Delivery{}, application.ErrInvalidCoordination
+	if params.Kind == coordination.DeliveryAcknowledged && params.MessageDigest.IsZero() {
+		return coordination.Delivery{}, coordination.ErrInvalidCoordination
 	}
-	var result application.Delivery
+	var result coordination.Delivery
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		var kind string
 		var required bool
@@ -552,11 +552,11 @@ func (store *Store) RecordDeliveryFact(ctx context.Context, params application.R
 			return err
 		}
 		switch params.Kind {
-		case application.DeliveryAvailable:
+		case coordination.DeliveryAvailable:
 			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET available_at_us = COALESCE(available_at_us, ?) WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.MessageID.String(), params.Recipient.String())
-		case application.DeliveryRead:
+		case coordination.DeliveryRead:
 			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET read_at_us = COALESCE(read_at_us, ?) WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.MessageID.String(), params.Recipient.String())
-		case application.DeliveryAcknowledged:
+		case coordination.DeliveryAcknowledged:
 			if !bytes.Equal(digest, params.MessageDigest[:]) {
 				return coordinationConflict(domain.ErrorCodeStateConflict, domain.ConflictDeliveryFact, "message digest does not match")
 			}
@@ -576,18 +576,18 @@ func (store *Store) RecordDeliveryFact(ctx context.Context, params application.R
 			WHERE message_id = ? AND recipient_actor_id = ?`, params.MessageID.String(), params.Recipient.String()).Scan(&available, &read, &acknowledged); err != nil {
 			return err
 		}
-		actorRecipient, _ := application.NewRecipient(params.Recipient, application.RecipientKind(kind))
-		result, err = application.NewDeliveryView(actorRecipient, required, nullableTime(available), nullableTime(read), nullableTime(acknowledged))
+		actorRecipient, _ := coordination.NewRecipient(params.Recipient, coordination.RecipientKind(kind))
+		result, err = coordination.NewDeliveryView(actorRecipient, required, nullableTime(available), nullableTime(read), nullableTime(acknowledged))
 		return err
 	})
 	return result, err
 }
 
-func (store *Store) AcquireLease(ctx context.Context, params application.AcquireLeaseParams) (application.Lease, error) {
-	if err := application.ValidateAcquireLease(params); err != nil {
-		return application.Lease{}, err
+func (store *Store) AcquireLease(ctx context.Context, params coordination.AcquireLeaseParams) (coordination.Lease, error) {
+	if err := coordination.ValidateAcquireLease(params); err != nil {
+		return coordination.Lease{}, err
 	}
-	var result application.Lease
+	var result coordination.Lease
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		now, err := sqliteNow(ctx, tx)
 		if err != nil {
@@ -608,7 +608,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		}
 		type existingSelector struct {
 			lease, holder, mode string
-			selector            application.LeaseSelector
+			selector            coordination.LeaseSelector
 			expires             int64
 		}
 		rows, err := tx.QueryContext(ctx, `SELECT lease.lease_id, lease.holder_actor_id, lease.mode,
@@ -631,7 +631,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			// Parsed once per stored selector rather than once per requested
 			// selector per stored selector, which is what the overlap loop below
 			// would otherwise pay for.
-			value.selector, err = application.NewLeaseSelector(application.LeaseSelectorKind(kind), selectorPath)
+			value.selector, err = coordination.NewLeaseSelector(coordination.LeaseSelectorKind(kind), selectorPath)
 			if err != nil {
 				return err
 			}
@@ -647,7 +647,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		// TTL. Holder identity is the actor rather than the session because a
 		// re-registration mints a new session for the same agent name and
 		// rebinds these very leases to it.
-		held := make(map[string][]application.LeaseSelector)
+		held := make(map[string][]coordination.LeaseSelector)
 		keys := make(map[string]struct{}, len(params.Selectors))
 		for _, prior := range existing {
 			if prior.holder == params.Holder.String() {
@@ -659,11 +659,11 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			for _, prior := range existing {
 				// Another claim by this actor is not a blocker. Its generation is
 				// advanced only when this request names the same selector key.
-				if prior.holder == params.Holder.String() || !application.LeaseSelectorsOverlap(requested, prior.selector) {
+				if prior.holder == params.Holder.String() || !coordination.LeaseSelectorsOverlap(requested, prior.selector) {
 					continue
 				}
 				keys[prior.selector.Key()] = struct{}{}
-				if params.Mode == application.LeaseExclusive || application.LeaseMode(prior.mode) == application.LeaseExclusive {
+				if params.Mode == coordination.LeaseExclusive || coordination.LeaseMode(prior.mode) == coordination.LeaseExclusive {
 					return coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictLease,
 						fmt.Sprintf("an active overlapping %s lease exists: lease %s held by actor %s over %s %s, free in %s",
 							prior.mode, prior.lease, prior.holder, prior.selector.Kind(), evidenceText(prior.selector.Path()),
@@ -681,7 +681,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			params.AuthorityEpoch.String(), string(params.Mode), timeMicros(now), timeMicros(expires)); err != nil {
 			return fmt.Errorf("insert SQLite lease: %w", err)
 		}
-		selectors := append([]application.LeaseSelector(nil), params.Selectors...)
+		selectors := append([]coordination.LeaseSelector(nil), params.Selectors...)
 		sort.Slice(selectors, func(i, j int) bool { return selectors[i].Key() < selectors[j].Key() })
 		for index, selector := range selectors {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO lease_selectors(lease_id, selector_ordinal, selector_kind, selector_path) VALUES (?, ?, ?, ?)`,
@@ -690,7 +690,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			}
 		}
 		generations := make(map[string]uint64, len(selectors))
-		if params.Mode == application.LeaseExclusive {
+		if params.Mode == coordination.LeaseExclusive {
 			ordered := make([]string, 0, len(keys))
 			for key := range keys {
 				ordered = append(ordered, key)
@@ -714,7 +714,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 				generations[key] = counter
 			}
 		}
-		result, err = application.NewLeaseView(application.LeaseViewParams{LeaseID: params.LeaseID, WorkspaceID: params.WorkspaceID,
+		result, err = coordination.NewLeaseView(coordination.LeaseViewParams{LeaseID: params.LeaseID, WorkspaceID: params.WorkspaceID,
 			Holder: params.Holder, HolderSession: params.HolderSession, AuthorityEpoch: params.AuthorityEpoch, Mode: params.Mode,
 			Selectors: selectors, ClaimGenerations: generations, AcquiredAt: now, ExpiresAt: expires})
 		if err != nil {
@@ -725,7 +725,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			return err
 		}
 		return appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
-			application.CoordinationEventLeaseAcquired, params.LeaseID.String(), now, payload,
+			coordination.CoordinationEventLeaseAcquired, params.LeaseID.String(), now, payload,
 			coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
@@ -739,8 +739,8 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 // retry fix is meant to remove. A lease covering anything outside the request
 // is left alone, because retiring it would silently drop paths its holder still
 // believes it has reserved.
-func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.AcquireLeaseParams,
-	held map[string][]application.LeaseSelector, now time.Time) error {
+func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params coordination.AcquireLeaseParams,
+	held map[string][]coordination.LeaseSelector, now time.Time) error {
 	superseded := make([]string, 0, len(held))
 	for lease, selectors := range held {
 		if sameSelectorSet(params.Selectors, selectors) {
@@ -771,7 +771,7 @@ func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.Acq
 			return err
 		}
 		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
-			application.CoordinationEventLeaseReleased, lease, now, payload,
+			coordination.CoordinationEventLeaseReleased, lease, now, payload,
 			coordinationVisibilityWorkspace, nil); err != nil {
 			return err
 		}
@@ -779,7 +779,7 @@ func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.Acq
 	return nil
 }
 
-func sameSelectorSet(left, right []application.LeaseSelector) bool {
+func sameSelectorSet(left, right []coordination.LeaseSelector) bool {
 	if len(left) != len(right) {
 		return false
 	}
@@ -795,26 +795,26 @@ func sameSelectorSet(left, right []application.LeaseSelector) bool {
 	return true
 }
 
-func (store *Store) RenewLease(ctx context.Context, params application.ChangeLeaseParams) (application.Lease, error) {
-	if params.TTL <= 0 || params.TTL > application.MaxLeaseTTL {
-		return application.Lease{}, application.ErrInvalidCoordination
+func (store *Store) RenewLease(ctx context.Context, params coordination.ChangeLeaseParams) (coordination.Lease, error) {
+	if params.TTL <= 0 || params.TTL > coordination.MaxLeaseTTL {
+		return coordination.Lease{}, coordination.ErrInvalidCoordination
 	}
 	return store.changeLease(ctx, params, false)
 }
 
-func (store *Store) ReleaseLease(ctx context.Context, params application.ChangeLeaseParams) (application.Lease, error) {
+func (store *Store) ReleaseLease(ctx context.Context, params coordination.ChangeLeaseParams) (coordination.Lease, error) {
 	if params.TTL != 0 {
-		return application.Lease{}, application.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalidCoordination
 	}
 	return store.changeLease(ctx, params, true)
 }
 
-func (store *Store) changeLease(ctx context.Context, params application.ChangeLeaseParams, release bool) (application.Lease, error) {
+func (store *Store) changeLease(ctx context.Context, params coordination.ChangeLeaseParams, release bool) (coordination.Lease, error) {
 	if params.WorkspaceID.IsZero() || params.Holder.IsZero() || params.HolderSession.IsZero() ||
-		params.AuthorityEpoch.IsZero() || len(params.Selectors) == 0 || len(params.Selectors) > application.MaxLeaseSelectors {
-		return application.Lease{}, application.ErrInvalidCoordination
+		params.AuthorityEpoch.IsZero() || len(params.Selectors) == 0 || len(params.Selectors) > coordination.MaxLeaseSelectors {
+		return coordination.Lease{}, coordination.ErrInvalidCoordination
 	}
-	var result application.Lease
+	var result coordination.Lease
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		if err := requireCurrentLeaseEpoch(ctx, tx, params.WorkspaceID, params.AuthorityEpoch); err != nil {
 			return err
@@ -836,8 +836,8 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 				timeMicros(now), lease.ID().String())
 		} else {
 			expires := now.Add(params.TTL)
-			if expires.After(lease.AcquiredAt().Add(application.MaxLeaseLifetime)) {
-				return application.ErrInvalidCoordination
+			if expires.After(lease.AcquiredAt().Add(coordination.MaxLeaseLifetime)) {
+				return coordination.ErrInvalidCoordination
 			}
 			_, err = tx.ExecContext(ctx, `UPDATE leases SET holder_session_id = ?, expires_at_us = ? WHERE lease_id = ? AND status = 'active'`,
 				params.HolderSession.String(), timeMicros(expires), lease.ID().String())
@@ -853,9 +853,9 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 		if err != nil {
 			return err
 		}
-		eventType := application.CoordinationEventLeaseRenewed
+		eventType := coordination.CoordinationEventLeaseRenewed
 		if release {
-			eventType = application.CoordinationEventLeaseReleased
+			eventType = coordination.CoordinationEventLeaseReleased
 		}
 		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(), eventType,
 			result.ID().String(), now, payload, coordinationVisibilityWorkspace, nil)
@@ -863,52 +863,52 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 	return result, err
 }
 
-func findHeldLease(ctx context.Context, tx *sql.Tx, params application.ChangeLeaseParams) (application.Lease, error) {
+func findHeldLease(ctx context.Context, tx *sql.Tx, params coordination.ChangeLeaseParams) (coordination.Lease, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT lease_id FROM leases WHERE workspace_id = ? AND holder_actor_id = ?
 		AND authority_epoch = ? AND status = 'active' ORDER BY acquired_at_us DESC`,
 		params.WorkspaceID.String(), params.Holder.String(), params.AuthorityEpoch.String())
 	if err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	defer func() { _ = rows.Close() }()
 	var ids []domain.LeaseID
 	for rows.Next() {
 		var text string
 		if err := rows.Scan(&text); err != nil {
-			return application.Lease{}, err
+			return coordination.Lease{}, err
 		}
 		id, err := domain.ParseLeaseID(text)
 		if err != nil {
-			return application.Lease{}, err
+			return coordination.Lease{}, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	if err := rows.Close(); err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	partial := false
 	for _, id := range ids {
 		lease, err := loadLease(ctx, tx, id)
 		if err != nil {
-			return application.Lease{}, err
+			return coordination.Lease{}, err
 		}
 		if sameSelectorSet(params.Selectors, lease.Selectors()) {
 			return lease, nil
 		}
 		for _, requested := range params.Selectors {
 			for _, held := range lease.Selectors() {
-				partial = partial || application.LeaseSelectorsOverlap(requested, held)
+				partial = partial || coordination.LeaseSelectorsOverlap(requested, held)
 			}
 		}
 	}
 	if partial {
-		return application.Lease{}, coordinationError(domain.ErrorCodeInvalidArgument,
+		return coordination.Lease{}, coordinationError(domain.ErrorCodeInvalidArgument,
 			"selectors must exactly match one active claim; partial release or renewal is not allowed")
 	}
-	return application.Lease{}, coordinationError(domain.ErrorCodeNotFound, "no active claim matches the exact selector set")
+	return coordination.Lease{}, coordinationError(domain.ErrorCodeNotFound, "no active claim matches the exact selector set")
 }
 
 // coordinationQuery is satisfied by both the pool and a transaction, so a
@@ -919,7 +919,7 @@ type coordinationQuery interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) (application.Lease, error) {
+func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) (coordination.Lease, error) {
 	var workspaceText, holderText, sessionText, epochText, mode, status string
 	var acquired, expires int64
 	var released sql.NullInt64
@@ -927,44 +927,44 @@ func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) 
 		status, acquired_at_us, expires_at_us, released_at_us FROM leases WHERE lease_id = ?`, id.String()).Scan(
 		&workspaceText, &holderText, &sessionText, &epochText, &mode, &status, &acquired, &expires, &released)
 	if errors.Is(err, sql.ErrNoRows) {
-		return application.Lease{}, coordinationError(domain.ErrorCodeNotFound, "lease was not found")
+		return coordination.Lease{}, coordinationError(domain.ErrorCodeNotFound, "lease was not found")
 	}
 	if err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	workspace, e1 := domain.ParseWorkspaceID(workspaceText)
 	holder, e2 := domain.ParseActorID(holderText)
 	session, e3 := domain.ParseActorSessionID(sessionText)
 	epoch, e4 := domain.ParseAuthorityEpoch(epochText)
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-		return application.Lease{}, application.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalidCoordination
 	}
 	selectorRows, err := query.QueryContext(ctx, `SELECT selector_kind, selector_path FROM lease_selectors WHERE lease_id = ? ORDER BY selector_ordinal`, id.String())
 	if err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	defer func() { _ = selectorRows.Close() }()
-	var selectors []application.LeaseSelector
+	var selectors []coordination.LeaseSelector
 	for selectorRows.Next() {
 		var kind, value string
 		if err := selectorRows.Scan(&kind, &value); err != nil {
-			return application.Lease{}, err
+			return coordination.Lease{}, err
 		}
-		selector, err := application.NewLeaseSelector(application.LeaseSelectorKind(kind), value)
+		selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorKind(kind), value)
 		if err != nil {
-			return application.Lease{}, err
+			return coordination.Lease{}, err
 		}
 		selectors = append(selectors, selector)
 	}
 	if err := selectorRows.Err(); err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	if err := selectorRows.Close(); err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	generationRows, err := query.QueryContext(ctx, `SELECT conflict_key, counter FROM lease_fences WHERE lease_id = ? ORDER BY conflict_key`, id.String())
 	if err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
 	defer func() { _ = generationRows.Close() }()
 	generations := make(map[string]uint64)
@@ -972,17 +972,17 @@ func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) 
 		var key string
 		var counter uint64
 		if err := generationRows.Scan(&key, &counter); err != nil {
-			return application.Lease{}, err
+			return coordination.Lease{}, err
 		}
 		generations[key] = counter
 	}
 	if err := generationRows.Err(); err != nil {
-		return application.Lease{}, err
+		return coordination.Lease{}, err
 	}
-	params := application.LeaseViewParams{LeaseID: id, WorkspaceID: workspace, Holder: holder, HolderSession: session,
-		AuthorityEpoch: epoch, Mode: application.LeaseMode(mode), Selectors: selectors, ClaimGenerations: generations,
+	params := coordination.LeaseViewParams{LeaseID: id, WorkspaceID: workspace, Holder: holder, HolderSession: session,
+		AuthorityEpoch: epoch, Mode: coordination.LeaseMode(mode), Selectors: selectors, ClaimGenerations: generations,
 		AcquiredAt: microsTime(acquired), ExpiresAt: microsTime(expires), ReleasedAt: nullableTime(released)}
-	return application.NewLeaseView(params)
+	return coordination.NewLeaseView(params)
 }
 
 func staleEpochError(scope, current, supplied string) error {
@@ -1026,7 +1026,7 @@ const (
 )
 
 func appendCoordinationEvent(ctx context.Context, tx *sql.Tx, workspace domain.WorkspaceID, actor domain.ActorID,
-	eventType application.CoordinationEventType, subjectID string, occurredAt time.Time, payload []byte,
+	eventType coordination.CoordinationEventType, subjectID string, occurredAt time.Time, payload []byte,
 	visibility string, recipients []domain.ActorID) error {
 	insert, err := tx.ExecContext(ctx, `INSERT INTO coordination_events(workspace_id, actor_id, event_type,
 		subject_id, occurred_at_us, payload, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)`, workspace.String(), actor.String(),
@@ -1055,11 +1055,11 @@ func coordinationPayload(value map[string]any) ([]byte, error) {
 	return payload, nil
 }
 
-func leaseCoordinationPayload(lease application.Lease) ([]byte, error) {
+func leaseCoordinationPayload(lease coordination.Lease) ([]byte, error) {
 	return coordinationPayload(leaseCoordinationFields(lease))
 }
 
-func leaseCoordinationFields(lease application.Lease) map[string]any {
+func leaseCoordinationFields(lease coordination.Lease) map[string]any {
 	selectors := make([]map[string]any, 0, len(lease.Selectors()))
 	for _, selector := range lease.Selectors() {
 		selectors = append(selectors, map[string]any{"kind": string(selector.Kind()), "path": selector.Path(),
@@ -1070,39 +1070,39 @@ func leaseCoordinationFields(lease application.Lease) map[string]any {
 }
 
 func (store *Store) SyncCoordinationEvents(ctx context.Context,
-	query application.CoordinationEventsQuery) (application.CoordinationEventsPage, error) {
+	query coordination.CoordinationEventsQuery) (coordination.CoordinationEventsPage, error) {
 	if query.WorkspaceID().IsZero() || query.ActorID().IsZero() || query.Limit() == 0 ||
-		query.Limit() > application.MaxQueryPageSize {
-		return application.CoordinationEventsPage{}, application.ErrInvalidCoordination
+		query.Limit() > coordination.MaxQueryPageSize {
+		return coordination.CoordinationEventsPage{}, coordination.ErrInvalidCoordination
 	}
 	if err := ctx.Err(); err != nil {
-		return application.CoordinationEventsPage{}, err
+		return coordination.CoordinationEventsPage{}, err
 	}
 	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return application.CoordinationEventsPage{}, fmt.Errorf("begin SQLite coordination event sync: %w", err)
+		return coordination.CoordinationEventsPage{}, fmt.Errorf("begin SQLite coordination event sync: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	after := uint64(0)
 	if !query.AfterCursor().IsZero() {
 		after, err = decodeCoordinationCursor(ctx, tx, query.AfterCursor(), query.WorkspaceID(), query.ActorID())
 		if err != nil {
-			return application.CoordinationEventsPage{}, err
+			return coordination.CoordinationEventsPage{}, err
 		}
 	} else if query.ConsumerID() != "" {
 		err = tx.QueryRowContext(ctx, `SELECT position FROM coordination_event_consumers
 			WHERE workspace_id = ? AND actor_id = ? AND consumer_id = ?`, query.WorkspaceID().String(),
 			query.ActorID().String(), query.ConsumerID().String()).Scan(&after)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return application.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination consumer: %w", err)
+			return coordination.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination consumer: %w", err)
 		}
 		if err == nil {
 			retainedFrom, _, boundsErr := coordinationJournalBounds(ctx, tx, query.WorkspaceID())
 			if boundsErr != nil {
-				return application.CoordinationEventsPage{}, boundsErr
+				return coordination.CoordinationEventsPage{}, boundsErr
 			}
 			if after < retainedFrom-1 {
-				return application.CoordinationEventsPage{}, coordinationError(domain.ErrorCodeCursorExpired,
+				return coordination.CoordinationEventsPage{}, coordinationError(domain.ErrorCodeCursorExpired,
 					"coordination consumer position has expired; restart from the retained journal boundary")
 			}
 		}
@@ -1118,11 +1118,11 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		ORDER BY event.position LIMIT ?`, query.WorkspaceID().String(), after, query.ActorID().String(),
 		query.ActorID().String(), int(query.Limit())+1)
 	if err != nil {
-		return application.CoordinationEventsPage{}, fmt.Errorf("query SQLite coordination events: %w", err)
+		return coordination.CoordinationEventsPage{}, fmt.Errorf("query SQLite coordination events: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	events := make([]application.CoordinationEvent, 0, query.Limit())
-	eventCursors := make([]application.CoordinationEventCursor, 0, query.Limit())
+	events := make([]coordination.CoordinationEvent, 0, query.Limit())
+	eventCursors := make([]coordination.CoordinationEventCursor, 0, query.Limit())
 	hasMore := false
 	nextPosition := after
 	for rows.Next() {
@@ -1131,7 +1131,7 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		var occurredAt int64
 		var payload []byte
 		if err := rows.Scan(&position, &actorText, &eventType, &subjectID, &occurredAt, &payload); err != nil {
-			return application.CoordinationEventsPage{}, err
+			return coordination.CoordinationEventsPage{}, err
 		}
 		if len(events) == int(query.Limit()) {
 			hasMore = true
@@ -1139,29 +1139,29 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		}
 		actor, actorErr := domain.ParseActorID(actorText)
 		if actorErr != nil {
-			return application.CoordinationEventsPage{}, actorErr
+			return coordination.CoordinationEventsPage{}, actorErr
 		}
-		event, eventErr := application.NewCoordinationEvent(application.CoordinationEventParams{Position: position,
-			Workspace: query.WorkspaceID(), Actor: actor, EventType: application.CoordinationEventType(eventType),
+		event, eventErr := coordination.NewCoordinationEvent(coordination.CoordinationEventParams{Position: position,
+			Workspace: query.WorkspaceID(), Actor: actor, EventType: coordination.CoordinationEventType(eventType),
 			SubjectID: subjectID, OccurredAt: microsTime(occurredAt), Payload: payload})
 		if eventErr != nil {
-			return application.CoordinationEventsPage{}, eventErr
+			return coordination.CoordinationEventsPage{}, eventErr
 		}
 		cursor, cursorErr := encodeCoordinationCursor(ctx, tx, query.WorkspaceID(), query.ActorID(), position)
 		if cursorErr != nil {
-			return application.CoordinationEventsPage{}, cursorErr
+			return coordination.CoordinationEventsPage{}, cursorErr
 		}
 		events = append(events, event)
 		eventCursors = append(eventCursors, cursor)
 		nextPosition = position
 	}
 	if err := rows.Err(); err != nil {
-		return application.CoordinationEventsPage{}, err
+		return coordination.CoordinationEventsPage{}, err
 	}
 	if !hasMore {
 		_, head, boundsErr := coordinationJournalBounds(ctx, tx, query.WorkspaceID())
 		if boundsErr != nil {
-			return application.CoordinationEventsPage{}, boundsErr
+			return coordination.CoordinationEventsPage{}, boundsErr
 		}
 		if head > nextPosition {
 			nextPosition = head
@@ -1169,17 +1169,17 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 	}
 	next, err := encodeCoordinationCursor(ctx, tx, query.WorkspaceID(), query.ActorID(), nextPosition)
 	if err != nil {
-		return application.CoordinationEventsPage{}, err
+		return coordination.CoordinationEventsPage{}, err
 	}
-	return application.NewCoordinationEventsPage(events, eventCursors, next, hasMore)
+	return coordination.NewCoordinationEventsPage(events, eventCursors, next, hasMore)
 }
 
 // CommitCoordinationConsumer advances one authenticated adapter monotonically.
 // Replaying the same or an older acknowledgement is idempotent and can never
 // move delivery backwards.
-func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit application.CoordinationConsumerCommit) error {
+func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit coordination.CoordinationConsumerCommit) error {
 	if commit.WorkspaceID().IsZero() || commit.ActorID().IsZero() || commit.ConsumerID() == "" || commit.Cursor().IsZero() {
-		return application.ErrInvalidCoordination
+		return coordination.ErrInvalidCoordination
 	}
 	return store.withImmediate(ctx, func(tx *sql.Tx) error {
 		position, err := decodeCoordinationCursor(ctx, tx, commit.Cursor(), commit.WorkspaceID(), commit.ActorID())
@@ -1205,23 +1205,23 @@ func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit appli
 
 func encodeCoordinationCursor(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, workspace domain.WorkspaceID, actor domain.ActorID, position uint64) (application.CoordinationEventCursor, error) {
+}, workspace domain.WorkspaceID, actor domain.ActorID, position uint64) (coordination.CoordinationEventCursor, error) {
 	key, err := coordinationCursorKey(ctx, query)
 	if err != nil {
-		return application.CoordinationEventCursor{}, err
+		return coordination.CoordinationEventCursor{}, err
 	}
 	wire := coordinationCursorWire{Workspace: workspace.String(), Actor: actor.String(), Position: position}
 	wire.MAC = coordinationCursorMAC(key, wire)
 	encoded, err := json.Marshal(wire)
 	if err != nil {
-		return application.CoordinationEventCursor{}, err
+		return coordination.CoordinationEventCursor{}, err
 	}
-	return application.NewCoordinationEventCursor("bbcc1_" + base64.RawURLEncoding.EncodeToString(encoded))
+	return coordination.NewCoordinationEventCursor("bbcc1_" + base64.RawURLEncoding.EncodeToString(encoded))
 }
 
 func decodeCoordinationCursor(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, cursor application.CoordinationEventCursor, workspace domain.WorkspaceID, actor domain.ActorID) (uint64, error) {
+}, cursor coordination.CoordinationEventCursor, workspace domain.WorkspaceID, actor domain.ActorID) (uint64, error) {
 	const prefix = "bbcc1_"
 	encoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(cursor.String(), prefix))
 	var wire coordinationCursorWire
@@ -1275,7 +1275,7 @@ func coordinationCursorKey(ctx context.Context, query interface {
 		return nil, fmt.Errorf("read SQLite coordination cursor key: %w", err)
 	}
 	if len(key) != sha256.Size {
-		return nil, application.ErrInvalidCoordination
+		return nil, coordination.ErrInvalidCoordination
 	}
 	return key, nil
 }
@@ -1314,37 +1314,37 @@ func requireCurrentLeaseEpoch(ctx context.Context, query interface {
 	return nil
 }
 
-func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentName, registrationToken string) (application.LocalAgentSession, string, error) {
-	if !validLocalCoordinationText(projectKey, application.MaxCoordinationKeyBytes) ||
-		!validLocalCoordinationText(agentName, application.MaxCoordinationNameBytes) {
-		return application.LocalAgentSession{}, "", application.ErrInvalidCoordination
+func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentName, registrationToken string) (coordination.LocalAgentSession, string, error) {
+	if !validLocalCoordinationText(projectKey, coordination.MaxCoordinationKeyBytes) ||
+		!validLocalCoordinationText(agentName, coordination.MaxCoordinationNameBytes) {
+		return coordination.LocalAgentSession{}, "", coordination.ErrInvalidCoordination
 	}
 	actorID, err := domain.NewActorID()
 	if err != nil {
-		return application.LocalAgentSession{}, "", err
+		return coordination.LocalAgentSession{}, "", err
 	}
 	sessionID, err := domain.NewActorSessionID()
 	if err != nil {
-		return application.LocalAgentSession{}, "", err
+		return coordination.LocalAgentSession{}, "", err
 	}
 	workspaceID, err := domain.NewWorkspaceID()
 	if err != nil {
-		return application.LocalAgentSession{}, "", err
+		return coordination.LocalAgentSession{}, "", err
 	}
 	runID, err := domain.NewRunID()
 	if err != nil {
-		return application.LocalAgentSession{}, "", err
+		return coordination.LocalAgentSession{}, "", err
 	}
 	authorityID, err := domain.NewAuthorityID()
 	if err != nil {
-		return application.LocalAgentSession{}, "", err
+		return coordination.LocalAgentSession{}, "", err
 	}
 	epoch, err := domain.ParseAuthorityEpoch(authorityID.String())
 	if err != nil {
-		return application.LocalAgentSession{}, "", err
+		return coordination.LocalAgentSession{}, "", err
 	}
 	issuedToken := ""
-	var result application.LocalAgentSession
+	var result coordination.LocalAgentSession
 	err = store.withImmediate(ctx, func(tx *sql.Tx) error {
 		now, nowErr := sqliteNow(ctx, tx)
 		if nowErr != nil {
@@ -1431,24 +1431,24 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 // milliseconds on this machine against a tenth of a millisecond without the
 // barrier -- so an inbox poll paid five milliseconds before it read anything
 // and a send paid it twice. The heartbeat is now coalesced through
-// flushLocalHeartbeat; see application.LocalAgentHeartbeatInterval for why a
+// flushLocalHeartbeat; see coordination.LocalAgentHeartbeatInterval for why a
 // lagging heartbeat is safe and a lost one is safe in the same direction.
 //
 // The returned LastSeenAt is this call's own instant rather than the stored
 // one, because the caller is asking when the session was last seen and the
 // answer is "now"; only the durable row is allowed to lag.
-func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (application.LocalAgentSession, error) {
+func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (coordination.LocalAgentSession, error) {
 	if token == "" || len(token) > maxLocalAgentTokenBytes {
-		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
+		return coordination.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
 			"agent token is missing or too long; call blackbird_join to get the current token")
 	}
 	digest := sha256.Sum256([]byte(token))
 	if err := ctx.Err(); err != nil {
-		return application.LocalAgentSession{}, err
+		return coordination.LocalAgentSession{}, err
 	}
 	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return application.LocalAgentSession{}, fmt.Errorf("begin SQLite agent authentication: %w", err)
+		return coordination.LocalAgentSession{}, fmt.Errorf("begin SQLite agent authentication: %w", err)
 	}
 	finished := false
 	defer func() {
@@ -1458,7 +1458,7 @@ func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (a
 	}()
 	now, err := sqliteNow(ctx, tx)
 	if err != nil {
-		return application.LocalAgentSession{}, err
+		return coordination.LocalAgentSession{}, err
 	}
 	var projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string
 	var started, lastSeen int64
@@ -1470,32 +1470,32 @@ func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (a
 		ORDER BY session.started_at_us DESC LIMIT 1`, digest[:]).Scan(&projectKey, &agentName, &workspaceText, &runText,
 		&actorText, &sessionText, &epochText, &started, &lastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
-		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
+		return coordination.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
 			"agent token was not found; call blackbird_join to start or resume this agent")
 	}
 	if err != nil {
-		return application.LocalAgentSession{}, err
+		return coordination.LocalAgentSession{}, err
 	}
 	result, err := localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText,
 		started, timeMicros(now))
 	if err != nil {
-		return application.LocalAgentSession{}, err
+		return coordination.LocalAgentSession{}, err
 	}
 	// The read transaction is finished with before any heartbeat write, so a
 	// flush never holds two of the five pooled connections at once and never
 	// waits on the write arbiter while pinning a reader.
 	finished = true
 	if err := tx.Rollback(); err != nil {
-		return application.LocalAgentSession{}, fmt.Errorf("finish SQLite agent authentication: %w", err)
+		return coordination.LocalAgentSession{}, fmt.Errorf("finish SQLite agent authentication: %w", err)
 	}
 	if err := store.flushLocalHeartbeat(ctx, sessionText, now); err != nil {
-		return application.LocalAgentSession{}, err
+		return coordination.LocalAgentSession{}, err
 	}
 	return result, nil
 }
 
 // flushLocalHeartbeat writes a session's liveness at most once per
-// application.LocalAgentHeartbeatInterval. The claim is taken before the write
+// coordination.LocalAgentHeartbeatInterval. The claim is taken before the write
 // and given back if the write fails, so a failed flush is retried by the next
 // call rather than suppressed for a whole interval.
 func (store *Store) flushLocalHeartbeat(ctx context.Context, sessionText string, now time.Time) error {
@@ -1527,7 +1527,7 @@ func (store *Store) claimHeartbeat(sessionText string, now time.Time) bool {
 		store.heartbeats.flushed = make(map[string]time.Time)
 	}
 	if flushed, known := store.heartbeats.flushed[sessionText]; known &&
-		now.After(flushed) && now.Sub(flushed) < application.LocalAgentHeartbeatInterval {
+		now.After(flushed) && now.Sub(flushed) < coordination.LocalAgentHeartbeatInterval {
 		return false
 	}
 	// Sessions that stopped calling are dropped here rather than by a sweeper,
@@ -1535,7 +1535,7 @@ func (store *Store) claimHeartbeat(sessionText string, now time.Time) bool {
 	// daemon. An entry older than the liveness horizon can only ever produce a
 	// flush anyway, so forgetting it changes nothing but the memory it held.
 	for session, flushed := range store.heartbeats.flushed {
-		if now.Sub(flushed) > application.LocalAgentActiveWindow {
+		if now.Sub(flushed) > coordination.LocalAgentActiveWindow {
 			delete(store.heartbeats.flushed, session)
 		}
 	}
@@ -1559,11 +1559,11 @@ func (store *Store) releaseHeartbeat(sessionText string) {
 // own clock, so the remaining lease time, the inbox counts and the roster all
 // describe the same instant.
 func (store *Store) LocalAgentSnapshot(ctx context.Context,
-	session application.LocalAgentSession) (application.LocalAgentSnapshot, error) {
+	session coordination.LocalAgentSession) (coordination.LocalAgentSnapshot, error) {
 	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
-		return application.LocalAgentSnapshot{}, application.ErrInvalidCoordination
+		return coordination.LocalAgentSnapshot{}, coordination.ErrInvalidCoordination
 	}
-	var snapshot application.LocalAgentSnapshot
+	var snapshot coordination.LocalAgentSnapshot
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
 		reservations, err := localAgentReservations(ctx, tx, session, now)
 		if err != nil {
@@ -1588,7 +1588,7 @@ func (store *Store) LocalAgentSnapshot(ctx context.Context,
 		return nil
 	})
 	if err != nil {
-		return application.LocalAgentSnapshot{}, err
+		return coordination.LocalAgentSnapshot{}, err
 	}
 	snapshot.ObservedAtUS = observed
 	return snapshot, nil
@@ -1596,8 +1596,8 @@ func (store *Store) LocalAgentSnapshot(ctx context.Context,
 
 // The lease rows are read first and then loaded whole so each selector carries
 // its informational claim generation in the registration snapshot.
-func localAgentReservations(ctx context.Context, tx *sql.Tx, session application.LocalAgentSession,
-	now time.Time) ([]application.LocalAgentReservation, error) {
+func localAgentReservations(ctx context.Context, tx *sql.Tx, session coordination.LocalAgentSession,
+	now time.Time) ([]coordination.LocalAgentReservation, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT lease_id FROM leases
 		WHERE holder_actor_id = ? AND workspace_id = ? AND status = 'active' AND expires_at_us > ?
 		ORDER BY expires_at_us, lease_id`, session.ActorID.String(), session.WorkspaceID.String(), timeMicros(now))
@@ -1613,7 +1613,7 @@ func localAgentReservations(ctx context.Context, tx *sql.Tx, session application
 		}
 		leaseID, parseErr := domain.ParseLeaseID(leaseText)
 		if parseErr != nil {
-			return nil, application.ErrInvalidCoordination
+			return nil, coordination.ErrInvalidCoordination
 		}
 		identifiers = append(identifiers, leaseID)
 	}
@@ -1623,7 +1623,7 @@ func localAgentReservations(ctx context.Context, tx *sql.Tx, session application
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	reservations := make([]application.LocalAgentReservation, 0, len(identifiers))
+	reservations := make([]coordination.LocalAgentReservation, 0, len(identifiers))
 	for _, leaseID := range identifiers {
 		lease, loadErr := loadLease(ctx, tx, leaseID)
 		if loadErr != nil {
@@ -1633,7 +1633,7 @@ func localAgentReservations(ctx context.Context, tx *sql.Tx, session application
 		for _, selector := range lease.Selectors() {
 			generations[selector.Key()] = lease.ClaimGeneration(selector)
 		}
-		reservations = append(reservations, application.LocalAgentReservation{LeaseID: lease.ID(), Mode: lease.Mode(),
+		reservations = append(reservations, coordination.LocalAgentReservation{LeaseID: lease.ID(), Mode: lease.Mode(),
 			Selectors: lease.Selectors(), ClaimGenerations: generations,
 			ExpiresInMS: lease.ExpiresAt().Sub(now).Milliseconds()})
 	}
@@ -1643,14 +1643,14 @@ func localAgentReservations(ctx context.Context, tx *sql.Tx, session application
 // The counts aggregate d.message_id rather than the row so an agent with no
 // mail reports zero rather than one, matching the admin summaries.
 func localAgentInbox(ctx context.Context, tx *sql.Tx,
-	session application.LocalAgentSession) (application.LocalAgentInbox, error) {
-	var inbox application.LocalAgentInbox
+	session coordination.LocalAgentSession) (coordination.LocalAgentInbox, error) {
+	var inbox coordination.LocalAgentInbox
 	if err := tx.QueryRowContext(ctx, `SELECT
 		count(d.message_id) FILTER (WHERE d.read_at_us IS NULL),
 		count(d.message_id) FILTER (WHERE d.acknowledgement_required = 1 AND d.acknowledged_at_us IS NULL)
 		FROM message_deliveries AS d WHERE d.recipient_actor_id = ?`,
 		session.ActorID.String()).Scan(&inbox.UnreadDeliveries, &inbox.UnackedDeliveries); err != nil {
-		return application.LocalAgentInbox{}, fmt.Errorf("query SQLite agent inbox counts: %w", err)
+		return coordination.LocalAgentInbox{}, fmt.Errorf("query SQLite agent inbox counts: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT m.message_id, m.conversation_id, COALESCE(author.agent_name, ''),
 		m.subject, d.read_at_us IS NOT NULL, d.acknowledgement_required, d.acknowledged_at_us IS NOT NULL, m.sent_at_us
@@ -1659,22 +1659,22 @@ func localAgentInbox(ctx context.Context, tx *sql.Tx,
 		LEFT JOIN coordination_agents AS author ON author.actor_id = m.author_actor_id
 		WHERE d.recipient_actor_id = ?
 		  AND (d.read_at_us IS NULL OR (d.acknowledgement_required = 1 AND d.acknowledged_at_us IS NULL))
-		ORDER BY m.position DESC LIMIT ?`, session.ActorID.String(), application.MaxLocalAgentSnapshotItems)
+		ORDER BY m.position DESC LIMIT ?`, session.ActorID.String(), coordination.MaxLocalAgentSnapshotItems)
 	if err != nil {
-		return application.LocalAgentInbox{}, fmt.Errorf("query SQLite agent inbox: %w", err)
+		return coordination.LocalAgentInbox{}, fmt.Errorf("query SQLite agent inbox: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		var item application.LocalAgentInboxItem
+		var item coordination.LocalAgentInboxItem
 		var messageText, conversationText string
 		if err := rows.Scan(&messageText, &conversationText, &item.AuthorAgentName, &item.Subject, &item.Read,
 			&item.AcknowledgementRequired, &item.Acknowledged, &item.SentAtUS); err != nil {
-			return application.LocalAgentInbox{}, fmt.Errorf("scan SQLite agent inbox item: %w", err)
+			return coordination.LocalAgentInbox{}, fmt.Errorf("scan SQLite agent inbox item: %w", err)
 		}
 		message, messageErr := domain.ParseMessageID(messageText)
 		conversation, conversationErr := domain.ParseConversationID(conversationText)
 		if messageErr != nil || conversationErr != nil {
-			return application.LocalAgentInbox{}, application.ErrInvalidCoordination
+			return coordination.LocalAgentInbox{}, coordination.ErrInvalidCoordination
 		}
 		item.MessageID, item.ConversationID = message, conversation
 		inbox.Recent = append(inbox.Recent, item)
@@ -1686,7 +1686,7 @@ func localAgentInbox(ctx context.Context, tx *sql.Tx,
 // this agent opened, wrote to, or was addressed in. A conversation it has never
 // touched is somebody else's work item and would only cost it context.
 func localAgentConversations(ctx context.Context, tx *sql.Tx,
-	session application.LocalAgentSession) ([]application.LocalAgentConversation, error) {
+	session coordination.LocalAgentSession) ([]coordination.LocalAgentConversation, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT c.conversation_id, c.topic,
 		(SELECT count(*) FROM messages AS m WHERE m.conversation_id = c.conversation_id),
 		COALESCE((SELECT max(m.sent_at_us) FROM messages AS m WHERE m.conversation_id = c.conversation_id),
@@ -1699,14 +1699,14 @@ func localAgentConversations(ctx context.Context, tx *sql.Tx,
 				WHERE m.conversation_id = c.conversation_id AND d.recipient_actor_id = ?))
 		ORDER BY last_message_at_us DESC, c.conversation_id LIMIT ?`,
 		session.WorkspaceID.String(), session.ActorID.String(), session.ActorID.String(), session.ActorID.String(),
-		application.MaxLocalAgentSnapshotItems)
+		coordination.MaxLocalAgentSnapshotItems)
 	if err != nil {
 		return nil, fmt.Errorf("query SQLite agent conversations: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var conversations []application.LocalAgentConversation
+	var conversations []coordination.LocalAgentConversation
 	for rows.Next() {
-		var conversation application.LocalAgentConversation
+		var conversation coordination.LocalAgentConversation
 		var conversationText string
 		if err := rows.Scan(&conversationText, &conversation.Topic, &conversation.Messages,
 			&conversation.LastMessageAtUS); err != nil {
@@ -1714,7 +1714,7 @@ func localAgentConversations(ctx context.Context, tx *sql.Tx,
 		}
 		id, parseErr := domain.ParseConversationID(conversationText)
 		if parseErr != nil {
-			return nil, application.ErrInvalidCoordination
+			return nil, coordination.ErrInvalidCoordination
 		}
 		conversation.ConversationID = id
 		conversations = append(conversations, conversation)
@@ -1724,21 +1724,21 @@ func localAgentConversations(ctx context.Context, tx *sql.Tx,
 
 // The liveness horizon is the shared one, and the clock is the store's, so this
 // roster and the admin roster cannot disagree about who is present.
-func localAgentPeers(ctx context.Context, tx *sql.Tx, session application.LocalAgentSession,
-	now time.Time) ([]application.ActiveAgent, error) {
+func localAgentPeers(ctx context.Context, tx *sql.Tx, session coordination.LocalAgentSession,
+	now time.Time) ([]coordination.ActiveAgent, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT agent.agent_name, agent.actor_id, session.session_id,
 		session.started_at_us, session.last_seen_at_us FROM coordination_agents AS agent
 		JOIN coordination_agent_sessions AS session USING(actor_id)
 		WHERE agent.project_key = ? AND agent.actor_id <> ? AND session.ended_at_us IS NULL
 		AND session.last_seen_at_us >= ? ORDER BY agent.agent_name`,
-		session.ProjectKey, session.ActorID.String(), timeMicros(now.Add(-application.LocalAgentActiveWindow)))
+		session.ProjectKey, session.ActorID.String(), timeMicros(now.Add(-coordination.LocalAgentActiveWindow)))
 	if err != nil {
 		return nil, fmt.Errorf("query SQLite agent peers: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var peers []application.ActiveAgent
+	var peers []coordination.ActiveAgent
 	for rows.Next() {
-		var peer application.ActiveAgent
+		var peer coordination.ActiveAgent
 		var actorText, sessionText string
 		var started, seen int64
 		if err := rows.Scan(&peer.Name, &actorText, &sessionText, &started, &seen); err != nil {
@@ -1747,7 +1747,7 @@ func localAgentPeers(ctx context.Context, tx *sql.Tx, session application.LocalA
 		actor, actorErr := domain.ParseActorID(actorText)
 		peerSession, sessionErr := domain.ParseActorSessionID(sessionText)
 		if actorErr != nil || sessionErr != nil {
-			return nil, application.ErrInvalidCoordination
+			return nil, coordination.ErrInvalidCoordination
 		}
 		peer.ActorID, peer.SessionID = actor, peerSession
 		peer.StartedAt, peer.LastSeenAt = microsTime(started), microsTime(seen)
@@ -1756,11 +1756,11 @@ func localAgentPeers(ctx context.Context, tx *sql.Tx, session application.LocalA
 	return peers, rows.Err()
 }
 
-func (store *Store) ListActiveLocalAgents(ctx context.Context, session application.LocalAgentSession) ([]application.ActiveAgent, error) {
+func (store *Store) ListActiveLocalAgents(ctx context.Context, session coordination.LocalAgentSession) ([]coordination.ActiveAgent, error) {
 	if session.WorkspaceID.IsZero() || session.ProjectKey == "" {
-		return nil, application.ErrInvalidCoordination
+		return nil, coordination.ErrInvalidCoordination
 	}
-	cutoff := time.Now().UTC().Add(-application.LocalAgentActiveWindow)
+	cutoff := time.Now().UTC().Add(-coordination.LocalAgentActiveWindow)
 	rows, err := store.db.QueryContext(ctx, `SELECT agent.agent_name, agent.actor_id, session.session_id,
 		session.started_at_us, session.last_seen_at_us FROM coordination_agents AS agent
 		JOIN coordination_agent_sessions AS session USING(actor_id)
@@ -1770,9 +1770,9 @@ func (store *Store) ListActiveLocalAgents(ctx context.Context, session applicati
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var result []application.ActiveAgent
+	var result []coordination.ActiveAgent
 	for rows.Next() {
-		var value application.ActiveAgent
+		var value coordination.ActiveAgent
 		var actorText, sessionText string
 		var started, seen int64
 		if err := rows.Scan(&value.Name, &actorText, &sessionText, &started, &seen); err != nil {
@@ -1792,18 +1792,18 @@ func (store *Store) ListActiveLocalAgents(ctx context.Context, session applicati
 	return result, rows.Err()
 }
 
-func (store *Store) ResolveLocalAgentNames(ctx context.Context, session application.LocalAgentSession, names []string) ([]domain.ActorID, error) {
-	if session.ProjectKey == "" || len(names) == 0 || len(names) > application.MaxMessageRecipients {
-		return nil, application.ErrInvalidCoordination
+func (store *Store) ResolveLocalAgentNames(ctx context.Context, session coordination.LocalAgentSession, names []string) ([]domain.ActorID, error) {
+	if session.ProjectKey == "" || len(names) == 0 || len(names) > coordination.MaxMessageRecipients {
+		return nil, coordination.ErrInvalidCoordination
 	}
 	result := make([]domain.ActorID, 0, len(names))
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		if !validLocalCoordinationText(name, application.MaxCoordinationNameBytes) {
-			return nil, application.ErrInvalidCoordination
+		if !validLocalCoordinationText(name, coordination.MaxCoordinationNameBytes) {
+			return nil, coordination.ErrInvalidCoordination
 		}
 		if _, duplicate := seen[name]; duplicate {
-			return nil, application.ErrInvalidCoordination
+			return nil, coordination.ErrInvalidCoordination
 		}
 		seen[name] = struct{}{}
 		var actorText string
@@ -1835,16 +1835,16 @@ func newLocalCoordinationToken() (string, error) {
 }
 
 func localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string,
-	started, lastSeen int64) (application.LocalAgentSession, error) {
+	started, lastSeen int64) (coordination.LocalAgentSession, error) {
 	workspace, e1 := domain.ParseWorkspaceID(workspaceText)
 	run, e2 := domain.ParseRunID(runText)
 	actor, e3 := domain.ParseActorID(actorText)
 	session, e4 := domain.ParseActorSessionID(sessionText)
 	epoch, e5 := domain.ParseAuthorityEpoch(epochText)
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil {
-		return application.LocalAgentSession{}, application.ErrInvalidCoordination
+		return coordination.LocalAgentSession{}, coordination.ErrInvalidCoordination
 	}
-	return application.LocalAgentSession{ProjectKey: projectKey, AgentName: agentName, WorkspaceID: workspace, RunID: run,
+	return coordination.LocalAgentSession{ProjectKey: projectKey, AgentName: agentName, WorkspaceID: workspace, RunID: run,
 		ActorID: actor, ActorSessionID: session, AuthorityEpoch: epoch, StartedAt: microsTime(started),
 		LastSeenAt: microsTime(lastSeen)}, nil
 }

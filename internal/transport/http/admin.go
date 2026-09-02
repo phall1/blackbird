@@ -15,7 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phall1/blackbird/internal/adminapi"
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/transport/metrics"
 )
@@ -57,14 +57,14 @@ type LocalIdentity struct {
 }
 
 type AdminDependencies struct {
-	Admin    application.LocalAdminStore
+	Admin    coordination.LocalAdminStore
 	Token    AdminTokenDigest
 	Identity LocalIdentity
 	Metrics  *metrics.Registry
 }
 
 type adminHandler struct {
-	admin    application.LocalAdminStore
+	admin    coordination.LocalAdminStore
 	token    AdminTokenDigest
 	identity LocalIdentity
 	metrics  *metrics.Registry
@@ -130,7 +130,7 @@ func (handler *adminHandler) describe(writer stdhttp.ResponseWriter, request *st
 	}
 	writeLocalJSON(writer, stdhttp.StatusOK, localAdminIdentity{Version: handler.identity.Version,
 		Commit: handler.identity.Commit, BuiltAt: handler.identity.BuiltAt, PID: handler.identity.PID,
-		StartedAt: localAdminInstant(application.MicrosFromTime(handler.identity.StartedAt)), UptimeMS: uptime,
+		StartedAt: localAdminInstant(coordination.MicrosFromTime(handler.identity.StartedAt)), UptimeMS: uptime,
 		HTTPAddress: handler.identity.HTTPAddress, MCPAddress: handler.identity.MCPAddress,
 		StorageBackend: storage.StorageBackend, DatabasePath: storage.DatabasePath,
 		SchemaVersion: storage.SchemaVersion, ObservedAt: localAdminInstant(storage.ObservedAtUS),
@@ -196,7 +196,7 @@ func (handler *adminHandler) agents(writer stdhttp.ResponseWriter, request *stdh
 		return
 	}
 	page, err := handler.admin.ListAdminAgents(request.Context(),
-		application.AdminAgentsQuery{ProjectKey: projectKey, AgentName: agentName, ActiveOnly: activeOnly,
+		coordination.AdminAgentsQuery{ProjectKey: projectKey, AgentName: agentName, ActiveOnly: activeOnly,
 			Limit: limit})
 	if err != nil {
 		writeLocalError(writer, err)
@@ -240,7 +240,7 @@ func (handler *adminHandler) inbox(writer stdhttp.ResponseWriter, request *stdht
 		return
 	}
 	page, err := handler.admin.AdminInbox(request.Context(),
-		application.AdminInboxQuery{ProjectKey: projectKey, AgentName: agentName, UnreadOnly: unreadOnly,
+		coordination.AdminInboxQuery{ProjectKey: projectKey, AgentName: agentName, UnreadOnly: unreadOnly,
 			UnackedOnly: unackedOnly, Limit: limit})
 	if err != nil {
 		writeLocalError(writer, err)
@@ -293,7 +293,7 @@ func (handler *adminHandler) conversations(writer stdhttp.ResponseWriter, reques
 		conversationID = parsed
 	}
 	page, err := handler.admin.ListAdminConversations(request.Context(),
-		application.AdminConversationsQuery{ProjectKey: projectKey, ConversationID: conversationID,
+		coordination.AdminConversationsQuery{ProjectKey: projectKey, ConversationID: conversationID,
 			OpenOnly: openOnly, Limit: limit})
 	if err != nil {
 		writeLocalError(writer, err)
@@ -331,12 +331,12 @@ func (handler *adminHandler) reservations(writer stdhttp.ResponseWriter, request
 	if !ok {
 		return
 	}
-	state := application.AdminReservationState(values.Get("state"))
+	state := coordination.AdminReservationState(values.Get("state"))
 	if !state.Valid() {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
-			fmt.Sprintf("state must be one of %s, %s, %s or %s", application.AdminReservationAll,
-				application.AdminReservationActive, application.AdminReservationExpired,
-				application.AdminReservationReleased))
+			fmt.Sprintf("state must be one of %s, %s, %s or %s", coordination.AdminReservationAll,
+				coordination.AdminReservationActive, coordination.AdminReservationExpired,
+				coordination.AdminReservationReleased))
 		return
 	}
 	mode, ok := localAdminReservationMode(writer, values)
@@ -348,7 +348,7 @@ func (handler *adminHandler) reservations(writer stdhttp.ResponseWriter, request
 		return
 	}
 	page, err := handler.admin.ListAdminReservations(request.Context(),
-		application.AdminReservationsQuery{ProjectKey: projectKey, AgentName: agentName,
+		coordination.AdminReservationsQuery{ProjectKey: projectKey, AgentName: agentName,
 			State: state.Normalized(), Mode: mode, Path: selectorPath, Limit: limit})
 	if err != nil {
 		writeLocalError(writer, err)
@@ -415,13 +415,13 @@ func (handler *adminHandler) events(writer stdhttp.ResponseWriter, request *stdh
 	if !ok {
 		return
 	}
-	eventType := application.CoordinationEventType(values.Get("type"))
+	eventType := coordination.CoordinationEventType(values.Get("type"))
 	if eventType != "" && !eventType.Valid() {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "type is not a coordination event type")
 		return
 	}
 	page, err := handler.admin.ListAdminEvents(request.Context(),
-		application.AdminEventsQuery{ProjectKey: projectKey, AgentName: agentName, EventType: eventType, Limit: limit})
+		coordination.AdminEventsQuery{ProjectKey: projectKey, AgentName: agentName, EventType: eventType, Limit: limit})
 	if err != nil {
 		writeLocalError(writer, err)
 		return
@@ -495,7 +495,7 @@ func localAdminProjectKey(writer stdhttp.ResponseWriter, values url.Values, requ
 		}
 		return "", true
 	}
-	if len(key) > application.MaxCoordinationKeyBytes || !utf8.ValidString(key) {
+	if len(key) > coordination.MaxCoordinationKeyBytes || !utf8.ValidString(key) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "project_key is invalid")
 		return "", false
 	}
@@ -504,7 +504,7 @@ func localAdminProjectKey(writer stdhttp.ResponseWriter, values url.Values, requ
 
 func localAdminAgentName(writer stdhttp.ResponseWriter, values url.Values) (string, bool) {
 	name := values.Get("agent")
-	if len(name) > application.MaxCoordinationNameBytes || !utf8.ValidString(name) {
+	if len(name) > coordination.MaxCoordinationNameBytes || !utf8.ValidString(name) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "agent is invalid")
 		return "", false
 	}
@@ -528,16 +528,16 @@ func localAdminFlag(writer stdhttp.ResponseWriter, values url.Values, name strin
 	return parsed, true
 }
 
-func localAdminReservationMode(writer stdhttp.ResponseWriter, values url.Values) (application.LeaseMode, bool) {
+func localAdminReservationMode(writer stdhttp.ResponseWriter, values url.Values) (coordination.LeaseMode, bool) {
 	text := values.Get("mode")
-	if text == "" || text == application.AdminReservationModeAny {
+	if text == "" || text == coordination.AdminReservationModeAny {
 		return "", true
 	}
-	mode := application.LeaseMode(text)
-	if !application.ValidAdminReservationMode(mode) {
+	mode := coordination.LeaseMode(text)
+	if !coordination.ValidAdminReservationMode(mode) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
-			fmt.Sprintf("mode must be one of %s, %s or %s", application.AdminReservationModeAny,
-				application.LeaseShared, application.LeaseExclusive))
+			fmt.Sprintf("mode must be one of %s, %s or %s", coordination.AdminReservationModeAny,
+				coordination.LeaseShared, coordination.LeaseExclusive))
 		return "", false
 	}
 	return mode, true
@@ -548,7 +548,7 @@ func localAdminPath(writer stdhttp.ResponseWriter, values url.Values) (string, b
 	if selectorPath == "" {
 		return "", true
 	}
-	if len(selectorPath) > application.MaxLeaseSelectorBytes || !utf8.ValidString(selectorPath) ||
+	if len(selectorPath) > coordination.MaxLeaseSelectorBytes || !utf8.ValidString(selectorPath) ||
 		strings.ContainsRune(selectorPath, 0) || strings.TrimSpace(selectorPath) != selectorPath {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "path is invalid")
 		return "", false
@@ -562,9 +562,9 @@ func localAdminLimit(writer stdhttp.ResponseWriter, values url.Values) (uint16, 
 		return 0, true
 	}
 	parsed, err := strconv.ParseUint(text, 10, 16)
-	if err != nil || parsed == 0 || parsed > application.MaxQueryPageSize {
+	if err != nil || parsed == 0 || parsed > coordination.MaxQueryPageSize {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
-			fmt.Sprintf("limit must be from 1 through %d", application.MaxQueryPageSize))
+			fmt.Sprintf("limit must be from 1 through %d", coordination.MaxQueryPageSize))
 		return 0, false
 	}
 	return uint16(parsed), true
@@ -574,7 +574,7 @@ func localAdminInstant(micros int64) string {
 	if micros == 0 {
 		return ""
 	}
-	return application.TimeFromMicros(micros).Format(time.RFC3339Nano)
+	return coordination.TimeFromMicros(micros).Format(time.RFC3339Nano)
 }
 
 func localAdminID[ID interface {

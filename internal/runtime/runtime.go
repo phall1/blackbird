@@ -309,7 +309,7 @@ func (drain *ingressDrain) wait(ctx context.Context) error {
 // newIngressServer builds the daemon's ingress server. It deliberately sets no
 // WriteTimeout, and that absence is load-bearing rather than an oversight:
 // blackbird_wait holds a single request open for up to
-// application.MaxCoordinationWait while it parks an agent behind a reservation,
+// coordination.MaxCoordinationWait while it parks an agent behind a reservation,
 // so any write timeout at or below that ceiling would cut long polls off
 // mid-answer. The agent does not see a timeout -- it sees a truncated response
 // from what looks like a broken daemon, which is the worst available failure

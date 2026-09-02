@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -129,7 +129,7 @@ func BenchmarkInboxEmptyPoll(b *testing.B) {
 	for _, scale := range []int{benchmarkInboxSmallScale, benchmarkInboxLargeScale} {
 		store := openBenchmarkStore(b, fmt.Sprintf("inbox-%d.db", scale))
 		seedInboxCorpus(b, store, workspaceText, scale)
-		query := application.InboxQuery{WorkspaceID: workspace, Recipient: viewer, Limit: benchmarkInboxLimit}
+		query := coordination.InboxQuery{WorkspaceID: workspace, Recipient: viewer, Limit: benchmarkInboxLimit}
 		b.Run(fmt.Sprintf("messages=%d", scale), func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -175,7 +175,7 @@ func BenchmarkAcquireLeaseWithStaleLeases(b *testing.B) {
 	// An exact selector that overlaps none of the seeded paths, so the cost
 	// being measured is reading and parsing the stale rows rather than the
 	// overlap conflict they would otherwise raise.
-	selector, err := application.NewLeaseSelector(application.LeaseSelectorExact, "bench/target.go")
+	selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, "bench/target.go")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -198,9 +198,9 @@ func BenchmarkAcquireLeaseWithStaleLeases(b *testing.B) {
 				if parseErr != nil {
 					b.Fatal(parseErr)
 				}
-				if _, err := store.AcquireLease(ctx, application.AcquireLeaseParams{LeaseID: leaseID,
+				if _, err := store.AcquireLease(ctx, coordination.AcquireLeaseParams{LeaseID: leaseID,
 					WorkspaceID: workspace, Holder: holder, HolderSession: session, AuthorityEpoch: epoch,
-					Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector},
+					Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{selector},
 					TTL: time.Hour}); err != nil {
 					b.Fatal(err)
 				}
@@ -306,7 +306,7 @@ func BenchmarkAwaitCoordination(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	selector, err := application.NewLeaseSelector(application.LeaseSelectorSubtree, "internal/storage")
+	selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorSubtree, "internal/storage")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -314,21 +314,21 @@ func BenchmarkAwaitCoordination(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if _, err := store.AcquireLease(ctx, application.AcquireLeaseParams{LeaseID: leaseID,
+	if _, err := store.AcquireLease(ctx, coordination.AcquireLeaseParams{LeaseID: leaseID,
 		WorkspaceID: holder.WorkspaceID, Holder: holder.ActorID, HolderSession: holder.ActorSessionID,
-		AuthorityEpoch: holder.AuthorityEpoch, Mode: application.LeaseExclusive,
-		Selectors: []application.LeaseSelector{selector}, TTL: time.Hour}); err != nil {
+		AuthorityEpoch: holder.AuthorityEpoch, Mode: coordination.LeaseExclusive,
+		Selectors: []coordination.LeaseSelector{selector}, TTL: time.Hour}); err != nil {
 		b.Fatal(err)
 	}
 	foldSeedIntoDatabase(b, store)
 
 	for _, variant := range []struct {
 		name    string
-		request application.CoordinationWaitRequest
+		request coordination.CoordinationWaitRequest
 	}{
-		{"blocked-path", application.CoordinationWaitRequest{Path: "internal/storage/sqlite/sqlite.go"}},
-		{"free-path", application.CoordinationWaitRequest{Path: "internal/transport/mcp/mcp.go"}},
-		{"mail", application.CoordinationWaitRequest{AwaitMail: true}},
+		{"blocked-path", coordination.CoordinationWaitRequest{Path: "internal/storage/sqlite/sqlite.go"}},
+		{"free-path", coordination.CoordinationWaitRequest{Path: "internal/transport/mcp/mcp.go"}},
+		{"mail", coordination.CoordinationWaitRequest{AwaitMail: true}},
 	} {
 		b.Run(variant.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -337,7 +337,7 @@ func BenchmarkAwaitCoordination(b *testing.B) {
 				// One observation rather than a whole wait: the loop's own cost
 				// is a sleep, and timing a sleep measures the clock.
 				if _, err := store.coordinationWaitState(ctx, waiter, variant.request,
-					application.LeaseExclusive); err != nil {
+					coordination.LeaseExclusive); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -428,7 +428,7 @@ func seedInboxCorpus(b *testing.B, store *Store, workspaceText string, count int
 	conversation := coordinationUUID(benchmarkInboxConversationIndex)
 	author := coordinationUUID(benchmarkInboxAuthorIndex)
 	session := coordinationUUID(benchmarkInboxSessionIndex)
-	digest := application.DigestBytes([]byte(benchmarkMessageBody))
+	digest := coordination.DigestBytes([]byte(benchmarkMessageBody))
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO conversations(conversation_id, workspace_id, run_id,
 			opened_by_actor_id, opened_by_session_id, topic, opened_at_us) VALUES (?, ?, ?, ?, ?, ?, ?)`,

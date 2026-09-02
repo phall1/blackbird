@@ -14,6 +14,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/integration/beads"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 	mcptransport "github.com/phall1/blackbird/internal/transport/mcp"
@@ -24,8 +25,8 @@ const mcpSessionTimeout = 30 * time.Minute
 
 type productionStore interface {
 	Storage
-	application.LocalCoordinationStore
-	application.LocalAdminStore
+	coordination.LocalCoordinationStore
+	coordination.LocalAdminStore
 }
 
 // NewProductionDaemon constructs the source-built local coordination daemon.
@@ -116,7 +117,7 @@ func composeProductionBundle(
 	httpMux.Handle("/api/v1/local/", localHTTPHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Logger: logger, Metrics: telemetry, Coordination: store,
-		Observations: observationReader(store), WorkReferences: beadsWorkReferenceObserver{},
+		Observations: observationReader(store), WorkReferences: newBeadsWorkReferenceObserver(),
 	})
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose MCP transport: %w", err)
@@ -165,30 +166,78 @@ func telemetryWorkers(handshake Worker, telemetry *telemetryWorker) []Worker {
 	return []Worker{handshake, telemetry}
 }
 
-type beadsWorkReferenceObserver struct{}
+// workObservationBudget bounds one whole observation, and workObservationStep
+// bounds each of the two executions inside it -- the provider probe and the
+// read. An observation shells out to a binary this daemon does not control,
+// against an issue database that may be cold, while the agent that asked is
+// parked on its turn; without a ceiling a wedged provider becomes a daemon that
+// looks dead. The budget is what an agent can actually wait for, and the step
+// is what keeps one hung execution from spending all of it.
+const (
+	workObservationBudget = 8 * time.Second
+	workObservationStep   = 4 * time.Second
+)
 
-func (beadsWorkReferenceObserver) ObserveWorkReference(
+// beadsWorkReferenceObserver reads work items owned by the bd tracker. Build it
+// with newBeadsWorkReferenceObserver: the zero value carries no lookup and no
+// bounds, and a defensive default for either would be code no test on a
+// workstation with bd installed and none without could reach the same way.
+//
+// It makes Blackbird no more authoritative over work than a caller reading bd
+// itself: nothing is written, nothing is cached, and every call re-probes the
+// binary, so the provenance reported beside an observation describes the binary
+// that actually answered rather than one this daemon met at startup.
+type beadsWorkReferenceObserver struct {
+	// lookPath is injected so this composition asserts the same thing on a
+	// workstation with bd installed and one without. It differs from the
+	// updater's detection on purpose: the updater schedules a job that runs
+	// under another unit's PATH, whereas the daemon is itself the process that
+	// will exec bd, so what the daemon can find here is exactly what it can
+	// run.
+	lookPath func(string) (string, error)
+	budget   time.Duration
+	step     time.Duration
+}
+
+func newBeadsWorkReferenceObserver() beadsWorkReferenceObserver {
+	return beadsWorkReferenceObserver{
+		lookPath: exec.LookPath, budget: workObservationBudget, step: workObservationStep,
+	}
+}
+
+// ObserveWorkReference reports what the tracker says about one work item now.
+// Every failure it can produce is a typed boundary failure, because "the
+// tracker is not installed here" and "the tracker is installed but unsupported"
+// lead an agent to different next moves and an internal error leads it to
+// neither.
+func (observer beadsWorkReferenceObserver) ObserveWorkReference(
 	ctx context.Context,
 	projectDir string,
 	objectID string,
-) (application.WorkReference, error) {
-	executable, err := exec.LookPath("bd")
+) (coordination.WorkReference, error) {
+	if !filepath.IsAbs(projectDir) {
+		return coordination.WorkReference{}, beads.DependencyFailure(beads.ErrorMalformed, "configure",
+			"this agent registered a project key that is not an absolute repository path, "+
+				"so no tracker directory can be derived; register with the repository's absolute path", nil)
+	}
+	executable, err := observer.lookPath(beads.ExecutableName)
 	if err != nil {
-		return application.WorkReference{}, &beads.DependencyError{
-			Kind: beads.ErrorUnavailable, Operation: "configure", Detail: "bd executable is unavailable", Cause: err,
-		}
+		return coordination.WorkReference{}, beads.DependencyFailure(beads.ErrorUnavailable, "configure",
+			"the bd work-item tracker is not on this daemon's PATH; "+
+				"install it to observe work items on this machine", err)
 	}
 	executable, err = filepath.Abs(executable)
 	if err != nil {
-		return application.WorkReference{}, &beads.DependencyError{
-			Kind: beads.ErrorUnavailable, Operation: "configure", Detail: "bd executable cannot be resolved", Cause: err,
-		}
+		return coordination.WorkReference{}, beads.DependencyFailure(beads.ErrorUnavailable, "configure",
+			"the bd work-item tracker could not be resolved to an absolute path", err)
 	}
-	provider, err := beads.New(ctx, beads.Config{
-		Executable: executable, ProjectDir: projectDir, Project: projectDir,
+	observation, cancel := context.WithTimeout(ctx, observer.budget)
+	defer cancel()
+	provider, err := beads.New(observation, beads.Config{
+		Executable: executable, ProjectDir: projectDir, Project: projectDir, Timeout: observer.step,
 	})
 	if err != nil {
-		return application.WorkReference{}, err
+		return coordination.WorkReference{}, err
 	}
-	return provider.Observe(ctx, objectID)
+	return provider.Observe(observation, objectID)
 }

@@ -16,7 +16,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
@@ -473,7 +473,7 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 
 	blocked := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 1})
-	if blocked.Reason != string(application.CoordinationWaitDeadline) || len(blocked.Blockers) != 1 ||
+	if blocked.Reason != string(coordination.CoordinationWaitDeadline) || len(blocked.Blockers) != 1 ||
 		blocked.Blockers[0].HolderAgentName != "alice" {
 		t.Fatalf("wait on a held path = %+v", blocked)
 	}
@@ -483,7 +483,7 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 		"agent_token": alice, "selectors": held.Selectors})
 	freed := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 30})
-	if freed.Reason != string(application.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
+	if freed.Reason != string(coordination.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
 		t.Fatalf("wait on a freed path = %+v", freed)
 	}
 	// A shared reader waits only for exclusive writers, and never for itself.
@@ -492,14 +492,14 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 	shared := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: alice, Path: "src/main.go", Mode: "shared", TimeoutSeconds: 30})
-	if shared.Reason != string(application.CoordinationWaitPathFree) {
+	if shared.Reason != string(coordination.CoordinationWaitPathFree) {
 		t.Fatalf("shared wait behind a shared reader = %+v", shared)
 	}
 	// await_mail alone is a valid wait: reaching the deadline rather than an
 	// argument failure is what proves the flag arrived at the store.
 	mail := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, AwaitMail: true, TimeoutSeconds: 1})
-	if mail.Reason != string(application.CoordinationWaitDeadline) || mail.WaitedMS <= 0 {
+	if mail.Reason != string(coordination.CoordinationWaitDeadline) || mail.WaitedMS <= 0 {
 		t.Fatalf("mail wait = %+v", mail)
 	}
 	neither := callCoordFailure(t, client, ToolWait, coordinationWaitInput{AgentToken: bob, TimeoutSeconds: 1})
@@ -521,11 +521,11 @@ func TestBoundedWaitTimeoutClampsWhateverTheCallerAsksFor(t *testing.T) {
 		seconds  uint32
 		expected time.Duration
 	}{
-		{name: "unset asks for the ceiling", seconds: 0, expected: application.MaxCoordinationWait},
+		{name: "unset asks for the ceiling", seconds: 0, expected: coordination.MaxCoordinationWait},
 		{name: "within the ceiling is honoured", seconds: 5, expected: 5 * time.Second},
-		{name: "at the ceiling is honoured", seconds: uint32(application.MaxCoordinationWait / time.Second),
-			expected: application.MaxCoordinationWait},
-		{name: "beyond the ceiling is clamped", seconds: 86400, expected: application.MaxCoordinationWait},
+		{name: "at the ceiling is honoured", seconds: uint32(coordination.MaxCoordinationWait / time.Second),
+			expected: coordination.MaxCoordinationWait},
+		{name: "beyond the ceiling is clamped", seconds: 86400, expected: coordination.MaxCoordinationWait},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -633,23 +633,23 @@ func TestDescribeLeaseConflictUsesRequestedMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, err := application.NewLeaseSelector(application.LeaseSelectorExact, "src/main.go")
+	selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, "src/main.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := application.LocalAgentSession{ActorID: actor}
+	session := coordination.LocalAgentSession{ActorID: actor}
 	for _, testCase := range []struct {
 		name string
-		mode application.LeaseMode
-		want application.LeaseMode
+		mode coordination.LeaseMode
+		want coordination.LeaseMode
 	}{
-		{name: "shared waits only on writers", mode: application.LeaseShared, want: application.LeaseExclusive},
-		{name: "exclusive waits on everyone", mode: application.LeaseExclusive},
+		{name: "shared waits only on writers", mode: coordination.LeaseShared, want: coordination.LeaseExclusive},
+		{name: "exclusive waits on everyone", mode: coordination.LeaseExclusive},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			store := &leaseConflictQueryStore{}
 			err := describeLeaseConflict(context.Background(), store, session, testCase.mode,
-				[]application.LeaseSelector{selector}, domain.ErrLeaseConflict)
+				[]coordination.LeaseSelector{selector}, domain.ErrLeaseConflict)
 			if err == nil || !errors.Is(err, domain.ErrLeaseConflict) {
 				t.Fatalf("error = %v, want lease conflict", err)
 			}
@@ -659,7 +659,7 @@ func TestDescribeLeaseConflictUsesRequestedMode(t *testing.T) {
 		})
 	}
 	failedLookup := describeLeaseConflict(context.Background(), &leaseConflictQueryStore{err: errors.New("query failed")},
-		session, application.LeaseExclusive, []application.LeaseSelector{selector}, domain.ErrLeaseConflict)
+		session, coordination.LeaseExclusive, []coordination.LeaseSelector{selector}, domain.ErrLeaseConflict)
 	var blocked *blockedError
 	if !errors.As(failedLookup, &blocked) || len(blocked.blockers) != 0 {
 		t.Fatalf("failed blocker lookup = %v, want a described conflict without blockers", failedLookup)
@@ -667,15 +667,15 @@ func TestDescribeLeaseConflictUsesRequestedMode(t *testing.T) {
 }
 
 type leaseConflictQueryStore struct {
-	application.LocalCoordinationStore
-	query application.AdminReservationsQuery
+	coordination.LocalCoordinationStore
+	query coordination.AdminReservationsQuery
 	err   error
 }
 
-func (store *leaseConflictQueryStore) LocalAgentReservations(_ context.Context, _ application.LocalAgentSession,
-	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
+func (store *leaseConflictQueryStore) LocalAgentReservations(_ context.Context, _ coordination.LocalAgentSession,
+	query coordination.AdminReservationsQuery) (coordination.AdminReservationsPage, error) {
 	store.query = query
-	return application.AdminReservationsPage{}, store.err
+	return coordination.AdminReservationsPage{}, store.err
 }
 
 func newCoordinationSession(t *testing.T, name string) (*sdkmcp.ClientSession, string, string) {
@@ -949,7 +949,7 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	if err := json.Unmarshal(waitSchema, &waitDecoded); err != nil {
 		t.Fatalf("decode wait schema: %v", err)
 	}
-	ceiling := application.MaxCoordinationWait.Seconds()
+	ceiling := coordination.MaxCoordinationWait.Seconds()
 	if maximum := waitDecoded.Properties.TimeoutSeconds.Maximum; maximum == nil || *maximum != ceiling {
 		t.Errorf("wait timeout maximum = %v, want the daemon ceiling %v", maximum, ceiling)
 	}
@@ -1036,15 +1036,15 @@ func (testWorkReferenceObserver) ObserveWorkReference(
 	_ context.Context,
 	projectDir string,
 	objectID string,
-) (application.WorkReference, error) {
-	return application.WorkReference{
+) (coordination.WorkReference, error) {
+	return coordination.WorkReference{
 		Provider: "test", Project: projectDir, ObjectID: objectID,
 		ObservedVersion: "1", ObservedAt: time.Unix(1, 0).UTC(),
-		Fields: application.WorkReferenceFields{Title: "Observed work", IssueType: "task", Status: "open"},
+		Fields: coordination.WorkReferenceFields{Title: "Observed work", IssueType: "task", Status: "open"},
 	}, nil
 }
 
-func newTestServer(t *testing.T, store application.LocalCoordinationStore) *Server {
+func newTestServer(t *testing.T, store coordination.LocalCoordinationStore) *Server {
 	t.Helper()
 	server, err := NewServer(Dependencies{Coordination: store, WorkReferences: testWorkReferenceObserver{}})
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -116,7 +117,7 @@ func appendEnvelope(ctx context.Context, modelCalls, spans *sql.Stmt,
 // its rows immortal.
 func (store *Store) SweepTelemetry(ctx context.Context, before time.Time) (int64, error) {
 	if before.IsZero() {
-		return 0, fmt.Errorf("%w: telemetry sweep needs a cutoff", application.ErrInvalidCoordination)
+		return 0, fmt.Errorf("%w: telemetry sweep needs a cutoff", coordination.ErrInvalidCoordination)
 	}
 	cutoff := before.UnixMicro()
 	var deleted int64
@@ -237,10 +238,10 @@ const spendDurationColumns = `COUNT(duration_ms), COALESCE(SUM(duration_ms), 0),
 // The project is the session's, always. Like the reservations projection, the
 // caller does not get to name a scope: an agent reads its own workspace or
 // nothing, and MineOnly narrows further to the caller itself.
-func (store *Store) SpendReport(ctx context.Context, session application.LocalAgentSession,
+func (store *Store) SpendReport(ctx context.Context, session coordination.LocalAgentSession,
 	query application.SpendQuery) (application.SpendReport, error) {
 	if session.ProjectKey == "" || session.ActorID.String() == "" {
-		return application.SpendReport{}, application.ErrInvalidCoordination
+		return application.SpendReport{}, coordination.ErrInvalidCoordination
 	}
 	if err := query.Validate(); err != nil {
 		return application.SpendReport{}, err
@@ -248,7 +249,7 @@ func (store *Store) SpendReport(ctx context.Context, session application.LocalAg
 	query = query.Normalized(time.Now().UTC())
 	shape, ok := spendShapeFor(query.Dimension)
 	if !ok {
-		return application.SpendReport{}, application.ErrInvalidCoordination
+		return application.SpendReport{}, coordination.ErrInvalidCoordination
 	}
 
 	filter := "WHERE calls.project_key = ? AND calls.started_at_us >= ?"

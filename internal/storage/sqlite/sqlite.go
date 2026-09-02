@@ -24,7 +24,7 @@ import (
 
 	sqlitedriver "modernc.org/sqlite"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 )
 
 const (
@@ -157,8 +157,8 @@ type heartbeatLedger struct {
 	flushed map[string]time.Time
 }
 
-var _ application.CoordinationStore = (*Store)(nil)
-var _ application.LocalCoordinationStore = (*Store)(nil)
+var _ coordination.CoordinationStore = (*Store)(nil)
+var _ coordination.LocalCoordinationStore = (*Store)(nil)
 
 type writeArbiter struct {
 	sync.Mutex

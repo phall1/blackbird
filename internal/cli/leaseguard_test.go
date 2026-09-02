@@ -10,9 +10,10 @@ import (
 
 	"github.com/phall1/blackbird/internal/adminapi"
 	// The guard restates the daemon's overlap rule because internal/cli may not
-	// import internal/application. Test files are exempt from the layer rules,
-	// which is what lets the duplication be pinned rather than merely reviewed.
-	"github.com/phall1/blackbird/internal/application"
+	// import internal/application/coordination. Test files are exempt from the
+	// layer rules, which is what lets the duplication be pinned rather than
+	// merely reviewed.
+	"github.com/phall1/blackbird/internal/application/coordination"
 )
 
 func guardReservation(holder, mode string, expired bool, selectors ...adminapi.Selector) Reservation {
@@ -187,17 +188,17 @@ func TestGuardOverlapMatchesTheDaemon(t *testing.T) {
 	overlaps, disjoint := 0, 0
 	for _, selector := range selectors {
 		for _, path := range paths {
-			staged, err := application.NewLeaseSelector(
-				application.LeaseSelectorExact, path)
+			staged, err := coordination.NewLeaseSelector(
+				coordination.LeaseSelectorExact, path)
 			if err != nil {
 				t.Fatalf("build staged selector %q: %v", path, err)
 			}
-			held, err := application.NewLeaseSelector(
-				application.LeaseSelectorKind(selector.Kind), selector.Path)
+			held, err := coordination.NewLeaseSelector(
+				coordination.LeaseSelectorKind(selector.Kind), selector.Path)
 			if err != nil {
 				t.Fatalf("build held selector %+v: %v", selector, err)
 			}
-			want := application.LeaseSelectorsOverlap(held, staged)
+			want := coordination.LeaseSelectorsOverlap(held, staged)
 			_, got := guardCoveringSelector(
 				Reservation{Selectors: []adminapi.Selector{selector}}, path)
 			if got != want {

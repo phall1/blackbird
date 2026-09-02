@@ -21,11 +21,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 )
 
 const (
-	ProviderName           = "beads"
+	ProviderName = "beads"
+	// ExecutableName is the command this adapter runs. The provider and its
+	// binary are not spelled the same, and a composition root that has to find
+	// the binary before an Adapter can exist should not have to know that.
+	ExecutableName         = "bd"
 	SupportedVersion       = "1.2.2"
 	SupportedSchemaVersion = 1
 	CapabilityObserveWork  = "work_reference.observe"
@@ -36,32 +40,38 @@ const (
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// ErrorKind is a stable provider-neutral dependency failure category.
-type ErrorKind string
+// The dependency failure vocabulary lives at the application boundary so a
+// transport can classify a broken work provider without importing this adapter;
+// these aliases preserve the adapter's public API.
+type ErrorKind = coordination.WorkObservationErrorKind
 
 const (
-	ErrorUnavailable  ErrorKind = "dependency_unavailable"
-	ErrorIncompatible ErrorKind = "dependency_incompatible"
-	ErrorMalformed    ErrorKind = "dependency_malformed"
+	ErrorUnavailable  = coordination.WorkObservationUnavailable
+	ErrorIncompatible = coordination.WorkObservationIncompatible
+	ErrorMalformed    = coordination.WorkObservationMalformed
 )
 
 // DependencyError reports a safe boundary failure without provider output.
-type DependencyError struct {
-	Kind      ErrorKind
-	Operation string
-	Detail    string
-	Cause     error
-}
-
-func (e *DependencyError) Error() string {
-	return fmt.Sprintf("%s %s: %s", ProviderName, e.Operation, e.Kind)
-}
-
-func (e *DependencyError) Unwrap() error { return e.Cause }
+type DependencyError = coordination.WorkObservationError
 
 func IsErrorKind(err error, kind ErrorKind) bool {
-	var dependencyError *DependencyError
-	return errors.As(err, &dependencyError) && dependencyError.Kind == kind
+	return coordination.IsWorkObservationKind(err, kind)
+}
+
+// DependencyFailure builds a boundary failure attributed to this provider. A
+// composition root needs it: locating the binary can fail before an Adapter
+// exists to report it, and that failure must still classify as this provider's.
+func DependencyFailure(kind ErrorKind, operation, detail string, cause error) error {
+	return dependencyError(kind, operation, detail, cause)
+}
+
+// dependencyError is the only way this package raises a boundary failure, so
+// every one of them is attributed to this provider and carries authored detail
+// rather than anything the external binary wrote.
+func dependencyError(kind ErrorKind, operation, detail string, cause error) error {
+	return &DependencyError{
+		Provider: ProviderName, Kind: kind, Operation: operation, Detail: detail, Cause: cause,
+	}
 }
 
 // Config contains composition inputs; ProjectDir is an opaque CLI locator.
@@ -75,10 +85,10 @@ type Config struct {
 
 // Provider-neutral work observations live at the application boundary; these
 // aliases preserve the adapter's public API.
-type Probe = application.WorkReferenceProvenance
-type Dependency = application.WorkReferenceDependency
-type WorkFields = application.WorkReferenceFields
-type WorkReference = application.WorkReference
+type Probe = coordination.WorkReferenceProvenance
+type Dependency = coordination.WorkReferenceDependency
+type WorkFields = coordination.WorkReferenceFields
+type WorkReference = coordination.WorkReference
 
 // Invocation is a stable, body-free audit record of one direct execution.
 type Invocation struct {
@@ -136,10 +146,8 @@ func New(ctx context.Context, config Config) (*Adapter, error) {
 		return nil, malformed("probe", "version response omits required provenance", nil)
 	}
 	if version.Version != SupportedVersion || version.SchemaVersion != SupportedSchemaVersion {
-		return nil, &DependencyError{
-			Kind: ErrorIncompatible, Operation: "probe",
-			Detail: "provider version or schema is unsupported",
-		}
+		return nil, dependencyError(ErrorIncompatible, "probe",
+			"provider version or schema is unsupported", nil)
 	}
 	probe := Probe{
 		Provider: ProviderName, Version: version.Version, Build: version.Build,
@@ -158,19 +166,19 @@ func validateConfig(config Config) (Config, string, error) {
 		config.MaxOutputBytes = defaultMaxOutputBytes
 	}
 	if !filepath.IsAbs(config.Executable) {
-		return Config{}, "", &DependencyError{Kind: ErrorUnavailable, Operation: "configure", Detail: "executable must be absolute"}
+		return Config{}, "", dependencyError(ErrorUnavailable, "configure", "executable must be absolute", nil)
 	}
 	if !filepath.IsAbs(config.ProjectDir) || !validProject(config.Project) ||
 		config.Timeout <= 0 || config.MaxOutputBytes <= 0 {
-		return Config{}, "", &DependencyError{Kind: ErrorMalformed, Operation: "configure", Detail: "configuration is invalid"}
+		return Config{}, "", dependencyError(ErrorMalformed, "configure", "configuration is invalid", nil)
 	}
 	info, err := os.Stat(config.Executable)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return Config{}, "", &DependencyError{Kind: ErrorUnavailable, Operation: "configure", Detail: "executable is unavailable", Cause: err}
+		return Config{}, "", dependencyError(ErrorUnavailable, "configure", "executable is unavailable", err)
 	}
 	digest, err := fileDigest(config.Executable)
 	if err != nil {
-		return Config{}, "", &DependencyError{Kind: ErrorUnavailable, Operation: "configure", Detail: "executable cannot be verified", Cause: err}
+		return Config{}, "", dependencyError(ErrorUnavailable, "configure", "executable cannot be verified", err)
 	}
 	return config, digest, nil
 }
@@ -297,7 +305,7 @@ func decodeOneJSON(data []byte, target any, strict bool) error {
 }
 
 func malformed(operation, detail string, cause error) error {
-	return &DependencyError{Kind: ErrorMalformed, Operation: operation, Detail: detail, Cause: cause}
+	return dependencyError(ErrorMalformed, operation, detail, cause)
 }
 
 type commandResult struct {
@@ -312,7 +320,7 @@ func classifyResult(operation string, result commandResult) error {
 		return malformed(operation, "provider output exceeded configured bound", result.err)
 	}
 	if result.err != nil {
-		return &DependencyError{Kind: ErrorUnavailable, Operation: operation, Detail: "provider invocation failed", Cause: result.err}
+		return dependencyError(ErrorUnavailable, operation, "provider invocation failed", result.err)
 	}
 	return nil
 }

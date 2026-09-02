@@ -15,7 +15,7 @@ const Absent = "-"
 var byteUnits = [...]string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
 
 // Instant converts a microsecond Unix timestamp to a UTC time. Blackbird's
-// admin read models carry timestamps this way (application.TimeFromMicros has
+// admin read models carry timestamps this way (coordination.TimeFromMicros has
 // the same contract), so this is the adapter into the time.Time surface below.
 // Non-positive values yield the zero time.
 func Instant(micros int64) time.Time {

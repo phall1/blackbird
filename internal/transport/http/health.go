@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -26,14 +26,14 @@ const (
 // younger than the window is reused, while every request outside the window
 // executes a real query.
 type HealthDependencies struct {
-	Readiness      application.ReadinessProbe
+	Readiness      coordination.ReadinessProbe
 	Version        string
 	ProbeTimeout   time.Duration
 	ProbeFreshness time.Duration
 }
 
 type healthHandler struct {
-	readiness application.ReadinessProbe
+	readiness coordination.ReadinessProbe
 	version   string
 	timeout   time.Duration
 	freshness time.Duration

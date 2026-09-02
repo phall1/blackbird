@@ -255,10 +255,10 @@ func leaseGuardConflicts(paths []string, reservations []Reservation, agent strin
 // commit can present: a staged path is always an exact file, so a claim covers
 // it when the claim names that file or names a subtree above it.
 //
-// The rule lives in internal/application, which this layer may not import. The
-// duplication is pinned instead: TestGuardOverlapMatchesTheDaemon compares this
-// against application.LeaseSelectorsOverlap over a table, so the two cannot
-// drift without failing the build.
+// The rule lives in internal/application/coordination, which this layer may
+// not import. The duplication is pinned instead: TestGuardOverlapMatchesTheDaemon
+// compares this against coordination.LeaseSelectorsOverlap over a table, so the
+// two cannot drift without failing the build.
 func guardCoveringSelector(reservation Reservation, path string) (string, bool) {
 	for _, selector := range reservation.Selectors {
 		if selector.Path == path {

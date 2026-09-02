@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
@@ -81,16 +81,16 @@ func TestLocalHTTPRegistrationSSEWakeAndCatchUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	conversationID, _ := domain.NewConversationID()
-	if _, err = store.OpenConversation(context.Background(), application.OpenConversationParams{ConversationID: conversationID,
+	if _, err = store.OpenConversation(context.Background(), coordination.OpenConversationParams{ConversationID: conversationID,
 		WorkspaceID: aliceSession.WorkspaceID, RunID: aliceSession.RunID, OpenedBy: aliceSession.ActorID,
 		OpenedBySession: aliceSession.ActorSessionID, Topic: "HTTP E2E"}); err != nil {
 		t.Fatal(err)
 	}
-	recipient, _ := application.NewRecipient(bobSession.ActorID, application.RecipientTo)
+	recipient, _ := coordination.NewRecipient(bobSession.ActorID, coordination.RecipientTo)
 	messageID, _ := domain.NewMessageID()
-	if _, err = store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+	if _, err = store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: messageID,
 		ConversationID: conversationID, WorkspaceID: aliceSession.WorkspaceID, Author: aliceSession.ActorID,
-		AuthorSession: aliceSession.ActorSessionID, Subject: "wake", Body: "durable", Recipients: []application.Recipient{recipient}}); err != nil {
+		AuthorSession: aliceSession.ActorSessionID, Subject: "wake", Body: "durable", Recipients: []coordination.Recipient{recipient}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -106,7 +106,7 @@ func TestLocalHTTPRegistrationSSEWakeAndCatchUp(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != stdhttp.StatusOK || len(page.Events) != 1 || page.Events[0].Type != application.CoordinationEventMessageAvailable ||
+	if response.StatusCode != stdhttp.StatusOK || len(page.Events) != 1 || page.Events[0].Type != coordination.CoordinationEventMessageAvailable ||
 		page.Events[0].Subject != messageID.String() || page.NextCursor != wakeup.Cursor || page.Events[0].Cursor != page.NextCursor {
 		t.Fatalf("catch-up response=%d page=%+v wakeup=%+v", response.StatusCode, page, wakeup)
 	}
@@ -170,10 +170,10 @@ func TestLocalHTTPRegistrationSSEWakeAndCatchUp(t *testing.T) {
 		t.Fatalf("consumer reconnect status=%d", consumerStreamResponse.StatusCode)
 	}
 	secondMessageID, _ := domain.NewMessageID()
-	if _, err = store.SendMessage(context.Background(), application.SendMessageParams{MessageID: secondMessageID,
+	if _, err = store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: secondMessageID,
 		ConversationID: conversationID, WorkspaceID: aliceSession.WorkspaceID, Author: aliceSession.ActorID,
 		AuthorSession: aliceSession.ActorSessionID, Subject: "wake again", Body: "durable",
-		Recipients: []application.Recipient{recipient}}); err != nil {
+		Recipients: []coordination.Recipient{recipient}}); err != nil {
 		t.Fatal(err)
 	}
 	consumerWakeup := readLocalWakeup(t, consumerStreamResponse.Body)
@@ -266,24 +266,24 @@ func TestLocalHTTPMessageFetchExactAndPrivate(t *testing.T) {
 	outsider := registerLocalHTTPAgentSession(t, store, handler, "/workspace/project", "outsider")
 
 	conversationID, _ := domain.NewConversationID()
-	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{ConversationID: conversationID,
+	if _, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{ConversationID: conversationID,
 		WorkspaceID: alice.session.WorkspaceID, RunID: alice.session.RunID, OpenedBy: alice.session.ActorID,
 		OpenedBySession: alice.session.ActorSessionID, Topic: "direct fetch"}); err != nil {
 		t.Fatal(err)
 	}
-	bobRecipient, _ := application.NewRecipient(bob.session.ActorID, application.RecipientTo)
-	charlieRecipient, _ := application.NewRecipient(charlie.session.ActorID, application.RecipientBcc)
+	bobRecipient, _ := coordination.NewRecipient(bob.session.ActorID, coordination.RecipientTo)
+	charlieRecipient, _ := coordination.NewRecipient(charlie.session.ActorID, coordination.RecipientBcc)
 	parentID, _ := domain.NewMessageID()
-	if _, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: parentID,
+	if _, err := store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: parentID,
 		ConversationID: conversationID, WorkspaceID: alice.session.WorkspaceID, Author: alice.session.ActorID,
-		AuthorSession: alice.session.ActorSessionID, Subject: "parent", Body: "first", Recipients: []application.Recipient{bobRecipient}}); err != nil {
+		AuthorSession: alice.session.ActorSessionID, Subject: "parent", Body: "first", Recipients: []coordination.Recipient{bobRecipient}}); err != nil {
 		t.Fatal(err)
 	}
 	messageID, _ := domain.NewMessageID()
-	sent, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+	sent, err := store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: messageID,
 		ConversationID: conversationID, WorkspaceID: alice.session.WorkspaceID, Author: alice.session.ActorID,
 		AuthorSession: alice.session.ActorSessionID, Subject: "handoff", Body: "exact durable body",
-		ReplyTo: &parentID, Recipients: []application.Recipient{bobRecipient, charlieRecipient}, AcknowledgementRequired: true})
+		ReplyTo: &parentID, Recipients: []coordination.Recipient{bobRecipient, charlieRecipient}, AcknowledgementRequired: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,10 +331,10 @@ func TestLocalHTTPMessageFetchExactAndPrivate(t *testing.T) {
 
 type localHTTPAgent struct {
 	response localRegisterResponse
-	session  application.LocalAgentSession
+	session  coordination.LocalAgentSession
 }
 
-func registerLocalHTTPAgentSession(t *testing.T, store application.LocalCoordinationStore, handler stdhttp.Handler,
+func registerLocalHTTPAgentSession(t *testing.T, store coordination.LocalCoordinationStore, handler stdhttp.Handler,
 	project, agent string) localHTTPAgent {
 	t.Helper()
 	body, _ := json.Marshal(localRegisterRequest{ProjectKey: project, AgentName: agent})

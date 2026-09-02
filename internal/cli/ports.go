@@ -150,7 +150,7 @@ type ConversationQuery struct {
 }
 
 // ReservationModeAny is the wire and flag spelling of "no mode predicate". It
-// matches application.AdminReservationModeAny, which the CLI cannot import.
+// matches coordination.AdminReservationModeAny, which the CLI cannot import.
 const ReservationModeAny = "any"
 
 type ReservationQuery struct {

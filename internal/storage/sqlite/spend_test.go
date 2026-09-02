@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -18,7 +19,7 @@ func spendCall(dedupe, model string, harness domain.Harness, usage domain.TokenU
 	}
 }
 
-func spendSession(t *testing.T, store *Store, project, agent string) application.LocalAgentSession {
+func spendSession(t *testing.T, store *Store, project, agent string) coordination.LocalAgentSession {
 	t.Helper()
 	session, _, err := store.RegisterLocalAgent(context.Background(), project, agent, "")
 	if err != nil {
@@ -27,7 +28,7 @@ func spendSession(t *testing.T, store *Store, project, agent string) application
 	return session
 }
 
-func appendFor(t *testing.T, store *Store, session application.LocalAgentSession,
+func appendFor(t *testing.T, store *Store, session coordination.LocalAgentSession,
 	calls []domain.ModelCall, spans []domain.Span) {
 	t.Helper()
 	envelope := application.TelemetryEnvelope{

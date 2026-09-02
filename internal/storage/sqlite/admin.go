@@ -7,13 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
 const adminStorageBackend = "sqlite"
 
-var _ application.LocalAdminStore = (*Store)(nil)
+var _ coordination.LocalAdminStore = (*Store)(nil)
 
 func (store *Store) CheckReadiness(ctx context.Context) (int, error) {
 	var version int
@@ -27,23 +27,23 @@ func (store *Store) CheckReadiness(ctx context.Context) (int, error) {
 	return version, nil
 }
 
-func (store *Store) AdminStorageIdentity(ctx context.Context) (application.AdminStorageIdentity, error) {
-	identity := application.AdminStorageIdentity{StorageBackend: adminStorageBackend, DatabasePath: store.path}
+func (store *Store) AdminStorageIdentity(ctx context.Context) (coordination.AdminStorageIdentity, error) {
+	identity := coordination.AdminStorageIdentity{StorageBackend: adminStorageBackend, DatabasePath: store.path}
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, _ time.Time) error {
 		return tx.QueryRowContext(ctx,
 			`SELECT COALESCE(max(schema_version), 0) FROM schema_manifest`).Scan(&identity.SchemaVersion)
 	})
 	if err != nil {
-		return application.AdminStorageIdentity{}, err
+		return coordination.AdminStorageIdentity{}, err
 	}
 	identity.ObservedAtUS = observed
 	return identity, nil
 }
 
-func (store *Store) AdminOverview(ctx context.Context) (application.AdminOverview, error) {
-	var overview application.AdminOverview
+func (store *Store) AdminOverview(ctx context.Context) (coordination.AdminOverview, error) {
+	var overview coordination.AdminOverview
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
-		cutoff := timeMicros(now.Add(-application.LocalAgentActiveWindow))
+		cutoff := timeMicros(now.Add(-coordination.LocalAgentActiveWindow))
 		nowMicros := timeMicros(now)
 		return tx.QueryRowContext(ctx, `SELECT
 			(SELECT count(*) FROM coordination_projects),
@@ -64,14 +64,14 @@ func (store *Store) AdminOverview(ctx context.Context) (application.AdminOvervie
 			&overview.ActiveReservations, &overview.ExpiredReservations, &overview.CoordinationEvents)
 	})
 	if err != nil {
-		return application.AdminOverview{}, fmt.Errorf("query SQLite admin overview: %w", err)
+		return coordination.AdminOverview{}, fmt.Errorf("query SQLite admin overview: %w", err)
 	}
 	overview.ObservedAtUS = observed
 	return overview, nil
 }
 
-func (store *Store) ListAdminProjects(ctx context.Context) (application.AdminProjectsPage, error) {
-	var projects []application.AdminProject
+func (store *Store) ListAdminProjects(ctx context.Context) (coordination.AdminProjectsPage, error) {
+	var projects []coordination.AdminProject
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
 		rows, err := tx.QueryContext(ctx, `SELECT p.project_key, p.workspace_id, p.run_id, p.created_at_us,
 			(SELECT count(*) FROM coordination_agents AS a WHERE a.project_key = p.project_key),
@@ -82,13 +82,13 @@ func (store *Store) ListAdminProjects(ctx context.Context) (application.AdminPro
 			COALESCE((SELECT max(e.occurred_at_us) FROM coordination_events AS e
 			   WHERE e.workspace_id = p.workspace_id), 0)
 			FROM coordination_projects AS p ORDER BY p.project_key`,
-			timeMicros(now.Add(-application.LocalAgentActiveWindow)))
+			timeMicros(now.Add(-coordination.LocalAgentActiveWindow)))
 		if err != nil {
 			return fmt.Errorf("query SQLite admin projects: %w", err)
 		}
 		defer func() { _ = rows.Close() }()
 		for rows.Next() {
-			var project application.AdminProject
+			var project coordination.AdminProject
 			var workspaceText, runText string
 			if err := rows.Scan(&project.ProjectKey, &workspaceText, &runText, &project.CreatedAtUS,
 				&project.Agents, &project.ActiveAgents, &project.Conversations, &project.LastEventAtUS); err != nil {
@@ -97,7 +97,7 @@ func (store *Store) ListAdminProjects(ctx context.Context) (application.AdminPro
 			workspace, workspaceErr := domain.ParseWorkspaceID(workspaceText)
 			run, runErr := domain.ParseRunID(runText)
 			if workspaceErr != nil || runErr != nil {
-				return application.ErrInvalidCoordination
+				return coordination.ErrInvalidCoordination
 			}
 			project.WorkspaceID, project.RunID = workspace, run
 			projects = append(projects, project)
@@ -105,36 +105,36 @@ func (store *Store) ListAdminProjects(ctx context.Context) (application.AdminPro
 		return rows.Err()
 	})
 	if err != nil {
-		return application.AdminProjectsPage{}, err
+		return coordination.AdminProjectsPage{}, err
 	}
-	return application.AdminProjectsPage{Projects: projects, ObservedAtUS: observed}, nil
+	return coordination.AdminProjectsPage{Projects: projects, ObservedAtUS: observed}, nil
 }
 
 func (store *Store) ListAdminAgents(ctx context.Context,
-	query application.AdminAgentsQuery) (application.AdminAgentsPage, error) {
+	query coordination.AdminAgentsQuery) (coordination.AdminAgentsPage, error) {
 	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
 	if err != nil {
-		return application.AdminAgentsPage{}, err
+		return coordination.AdminAgentsPage{}, err
 	}
-	var agents []application.AdminAgent
+	var agents []coordination.AdminAgent
 	truncated := false
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
 		agents, truncated, err = adminAgentRows(ctx, tx, query, limit, now)
 		return err
 	})
 	if err != nil {
-		return application.AdminAgentsPage{}, err
+		return coordination.AdminAgentsPage{}, err
 	}
-	return application.AdminAgentsPage{Agents: agents, Truncated: truncated, ObservedAtUS: observed}, nil
+	return coordination.AdminAgentsPage{Agents: agents, Truncated: truncated, ObservedAtUS: observed}, nil
 }
 
 // Liveness is derived from the store's own clock inside the snapshot
 // transaction and pushed into the WHERE clause for the same reason lease expiry
 // is: an active-only page filtered in Go after LIMIT comes back empty whenever
 // the head of the result set is offline.
-func adminAgentRows(ctx context.Context, tx *sql.Tx, query application.AdminAgentsQuery, limit uint16,
-	now time.Time) ([]application.AdminAgent, bool, error) {
-	cutoff := timeMicros(now.Add(-application.LocalAgentActiveWindow))
+func adminAgentRows(ctx context.Context, tx *sql.Tx, query coordination.AdminAgentsQuery, limit uint16,
+	now time.Time) ([]coordination.AdminAgent, bool, error) {
+	cutoff := timeMicros(now.Add(-coordination.LocalAgentActiveWindow))
 	statement := `SELECT a.project_key, a.agent_name, a.actor_id, a.created_at_us,
 		COALESCE(s.session_id, ''), COALESCE(s.started_at_us, 0), COALESCE(s.last_seen_at_us, 0),
 		(SELECT count(*) FROM message_deliveries AS d
@@ -162,10 +162,10 @@ func adminAgentRows(ctx context.Context, tx *sql.Tx, query application.AdminAgen
 		return nil, false, fmt.Errorf("query SQLite admin agents: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var agents []application.AdminAgent
+	var agents []coordination.AdminAgent
 	truncated := false
 	for rows.Next() {
-		var agent application.AdminAgent
+		var agent coordination.AdminAgent
 		var actorText, sessionText string
 		if err := rows.Scan(&agent.ProjectKey, &agent.AgentName, &actorText, &agent.CreatedAtUS,
 			&sessionText, &agent.StartedAtUS, &agent.LastSeenAtUS, &agent.UnreadDeliveries,
@@ -178,13 +178,13 @@ func adminAgentRows(ctx context.Context, tx *sql.Tx, query application.AdminAgen
 		}
 		actor, actorErr := domain.ParseActorID(actorText)
 		if actorErr != nil {
-			return nil, false, application.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalidCoordination
 		}
 		agent.ActorID = actor
 		if sessionText != "" {
 			session, sessionErr := domain.ParseActorSessionID(sessionText)
 			if sessionErr != nil {
-				return nil, false, application.ErrInvalidCoordination
+				return nil, false, coordination.ErrInvalidCoordination
 			}
 			agent.SessionID = session
 			agent.Active = agent.LastSeenAtUS >= cutoff
@@ -195,15 +195,15 @@ func adminAgentRows(ctx context.Context, tx *sql.Tx, query application.AdminAgen
 }
 
 func (store *Store) AdminInbox(ctx context.Context,
-	query application.AdminInboxQuery) (application.AdminInboxPage, error) {
+	query coordination.AdminInboxQuery) (coordination.AdminInboxPage, error) {
 	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
 	if err != nil {
-		return application.AdminInboxPage{}, err
+		return coordination.AdminInboxPage{}, err
 	}
 	if query.ProjectKey == "" {
-		return application.AdminInboxPage{}, application.ErrInvalidCoordination
+		return coordination.AdminInboxPage{}, coordination.ErrInvalidCoordination
 	}
-	page := application.AdminInboxPage{ProjectKey: query.ProjectKey}
+	page := coordination.AdminInboxPage{ProjectKey: query.ProjectKey}
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, _ time.Time) error {
 		summaries, err := adminInboxSummaries(ctx, tx, query)
 		if err != nil {
@@ -218,7 +218,7 @@ func (store *Store) AdminInbox(ctx context.Context,
 		return nil
 	})
 	if err != nil {
-		return application.AdminInboxPage{}, err
+		return coordination.AdminInboxPage{}, err
 	}
 	page.ObservedAtUS = observed
 	return page, nil
@@ -228,7 +228,7 @@ func (store *Store) AdminInbox(ctx context.Context,
 // LEFT JOIN, and count(*) FILTER (WHERE d.read_at_us IS NULL) also counts the
 // NULL-padded row, reporting one unread delivery for every agent with no mail.
 func adminInboxSummaries(ctx context.Context, tx *sql.Tx,
-	query application.AdminInboxQuery) ([]application.AdminInboxSummary, error) {
+	query coordination.AdminInboxQuery) ([]coordination.AdminInboxSummary, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT a.agent_name, a.actor_id,
 		count(d.message_id) FILTER (WHERE d.read_at_us IS NULL),
 		count(d.message_id) FILTER (WHERE d.acknowledgement_required = 1 AND d.acknowledged_at_us IS NULL),
@@ -243,9 +243,9 @@ func adminInboxSummaries(ctx context.Context, tx *sql.Tx,
 		return nil, fmt.Errorf("query SQLite admin inbox summaries: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var summaries []application.AdminInboxSummary
+	var summaries []coordination.AdminInboxSummary
 	for rows.Next() {
-		summary := application.AdminInboxSummary{ProjectKey: query.ProjectKey}
+		summary := coordination.AdminInboxSummary{ProjectKey: query.ProjectKey}
 		var actorText string
 		if err := rows.Scan(&summary.AgentName, &actorText, &summary.UnreadDeliveries,
 			&summary.UnackedDeliveries, &summary.OldestUnreadAtUS); err != nil {
@@ -253,7 +253,7 @@ func adminInboxSummaries(ctx context.Context, tx *sql.Tx,
 		}
 		actor, actorErr := domain.ParseActorID(actorText)
 		if actorErr != nil {
-			return nil, application.ErrInvalidCoordination
+			return nil, coordination.ErrInvalidCoordination
 		}
 		summary.ActorID = actor
 		summaries = append(summaries, summary)
@@ -264,8 +264,8 @@ func adminInboxSummaries(ctx context.Context, tx *sql.Tx,
 // The unread and unacknowledged predicates narrow the pending set in SQL: the
 // newest deliveries are the ones most likely to be read already, so filtering
 // after LIMIT renders an empty inbox while dozens of matches sit behind it.
-func adminInboxPending(ctx context.Context, tx *sql.Tx, query application.AdminInboxQuery,
-	limit uint16) ([]application.AdminInboxItem, bool, error) {
+func adminInboxPending(ctx context.Context, tx *sql.Tx, query coordination.AdminInboxQuery,
+	limit uint16) ([]coordination.AdminInboxItem, bool, error) {
 	statement := `SELECT m.message_id, m.conversation_id, a.agent_name, a.actor_id,
 		COALESCE(author.agent_name, ''), m.author_actor_id, m.subject, d.recipient_kind,
 		d.read_at_us IS NOT NULL, d.acknowledged_at_us IS NOT NULL, d.acknowledgement_required, m.sent_at_us
@@ -289,10 +289,10 @@ func adminInboxPending(ctx context.Context, tx *sql.Tx, query application.AdminI
 		return nil, false, fmt.Errorf("query SQLite admin inbox: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var items []application.AdminInboxItem
+	var items []coordination.AdminInboxItem
 	truncated := false
 	for rows.Next() {
-		item := application.AdminInboxItem{ProjectKey: query.ProjectKey}
+		item := coordination.AdminInboxItem{ProjectKey: query.ProjectKey}
 		var messageText, conversationText, recipientText, authorText, kindText string
 		if err := rows.Scan(&messageText, &conversationText, &item.RecipientAgentName, &recipientText,
 			&item.AuthorAgentName, &authorText, &item.Subject, &kindText, &item.Read, &item.Acknowledged,
@@ -308,23 +308,23 @@ func adminInboxPending(ctx context.Context, tx *sql.Tx, query application.AdminI
 		recipient, recipientErr := domain.ParseActorID(recipientText)
 		author, authorErr := domain.ParseActorID(authorText)
 		if messageErr != nil || conversationErr != nil || recipientErr != nil || authorErr != nil {
-			return nil, false, application.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalidCoordination
 		}
 		item.MessageID, item.ConversationID = message, conversation
 		item.RecipientActorID, item.AuthorActorID = recipient, author
-		item.Kind = application.RecipientKind(kindText)
+		item.Kind = coordination.RecipientKind(kindText)
 		items = append(items, item)
 	}
 	return items, truncated, rows.Err()
 }
 
 func (store *Store) ListAdminConversations(ctx context.Context,
-	query application.AdminConversationsQuery) (application.AdminConversationsPage, error) {
+	query coordination.AdminConversationsQuery) (coordination.AdminConversationsPage, error) {
 	limit, err := adminFilters(query.ProjectKey, "", query.Limit)
 	if err != nil {
-		return application.AdminConversationsPage{}, err
+		return coordination.AdminConversationsPage{}, err
 	}
-	var conversations []application.AdminConversation
+	var conversations []coordination.AdminConversation
 	truncated := false
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, _ time.Time) error {
 		conversations, truncated, err = adminConversationRows(ctx, tx, query, limit)
@@ -334,14 +334,14 @@ func (store *Store) ListAdminConversations(ctx context.Context,
 		return adminConversationDetails(ctx, tx, conversations)
 	})
 	if err != nil {
-		return application.AdminConversationsPage{}, err
+		return coordination.AdminConversationsPage{}, err
 	}
-	return application.AdminConversationsPage{Conversations: conversations, Truncated: truncated,
+	return coordination.AdminConversationsPage{Conversations: conversations, Truncated: truncated,
 		ObservedAtUS: observed}, nil
 }
 
-func adminConversationRows(ctx context.Context, tx *sql.Tx, query application.AdminConversationsQuery,
-	limit uint16) ([]application.AdminConversation, bool, error) {
+func adminConversationRows(ctx context.Context, tx *sql.Tx, query coordination.AdminConversationsQuery,
+	limit uint16) ([]coordination.AdminConversation, bool, error) {
 	conversationFilter := ""
 	if !query.ConversationID.IsZero() {
 		conversationFilter = query.ConversationID.String()
@@ -358,7 +358,7 @@ func adminConversationRows(ctx context.Context, tx *sql.Tx, query application.Ad
 	arguments := []any{query.ProjectKey, query.ProjectKey, conversationFilter, conversationFilter}
 	if query.OpenOnly {
 		statement += ` AND c.status = ?`
-		arguments = append(arguments, string(application.AdminConversationOpen))
+		arguments = append(arguments, string(coordination.AdminConversationOpen))
 	}
 	statement += ` ORDER BY c.opened_at_us DESC, c.conversation_id LIMIT ?`
 	arguments = append(arguments, int(limit)+1)
@@ -367,10 +367,10 @@ func adminConversationRows(ctx context.Context, tx *sql.Tx, query application.Ad
 		return nil, false, fmt.Errorf("query SQLite admin conversations: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var conversations []application.AdminConversation
+	var conversations []coordination.AdminConversation
 	truncated := false
 	for rows.Next() {
-		var conversation application.AdminConversation
+		var conversation coordination.AdminConversation
 		var conversationText, workspaceText, statusText, openedByText string
 		if err := rows.Scan(&conversationText, &workspaceText, &conversation.ProjectKey, &conversation.Topic,
 			&statusText, &conversation.OpenedByAgentName, &openedByText, &conversation.OpenedAtUS,
@@ -385,17 +385,17 @@ func adminConversationRows(ctx context.Context, tx *sql.Tx, query application.Ad
 		workspace, workspaceErr := domain.ParseWorkspaceID(workspaceText)
 		openedBy, openedByErr := domain.ParseActorID(openedByText)
 		if idErr != nil || workspaceErr != nil || openedByErr != nil {
-			return nil, false, application.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalidCoordination
 		}
 		conversation.ConversationID, conversation.WorkspaceID = id, workspace
 		conversation.OpenedByActorID = openedBy
-		conversation.Status = application.AdminConversationStatus(statusText)
+		conversation.Status = coordination.AdminConversationStatus(statusText)
 		conversations = append(conversations, conversation)
 	}
 	return conversations, truncated, rows.Err()
 }
 
-func adminConversationDetails(ctx context.Context, tx *sql.Tx, conversations []application.AdminConversation) error {
+func adminConversationDetails(ctx context.Context, tx *sql.Tx, conversations []coordination.AdminConversation) error {
 	if len(conversations) == 0 {
 		return nil
 	}
@@ -437,7 +437,7 @@ func adminConversationDetails(ctx context.Context, tx *sql.Tx, conversations []a
 	return adminConversationLastMessage(ctx, tx, conversations, placeholders, arguments, index)
 }
 
-func adminConversationLastMessage(ctx context.Context, tx *sql.Tx, conversations []application.AdminConversation,
+func adminConversationLastMessage(ctx context.Context, tx *sql.Tx, conversations []coordination.AdminConversation,
 	placeholders string, arguments []any, index map[string]int) error {
 	rows, err := tx.QueryContext(ctx, `SELECT m.conversation_id, m.sent_at_us, COALESCE(a.agent_name, ''), m.subject
 		FROM messages AS m LEFT JOIN coordination_agents AS a ON a.actor_id = m.author_actor_id
@@ -464,17 +464,17 @@ func adminConversationLastMessage(ctx context.Context, tx *sql.Tx, conversations
 }
 
 func (store *Store) ListAdminReservations(ctx context.Context,
-	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
+	query coordination.AdminReservationsQuery) (coordination.AdminReservationsPage, error) {
 	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
 	if err != nil {
-		return application.AdminReservationsPage{}, err
+		return coordination.AdminReservationsPage{}, err
 	}
 	state := query.State.Normalized()
-	if !state.Valid() || !application.ValidAdminReservationMode(query.Mode) {
-		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	if !state.Valid() || !coordination.ValidAdminReservationMode(query.Mode) {
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
 	}
-	if query.Path != "" && !validLocalCoordinationText(query.Path, application.MaxLeaseSelectorBytes) {
-		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	if query.Path != "" && !validLocalCoordinationText(query.Path, coordination.MaxLeaseSelectorBytes) {
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
 	}
 	return store.reservationsPage(ctx, query, state, limit, reservationScope{})
 }
@@ -484,11 +484,11 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 // the authorization boundary, so this deliberately bypasses holder checks
 // while retaining the normal release row and journal fact.
 func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
-	leaseID domain.LeaseID) (application.Lease, error) {
+	leaseID domain.LeaseID) (coordination.Lease, error) {
 	if leaseID.IsZero() {
-		return application.Lease{}, application.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalidCoordination
 	}
-	var result application.Lease
+	var result coordination.Lease
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		lease, err := loadLease(ctx, tx, leaseID)
 		if err != nil {
@@ -511,7 +511,7 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 			if err != nil {
 				return fmt.Errorf("count force released SQLite leases: %w", err)
 			}
-			return application.ErrInvalidCoordination
+			return coordination.ErrInvalidCoordination
 		}
 		result, err = loadLease(ctx, tx, leaseID)
 		if err != nil {
@@ -524,7 +524,7 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 			return err
 		}
 		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(),
-			application.CoordinationEventLeaseReleased, result.ID().String(), now, payload,
+			coordination.CoordinationEventLeaseReleased, result.ID().String(), now, payload,
 			coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
@@ -540,22 +540,22 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 // forwards, and the workspace predicate is applied to the lease row itself
 // rather than to the project it joins -- a lease whose project row is missing
 // must not fall out of a scoped read as if it were unscoped.
-func (store *Store) LocalAgentReservations(ctx context.Context, session application.LocalAgentSession,
-	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
+func (store *Store) LocalAgentReservations(ctx context.Context, session coordination.LocalAgentSession,
+	query coordination.AdminReservationsQuery) (coordination.AdminReservationsPage, error) {
 	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
-		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
 	}
 	query.ProjectKey = session.ProjectKey
 	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
 	if err != nil {
-		return application.AdminReservationsPage{}, err
+		return coordination.AdminReservationsPage{}, err
 	}
 	state := query.State.Normalized()
-	if !state.Valid() || !application.ValidAdminReservationMode(query.Mode) {
-		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	if !state.Valid() || !coordination.ValidAdminReservationMode(query.Mode) {
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
 	}
-	if query.Path != "" && !validLocalCoordinationText(query.Path, application.MaxLeaseSelectorBytes) {
-		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	if query.Path != "" && !validLocalCoordinationText(query.Path, coordination.MaxLeaseSelectorBytes) {
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
 	}
 	return store.reservationsPage(ctx, query, state, limit,
 		reservationScope{workspaceID: session.WorkspaceID.String()})
@@ -574,10 +574,10 @@ type reservationScope struct {
 	excludeHolder string
 }
 
-func (store *Store) reservationsPage(ctx context.Context, query application.AdminReservationsQuery,
-	state application.AdminReservationState, limit uint16,
-	scope reservationScope) (application.AdminReservationsPage, error) {
-	var reservations []application.AdminReservation
+func (store *Store) reservationsPage(ctx context.Context, query coordination.AdminReservationsQuery,
+	state coordination.AdminReservationState, limit uint16,
+	scope reservationScope) (coordination.AdminReservationsPage, error) {
+	var reservations []coordination.AdminReservation
 	truncated := false
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
 		var rowErr error
@@ -600,9 +600,9 @@ func (store *Store) reservationsPage(ctx context.Context, query application.Admi
 		return nil
 	})
 	if err != nil {
-		return application.AdminReservationsPage{}, err
+		return coordination.AdminReservationsPage{}, err
 	}
-	return application.AdminReservationsPage{Reservations: reservations, Truncated: truncated,
+	return coordination.AdminReservationsPage{Reservations: reservations, Truncated: truncated,
 		ObservedAtUS: observed}, nil
 }
 
@@ -637,9 +637,9 @@ const adminSelectorCoversPath = ` AND EXISTS (SELECT 1 FROM lease_selectors AS s
 // Expiry is derived from the store's own clock inside the snapshot transaction
 // and pushed into the WHERE clause: filtering in Go after LIMIT would silently
 // return an empty page whenever the head of the result set is the wrong state.
-func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.AdminReservationsQuery,
-	state application.AdminReservationState, limit uint16, nowMicros int64,
-	scope reservationScope) ([]application.AdminReservation, bool, error) {
+func adminReservationRows(ctx context.Context, tx *sql.Tx, query coordination.AdminReservationsQuery,
+	state coordination.AdminReservationState, limit uint16, nowMicros int64,
+	scope reservationScope) ([]coordination.AdminReservation, bool, error) {
 	statement := `SELECT l.lease_id, COALESCE(p.project_key, ''), l.workspace_id, COALESCE(a.agent_name, ''),
 		l.holder_actor_id, l.holder_session_id, l.mode, l.status, l.acquired_at_us, l.expires_at_us,
 		COALESCE(l.released_at_us, 0)
@@ -657,15 +657,15 @@ func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.Adm
 		arguments = append(arguments, scope.excludeHolder)
 	}
 	switch state {
-	case application.AdminReservationActive:
+	case coordination.AdminReservationActive:
 		statement += adminReservationActive
 		arguments = append(arguments, nowMicros)
-	case application.AdminReservationExpired:
+	case coordination.AdminReservationExpired:
 		statement += adminReservationExpired
 		arguments = append(arguments, nowMicros)
-	case application.AdminReservationReleased:
+	case coordination.AdminReservationReleased:
 		statement += adminReservationReleased
-	case application.AdminReservationAll:
+	case coordination.AdminReservationAll:
 	}
 	if query.Mode != "" {
 		statement += ` AND l.mode = ?`
@@ -682,10 +682,10 @@ func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.Adm
 		return nil, false, fmt.Errorf("query SQLite admin reservations: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var reservations []application.AdminReservation
+	var reservations []coordination.AdminReservation
 	truncated := false
 	for rows.Next() {
-		var reservation application.AdminReservation
+		var reservation coordination.AdminReservation
 		var leaseText, workspaceText, holderText, sessionText, modeText, statusText string
 		if err := rows.Scan(&leaseText, &reservation.ProjectKey, &workspaceText, &reservation.HolderAgentName,
 			&holderText, &sessionText, &modeText, &statusText, &reservation.AcquiredAtUS,
@@ -701,27 +701,27 @@ func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.Adm
 		holder, holderErr := domain.ParseActorID(holderText)
 		session, sessionErr := domain.ParseActorSessionID(sessionText)
 		if leaseErr != nil || workspaceErr != nil || holderErr != nil || sessionErr != nil {
-			return nil, false, application.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalidCoordination
 		}
 		reservation.LeaseID, reservation.WorkspaceID = lease, workspace
 		reservation.HolderActorID, reservation.HolderSessionID = holder, session
-		reservation.Mode = application.LeaseMode(modeText)
+		reservation.Mode = coordination.LeaseMode(modeText)
 		reservation.State = adminReservationState(statusText, reservation.ExpiresAtUS, nowMicros)
-		reservation.Expired = reservation.State == application.AdminReservationExpired
+		reservation.Expired = reservation.State == coordination.AdminReservationExpired
 		reservation.ExpiresInMS = (reservation.ExpiresAtUS - nowMicros) / 1000
 		reservations = append(reservations, reservation)
 	}
 	return reservations, truncated, rows.Err()
 }
 
-func adminReservationState(status string, expiresAtUS, nowMicros int64) application.AdminReservationState {
+func adminReservationState(status string, expiresAtUS, nowMicros int64) coordination.AdminReservationState {
 	switch {
 	case status == "released":
-		return application.AdminReservationReleased
+		return coordination.AdminReservationReleased
 	case expiresAtUS > nowMicros:
-		return application.AdminReservationActive
+		return coordination.AdminReservationActive
 	default:
-		return application.AdminReservationExpired
+		return coordination.AdminReservationExpired
 	}
 }
 
@@ -743,20 +743,20 @@ func adminClaimGenerations(ctx context.Context, tx *sql.Tx, lease domain.LeaseID
 	return generations, rows.Err()
 }
 
-func adminLeaseSelectors(ctx context.Context, tx *sql.Tx, lease domain.LeaseID) ([]application.LeaseSelector, error) {
+func adminLeaseSelectors(ctx context.Context, tx *sql.Tx, lease domain.LeaseID) ([]coordination.LeaseSelector, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT selector_kind, selector_path FROM lease_selectors
 		WHERE lease_id = ? ORDER BY selector_ordinal`, lease.String())
 	if err != nil {
 		return nil, fmt.Errorf("query SQLite admin lease selectors: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var selectors []application.LeaseSelector
+	var selectors []coordination.LeaseSelector
 	for rows.Next() {
 		var kind, value string
 		if err := rows.Scan(&kind, &value); err != nil {
 			return nil, fmt.Errorf("scan SQLite admin lease selector: %w", err)
 		}
-		selector, selectorErr := application.NewLeaseSelector(application.LeaseSelectorKind(kind), value)
+		selector, selectorErr := coordination.NewLeaseSelector(coordination.LeaseSelectorKind(kind), value)
 		if selectorErr != nil {
 			return nil, selectorErr
 		}
@@ -766,15 +766,15 @@ func adminLeaseSelectors(ctx context.Context, tx *sql.Tx, lease domain.LeaseID) 
 }
 
 func (store *Store) ListAdminEvents(ctx context.Context,
-	query application.AdminEventsQuery) (application.AdminEventsPage, error) {
+	query coordination.AdminEventsQuery) (coordination.AdminEventsPage, error) {
 	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
 	if err != nil {
-		return application.AdminEventsPage{}, err
+		return coordination.AdminEventsPage{}, err
 	}
 	if query.EventType != "" && !query.EventType.Valid() {
-		return application.AdminEventsPage{}, application.ErrInvalidCoordination
+		return coordination.AdminEventsPage{}, coordination.ErrInvalidCoordination
 	}
-	var events []application.AdminEvent
+	var events []coordination.AdminEvent
 	truncated := false
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, _ time.Time) error {
 		rows, queryErr := tx.QueryContext(ctx, `SELECT e.position, COALESCE(p.project_key, ''), e.workspace_id,
@@ -790,7 +790,7 @@ func (store *Store) ListAdminEvents(ctx context.Context,
 		}
 		defer func() { _ = rows.Close() }()
 		for rows.Next() {
-			var event application.AdminEvent
+			var event coordination.AdminEvent
 			var workspaceText, actorText, typeText string
 			if err := rows.Scan(&event.Position, &event.ProjectKey, &workspaceText, &event.AgentName,
 				&actorText, &typeText, &event.SubjectID, &event.OccurredAtUS, &event.Payload); err != nil {
@@ -803,18 +803,18 @@ func (store *Store) ListAdminEvents(ctx context.Context,
 			workspace, workspaceErr := domain.ParseWorkspaceID(workspaceText)
 			actor, actorErr := domain.ParseActorID(actorText)
 			if workspaceErr != nil || actorErr != nil {
-				return application.ErrInvalidCoordination
+				return coordination.ErrInvalidCoordination
 			}
 			event.WorkspaceID, event.ActorID = workspace, actor
-			event.EventType = application.CoordinationEventType(typeText)
+			event.EventType = coordination.CoordinationEventType(typeText)
 			events = append(events, event)
 		}
 		return rows.Err()
 	})
 	if err != nil {
-		return application.AdminEventsPage{}, err
+		return coordination.AdminEventsPage{}, err
 	}
-	return application.AdminEventsPage{Events: events, Truncated: truncated, ObservedAtUS: observed}, nil
+	return coordination.AdminEventsPage{Events: events, Truncated: truncated, ObservedAtUS: observed}, nil
 }
 
 func (store *Store) adminSnapshot(ctx context.Context, snapshot func(*sql.Tx, time.Time) error) (int64, error) {
@@ -837,11 +837,11 @@ func (store *Store) adminSnapshot(ctx context.Context, snapshot func(*sql.Tx, ti
 }
 
 func adminFilters(projectKey, agentName string, limit uint16) (uint16, error) {
-	if projectKey != "" && !validLocalCoordinationText(projectKey, application.MaxCoordinationKeyBytes) {
-		return 0, application.ErrInvalidCoordination
+	if projectKey != "" && !validLocalCoordinationText(projectKey, coordination.MaxCoordinationKeyBytes) {
+		return 0, coordination.ErrInvalidCoordination
 	}
-	if agentName != "" && !validLocalCoordinationText(agentName, application.MaxCoordinationNameBytes) {
-		return 0, application.ErrInvalidCoordination
+	if agentName != "" && !validLocalCoordinationText(agentName, coordination.MaxCoordinationNameBytes) {
+		return 0, coordination.ErrInvalidCoordination
 	}
-	return application.AdminPageLimit(limit)
+	return coordination.AdminPageLimit(limit)
 }

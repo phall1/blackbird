@@ -1,3 +1,6 @@
+// Package application holds the observation plane: the bounded telemetry
+// ingest sink and the spend rollup contracts. The coordination contracts it
+// attributes observations against live in the coordination sub-package.
 package application
 
 import (
@@ -9,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -387,7 +391,7 @@ func (query SpendQuery) Normalized(now time.Time) SpendQuery {
 
 func (query SpendQuery) Validate() error {
 	if !query.Dimension.Valid() {
-		return fmt.Errorf("%w: unknown spend dimension %q", ErrInvalidCoordination, query.Dimension)
+		return fmt.Errorf("%w: unknown spend dimension %q", coordination.ErrInvalidCoordination, query.Dimension)
 	}
 	return nil
 }
@@ -436,5 +440,5 @@ type SpendReport struct {
 // path is an ordinary query -- and because a daemon may compose one without the
 // other, in which case the agent-facing tool is simply not registered.
 type TelemetryReader interface {
-	SpendReport(context.Context, LocalAgentSession, SpendQuery) (SpendReport, error)
+	SpendReport(context.Context, coordination.LocalAgentSession, SpendQuery) (SpendReport, error)
 }

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -55,7 +55,7 @@ func TestAuthenticateLocalAgentCoalescesTheSessionHeartbeat(t *testing.T) {
 	// Once the coalescing window has elapsed the next call does write, so the
 	// durable row can never fall further behind than one interval.
 	store.heartbeats.Lock()
-	store.heartbeats.flushed[sessionText] = time.Now().Add(-2 * application.LocalAgentHeartbeatInterval)
+	store.heartbeats.flushed[sessionText] = time.Now().Add(-2 * coordination.LocalAgentHeartbeatInterval)
 	store.heartbeats.Unlock()
 	if _, err := store.AuthenticateLocalAgent(ctx, token); err != nil {
 		t.Fatal(err)
@@ -177,11 +177,11 @@ func TestLocalAgentReservationsAnswerWhoHoldsAPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease := acquireTestLease(t, store, alice, application.LeaseExclusive,
-		application.LeaseSelectorSubtree, "internal/storage")
+	lease := acquireTestLease(t, store, alice, coordination.LeaseExclusive,
+		coordination.LeaseSelectorSubtree, "internal/storage")
 
-	page, err := store.LocalAgentReservations(ctx, bob, application.AdminReservationsQuery{
-		State: application.AdminReservationActive, Path: "internal/storage/sqlite/sqlite.go"})
+	page, err := store.LocalAgentReservations(ctx, bob, coordination.AdminReservationsQuery{
+		State: coordination.AdminReservationActive, Path: "internal/storage/sqlite/sqlite.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,8 +189,8 @@ func TestLocalAgentReservationsAnswerWhoHoldsAPath(t *testing.T) {
 		t.Fatalf("reservations=%+v, want the one covering the path", page.Reservations)
 	}
 	held := page.Reservations[0]
-	if held.LeaseID != lease.ID() || held.HolderAgentName != "alice" || held.Mode != application.LeaseExclusive ||
-		held.State != application.AdminReservationActive || held.ExpiresInMS <= 0 ||
+	if held.LeaseID != lease.ID() || held.HolderAgentName != "alice" || held.Mode != coordination.LeaseExclusive ||
+		held.State != coordination.AdminReservationActive || held.ExpiresInMS <= 0 ||
 		len(held.Selectors) != 1 || held.Selectors[0].Path() != "internal/storage" {
 		t.Fatalf("held reservation=%+v", held)
 	}
@@ -201,8 +201,8 @@ func TestLocalAgentReservationsAnswerWhoHoldsAPath(t *testing.T) {
 	// The boundary rule the admin query already enforces has to survive the
 	// scoping: a sibling path is not a conflict, and reporting one would be the
 	// single worst answer this query can give.
-	sibling, err := store.LocalAgentReservations(ctx, bob, application.AdminReservationsQuery{
-		State: application.AdminReservationActive, Path: "internal/storagefoo/thing.go"})
+	sibling, err := store.LocalAgentReservations(ctx, bob, coordination.AdminReservationsQuery{
+		State: coordination.AdminReservationActive, Path: "internal/storagefoo/thing.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,9 +226,9 @@ func TestLocalAgentReservationsCannotReadAnotherWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acquireTestLease(t, store, alice, application.LeaseExclusive, application.LeaseSelectorExact, "shared/path.go")
+	acquireTestLease(t, store, alice, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "shared/path.go")
 
-	page, err := store.LocalAgentReservations(ctx, carol, application.AdminReservationsQuery{
+	page, err := store.LocalAgentReservations(ctx, carol, coordination.AdminReservationsQuery{
 		ProjectKey: alice.ProjectKey, Path: "shared/path.go"})
 	if err != nil {
 		t.Fatal(err)
@@ -236,12 +236,12 @@ func TestLocalAgentReservationsCannotReadAnotherWorkspace(t *testing.T) {
 	if len(page.Reservations) != 0 {
 		t.Fatalf("cross-workspace read returned %+v", page.Reservations)
 	}
-	if _, err := store.LocalAgentReservations(ctx, application.LocalAgentSession{},
-		application.AdminReservationsQuery{}); !errors.Is(err, application.ErrInvalidCoordination) {
+	if _, err := store.LocalAgentReservations(ctx, coordination.LocalAgentSession{},
+		coordination.AdminReservationsQuery{}); !errors.Is(err, coordination.ErrInvalidCoordination) {
 		t.Fatalf("unsessioned read error=%v, want an invalid coordination rejection", err)
 	}
 	if _, err := store.LocalAgentReservations(ctx, carol,
-		application.AdminReservationsQuery{State: "sideways"}); !errors.Is(err, application.ErrInvalidCoordination) {
+		coordination.AdminReservationsQuery{State: "sideways"}); !errors.Is(err, coordination.ErrInvalidCoordination) {
 		t.Fatalf("invalid state error=%v, want an invalid coordination rejection", err)
 	}
 }
@@ -328,24 +328,24 @@ func TestOpenConversationRejectsAnUnusableSlug(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, slug := range []string{" leading-space", strings.Repeat("s", application.MaxConversationSlugBytes+1)} {
-		_, err := store.OpenConversation(ctx, application.OpenConversationParams{ConversationID: conversationID,
+	for _, slug := range []string{" leading-space", strings.Repeat("s", coordination.MaxConversationSlugBytes+1)} {
+		_, err := store.OpenConversation(ctx, coordination.OpenConversationParams{ConversationID: conversationID,
 			WorkspaceID: alice.WorkspaceID, RunID: alice.RunID, OpenedBy: alice.ActorID,
 			OpenedBySession: alice.ActorSessionID, Topic: "topic", Slug: slug})
-		if !errors.Is(err, application.ErrInvalidCoordination) {
+		if !errors.Is(err, coordination.ErrInvalidCoordination) {
 			t.Fatalf("slug %q error=%v, want an invalid coordination rejection", slug, err)
 		}
 	}
 }
 
-func openTestConversation(t *testing.T, store *Store, session application.LocalAgentSession,
-	topic, slug string) application.Conversation {
+func openTestConversation(t *testing.T, store *Store, session coordination.LocalAgentSession,
+	topic, slug string) coordination.Conversation {
 	t.Helper()
 	conversationID, err := domain.NewConversationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	conversation, err := store.OpenConversation(context.Background(), application.OpenConversationParams{
+	conversation, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{
 		ConversationID: conversationID, WorkspaceID: session.WorkspaceID, RunID: session.RunID,
 		OpenedBy: session.ActorID, OpenedBySession: session.ActorSessionID, Topic: topic, Slug: slug})
 	if err != nil {
@@ -354,21 +354,21 @@ func openTestConversation(t *testing.T, store *Store, session application.LocalA
 	return conversation
 }
 
-func acquireTestLease(t *testing.T, store *Store, session application.LocalAgentSession,
-	mode application.LeaseMode, kind application.LeaseSelectorKind, path string) application.Lease {
+func acquireTestLease(t *testing.T, store *Store, session coordination.LocalAgentSession,
+	mode coordination.LeaseMode, kind coordination.LeaseSelectorKind, path string) coordination.Lease {
 	t.Helper()
 	leaseID, err := domain.NewLeaseID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, err := application.NewLeaseSelector(kind, path)
+	selector, err := coordination.NewLeaseSelector(kind, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+	lease, err := store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{LeaseID: leaseID,
 		WorkspaceID: session.WorkspaceID, Holder: session.ActorID, HolderSession: session.ActorSessionID,
 		AuthorityEpoch: session.AuthorityEpoch, Mode: mode,
-		Selectors: []application.LeaseSelector{selector}, TTL: 20 * time.Minute})
+		Selectors: []coordination.LeaseSelector{selector}, TTL: 20 * time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestHeartbeatLedgerGivesTheClaimBackWhenTheWriteFails(t *testing.T) {
 	if !store.claimHeartbeat(sessionText, now.Add(time.Second)) {
 		t.Fatal("a released claim was not retried")
 	}
-	if !store.claimHeartbeat(sessionText, now.Add(2*application.LocalAgentHeartbeatInterval)) {
+	if !store.claimHeartbeat(sessionText, now.Add(2*coordination.LocalAgentHeartbeatInterval)) {
 		t.Fatal("the interval elapsed without owing a heartbeat")
 	}
 	// A clock that stepped backwards must flush rather than stall: comparing

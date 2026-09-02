@@ -1,5 +1,7 @@
-// Package application defines Blackbird's local coordination contracts.
-package application
+// Package coordination defines Blackbird's durable coordination contracts:
+// mail, leases, and the admin projection over both. It is the inward half of
+// the application layer and depends on nothing but domain.
+package coordination
 
 import (
 	"context"

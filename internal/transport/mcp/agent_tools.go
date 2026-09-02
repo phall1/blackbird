@@ -11,6 +11,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -55,7 +56,7 @@ type statusInput struct {
 	AgentToken string `json:"agent_token"`
 	Path       string `json:"path,omitempty" jsonschema:"Repository-relative path used to filter active claims."`
 	Limit      uint16 `json:"limit,omitempty" jsonschema:"Maximum claims, peers, or spend groups to return."`
-	ObjectID   string `json:"object_id,omitempty" jsonschema:"Optional provider-owned work item to observe."`
+	ObjectID   string `json:"object_id,omitempty" jsonschema:"Work item to observe in this repository's issue tracker, for example blackbird-a1u.1. The result's work_reference carries the tracker's title, status, type, priority, assignee and dependencies as of observed_at, together with the provider and version that answered, scoped to the project this agent registered under. Omit it to skip the tracker."`
 	Spend      bool   `json:"spend,omitempty" jsonschema:"Include a telemetry rollup when the observation reader is available."`
 	Dimension  string `json:"dimension,omitempty" jsonschema:"Spend grouping: model, agent, harness, span_kind, or span_name."`
 	SinceHours uint32 `json:"since_hours,omitempty" jsonschema:"Spend lookback window in hours; zero uses the service default."`
@@ -63,11 +64,11 @@ type statusInput struct {
 }
 
 type statusOutput struct {
-	Agents        []activeAgentOutput        `json:"agents"`
-	Reservations  []reservationHolderOutput  `json:"reservations"`
-	Truncated     bool                       `json:"truncated"`
-	WorkReference *application.WorkReference `json:"work_reference,omitempty"`
-	SpendReport   *spendReportOutput         `json:"spend_report,omitempty"`
+	Agents        []activeAgentOutput         `json:"agents"`
+	Reservations  []reservationHolderOutput   `json:"reservations"`
+	Truncated     bool                        `json:"truncated"`
+	WorkReference *coordination.WorkReference `json:"work_reference,omitempty" jsonschema:"One point-in-time observation of a tracker work item. Blackbird is not authoritative for these fields and does not retain them; observed_at and provenance say when it was read and by what."`
+	SpendReport   *spendReportOutput          `json:"spend_report,omitempty"`
 }
 
 type releaseInput struct {
@@ -86,8 +87,8 @@ type claimOutput struct {
 	Options   []string                   `json:"options,omitempty"`
 }
 
-func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoordinationStore,
-	observations application.TelemetryReader, workReferences application.WorkReferenceObserver, logger *slog.Logger) {
+func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalCoordinationStore,
+	observations application.TelemetryReader, workReferences coordination.WorkReferenceObserver, logger *slog.Logger) {
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolJoin,
 		Description: "Read blackbird://coordination/protocol, then start or resume one durable repository agent and recover its compact snapshot: claims, inbox, conversations, and peers."},
 		func(ctx context.Context, input registerAgentInput) (agentSessionOutput, error) {
@@ -108,7 +109,7 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 
 	claimSchema := coordinationInputSchema[reservationAcquireInput](func(properties map[string]*jsonschema.Schema) {
 		properties["mode"].Default = json.RawMessage(`"exclusive"`)
-		properties["mode"].Enum = []any{string(application.LeaseShared), string(application.LeaseExclusive)}
+		properties["mode"].Enum = []any{string(coordination.LeaseShared), string(coordination.LeaseExclusive)}
 		setSelectorKindSchema(properties["selectors"].Items.Properties["kind"])
 		setTTLSchema(properties["ttl_seconds"])
 	})
@@ -127,8 +128,8 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 			if err != nil {
 				return claimOutput{}, err
 			}
-			mode := application.LeaseMode(input.Mode)
-			lease, err := store.AcquireLease(ctx, application.AcquireLeaseParams{LeaseID: leaseID,
+			mode := coordination.LeaseMode(input.Mode)
+			lease, err := store.AcquireLease(ctx, coordination.AcquireLeaseParams{LeaseID: leaseID,
 				WorkspaceID: session.WorkspaceID, Holder: session.ActorID, HolderSession: session.ActorSessionID,
 				AuthorityEpoch: session.AuthorityEpoch, Mode: mode, Selectors: selectors,
 				TTL: time.Duration(input.TTLSeconds) * time.Second})
@@ -164,7 +165,10 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 			string(application.SpendByHarness), string(application.SpendBySpanKind), string(application.SpendBySpanName)}
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolStatus,
-		Description: "Inspect peers and active claims. Optionally observe one work item or include a project telemetry rollup without adding more tools.", InputSchema: statusSchema},
+		Description: "Inspect peers and active claims; optionally observe one work item in this repository's issue tracker, or a telemetry rollup, without adding more tools. " +
+			"A work_reference in the result is an observation, never Blackbird state: it is what the tracker said at observed_at, nothing is stored, and the tracker stays the only authority over work fields, so read it again rather than trusting an earlier copy. " +
+			"Where no tracker is installed the call fails with DEPENDENCY_UNAVAILABLE and a dependency.kind naming why; that is a property of the machine, and peers, claims and spend are unaffected.",
+		InputSchema: statusSchema},
 		func(ctx context.Context, input statusInput) (statusOutput, error) {
 			return agentStatus(ctx, store, observations, workReferences, input)
 		})
@@ -188,7 +192,7 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 		})
 
 	ackSchema := coordinationInputSchema[messageFactInput](func(properties map[string]*jsonschema.Schema) {
-		properties["kind"].Enum = []any{string(application.DeliveryRead), string(application.DeliveryAcknowledged)}
+		properties["kind"].Enum = []any{string(coordination.DeliveryRead), string(coordination.DeliveryAcknowledged)}
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolAck,
 		Description: "Record read or acknowledged for one message delivered to the authenticated agent.", InputSchema: ackSchema},
@@ -199,7 +203,7 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 	waitSchema := coordinationInputSchema[coordinationWaitInput](func(properties map[string]*jsonschema.Schema) {
 		properties["await_mail"].Default = json.RawMessage("false")
 		properties["mode"].Default = json.RawMessage(`"exclusive"`)
-		properties["mode"].Enum = []any{string(application.LeaseShared), string(application.LeaseExclusive)}
+		properties["mode"].Enum = []any{string(coordination.LeaseShared), string(coordination.LeaseExclusive)}
 		setWaitTimeoutSchema(properties["timeout_seconds"])
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolWait,
@@ -209,8 +213,8 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 			if err != nil {
 				return coordinationWaitOutput{}, err
 			}
-			result, err := store.AwaitCoordination(ctx, session, application.CoordinationWaitRequest{
-				Path: input.Path, Mode: application.LeaseMode(input.Mode), AwaitMail: input.AwaitMail,
+			result, err := store.AwaitCoordination(ctx, session, coordination.CoordinationWaitRequest{
+				Path: input.Path, Mode: coordination.LeaseMode(input.Mode), AwaitMail: input.AwaitMail,
 				Timeout: boundedWaitTimeout(input.TimeoutSeconds)})
 			if err != nil {
 				return coordinationWaitOutput{}, err
@@ -220,13 +224,13 @@ func registerAgentNativeTools(server *sdkmcp.Server, store application.LocalCoor
 		})
 }
 
-func claimResult(lease application.Lease) claimOutput {
+func claimResult(lease coordination.Lease) claimOutput {
 	value := localReservationOutput(lease)
 	return claimOutput{OK: true, LeaseID: value.LeaseID, Mode: value.Mode, Selectors: value.Selectors, ExpiresAt: value.ExpiresAt}
 }
 
-func agentStatus(ctx context.Context, store application.LocalCoordinationStore, observations application.TelemetryReader,
-	workReferences application.WorkReferenceObserver, input statusInput) (statusOutput, error) {
+func agentStatus(ctx context.Context, store coordination.LocalCoordinationStore, observations application.TelemetryReader,
+	workReferences coordination.WorkReferenceObserver, input statusInput) (statusOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return statusOutput{}, err
@@ -235,8 +239,8 @@ func agentStatus(ctx context.Context, store application.LocalCoordinationStore, 
 	if err != nil {
 		return statusOutput{}, err
 	}
-	page, err := store.LocalAgentReservations(ctx, session, application.AdminReservationsQuery{
-		State: application.AdminReservationActive, Path: input.Path, Limit: input.Limit})
+	page, err := store.LocalAgentReservations(ctx, session, coordination.AdminReservationsQuery{
+		State: coordination.AdminReservationActive, Path: input.Path, Limit: input.Limit})
 	if err != nil {
 		return statusOutput{}, err
 	}
@@ -252,7 +256,15 @@ func agentStatus(ctx context.Context, store application.LocalCoordinationStore, 
 	}
 	if input.ObjectID != "" {
 		if isNil(workReferences) {
-			return statusOutput{}, invalidInput("object_id requires a configured work-reference provider")
+			// Not a bad argument: the request was well formed and this
+			// machine simply has no work provider composed. Saying
+			// INVALID_ARGUMENT would send an agent to rewrite a call that was
+			// already correct, so it degrades to the same dependency failure a
+			// missing provider binary produces.
+			return statusOutput{}, &coordination.WorkObservationError{
+				Kind: coordination.WorkObservationUnavailable, Operation: "observe",
+				Detail: "no work-item provider is composed on this daemon, so object_id cannot be observed here",
+			}
 		}
 		observed, observeErr := workReferences.ObserveWorkReference(ctx, session.ProjectKey, input.ObjectID)
 		if observeErr != nil {
@@ -281,7 +293,7 @@ func agentStatus(ctx context.Context, store application.LocalCoordinationStore, 
 	return output, nil
 }
 
-func say(ctx context.Context, store application.LocalCoordinationStore, input sayInput) (sayOutput, error) {
+func say(ctx context.Context, store coordination.LocalCoordinationStore, input sayInput) (sayOutput, error) {
 	conversationID := input.ConversationID
 	output := sayOutput{}
 	if conversationID == "" {
@@ -293,7 +305,7 @@ func say(ctx context.Context, store application.LocalCoordinationStore, input sa
 		if err != nil {
 			return sayOutput{}, err
 		}
-		conversation, err := store.OpenConversation(ctx, application.OpenConversationParams{ConversationID: id,
+		conversation, err := store.OpenConversation(ctx, coordination.OpenConversationParams{ConversationID: id,
 			WorkspaceID: session.WorkspaceID, RunID: session.RunID, OpenedBy: session.ActorID,
 			OpenedBySession: session.ActorSessionID, Topic: input.Topic, Slug: input.Slug})
 		if err != nil {
@@ -318,13 +330,13 @@ func say(ctx context.Context, store application.LocalCoordinationStore, input sa
 	return output, nil
 }
 
-func readMessages(ctx context.Context, store application.LocalCoordinationStore, input readInput) (messagePageOutput, error) {
+func readMessages(ctx context.Context, store coordination.LocalCoordinationStore, input readInput) (messagePageOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return messagePageOutput{}, err
 	}
 	if input.ConversationID == "" {
-		page, err := store.Inbox(ctx, application.InboxQuery{WorkspaceID: session.WorkspaceID, Recipient: session.ActorID,
+		page, err := store.Inbox(ctx, coordination.InboxQuery{WorkspaceID: session.WorkspaceID, Recipient: session.ActorID,
 			After: input.After, Limit: input.Limit, UnreadOnly: input.UnreadOnly})
 		if err != nil {
 			return messagePageOutput{}, err
@@ -335,7 +347,7 @@ func readMessages(ctx context.Context, store application.LocalCoordinationStore,
 	if err != nil {
 		return messagePageOutput{}, invalidInput("conversation_id must be a valid UUID")
 	}
-	page, err := store.Thread(ctx, application.ThreadQuery{WorkspaceID: session.WorkspaceID, ConversationID: conversation,
+	page, err := store.Thread(ctx, coordination.ThreadQuery{WorkspaceID: session.WorkspaceID, ConversationID: conversation,
 		Viewer: session.ActorID, After: input.After, Limit: input.Limit})
 	if err != nil {
 		return messagePageOutput{}, err
@@ -343,8 +355,8 @@ func readMessages(ctx context.Context, store application.LocalCoordinationStore,
 	return coordinationPageOutput(page), nil
 }
 
-func recordDeliveryFact(ctx context.Context, store application.LocalCoordinationStore, input messageFactInput) (deliveryFactOutput, error) {
-	kind := application.DeliveryFactKind(input.Kind)
+func recordDeliveryFact(ctx context.Context, store coordination.LocalCoordinationStore, input messageFactInput) (deliveryFactOutput, error) {
+	kind := coordination.DeliveryFactKind(input.Kind)
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return deliveryFactOutput{}, err
@@ -353,9 +365,9 @@ func recordDeliveryFact(ctx context.Context, store application.LocalCoordination
 	if err != nil {
 		return deliveryFactOutput{}, invalidInput("message_id must be a valid UUID")
 	}
-	params := application.RecordDeliveryFactParams{WorkspaceID: session.WorkspaceID, MessageID: messageID,
+	params := coordination.RecordDeliveryFactParams{WorkspaceID: session.WorkspaceID, MessageID: messageID,
 		Recipient: session.ActorID, ActorSessionID: &session.ActorSessionID, Kind: kind}
-	if kind == application.DeliveryAcknowledged {
+	if kind == coordination.DeliveryAcknowledged {
 		message, findErr := store.GetVisibleMessage(ctx, session.WorkspaceID, session.ActorID, messageID)
 		if findErr != nil {
 			return deliveryFactOutput{}, findErr

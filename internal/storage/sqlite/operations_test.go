@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -79,37 +79,37 @@ func TestCoordinationMessagePrivacyAndIndependentFacts(t *testing.T) {
 	outsider := coordinationActor(t, 7)
 	session, _ := domain.ParseActorSessionID(coordinationUUID(8))
 	conversationID, _ := domain.ParseConversationID(coordinationUUID(9))
-	conversation, err := store.OpenConversation(context.Background(), application.OpenConversationParams{
+	conversation, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{
 		ConversationID: conversationID, WorkspaceID: workspace, RunID: run, OpenedBy: author,
 		OpenedBySession: session, Topic: "daily coordination",
 	})
 	if err != nil || conversation.ID() != conversationID {
 		t.Fatalf("conversation=%v error=%v", conversation.ID(), err)
 	}
-	recipients := make([]application.Recipient, 0, 3)
+	recipients := make([]coordination.Recipient, 0, 3)
 	for _, value := range []struct {
 		actor domain.ActorID
-		kind  application.RecipientKind
+		kind  coordination.RecipientKind
 	}{
-		{to, application.RecipientTo}, {cc, application.RecipientCc}, {bcc, application.RecipientBcc},
+		{to, coordination.RecipientTo}, {cc, coordination.RecipientCc}, {bcc, coordination.RecipientBcc},
 	} {
-		recipient, recipientErr := application.NewRecipient(value.actor, value.kind)
+		recipient, recipientErr := coordination.NewRecipient(value.actor, value.kind)
 		if recipientErr != nil {
 			t.Fatal(recipientErr)
 		}
 		recipients = append(recipients, recipient)
 	}
 	messageID, _ := domain.ParseMessageID(coordinationUUID(10))
-	message, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+	message, err := store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: messageID,
 		ConversationID: conversationID, WorkspaceID: workspace, Author: author, AuthorSession: session,
 		Subject: "handoff", Body: "durable body", Recipients: recipients, AcknowledgementRequired: true})
 	if err != nil || len(message.Deliveries()) != 3 {
 		t.Fatalf("deliveries=%d error=%v", len(message.Deliveries()), err)
 	}
 
-	assertVisibleKinds := func(viewer domain.ActorID, want ...application.RecipientKind) {
+	assertVisibleKinds := func(viewer domain.ActorID, want ...coordination.RecipientKind) {
 		t.Helper()
-		page, queryErr := store.Thread(context.Background(), application.ThreadQuery{WorkspaceID: workspace,
+		page, queryErr := store.Thread(context.Background(), coordination.ThreadQuery{WorkspaceID: workspace,
 			ConversationID: conversationID, Viewer: viewer, Limit: 10})
 		if queryErr != nil {
 			t.Fatal(queryErr)
@@ -133,14 +133,14 @@ func TestCoordinationMessagePrivacyAndIndependentFacts(t *testing.T) {
 			}
 		}
 	}
-	assertVisibleKinds(author, application.RecipientBcc, application.RecipientCc, application.RecipientTo)
-	assertVisibleKinds(to, application.RecipientCc, application.RecipientTo)
-	assertVisibleKinds(bcc, application.RecipientBcc, application.RecipientCc, application.RecipientTo)
+	assertVisibleKinds(author, coordination.RecipientBcc, coordination.RecipientCc, coordination.RecipientTo)
+	assertVisibleKinds(to, coordination.RecipientCc, coordination.RecipientTo)
+	assertVisibleKinds(bcc, coordination.RecipientBcc, coordination.RecipientCc, coordination.RecipientTo)
 	assertVisibleKinds(outsider)
 
 	digest := message.Digest()
-	ack, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
-		MessageID: messageID, Recipient: bcc, ActorSessionID: &session, Kind: application.DeliveryAcknowledged,
+	ack, err := store.RecordDeliveryFact(context.Background(), coordination.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: bcc, ActorSessionID: &session, Kind: coordination.DeliveryAcknowledged,
 		MessageDigest: digest})
 	if err != nil {
 		t.Fatal(err)
@@ -151,8 +151,8 @@ func TestCoordinationMessagePrivacyAndIndependentFacts(t *testing.T) {
 	if _, ok := ack.ReadAt(); ok {
 		t.Fatal("acknowledgement implied read")
 	}
-	read, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
-		MessageID: messageID, Recipient: bcc, ActorSessionID: &session, Kind: application.DeliveryRead})
+	read, err := store.RecordDeliveryFact(context.Background(), coordination.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: bcc, ActorSessionID: &session, Kind: coordination.DeliveryRead})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,8 +166,8 @@ func TestCoordinationMessagePrivacyAndIndependentFacts(t *testing.T) {
 	if availableAt, ok := read.AvailableAt(); !ok || availableAt.After(readAt) {
 		t.Fatal("send-time availability was not retained")
 	}
-	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
-		MessageID: messageID, Recipient: outsider, ActorSessionID: &session, Kind: application.DeliveryRead}); !errors.Is(err, domain.ErrForbidden) {
+	if _, err := store.RecordDeliveryFact(context.Background(), coordination.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: outsider, ActorSessionID: &session, Kind: coordination.DeliveryRead}); !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("outsider read error=%v", err)
 	}
 }
@@ -182,26 +182,26 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	session, _ := domain.ParseActorSessionID(coordinationUUID(304))
 	run, _ := domain.ParseRunID(coordinationUUID(305))
 	conversationID, _ := domain.ParseConversationID(coordinationUUID(306))
-	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{ConversationID: conversationID,
+	if _, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{ConversationID: conversationID,
 		WorkspaceID: workspace, RunID: run, OpenedBy: author, OpenedBySession: session, Topic: "journal"}); err != nil {
 		t.Fatal(err)
 	}
-	to, _ := application.NewRecipient(recipient, application.RecipientTo)
+	to, _ := coordination.NewRecipient(recipient, coordination.RecipientTo)
 	for index := 0; index < 2; index++ {
 		messageID, _ := domain.ParseMessageID(coordinationUUID(310 + index))
-		if _, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+		if _, err := store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: messageID,
 			ConversationID: conversationID, WorkspaceID: workspace, Author: author, AuthorSession: session,
-			Subject: "event", Body: "body", Recipients: []application.Recipient{to}}); err != nil {
+			Subject: "event", Body: "body", Recipients: []coordination.Recipient{to}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	query, _ := application.NewCoordinationEventsQuery(workspace, recipient, application.CoordinationEventCursor{}, 1)
+	query, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, coordination.CoordinationEventCursor{}, 1)
 	first, err := store.SyncCoordinationEvents(context.Background(), query)
 	if err != nil || len(first.Events()) != 1 || !first.HasMore() || first.NextCursor().IsZero() ||
-		first.Events()[0].EventType() != application.CoordinationEventMessageAvailable || first.Events()[0].ActorID() != author {
+		first.Events()[0].EventType() != coordination.CoordinationEventMessageAvailable || first.Events()[0].ActorID() != author {
 		t.Fatalf("first coordination page=%+v error=%v", first, err)
 	}
-	continued, _ := application.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
+	continued, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
 	second, err := store.SyncCoordinationEvents(context.Background(), continued)
 	if err != nil || len(second.Events()) != 1 || second.HasMore() || second.Events()[0].Position() <= first.Events()[0].Position() {
 		t.Fatalf("second coordination page=%+v error=%v", second, err)
@@ -209,13 +209,13 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if len(first.EventCursors()) != 1 || first.EventCursors()[0].IsZero() || len(second.EventCursors()) != 1 {
 		t.Fatalf("event cursors first=%+v second=%+v", first.EventCursors(), second.EventCursors())
 	}
-	consumer, _ := application.NewCoordinationConsumerID("pi-extension")
-	consumerQuery, _ := application.NewCoordinationConsumerEventsQuery(workspace, recipient, consumer, 1)
+	consumer, _ := coordination.NewCoordinationConsumerID("pi-extension")
+	consumerQuery, _ := coordination.NewCoordinationConsumerEventsQuery(workspace, recipient, consumer, 1)
 	consumerFirst, err := store.SyncCoordinationEvents(context.Background(), consumerQuery)
 	if err != nil || len(consumerFirst.Events()) != 1 || consumerFirst.Events()[0].Position() != first.Events()[0].Position() {
 		t.Fatalf("initial consumer page=%+v error=%v", consumerFirst, err)
 	}
-	commit, _ := application.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
+	commit, _ := coordination.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
@@ -223,12 +223,12 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if err != nil || len(consumerSecond.Events()) != 1 || consumerSecond.Events()[0].Position() != second.Events()[0].Position() {
 		t.Fatalf("advanced consumer page=%+v error=%v", consumerSecond, err)
 	}
-	commit, _ = application.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerSecond.EventCursors()[0])
+	commit, _ = coordination.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerSecond.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
 	// A delayed duplicate acknowledgement cannot move the consumer backwards.
-	stale, _ := application.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
+	stale, _ := coordination.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), stale); err != nil {
 		t.Fatal(err)
 	}
@@ -236,27 +236,27 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if err != nil || len(drained.Events()) != 0 {
 		t.Fatalf("drained consumer page=%+v error=%v", drained, err)
 	}
-	independent, _ := application.NewCoordinationConsumerID("opencode")
-	independentQuery, _ := application.NewCoordinationConsumerEventsQuery(workspace, recipient, independent, 1)
+	independent, _ := coordination.NewCoordinationConsumerID("opencode")
+	independentQuery, _ := coordination.NewCoordinationConsumerEventsQuery(workspace, recipient, independent, 1)
 	independentPage, err := store.SyncCoordinationEvents(context.Background(), independentQuery)
 	if err != nil || len(independentPage.Events()) != 1 || independentPage.Events()[0].Position() != first.Events()[0].Position() {
 		t.Fatalf("independent consumer page=%+v error=%v", independentPage, err)
 	}
-	wrongScope, _ := application.NewCoordinationConsumerCommit(workspace, other, consumer, first.EventCursors()[0])
+	wrongScope, _ := coordination.NewCoordinationConsumerCommit(workspace, other, consumer, first.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), wrongScope); err == nil {
 		t.Fatal("actor-scoped acknowledgement was accepted for another actor")
 	}
-	otherQuery, _ := application.NewCoordinationEventsQuery(workspace, other, application.CoordinationEventCursor{}, 10)
+	otherQuery, _ := coordination.NewCoordinationEventsQuery(workspace, other, coordination.CoordinationEventCursor{}, 10)
 	private, err := store.SyncCoordinationEvents(context.Background(), otherQuery)
 	if err != nil || len(private.Events()) != 0 {
 		t.Fatalf("other actor events=%d error=%v", len(private.Events()), err)
 	}
-	scopeMismatch, _ := application.NewCoordinationEventsQuery(workspace, other, first.NextCursor(), 1)
+	scopeMismatch, _ := coordination.NewCoordinationEventsQuery(workspace, other, first.NextCursor(), 1)
 	if _, err := store.SyncCoordinationEvents(context.Background(), scopeMismatch); err == nil {
 		t.Fatal("actor-scoped cursor was accepted for another actor")
 	}
-	tampered, _ := application.NewCoordinationEventCursor(first.NextCursor().String() + "x")
-	tamperedQuery, _ := application.NewCoordinationEventsQuery(workspace, recipient, tampered, 1)
+	tampered, _ := coordination.NewCoordinationEventCursor(first.NextCursor().String() + "x")
+	tamperedQuery, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, tampered, 1)
 	if _, err := store.SyncCoordinationEvents(context.Background(), tamperedQuery); err == nil {
 		t.Fatal("tampered coordination cursor was accepted")
 	}
@@ -276,7 +276,7 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 		second.Events()[0].Position()+1); err != nil {
 		t.Fatal(err)
 	}
-	expired, _ := application.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
+	expired, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
 	if _, err := store.SyncCoordinationEvents(context.Background(), expired); !errors.Is(err, domain.ErrCursorExpired) {
 		t.Fatalf("expired cursor error=%v, want CURSOR_EXPIRED", err)
 	}
@@ -294,15 +294,15 @@ func TestCoordinationJournalStoresOneMessageFactForAllRecipients(t *testing.T) {
 	run, _ := domain.ParseRunID(coordinationUUID(336))
 	conversationID, _ := domain.ParseConversationID(coordinationUUID(337))
 	messageID, _ := domain.ParseMessageID(coordinationUUID(338))
-	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{ConversationID: conversationID,
+	if _, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{ConversationID: conversationID,
 		WorkspaceID: workspace, RunID: run, OpenedBy: author, OpenedBySession: session, Topic: "one fact"}); err != nil {
 		t.Fatal(err)
 	}
-	to, _ := application.NewRecipient(toActor, application.RecipientTo)
-	bcc, _ := application.NewRecipient(bccActor, application.RecipientBcc)
-	message, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+	to, _ := coordination.NewRecipient(toActor, coordination.RecipientTo)
+	bcc, _ := coordination.NewRecipient(bccActor, coordination.RecipientBcc)
+	message, err := store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: messageID,
 		ConversationID: conversationID, WorkspaceID: workspace, Author: author, AuthorSession: session,
-		Subject: "event", Body: "body", Recipients: []application.Recipient{to, bcc}, AcknowledgementRequired: true})
+		Subject: "event", Body: "body", Recipients: []coordination.Recipient{to, bcc}, AcknowledgementRequired: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestCoordinationJournalStoresOneMessageFactForAllRecipients(t *testing.T) {
 		t.Fatalf("message facts=%d recipients=%d, want one fact for two recipients", events, recipients)
 	}
 	for _, actor := range []domain.ActorID{toActor, bccActor} {
-		query, _ := application.NewCoordinationEventsQuery(workspace, actor, application.CoordinationEventCursor{}, 10)
+		query, _ := coordination.NewCoordinationEventsQuery(workspace, actor, coordination.CoordinationEventCursor{}, 10)
 		page, syncErr := store.SyncCoordinationEvents(context.Background(), query)
 		if syncErr != nil || len(page.Events()) != 1 || page.Events()[0].ActorID() != author {
 			t.Fatalf("recipient %s page=%+v error=%v", actor, page, syncErr)
@@ -328,18 +328,18 @@ func TestCoordinationJournalStoresOneMessageFactForAllRecipients(t *testing.T) {
 			t.Fatalf("recipient list leaked through message event payload: %s", page.Events()[0].Payload())
 		}
 	}
-	outsiderQuery, _ := application.NewCoordinationEventsQuery(workspace, outsider, application.CoordinationEventCursor{}, 10)
+	outsiderQuery, _ := coordination.NewCoordinationEventsQuery(workspace, outsider, coordination.CoordinationEventCursor{}, 10)
 	outsiderPage, err := store.SyncCoordinationEvents(context.Background(), outsiderQuery)
 	if err != nil || len(outsiderPage.Events()) != 0 {
 		t.Fatalf("outsider page=%+v error=%v", outsiderPage, err)
 	}
 	digest := message.Digest()
-	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
-		MessageID: messageID, Recipient: toActor, ActorSessionID: &session, Kind: application.DeliveryRead}); err != nil {
+	if _, err := store.RecordDeliveryFact(context.Background(), coordination.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: toActor, ActorSessionID: &session, Kind: coordination.DeliveryRead}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
-		MessageID: messageID, Recipient: toActor, ActorSessionID: &session, Kind: application.DeliveryAcknowledged,
+	if _, err := store.RecordDeliveryFact(context.Background(), coordination.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: toActor, ActorSessionID: &session, Kind: coordination.DeliveryAcknowledged,
 		MessageDigest: digest}); err != nil {
 		t.Fatal(err)
 	}
@@ -359,32 +359,32 @@ func TestCoordinationLeaseReleaseIsWorkspaceVisible(t *testing.T) {
 	observer := coordinationActor(t, 342)
 	session, _ := domain.ParseActorSessionID(coordinationUUID(343))
 	epoch, _ := domain.ParseAuthorityEpoch(coordinationUUID(344))
-	selector, _ := application.NewLeaseSelector(application.LeaseSelectorExact, "src/main.go")
+	selector, _ := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, "src/main.go")
 	if _, err := store.db.Exec(`INSERT INTO scope_guards(scope_kind, scope_id, authority_id, authority_epoch,
 		write_status, guard_generation, updated_at_us) VALUES ('workspace', ?, ?, ?, 'open', 1, 1)`,
 		workspace.String(), coordinationUUID(345), epoch.String()); err != nil {
 		t.Fatal(err)
 	}
 	leaseID, _ := domain.ParseLeaseID(coordinationUUID(346))
-	lease, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+	lease, err := store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{LeaseID: leaseID,
 		WorkspaceID: workspace, Holder: holder, HolderSession: session, AuthorityEpoch: epoch,
-		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour})
+		Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{selector}, TTL: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
-	query, _ := application.NewCoordinationEventsQuery(workspace, observer, application.CoordinationEventCursor{}, 10)
+	query, _ := coordination.NewCoordinationEventsQuery(workspace, observer, coordination.CoordinationEventCursor{}, 10)
 	acquired, err := store.SyncCoordinationEvents(context.Background(), query)
-	if err != nil || len(acquired.Events()) != 1 || acquired.Events()[0].EventType() != application.CoordinationEventLeaseAcquired ||
+	if err != nil || len(acquired.Events()) != 1 || acquired.Events()[0].EventType() != coordination.CoordinationEventLeaseAcquired ||
 		acquired.Events()[0].ActorID() != holder {
 		t.Fatalf("observer acquired page=%+v error=%v", acquired, err)
 	}
-	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{WorkspaceID: workspace,
+	if _, err := store.ReleaseLease(context.Background(), coordination.ChangeLeaseParams{WorkspaceID: workspace,
 		Holder: holder, HolderSession: session, AuthorityEpoch: epoch, Selectors: lease.Selectors()}); err != nil {
 		t.Fatal(err)
 	}
-	continued, _ := application.NewCoordinationEventsQuery(workspace, observer, acquired.NextCursor(), 10)
+	continued, _ := coordination.NewCoordinationEventsQuery(workspace, observer, acquired.NextCursor(), 10)
 	released, err := store.SyncCoordinationEvents(context.Background(), continued)
-	if err != nil || len(released.Events()) != 1 || released.Events()[0].EventType() != application.CoordinationEventLeaseReleased ||
+	if err != nil || len(released.Events()) != 1 || released.Events()[0].EventType() != coordination.CoordinationEventLeaseReleased ||
 		released.Events()[0].ActorID() != holder {
 		t.Fatalf("observer release page=%+v error=%v", released, err)
 	}
@@ -397,7 +397,7 @@ func TestCoordinationLeaseConcurrencyAndClaimGeneration(t *testing.T) {
 	holder := coordinationActor(t, 21)
 	session, _ := domain.ParseActorSessionID(coordinationUUID(22))
 	epoch, _ := domain.ParseAuthorityEpoch(coordinationUUID(23))
-	selector, _ := application.NewLeaseSelector(application.LeaseSelectorSubtree, "src/service")
+	selector, _ := coordination.NewLeaseSelector(coordination.LeaseSelectorSubtree, "src/service")
 	if _, err := store.db.Exec(`INSERT INTO scope_guards(scope_kind, scope_id, authority_id, authority_epoch,
 		write_status, guard_generation, updated_at_us) VALUES ('workspace', ?, ?, ?, 'open', 1, 1)`,
 		workspace.String(), coordinationUUID(24), epoch.String()); err != nil {
@@ -421,9 +421,9 @@ func TestCoordinationLeaseConcurrencyAndClaimGeneration(t *testing.T) {
 			defer wait.Done()
 			<-start
 			leaseID, _ := domain.ParseLeaseID(coordinationUUID(100 + index))
-			_, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+			_, err := store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{LeaseID: leaseID,
 				WorkspaceID: workspace, Holder: contendingHolders[index], HolderSession: session, AuthorityEpoch: epoch,
-				Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour})
+				Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{selector}, TTL: time.Hour})
 			results <- err
 		}(index)
 	}
@@ -459,9 +459,9 @@ func TestCoordinationLeaseConcurrencyAndClaimGeneration(t *testing.T) {
 	}
 	time.Sleep(time.Millisecond)
 	replacementID, _ := domain.ParseLeaseID(coordinationUUID(200))
-	replacement, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: replacementID,
+	replacement, err := store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{LeaseID: replacementID,
 		WorkspaceID: workspace, Holder: holder, HolderSession: session, AuthorityEpoch: epoch,
-		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour})
+		Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{selector}, TTL: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +618,7 @@ func newMailFixture(t *testing.T, base, messages int) *mailFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.store.OpenConversation(context.Background(), application.OpenConversationParams{
+	if _, err := fixture.store.OpenConversation(context.Background(), coordination.OpenConversationParams{
 		ConversationID: fixture.conversation, WorkspaceID: fixture.workspace, RunID: run, OpenedBy: fixture.author,
 		OpenedBySession: fixture.session, Topic: "cursor arithmetic",
 	}); err != nil {
@@ -630,20 +630,20 @@ func newMailFixture(t *testing.T, base, messages int) *mailFixture {
 	return fixture
 }
 
-func (fixture *mailFixture) send(t *testing.T) application.Message {
+func (fixture *mailFixture) send(t *testing.T) coordination.Message {
 	t.Helper()
 	messageID, err := domain.ParseMessageID(coordinationUUID(fixture.base + 100 + fixture.sent))
 	if err != nil {
 		t.Fatal(err)
 	}
-	recipient, err := application.NewRecipient(fixture.recipient, application.RecipientTo)
+	recipient, err := coordination.NewRecipient(fixture.recipient, coordination.RecipientTo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, err := fixture.store.SendMessage(context.Background(), application.SendMessageParams{
+	message, err := fixture.store.SendMessage(context.Background(), coordination.SendMessageParams{
 		MessageID: messageID, ConversationID: fixture.conversation, WorkspaceID: fixture.workspace,
 		Author: fixture.author, AuthorSession: fixture.session, Subject: "position",
-		Body: fmt.Sprintf("message %d", fixture.sent), Recipients: []application.Recipient{recipient},
+		Body: fmt.Sprintf("message %d", fixture.sent), Recipients: []coordination.Recipient{recipient},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -679,7 +679,7 @@ func TestCoordinationCursorAdvancesPastMailTheViewerCannotSee(t *testing.T) {
 		{name: "an exhausted cursor stays at the head", viewer: fixture.recipient, after: head, limit: 2, wantCursor: head},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			page, err := fixture.store.Inbox(context.Background(), application.InboxQuery{WorkspaceID: fixture.workspace,
+			page, err := fixture.store.Inbox(context.Background(), coordination.InboxQuery{WorkspaceID: fixture.workspace,
 				Recipient: testCase.viewer, After: testCase.after, Limit: testCase.limit})
 			if err != nil {
 				t.Fatal(err)
@@ -695,7 +695,7 @@ func TestCoordinationCursorAdvancesPastMailTheViewerCannotSee(t *testing.T) {
 
 	t.Run("a cursor at the head still delivers later mail", func(t *testing.T) {
 		later := fixture.send(t)
-		page, err := fixture.store.Inbox(context.Background(), application.InboxQuery{WorkspaceID: fixture.workspace,
+		page, err := fixture.store.Inbox(context.Background(), coordination.InboxQuery{WorkspaceID: fixture.workspace,
 			Recipient: fixture.recipient, After: head, Limit: 4})
 		if err != nil {
 			t.Fatal(err)
@@ -721,7 +721,7 @@ func TestThreadCursorAdvancesPastOtherConversations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.store.OpenConversation(context.Background(), application.OpenConversationParams{
+	if _, err := fixture.store.OpenConversation(context.Background(), coordination.OpenConversationParams{
 		ConversationID: other, WorkspaceID: fixture.workspace, RunID: run, OpenedBy: fixture.author,
 		OpenedBySession: fixture.session, Topic: "another thread",
 	}); err != nil {
@@ -730,7 +730,7 @@ func TestThreadCursorAdvancesPastOtherConversations(t *testing.T) {
 	fixture.conversation = other
 	head := fixture.send(t).Position()
 
-	page, err := fixture.store.Thread(context.Background(), application.ThreadQuery{WorkspaceID: fixture.workspace,
+	page, err := fixture.store.Thread(context.Background(), coordination.ThreadQuery{WorkspaceID: fixture.workspace,
 		ConversationID: other, Viewer: fixture.recipient, After: fixture.positions[0], Limit: 8})
 	if err != nil {
 		t.Fatal(err)
@@ -775,24 +775,24 @@ func newLeaseFixture(t *testing.T, base int) *leaseFixture {
 	return fixture
 }
 
-func (fixture *leaseFixture) acquire(t *testing.T, holder domain.ActorID, mode application.LeaseMode,
-	kind application.LeaseSelectorKind, path string) (application.Lease, error) {
+func (fixture *leaseFixture) acquire(t *testing.T, holder domain.ActorID, mode coordination.LeaseMode,
+	kind coordination.LeaseSelectorKind, path string) (coordination.Lease, error) {
 	t.Helper()
 	leaseID, err := domain.ParseLeaseID(coordinationUUID(fixture.base + 100 + fixture.acquired))
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture.acquired++
-	selector, err := application.NewLeaseSelector(kind, path)
+	selector, err := coordination.NewLeaseSelector(kind, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fixture.store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+	return fixture.store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{LeaseID: leaseID,
 		WorkspaceID: fixture.workspace, Holder: holder, HolderSession: fixture.session, AuthorityEpoch: fixture.epoch,
-		Mode: mode, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour})
+		Mode: mode, Selectors: []coordination.LeaseSelector{selector}, TTL: time.Hour})
 }
 
-func (fixture *leaseFixture) expire(t *testing.T, lease application.Lease) {
+func (fixture *leaseFixture) expire(t *testing.T, lease coordination.Lease) {
 	t.Helper()
 	if _, err := fixture.store.db.Exec(`UPDATE leases SET expires_at_us = acquired_at_us + 1 WHERE lease_id = ?`,
 		lease.ID().String()); err != nil {
@@ -800,7 +800,7 @@ func (fixture *leaseFixture) expire(t *testing.T, lease application.Lease) {
 	}
 }
 
-func (fixture *leaseFixture) status(t *testing.T, lease application.Lease) (string, sql.NullInt64) {
+func (fixture *leaseFixture) status(t *testing.T, lease coordination.Lease) (string, sql.NullInt64) {
 	t.Helper()
 	var status string
 	var released sql.NullInt64
@@ -827,7 +827,7 @@ func commandMessage(t *testing.T, err error) string {
 func TestAcquireLeaseReapsExpiredLeases(t *testing.T) {
 	t.Parallel()
 	fixture := newLeaseFixture(t, 600)
-	stale, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/stale.go")
+	stale, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "src/stale.go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -835,7 +835,7 @@ func TestAcquireLeaseReapsExpiredLeases(t *testing.T) {
 
 	// The reaper runs inside an acquisition that does not overlap the corpse,
 	// so retiring it cannot be a side effect of resolving a conflict.
-	if _, err := fixture.acquire(t, fixture.other, application.LeaseExclusive, application.LeaseSelectorExact, "src/other.go"); err != nil {
+	if _, err := fixture.acquire(t, fixture.other, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "src/other.go"); err != nil {
 		t.Fatal(err)
 	}
 	status, released := fixture.status(t, stale)
@@ -844,7 +844,7 @@ func TestAcquireLeaseReapsExpiredLeases(t *testing.T) {
 	}
 
 	// A reaped selector set is no longer an active claim.
-	renew := application.ChangeLeaseParams{WorkspaceID: fixture.workspace, Holder: fixture.holder,
+	renew := coordination.ChangeLeaseParams{WorkspaceID: fixture.workspace, Holder: fixture.holder,
 		HolderSession: fixture.session, AuthorityEpoch: fixture.epoch, Selectors: stale.Selectors(), TTL: time.Hour}
 	if _, err := fixture.store.RenewLease(context.Background(), renew); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("renew of a reaped lease error=%v", err)
@@ -855,11 +855,11 @@ func TestAcquireLeaseReapsExpiredLeases(t *testing.T) {
 	}
 
 	// A live exact selector set can still be released normally.
-	live, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/live.go")
+	live, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "src/live.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := application.ChangeLeaseParams{WorkspaceID: fixture.workspace, Holder: fixture.holder,
+	release := coordination.ChangeLeaseParams{WorkspaceID: fixture.workspace, Holder: fixture.holder,
 		HolderSession: fixture.session, AuthorityEpoch: fixture.epoch, Selectors: live.Selectors()}
 	if _, err := fixture.store.ReleaseLease(context.Background(), release); err != nil {
 		t.Fatalf("release error=%v", err)
@@ -872,11 +872,11 @@ func TestAcquireLeaseReapsExpiredLeases(t *testing.T) {
 func TestAcquireLeaseConflictCarriesRecoveryEvidence(t *testing.T) {
 	t.Parallel()
 	fixture := newLeaseFixture(t, 700)
-	held, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorSubtree, "src/service")
+	held, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive, coordination.LeaseSelectorSubtree, "src/service")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = fixture.acquire(t, fixture.other, application.LeaseExclusive, application.LeaseSelectorExact, "src/service/main.go")
+	_, err = fixture.acquire(t, fixture.other, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "src/service/main.go")
 	if !errors.Is(err, domain.ErrLeaseConflict) {
 		t.Fatalf("overlapping acquire error=%v", err)
 	}
@@ -896,11 +896,11 @@ func TestAcquireLeaseConflictCarriesRecoveryEvidence(t *testing.T) {
 func TestAcquireLeaseRetryByItsOwnHolderExtendsInsteadOfConflicting(t *testing.T) {
 	t.Parallel()
 	fixture := newLeaseFixture(t, 900)
-	first, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/main.go")
+	first, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "src/main.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	retry, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/main.go")
+	retry, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive, coordination.LeaseSelectorExact, "src/main.go")
 	if err != nil {
 		t.Fatalf("the holder was refused by its own lease: %v", err)
 	}
@@ -915,8 +915,8 @@ func TestAcquireLeaseRetryByItsOwnHolderExtendsInsteadOfConflicting(t *testing.T
 	if status != "released" || !released.Valid || released.Int64 >= timeMicros(first.ExpiresAt()) {
 		t.Fatalf("superseded lease status=%q released=%v, want an explicit release before its deadline", status, released)
 	}
-	if _, err := fixture.acquire(t, fixture.other, application.LeaseExclusive,
-		application.LeaseSelectorExact, "src/main.go"); !errors.Is(err, domain.ErrLeaseConflict) {
+	if _, err := fixture.acquire(t, fixture.other, coordination.LeaseExclusive,
+		coordination.LeaseSelectorExact, "src/main.go"); !errors.Is(err, domain.ErrLeaseConflict) {
 		t.Fatalf("another actor was not refused by the retry's lease: %v", err)
 	}
 }
@@ -926,12 +926,12 @@ func TestAcquireLeaseRetryByItsOwnHolderExtendsInsteadOfConflicting(t *testing.T
 func TestAcquireLeaseSupersedesOnlyExactSelectorSet(t *testing.T) {
 	t.Parallel()
 	fixture := newLeaseFixture(t, 1000)
-	wide, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorSubtree, "docs")
+	wide, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive, coordination.LeaseSelectorSubtree, "docs")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive,
-		application.LeaseSelectorExact, "docs/guide.md"); err != nil {
+	if _, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive,
+		coordination.LeaseSelectorExact, "docs/guide.md"); err != nil {
 		t.Fatalf("narrowing re-claim was refused by the holder's own subtree lease: %v", err)
 	}
 	if status, _ := fixture.status(t, wide); status != "active" {
@@ -939,12 +939,12 @@ func TestAcquireLeaseSupersedesOnlyExactSelectorSet(t *testing.T) {
 	}
 
 	// Widening also leaves the distinct exact claim active.
-	narrow, err := fixture.acquire(t, fixture.holder, application.LeaseShared, application.LeaseSelectorExact, "pkg/a.go")
+	narrow, err := fixture.acquire(t, fixture.holder, coordination.LeaseShared, coordination.LeaseSelectorExact, "pkg/a.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive,
-		application.LeaseSelectorSubtree, "pkg"); err != nil {
+	if _, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive,
+		coordination.LeaseSelectorSubtree, "pkg"); err != nil {
 		t.Fatalf("exclusive re-claim over the holder's own shared lease: %v", err)
 	}
 	if status, _ := fixture.status(t, narrow); status != "active" {
@@ -953,12 +953,12 @@ func TestAcquireLeaseSupersedesOnlyExactSelectorSet(t *testing.T) {
 
 	// A shared lease held by somebody else still refuses the same widening, so
 	// the holder check narrows nothing but the holder's own reservations.
-	if _, err := fixture.acquire(t, fixture.other, application.LeaseShared,
-		application.LeaseSelectorExact, "web/app.ts"); err != nil {
+	if _, err := fixture.acquire(t, fixture.other, coordination.LeaseShared,
+		coordination.LeaseSelectorExact, "web/app.ts"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive,
-		application.LeaseSelectorSubtree, "web"); !errors.Is(err, domain.ErrLeaseConflict) {
+	if _, err := fixture.acquire(t, fixture.holder, coordination.LeaseExclusive,
+		coordination.LeaseSelectorSubtree, "web"); !errors.Is(err, domain.ErrLeaseConflict) {
 		t.Fatalf("another actor's shared lease did not refuse the exclusive claim: %v", err)
 	}
 }
@@ -983,14 +983,14 @@ func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, err := application.NewLeaseSelector(application.LeaseSelectorSubtree, "internal/storage")
+	selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorSubtree, "internal/storage")
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+	lease, err := store.AcquireLease(context.Background(), coordination.AcquireLeaseParams{LeaseID: leaseID,
 		WorkspaceID: alice.WorkspaceID, Holder: alice.ActorID, HolderSession: alice.ActorSessionID,
-		AuthorityEpoch: alice.AuthorityEpoch, Mode: application.LeaseExclusive,
-		Selectors: []application.LeaseSelector{selector}, TTL: 20 * time.Minute})
+		AuthorityEpoch: alice.AuthorityEpoch, Mode: coordination.LeaseExclusive,
+		Selectors: []coordination.LeaseSelector{selector}, TTL: 20 * time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,7 +1013,7 @@ func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
 		t.Fatalf("reservations=%+v, want the lease registration just rebound", snapshot.Reservations)
 	}
 	held := snapshot.Reservations[0]
-	if held.LeaseID != lease.ID() || held.Mode != application.LeaseExclusive ||
+	if held.LeaseID != lease.ID() || held.Mode != coordination.LeaseExclusive ||
 		len(held.Selectors) != 1 || held.Selectors[0].Path() != "internal/storage" {
 		t.Fatalf("held reservation = %+v", held)
 	}
@@ -1041,7 +1041,7 @@ func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
 
 	// A released lease leaves the snapshot, so the projection cannot keep
 	// telling a resuming agent to clean up something it already cleaned up.
-	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{WorkspaceID: resumed.WorkspaceID,
+	if _, err := store.ReleaseLease(context.Background(), coordination.ChangeLeaseParams{WorkspaceID: resumed.WorkspaceID,
 		Holder: resumed.ActorID, HolderSession: resumed.ActorSessionID, AuthorityEpoch: resumed.AuthorityEpoch,
 		Selectors: held.Selectors}); err != nil {
 		t.Fatalf("release with the selector set the snapshot handed back: %v", err)
@@ -1057,14 +1057,14 @@ func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
 
 // seedSnapshotMail sends one acknowledgement-required message from author to
 // recipient, which is the shape a resuming agent most needs to be told about.
-func seedSnapshotMail(t *testing.T, store *Store, author, recipient application.LocalAgentSession,
-) (application.Conversation, application.Message) {
+func seedSnapshotMail(t *testing.T, store *Store, author, recipient coordination.LocalAgentSession,
+) (coordination.Conversation, coordination.Message) {
 	t.Helper()
 	conversationID, err := domain.NewConversationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	conversation, err := store.OpenConversation(context.Background(), application.OpenConversationParams{
+	conversation, err := store.OpenConversation(context.Background(), coordination.OpenConversationParams{
 		ConversationID: conversationID, WorkspaceID: author.WorkspaceID, RunID: author.RunID,
 		OpenedBy: author.ActorID, OpenedBySession: author.ActorSessionID, Topic: "handoff"})
 	if err != nil {
@@ -1074,14 +1074,14 @@ func seedSnapshotMail(t *testing.T, store *Store, author, recipient application.
 	if err != nil {
 		t.Fatal(err)
 	}
-	to, err := application.NewRecipient(recipient.ActorID, application.RecipientTo)
+	to, err := coordination.NewRecipient(recipient.ActorID, coordination.RecipientTo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+	message, err := store.SendMessage(context.Background(), coordination.SendMessageParams{MessageID: messageID,
 		ConversationID: conversationID, WorkspaceID: author.WorkspaceID, Author: author.ActorID,
 		AuthorSession: author.ActorSessionID, Subject: "storage rewrite", Body: "please pick this up",
-		Recipients: []application.Recipient{to}, AcknowledgementRequired: true})
+		Recipients: []coordination.Recipient{to}, AcknowledgementRequired: true})
 	if err != nil {
 		t.Fatal(err)
 	}

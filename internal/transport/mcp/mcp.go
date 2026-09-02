@@ -18,6 +18,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -59,9 +60,9 @@ type MetricsObserver interface {
 }
 
 type Dependencies struct {
-	Coordination   application.LocalCoordinationStore
+	Coordination   coordination.LocalCoordinationStore
 	Observations   application.TelemetryReader
-	WorkReferences application.WorkReferenceObserver
+	WorkReferences coordination.WorkReferenceObserver
 	Logger         *slog.Logger
 	Metrics        MetricsObserver
 }
@@ -372,6 +373,19 @@ type coordinationFailureOutput struct {
 	Conflict     string                    `json:"conflict,omitempty" jsonschema:"Which conflict was detected. LeaseConflict means someone else holds the path; LeaseTerminalConflict means the claim expired."`
 	RetryAfterMS int64                     `json:"retry_after_ms,omitempty" jsonschema:"How long to wait before retrying, when the daemon can say. On a lease conflict this is the blocking lease's remaining time; blackbird_wait spends it for you."`
 	Blockers     []reservationHolderOutput `json:"blockers,omitempty" jsonschema:"Leases that caused a LEASE_CONFLICT: who holds the path and for how much longer. Message a holder, wait with blackbird_wait, or narrow your selectors to a disjoint path."`
+	Dependency   *dependencyFailureOutput  `json:"dependency,omitempty" jsonschema:"Present on DEPENDENCY_UNAVAILABLE: which external tool Blackbird could not read through, and why. Blackbird itself is healthy; only the observation failed."`
+}
+
+// dependencyFailureOutput classifies a failure at an external-tool boundary.
+// DEPENDENCY_UNAVAILABLE alone tells an agent that something outside Blackbird
+// did not answer, which is not enough to choose a next move: a tool that is not
+// installed is a different situation from one that is installed and speaks an
+// unsupported interface, and only the first is worth trying again.
+type dependencyFailureOutput struct {
+	Provider  string `json:"provider" jsonschema:"External tool Blackbird tried to read through, for example beads."`
+	Kind      string `json:"kind" jsonschema:"dependency_unavailable means the tool is not installed here or did not answer in time and installing it changes the answer; dependency_incompatible means it is installed but its version or schema is unsupported; dependency_malformed means the request or the tool's answer did not match the supported shape. Only dependency_unavailable is worth retrying."`
+	Operation string `json:"operation" jsonschema:"Step that failed at the boundary, for example configure, probe or observe."`
+	Detail    string `json:"detail" jsonschema:"Blackbird's own description of the boundary failure. It never contains the external tool's output."`
 }
 
 // blockedError decorates a lease conflict with the reservations that caused it.
@@ -427,7 +441,7 @@ type invalidCoordinationInputError struct{ message string }
 
 func (failure *invalidCoordinationInputError) Error() string { return failure.message }
 func (failure *invalidCoordinationInputError) Unwrap() error {
-	return application.ErrInvalidCoordination
+	return coordination.ErrInvalidCoordination
 }
 
 func invalidInput(message string) error { return &invalidCoordinationInputError{message: message} }
@@ -438,7 +452,20 @@ func coordinationFailure(requestID string, err error) coordinationFailureOutput 
 		Retryable: domain.ErrorCodeInternal.DefaultRetryable()}
 	var commandError *domain.CommandError
 	var invalidInputError *invalidCoordinationInputError
+	var observationError *coordination.WorkObservationError
 	switch {
+	case errors.As(err, &observationError):
+		// The port answers code, category, retry posture and message itself, so
+		// this transport and the loopback HTTP surface cannot disagree about
+		// what a broken external work provider is. The kind travels beside the
+		// code rather than inside it: an agent branches on the kind to decide
+		// between retrying, installing the tool, and giving up.
+		failure.Code, failure.Category = string(observationError.Code()), string(observationError.Category())
+		failure.Message, failure.Retryable = observationError.Message(), observationError.Retryable()
+		failure.Dependency = &dependencyFailureOutput{
+			Provider: observationError.Provider, Kind: string(observationError.Kind),
+			Operation: observationError.Operation, Detail: observationError.Detail,
+		}
 	case errors.As(err, &commandError):
 		failure.Code, failure.Category = string(commandError.Code()), string(commandError.Category())
 		failure.Retryable = commandError.Retryable()
@@ -452,7 +479,7 @@ func coordinationFailure(requestID string, err error) coordinationFailureOutput 
 	case errors.As(err, &invalidInputError):
 		failure.Code, failure.Category = string(domain.ErrorCodeInvalidArgument), string(domain.ErrorCategoryValidation)
 		failure.Message, failure.Retryable = invalidInputError.message, false
-	case errors.Is(err, application.ErrInvalidCoordination):
+	case errors.Is(err, coordination.ErrInvalidCoordination):
 		failure.Code, failure.Category = string(domain.ErrorCodeInvalidArgument), string(domain.ErrorCategoryValidation)
 		failure.Message, failure.Retryable = "coordination request is invalid", false
 	}
@@ -482,22 +509,22 @@ func soonestExpiry(blockers []reservationHolderOutput) int64 {
 	return soonest
 }
 
-func sendLocalMessage(ctx context.Context, store application.LocalCoordinationStore, input sendMessageInput) (messageOutput, error) {
+func sendLocalMessage(ctx context.Context, store coordination.LocalCoordinationStore, input sendMessageInput) (messageOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return messageOutput{}, err
 	}
 	conversation, err := domain.ParseConversationID(input.ConversationID)
 	if err != nil {
-		return messageOutput{}, application.ErrInvalidCoordination
+		return messageOutput{}, coordination.ErrInvalidCoordination
 	}
 	actors, err := store.ResolveLocalAgentNames(ctx, session, input.To)
 	if err != nil {
 		return messageOutput{}, err
 	}
-	recipients := make([]application.Recipient, 0, len(actors))
+	recipients := make([]coordination.Recipient, 0, len(actors))
 	for _, actor := range actors {
-		recipient, recipientErr := application.NewRecipient(actor, application.RecipientTo)
+		recipient, recipientErr := coordination.NewRecipient(actor, coordination.RecipientTo)
 		if recipientErr != nil {
 			return messageOutput{}, recipientErr
 		}
@@ -507,14 +534,14 @@ func sendLocalMessage(ctx context.Context, store application.LocalCoordinationSt
 	if err != nil {
 		return messageOutput{}, err
 	}
-	params := application.SendMessageParams{MessageID: messageID, ConversationID: conversation,
+	params := coordination.SendMessageParams{MessageID: messageID, ConversationID: conversation,
 		WorkspaceID: session.WorkspaceID, Author: session.ActorID, AuthorSession: session.ActorSessionID,
 		Subject: input.Subject, Body: input.Body, Recipients: recipients,
 		AcknowledgementRequired: input.AcknowledgementRequired}
 	if input.ReplyToMessageID != "" {
 		reply, parseErr := domain.ParseMessageID(input.ReplyToMessageID)
 		if parseErr != nil {
-			return messageOutput{}, application.ErrInvalidCoordination
+			return messageOutput{}, coordination.ErrInvalidCoordination
 		}
 		params.ReplyTo = &reply
 	}
@@ -529,8 +556,8 @@ func sendLocalMessage(ctx context.Context, store application.LocalCoordinationSt
 // measured by the daemon. An absolute timestamp would make the client's own
 // clock part of the answer, and a compacted agent restarting on a machine whose
 // clock has drifted would read a live reservation as long expired.
-func localAgentSessionOutput(session application.LocalAgentSession, issued string,
-	snapshot application.LocalAgentSnapshot) agentSessionOutput {
+func localAgentSessionOutput(session coordination.LocalAgentSession, issued string,
+	snapshot coordination.LocalAgentSnapshot) agentSessionOutput {
 	output := agentSessionOutput{ProjectKey: session.ProjectKey, AgentName: session.AgentName,
 		WorkspaceID: session.WorkspaceID.String(), ActorID: session.ActorID.String(),
 		SessionID: session.ActorSessionID.String(), RegistrationToken: issued,
@@ -563,7 +590,7 @@ func localAgentSessionOutput(session application.LocalAgentSession, issued strin
 	}
 	for _, peer := range snapshot.Peers {
 		output.OtherAgents = append(output.OtherAgents, agentPeerOutput{Name: peer.Name, ActorID: peer.ActorID.String(),
-			LastSeenMSAgo: elapsedMS(snapshot.ObservedAtUS, application.MicrosFromTime(peer.LastSeenAt))})
+			LastSeenMSAgo: elapsedMS(snapshot.ObservedAtUS, coordination.MicrosFromTime(peer.LastSeenAt))})
 	}
 	return output
 }
@@ -578,7 +605,7 @@ func elapsedMS(observedAtUS, instantUS int64) int64 {
 	return (observedAtUS - instantUS) / 1000
 }
 
-func coordinationPageOutput(page application.CoordinationPage) messagePageOutput {
+func coordinationPageOutput(page coordination.CoordinationPage) messagePageOutput {
 	messages := page.Messages()
 	result := messagePageOutput{Messages: make([]messageOutput, 0, len(messages)), Next: page.NextCursor(), HasMore: page.HasMore()}
 	for _, message := range messages {
@@ -587,7 +614,7 @@ func coordinationPageOutput(page application.CoordinationPage) messagePageOutput
 	return result
 }
 
-func localMessageOutput(message application.Message) messageOutput {
+func localMessageOutput(message coordination.Message) messageOutput {
 	digest := message.Digest()
 	result := messageOutput{MessageID: message.ID().String(), ConversationID: message.ConversationID().String(),
 		AuthorActorID: message.Author().String(), Subject: message.Subject(), Body: message.Body(), BodyDigest: hex.EncodeToString(digest[:]),
@@ -606,8 +633,8 @@ func localMessageOutput(message application.Message) messageOutput {
 
 func boundedWaitTimeout(seconds uint32) time.Duration {
 	requested := time.Duration(seconds) * time.Second
-	if requested <= 0 || requested > application.MaxCoordinationWait {
-		return application.MaxCoordinationWait
+	if requested <= 0 || requested > coordination.MaxCoordinationWait {
+		return coordination.MaxCoordinationWait
 	}
 	return requested
 }
@@ -616,20 +643,20 @@ func boundedWaitTimeout(seconds uint32) time.Duration {
 // evidence is best effort by design: the refusal is already the answer, and a
 // failed follow-up read must not turn a conflict the caller can act on into an
 // internal error it cannot.
-func describeLeaseConflict(ctx context.Context, store application.LocalCoordinationStore,
-	session application.LocalAgentSession, mode application.LeaseMode, selectors []application.LeaseSelector, cause error) error {
+func describeLeaseConflict(ctx context.Context, store coordination.LocalCoordinationStore,
+	session coordination.LocalAgentSession, mode coordination.LeaseMode, selectors []coordination.LeaseSelector, cause error) error {
 	if !errors.Is(cause, domain.ErrLeaseConflict) {
 		return cause
 	}
-	queryMode := application.LeaseMode("")
-	if mode == application.LeaseShared {
-		queryMode = application.LeaseExclusive
+	queryMode := coordination.LeaseMode("")
+	if mode == coordination.LeaseShared {
+		queryMode = coordination.LeaseExclusive
 	}
 	blockers := make([]reservationHolderOutput, 0, len(selectors))
 	seen := make(map[string]struct{}, len(selectors))
 	for _, selector := range selectors {
-		page, err := store.LocalAgentReservations(ctx, session, application.AdminReservationsQuery{
-			State: application.AdminReservationActive, Mode: queryMode, Path: selector.Path(), Limit: maxCoordinationBlockers})
+		page, err := store.LocalAgentReservations(ctx, session, coordination.AdminReservationsQuery{
+			State: coordination.AdminReservationActive, Mode: queryMode, Path: selector.Path(), Limit: maxCoordinationBlockers})
 		if err != nil {
 			return &blockedError{cause: cause, blockers: blockers}
 		}
@@ -652,7 +679,7 @@ func describeLeaseConflict(ctx context.Context, store application.LocalCoordinat
 	return &blockedError{cause: cause, blockers: blockers}
 }
 
-func reservationHolders(reservations []application.AdminReservation) []reservationHolderOutput {
+func reservationHolders(reservations []coordination.AdminReservation) []reservationHolderOutput {
 	holders := make([]reservationHolderOutput, 0, len(reservations))
 	for _, reservation := range reservations {
 		holders = append(holders, reservationHolder(reservation))
@@ -660,7 +687,7 @@ func reservationHolders(reservations []application.AdminReservation) []reservati
 	return holders
 }
 
-func reservationHolder(reservation application.AdminReservation) reservationHolderOutput {
+func reservationHolder(reservation coordination.AdminReservation) reservationHolderOutput {
 	holder := reservationHolderOutput{LeaseID: reservation.LeaseID.String(),
 		HolderAgentName: reservation.HolderAgentName, HolderActorID: reservation.HolderActorID.String(),
 		Mode: string(reservation.Mode), ExpiresInMS: reservation.ExpiresInMS,
@@ -696,7 +723,7 @@ func coordinationInputSchema[Input any](configure ...func(map[string]*jsonschema
 // the field accepted any string, so an invented kind passed the schema and was
 // rejected later with no hint that only two values exist.
 func setSelectorKindSchema(schema *jsonschema.Schema) {
-	schema.Enum = []any{string(application.LeaseSelectorExact), string(application.LeaseSelectorSubtree)}
+	schema.Enum = []any{string(coordination.LeaseSelectorExact), string(coordination.LeaseSelectorSubtree)}
 	schema.Description = "exact reserves the one named file; subtree reserves the directory and everything beneath it. Prefer exact unless the edit genuinely spans a package."
 }
 
@@ -704,14 +731,14 @@ func setPageLimitSchema(schema *jsonschema.Schema) {
 	schema.Description = "Most entries to return in one answer."
 	schema.Default = json.RawMessage(strconv.Itoa(defaultCoordinationPageLimit))
 	schema.Minimum = jsonschema.Ptr(float64(1))
-	schema.Maximum = jsonschema.Ptr(float64(application.MaxQueryPageSize))
+	schema.Maximum = jsonschema.Ptr(float64(coordination.MaxQueryPageSize))
 }
 
 func setTTLSchema(schema *jsonschema.Schema) {
 	schema.Description = "How long the reservation lasts before it lapses on its own. Prefer a span the work really needs: everything overlapping it waits out the remainder if you abandon it."
 	schema.Default = json.RawMessage(strconv.Itoa(defaultReservationTTLSeconds))
 	schema.Minimum = jsonschema.Ptr(float64(1))
-	schema.Maximum = jsonschema.Ptr(application.MaxLeaseTTL.Seconds())
+	schema.Maximum = jsonschema.Ptr(coordination.MaxLeaseTTL.Seconds())
 }
 
 // setWaitTimeoutSchema states the ceiling the daemon enforces anyway, so a
@@ -719,13 +746,13 @@ func setTTLSchema(schema *jsonschema.Schema) {
 // back shorter than it asked for. The schema is documentation, not the guard;
 // boundedWaitTimeout is the guard.
 func setWaitTimeoutSchema(schema *jsonschema.Schema) {
-	ceiling := application.MaxCoordinationWait.Seconds()
+	ceiling := coordination.MaxCoordinationWait.Seconds()
 	schema.Default = json.RawMessage(strconv.Itoa(int(ceiling)))
 	schema.Minimum = jsonschema.Ptr(float64(1))
 	schema.Maximum = jsonschema.Ptr(ceiling)
 }
 
-func changeLocalReservation(ctx context.Context, store application.LocalCoordinationStore,
+func changeLocalReservation(ctx context.Context, store coordination.LocalCoordinationStore,
 	input reservationChangeInput) (reservationOutput, error) {
 	if input.Action == "release" && input.TTLSeconds != 0 {
 		return reservationOutput{}, invalidInput("ttl_seconds must be omitted when action is release")
@@ -741,10 +768,10 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	if err != nil {
 		return reservationOutput{}, err
 	}
-	params := application.ChangeLeaseParams{WorkspaceID: session.WorkspaceID, Holder: session.ActorID,
+	params := coordination.ChangeLeaseParams{WorkspaceID: session.WorkspaceID, Holder: session.ActorID,
 		HolderSession: session.ActorSessionID, AuthorityEpoch: session.AuthorityEpoch, Selectors: selectors,
 		TTL: time.Duration(input.TTLSeconds) * time.Second}
-	var lease application.Lease
+	var lease coordination.Lease
 	switch input.Action {
 	case "renew":
 		lease, err = store.RenewLease(ctx, params)
@@ -759,10 +786,10 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	return localReservationOutput(lease), nil
 }
 
-func reservationSelectors(raw []reservationSelectorInput) ([]application.LeaseSelector, error) {
-	selectors := make([]application.LeaseSelector, 0, len(raw))
+func reservationSelectors(raw []reservationSelectorInput) ([]coordination.LeaseSelector, error) {
+	selectors := make([]coordination.LeaseSelector, 0, len(raw))
 	for index, value := range raw {
-		selector, err := application.NewLeaseSelector(application.LeaseSelectorKind(value.Kind), value.Path)
+		selector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorKind(value.Kind), value.Path)
 		if err != nil {
 			return nil, invalidInput(fmt.Sprintf("selectors[%d] must use kind exact or subtree and a canonical repository-relative path", index))
 		}
@@ -771,7 +798,7 @@ func reservationSelectors(raw []reservationSelectorInput) ([]application.LeaseSe
 	return selectors, nil
 }
 
-func localReservationOutput(lease application.Lease) reservationOutput {
+func localReservationOutput(lease coordination.Lease) reservationOutput {
 	result := reservationOutput{LeaseID: lease.ID().String(), Mode: string(lease.Mode()), ExpiresAt: lease.ExpiresAt().Format(time.RFC3339Nano),
 		Selectors: []reservationSelectorInput{}}
 	for _, selector := range lease.Selectors() {
