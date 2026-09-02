@@ -229,6 +229,27 @@ type Daemon struct {
 
 // New returns an identity-only daemon retained for build-info callers. Run
 // fails closed because no production composition has been supplied.
+// newIngressServer builds the daemon's ingress server. It deliberately sets no
+// WriteTimeout, and that absence is load-bearing rather than an oversight:
+// blackbird_wait holds a single request open for up to
+// application.MaxCoordinationWait while it parks an agent behind a reservation,
+// so any write timeout at or below that ceiling would cut long polls off
+// mid-answer. The agent does not see a timeout -- it sees a truncated response
+// from what looks like a broken daemon, which is the worst available failure
+// for a coordination feature. Read and idle timeouts are safe because neither
+// bounds the time spent producing a response.
+//
+// TestIngressServerAdmitsTheLongPollCeiling enforces this, because a comment
+// does not survive a well-meaning hardening pass.
+func newIngressServer(address string, handler http.Handler) IngressServer {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
 func New(build BuildInfo) *Daemon {
 	return &Daemon{build: build.Normalize(), logger: slog.New(slog.NewTextHandler(os.Stderr, nil))}
 }
@@ -252,14 +273,7 @@ func NewDaemon(build BuildInfo, config Config, dependencies Dependencies) (*Daem
 		dependencies.Listen = net.Listen
 	}
 	if dependencies.NewServer == nil {
-		dependencies.NewServer = func(address string, handler http.Handler) IngressServer {
-			return &http.Server{
-				Addr:              address,
-				Handler:           handler,
-				ReadHeaderTimeout: 10 * time.Second,
-				IdleTimeout:       2 * time.Minute,
-			}
-		}
+		dependencies.NewServer = newIngressServer
 	}
 	severity := dependencies.LogSeverity
 	if dependencies.Logger == nil {

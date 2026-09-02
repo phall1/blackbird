@@ -809,6 +809,16 @@ func filesystemName(stat syscall.Statfs_t) string {
 	return strings.ToLower(string(name))
 }
 
+// OpenConversation is an upsert on (workspace, slug) when the caller supplies a
+// slug, and the plain insert it always was when it does not. The lookup and the
+// insert share the one write transaction, so two agents racing to open the same
+// slug cannot both create a thread: the write arbiter serializes them and the
+// second sees the first's row.
+//
+// A reused open returns the stored conversation, whose ID is not the one the
+// caller proposed. That difference is the caller's signal, and it is why the
+// proposed UUID is discarded rather than recorded anywhere -- a second identity
+// for one thread is exactly the failure the slug exists to prevent.
 func (store *Store) OpenConversation(ctx context.Context, params application.OpenConversationParams) (application.Conversation, error) {
 	var result application.Conversation
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
@@ -820,16 +830,63 @@ func (store *Store) OpenConversation(ctx context.Context, params application.Ope
 		if err != nil {
 			return err
 		}
+		if params.Slug != "" {
+			existing, found, lookupErr := conversationBySlug(ctx, tx, params)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			if found {
+				result = existing
+				return nil
+			}
+		}
+		var slug any
+		if params.Slug != "" {
+			slug = params.Slug
+		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO conversations(conversation_id, workspace_id, run_id,
-			opened_by_actor_id, opened_by_session_id, topic, opened_at_us) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			opened_by_actor_id, opened_by_session_id, topic, slug, opened_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			params.ConversationID.String(), params.WorkspaceID.String(), params.RunID.String(), params.OpenedBy.String(),
-			params.OpenedBySession.String(), params.Topic, timeMicros(now))
+			params.OpenedBySession.String(), params.Topic, slug, timeMicros(now))
 		if err != nil {
 			return fmt.Errorf("insert SQLite conversation: %w", err)
 		}
 		return nil
 	})
 	return result, err
+}
+
+// conversationBySlug rebuilds the stored conversation rather than the requested
+// one, so a reopen reports the topic and opener the thread actually has instead
+// of whatever the returning caller happened to type this time.
+func conversationBySlug(ctx context.Context, tx *sql.Tx,
+	params application.OpenConversationParams) (application.Conversation, bool, error) {
+	var conversationText, runText, openedByText, sessionText, topic string
+	var openedAt int64
+	err := tx.QueryRowContext(ctx, `SELECT conversation_id, run_id, opened_by_actor_id, opened_by_session_id,
+		topic, opened_at_us FROM conversations WHERE workspace_id = ? AND slug = ?`,
+		params.WorkspaceID.String(), params.Slug).Scan(&conversationText, &runText, &openedByText, &sessionText,
+		&topic, &openedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.Conversation{}, false, nil
+	}
+	if err != nil {
+		return application.Conversation{}, false, fmt.Errorf("read SQLite conversation slug: %w", err)
+	}
+	conversationID, e1 := domain.ParseConversationID(conversationText)
+	run, e2 := domain.ParseRunID(runText)
+	openedBy, e3 := domain.ParseActorID(openedByText)
+	openedBySession, e4 := domain.ParseActorSessionID(sessionText)
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+		return application.Conversation{}, false, application.ErrInvalidCoordination
+	}
+	stored, err := application.NewConversation(application.OpenConversationParams{ConversationID: conversationID,
+		WorkspaceID: params.WorkspaceID, RunID: run, OpenedBy: openedBy, OpenedBySession: openedBySession,
+		Topic: topic, Slug: params.Slug}, microsTime(openedAt))
+	if err != nil {
+		return application.Conversation{}, false, err
+	}
+	return stored, true, nil
 }
 
 func (store *Store) SendMessage(ctx context.Context, params application.SendMessageParams) (application.Message, error) {
@@ -1714,6 +1771,10 @@ func staleEpochError(scope, current, supplied string) error {
 			evidenceText(current), evidenceText(supplied)))
 }
 
+// maxLocalAgentTokenBytes bounds a bearer token before it is ever hashed or
+// compared, so a caller cannot make the daemon digest an arbitrary payload.
+const maxLocalAgentTokenBytes = 256
+
 // maxEvidenceTextBytes bounds one interpolated fact. A selector path or a
 // conflict key runs to thousands of bytes while a command error message is
 // capped at 512, and an over-long message is rejected by the constructor --
@@ -1986,7 +2047,8 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 			WHERE project_key = ? AND agent_name = ?`, projectKey, agentName).Scan(&actorText, &storedDigest)
 		if errors.Is(agentErr, sql.ErrNoRows) {
 			if registrationToken != "" {
-				return coordinationError(domain.ErrorCodeUnauthenticated, "registration token is not valid")
+				return coordinationError(domain.ErrorCodeUnauthenticated,
+					"registration token names no existing agent; call blackbird_agent_register without registration_token to create it")
 			}
 			issuedToken, err = newLocalCoordinationToken()
 			if err != nil {
@@ -2004,7 +2066,8 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 		} else {
 			provided := sha256.Sum256([]byte(registrationToken))
 			if registrationToken == "" || len(storedDigest) != sha256.Size || subtle.ConstantTimeCompare(provided[:], storedDigest) != 1 {
-				return coordinationError(domain.ErrorCodeUnauthenticated, "registration token is not valid")
+				return coordinationError(domain.ErrorCodeUnauthenticated,
+					"registration token does not match this agent; use the registration_token originally returned for this project and agent name")
 			}
 		}
 		if _, updateErr := tx.ExecContext(ctx, `UPDATE coordination_agent_sessions SET ended_at_us = ?
@@ -2028,41 +2091,134 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 	return result, issuedToken, err
 }
 
+// AuthenticateLocalAgent is the first statement of every MCP tool call and of
+// the whole HTTP local API, so its cost is a floor under every operation the
+// daemon performs. It reads in a deferred read-only transaction: nothing about
+// verifying a bearer token needs a write lock, registration_token_digest is
+// uniquely indexed, and the read pool serves these concurrently.
+//
+// It used to run inside a BEGIN IMMEDIATE solely to stamp the session's
+// last_seen_at_us. That made every read pay one durable fullfsync commit and
+// one turn of the daemon-wide write arbiter -- measured at roughly five
+// milliseconds on this machine against a tenth of a millisecond without the
+// barrier -- so an inbox poll paid five milliseconds before it read anything
+// and a send paid it twice. The heartbeat is now coalesced through
+// flushLocalHeartbeat; see application.LocalAgentHeartbeatInterval for why a
+// lagging heartbeat is safe and a lost one is safe in the same direction.
+//
+// The returned LastSeenAt is this call's own instant rather than the stored
+// one, because the caller is asking when the session was last seen and the
+// answer is "now"; only the durable row is allowed to lag.
 func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (application.LocalAgentSession, error) {
-	if token == "" || len(token) > 256 {
-		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated, "agent token is not valid")
+	if token == "" || len(token) > maxLocalAgentTokenBytes {
+		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
+			"agent token is missing or too long; call blackbird_agent_register to get the current token")
 	}
 	digest := sha256.Sum256([]byte(token))
-	var result application.LocalAgentSession
+	if err := ctx.Err(); err != nil {
+		return application.LocalAgentSession{}, err
+	}
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return application.LocalAgentSession{}, fmt.Errorf("begin SQLite agent authentication: %w", err)
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			_ = tx.Rollback()
+		}
+	}()
+	now, err := sqliteNow(ctx, tx)
+	if err != nil {
+		return application.LocalAgentSession{}, err
+	}
+	var projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string
+	var started, lastSeen int64
+	err = tx.QueryRowContext(ctx, `SELECT project.project_key, agent.agent_name, project.workspace_id, project.run_id,
+		agent.actor_id, session.session_id, project.authority_epoch, session.started_at_us, session.last_seen_at_us
+		FROM coordination_agents AS agent JOIN coordination_projects AS project USING(project_key)
+		JOIN coordination_agent_sessions AS session USING(actor_id)
+		WHERE agent.registration_token_digest = ? AND session.ended_at_us IS NULL
+		ORDER BY session.started_at_us DESC LIMIT 1`, digest[:]).Scan(&projectKey, &agentName, &workspaceText, &runText,
+		&actorText, &sessionText, &epochText, &started, &lastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.LocalAgentSession{}, coordinationError(domain.ErrorCodeUnauthenticated,
+			"agent token was not found; call blackbird_agent_register to start or resume this agent")
+	}
+	if err != nil {
+		return application.LocalAgentSession{}, err
+	}
+	result, err := localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText,
+		started, timeMicros(now))
+	if err != nil {
+		return application.LocalAgentSession{}, err
+	}
+	// The read transaction is finished with before any heartbeat write, so a
+	// flush never holds two of the five pooled connections at once and never
+	// waits on the write arbiter while pinning a reader.
+	finished = true
+	if err := tx.Rollback(); err != nil {
+		return application.LocalAgentSession{}, fmt.Errorf("finish SQLite agent authentication: %w", err)
+	}
+	if err := store.flushLocalHeartbeat(ctx, sessionText, now); err != nil {
+		return application.LocalAgentSession{}, err
+	}
+	return result, nil
+}
+
+// flushLocalHeartbeat writes a session's liveness at most once per
+// application.LocalAgentHeartbeatInterval. The claim is taken before the write
+// and given back if the write fails, so a failed flush is retried by the next
+// call rather than suppressed for a whole interval.
+func (store *Store) flushLocalHeartbeat(ctx context.Context, sessionText string, now time.Time) error {
+	if !store.claimHeartbeat(sessionText, now) {
+		return nil
+	}
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
-		now, err := sqliteNow(ctx, tx)
-		if err != nil {
-			return err
+		if _, execErr := tx.ExecContext(ctx, `UPDATE coordination_agent_sessions SET last_seen_at_us = ?
+			WHERE session_id = ? AND ended_at_us IS NULL`, timeMicros(now), sessionText); execErr != nil {
+			return fmt.Errorf("write SQLite session heartbeat: %w", execErr)
 		}
-		var projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string
-		var started, lastSeen int64
-		err = tx.QueryRowContext(ctx, `SELECT project.project_key, agent.agent_name, project.workspace_id, project.run_id,
-			agent.actor_id, session.session_id, project.authority_epoch, session.started_at_us, session.last_seen_at_us
-			FROM coordination_agents AS agent JOIN coordination_projects AS project USING(project_key)
-			JOIN coordination_agent_sessions AS session USING(actor_id)
-			WHERE agent.registration_token_digest = ? AND session.ended_at_us IS NULL
-			ORDER BY session.started_at_us DESC LIMIT 1`, digest[:]).Scan(&projectKey, &agentName, &workspaceText, &runText,
-			&actorText, &sessionText, &epochText, &started, &lastSeen)
-		if errors.Is(err, sql.ErrNoRows) {
-			return coordinationError(domain.ErrorCodeUnauthenticated, "agent token is not valid")
-		}
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE coordination_agent_sessions SET last_seen_at_us = ? WHERE session_id = ?`,
-			timeMicros(now), sessionText); err != nil {
-			return err
-		}
-		result, err = localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText,
-			started, timeMicros(now))
-		return err
+		return nil
 	})
-	return result, err
+	if err != nil {
+		store.releaseHeartbeat(sessionText)
+		return err
+	}
+	return nil
+}
+
+// claimHeartbeat reports whether this call owes a durable heartbeat write. A
+// clock that moved backwards flushes rather than stalls: the comparison asks
+// whether the recorded flush is in the past and recent, not merely how far
+// apart the two instants are.
+func (store *Store) claimHeartbeat(sessionText string, now time.Time) bool {
+	store.heartbeats.Lock()
+	defer store.heartbeats.Unlock()
+	if store.heartbeats.flushed == nil {
+		store.heartbeats.flushed = make(map[string]time.Time)
+	}
+	if flushed, known := store.heartbeats.flushed[sessionText]; known &&
+		now.After(flushed) && now.Sub(flushed) < application.LocalAgentHeartbeatInterval {
+		return false
+	}
+	// Sessions that stopped calling are dropped here rather than by a sweeper,
+	// which bounds the ledger by the number of agents actually talking to the
+	// daemon. An entry older than the liveness horizon can only ever produce a
+	// flush anyway, so forgetting it changes nothing but the memory it held.
+	for session, flushed := range store.heartbeats.flushed {
+		if now.Sub(flushed) > application.LocalAgentActiveWindow {
+			delete(store.heartbeats.flushed, session)
+		}
+	}
+	store.heartbeats.flushed[sessionText] = now
+	return true
+}
+
+func (store *Store) releaseHeartbeat(sessionText string) {
+	store.heartbeats.Lock()
+	defer store.heartbeats.Unlock()
+	delete(store.heartbeats.flushed, sessionText)
 }
 
 // LocalAgentSnapshot answers the one question a resuming agent cannot answer

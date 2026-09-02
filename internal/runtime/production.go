@@ -33,6 +33,12 @@ const (
 	// mcpSessionTimeout bounds how long an idle MCP session survives without a
 	// client request. It is long enough to outlast a thinking agent and short
 	// enough that an abandoned session is reclaimed within one work break.
+	//
+	// It is idle time, not request time: blackbird_wait holds one request open
+	// for up to application.MaxCoordinationWait while it parks an agent behind a
+	// reservation. That is why the ingress server sets no write timeout -- one
+	// shorter than the wait ceiling would cut every long poll off mid-answer,
+	// and the agent would read a coordination feature as a broken daemon.
 	mcpSessionTimeout = 30 * time.Minute
 )
 

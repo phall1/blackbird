@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	stdhttp "net/http"
 	"net/http/httptest"
@@ -34,6 +36,15 @@ var identityPlaneToolNames = []string{
 	ToolActorDelegationPropose, ToolActorDelegationActivate, ToolSessionStart, ToolWorkRefObserve,
 	ToolObjectiveAndWorkCreate, ToolObjectiveActivate, ToolRunPlanWithBindings, ToolRunJoin,
 	ToolRunStart, ToolContextGet, ToolEventsSync,
+}
+
+// coordinationToolNames is the surface an agent actually gets over MCP, listed
+// once so the exposure count and the schema assertions cannot describe
+// different sets.
+var coordinationToolNames = []string{
+	ToolAgentRegister, ToolAgentsList, ToolConversationOpen, ToolMessageSend, ToolMessageReply,
+	ToolInboxFetch, ToolThreadFetch, ToolMessageMarkRead, ToolMessageAcknowledge,
+	ToolReservationAcquire, ToolReservationRenew, ToolReservationRelease, ToolReservationsStatus, ToolWait,
 }
 
 type testMCPAuthenticator struct{}
@@ -494,8 +505,13 @@ func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
 			t.Errorf("identity-plane tool %q was published on a transport that carries no credential", name)
 		}
 	}
-	if !listed[ToolAgentRegister] || !listed[ToolReservationAcquire] || len(listed) != 12 {
-		t.Fatalf("coordination surface = %d tools, want the 12 coordination tools: %v", len(listed), listed)
+	for _, name := range coordinationToolNames {
+		if !listed[name] {
+			t.Errorf("coordination tool %q was not published", name)
+		}
+	}
+	if len(listed) != len(coordinationToolNames) {
+		t.Fatalf("coordination surface = %d tools, want %d: %v", len(listed), len(coordinationToolNames), listed)
 	}
 	// Resources are a fixed pair of URIs rather than a per-request token cost, so
 	// withholding the tools must not withhold them.
@@ -549,11 +565,27 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 		t.Fatal("an unknown agent token was accepted")
 	}
 	logged := sink.String()
-	if !strings.Contains(logged, ToolReservationAcquire) || !strings.Contains(logged, "mcp tool failed") {
-		t.Fatalf("failure log = %q, want the tool name and the failure", logged)
+	if !strings.Contains(logged, ToolReservationAcquire) || !strings.Contains(logged, "tool failed") ||
+		!strings.Contains(logged, string(domain.ErrorCodeUnauthenticated)) {
+		t.Fatalf("failure log = %q, want the tool name, the failure and its code", logged)
+	}
+	// One failure earns one record. The coordination tools log their own with
+	// the request id and the cause chain, so the generic middleware record would
+	// only repeat the half of it that reached the caller anyway.
+	if records := strings.Count(logged, "\"level\":\"ERROR\""); records != 1 {
+		t.Fatalf("one failure produced %d records: %s", records, logged)
+	}
+	if !strings.Contains(logged, `"request_id":"req_`) {
+		t.Fatalf("failure log carries no request id: %q", logged)
 	}
 	if strings.Contains(logged, secret) {
 		t.Fatalf("failure log carried the caller's token: %q", logged)
+	}
+	// The caller is given the same identifier, so a bug report can name the
+	// record an operator has to find.
+	failure := coordinationFailureOf(t, result)
+	if failure.Code != string(domain.ErrorCodeUnauthenticated) || !strings.Contains(logged, failure.RequestID) {
+		t.Fatalf("caller failure = %+v, log = %q", failure, logged)
 	}
 
 	// A successful call is not noise: only failures earn a record.
@@ -563,6 +595,354 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 	if logged := sink.String(); logged != "" {
 		t.Fatalf("successful call logged %q", logged)
 	}
+}
+
+// TestCoordinationFailuresCarryTheirCodeAndTheirBlockers covers what an agent
+// can do with a refusal. The SDK flattens a returned Go error into a bare
+// string, so a lease conflict and a dead token used to arrive looking identical
+// and the only remaining strategy was to give up or to retry something that
+// could never work. A conflict has to name the holder, the time left, and a
+// retry posture, because those are the inputs to every decision that follows.
+func TestCoordinationFailuresCarryTheirCodeAndTheirBlockers(t *testing.T) {
+	t.Parallel()
+	client, alice, bob := newCoordinationSession(t, "failures.db")
+	held := callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
+
+	conflict := callCoordFailure(t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: bob, Mode: "exclusive", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "src"}}})
+	if conflict.Code != string(domain.ErrorCodeLeaseConflict) || conflict.Category != string(domain.ErrorCategoryConflict) ||
+		conflict.Conflict != string(domain.ConflictLease) || !conflict.Retryable {
+		t.Fatalf("lease conflict = %+v, want a retryable machine-readable LEASE_CONFLICT", conflict)
+	}
+	if len(conflict.Blockers) != 1 || conflict.Blockers[0].HolderAgentName != "alice" ||
+		conflict.Blockers[0].LeaseID != held.LeaseID || conflict.Blockers[0].Mode != "exclusive" {
+		t.Fatalf("conflict blockers = %+v, want the lease alice holds", conflict.Blockers)
+	}
+	if conflict.Blockers[0].ExpiresInMS <= 0 || conflict.RetryAfterMS != conflict.Blockers[0].ExpiresInMS {
+		t.Fatalf("conflict retry advice = %d, blocker = %+v", conflict.RetryAfterMS, conflict.Blockers[0])
+	}
+	if len(conflict.Blockers[0].Selectors) != 1 || conflict.Blockers[0].Selectors[0].Path != "src/main.go" {
+		t.Fatalf("blocker selectors = %+v, want the path that overlapped", conflict.Blockers[0].Selectors)
+	}
+
+	// An agent's own lease never blocks it, so widening a reservation it already
+	// holds must not report the agent to itself as a blocker.
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
+
+	unauthenticated := callCoordFailure(t, client, ToolAgentsList, tokenInput{AgentToken: "bbm_" + strings.Repeat("0", 32)})
+	if unauthenticated.Code != string(domain.ErrorCodeUnauthenticated) || unauthenticated.Retryable ||
+		len(unauthenticated.Blockers) != 0 {
+		t.Fatalf("unauthenticated failure = %+v, want a terminal UNAUTHENTICATED with no blockers", unauthenticated)
+	}
+	invalid := callCoordFailure(t, client, ToolThreadFetch, map[string]any{
+		"agent_token": bob, "conversation_id": "not-a-conversation"})
+	if invalid.Code != string(domain.ErrorCodeInvalidArgument) || invalid.Category != string(domain.ErrorCategoryValidation) ||
+		invalid.Retryable {
+		t.Fatalf("invalid request failure = %+v, want a terminal INVALID_ARGUMENT", invalid)
+	}
+	stale := callCoordFailure(t, client, ToolReservationRelease, map[string]any{"agent_token": alice,
+		"lease_id": held.LeaseID, "fences": []fenceOutput{{ConflictKey: held.Fences[0].ConflictKey, Counter: 1 << 20}}})
+	if stale.Conflict != string(domain.ConflictFence) || stale.Retryable {
+		t.Fatalf("stale fence failure = %+v, want a terminal FenceConflict", stale)
+	}
+	if stale.RequestID == "" || stale.Message == "" {
+		t.Fatalf("failure omitted its identifier or its message: %+v", stale)
+	}
+}
+
+// TestReservationsStatusAnswersWhoIsBlockingMe covers the question an agent
+// could not ask at all: the reservation projection existed only on the
+// operator's loopback CLI, which is not a surface the blocked agent has.
+func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
+	t.Parallel()
+	client, alice, bob := newCoordinationSession(t, "status.db")
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: bob, Mode: "shared", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "subtree", Path: "docs"}}})
+
+	// A subtree path is covered on directory boundaries, so asking about a file
+	// inside it has to find the lease over the directory.
+	covered := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
+		reservationsStatusInput{AgentToken: alice, Path: "docs/guide.md"})
+	if len(covered.Reservations) != 1 || covered.Reservations[0].HolderAgentName != "bob" ||
+		covered.Reservations[0].Mode != "shared" || covered.Reservations[0].ExpiresInMS <= 0 {
+		t.Fatalf("status for a covered path = %+v", covered.Reservations)
+	}
+	if covered.Reservations[0].HolderActorID == "" || covered.Truncated {
+		t.Fatalf("status entry = %+v", covered.Reservations[0])
+	}
+	all := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
+		reservationsStatusInput{AgentToken: bob})
+	if len(all.Reservations) != 2 {
+		t.Fatalf("unfiltered status = %+v, want both leases including the caller's own", all.Reservations)
+	}
+	free := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
+		reservationsStatusInput{AgentToken: bob, Path: "internal/other.go"})
+	if len(free.Reservations) != 0 {
+		t.Fatalf("status for an unheld path = %+v", free.Reservations)
+	}
+	assertCoordinationInputRejected(t, client, ToolReservationsStatus, map[string]any{"agent_token": alice, "limit": 0})
+}
+
+// TestWaitReportsWhichConditionEndedIt covers the tool that turns a refusal into
+// a queue. Which of the three things happened is returned rather than inferred,
+// because a caller comparing timestamps gets it wrong exactly when the deadline
+// and the release coincide.
+func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
+	t.Parallel()
+	client, alice, bob := newCoordinationSession(t, "wait.db")
+	held := callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: alice, Mode: "exclusive", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
+
+	blocked := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
+		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 1})
+	if blocked.Reason != string(application.CoordinationWaitDeadline) || len(blocked.Blockers) != 1 ||
+		blocked.Blockers[0].HolderAgentName != "alice" {
+		t.Fatalf("wait on a held path = %+v", blocked)
+	}
+	// A holder that gave up its lease is not a blocker any more, and the waiter
+	// has to be told so rather than sitting out the rest of its budget.
+	callCoord[reservationOutput](t, client, ToolReservationRelease, map[string]any{
+		"agent_token": alice, "lease_id": held.LeaseID, "fences": held.Fences})
+	freed := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
+		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 30})
+	if freed.Reason != string(application.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
+		t.Fatalf("wait on a freed path = %+v", freed)
+	}
+	// A shared reader waits only for exclusive writers, and never for itself.
+	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{
+		AgentToken: bob, Mode: "shared", TTLSeconds: 300,
+		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
+	shared := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
+		AgentToken: alice, Path: "src/main.go", Mode: "shared", TimeoutSeconds: 30})
+	if shared.Reason != string(application.CoordinationWaitPathFree) {
+		t.Fatalf("shared wait behind a shared reader = %+v", shared)
+	}
+	// await_mail alone is a valid wait: reaching the deadline rather than an
+	// argument failure is what proves the flag arrived at the store.
+	mail := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
+		AgentToken: bob, AwaitMail: true, TimeoutSeconds: 1})
+	if mail.Reason != string(application.CoordinationWaitDeadline) || mail.WaitedMS <= 0 {
+		t.Fatalf("mail wait = %+v", mail)
+	}
+	neither := callCoordFailure(t, client, ToolWait, coordinationWaitInput{AgentToken: bob, TimeoutSeconds: 1})
+	if neither.Code != string(domain.ErrorCodeInvalidArgument) {
+		t.Fatalf("wait for nothing = %+v, want INVALID_ARGUMENT", neither)
+	}
+	assertCoordinationInputRejected(t, client, ToolWait, map[string]any{"agent_token": bob,
+		"path": "src/main.go", "timeout_seconds": 600})
+}
+
+// TestBoundedWaitTimeoutClampsWhateverTheCallerAsksFor covers the guard behind
+// the schema. A maximum in the schema binds only a client that validates
+// against it, and a hold that outlives the caller's own request timeout is
+// indistinguishable from a hung daemon.
+func TestBoundedWaitTimeoutClampsWhateverTheCallerAsksFor(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name     string
+		seconds  uint32
+		expected time.Duration
+	}{
+		{name: "unset asks for the ceiling", seconds: 0, expected: application.MaxCoordinationWait},
+		{name: "within the ceiling is honoured", seconds: 5, expected: 5 * time.Second},
+		{name: "at the ceiling is honoured", seconds: uint32(application.MaxCoordinationWait / time.Second),
+			expected: application.MaxCoordinationWait},
+		{name: "beyond the ceiling is clamped", seconds: 86400, expected: application.MaxCoordinationWait},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := boundedWaitTimeout(testCase.seconds); got != testCase.expected {
+				t.Fatalf("boundedWaitTimeout(%d) = %s, want %s", testCase.seconds, got, testCase.expected)
+			}
+		})
+	}
+}
+
+// TestConversationSlugReopensTheSameThread covers what a compacted agent cannot
+// infer. Without a stable name, reopening "the auth refactor" mints a second
+// conversation and every reply its teammates already wrote stays in a thread it
+// can no longer name.
+func TestConversationSlugReopensTheSameThread(t *testing.T) {
+	t.Parallel()
+	client, alice, bob := newCoordinationSession(t, "slug.db")
+	opened := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+		AgentToken: alice, Topic: "auth refactor", Slug: "auth-refactor"})
+	if opened.Reused || opened.Slug != "auth-refactor" || opened.ConversationID == "" {
+		t.Fatalf("first open = %+v, want a fresh conversation under the slug", opened)
+	}
+	reopened := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+		AgentToken: alice, Topic: "something else entirely", Slug: "auth-refactor"})
+	if !reopened.Reused || reopened.ConversationID != opened.ConversationID || reopened.Topic != opened.Topic {
+		t.Fatalf("reopen = %+v, want the stored conversation %+v", reopened, opened)
+	}
+	// The slug is per repository rather than per agent: finding a teammate's
+	// thread is the whole reason to name one.
+	joined := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+		AgentToken: bob, Topic: "auth refactor", Slug: "auth-refactor"})
+	if !joined.Reused || joined.ConversationID != opened.ConversationID {
+		t.Fatalf("teammate open = %+v, want the same conversation", joined)
+	}
+	callCoord[messageOutput](t, client, ToolMessageSend, sendMessageInput{AgentToken: bob,
+		ConversationID: joined.ConversationID, To: []string{"alice"}, Subject: "found it", Body: "in the same thread"})
+	thread := callCoord[messagePageOutput](t, client, ToolThreadFetch, map[string]any{
+		"agent_token": alice, "conversation_id": opened.ConversationID})
+	if len(thread.Messages) != 1 {
+		t.Fatalf("thread after a reopen = %+v", thread.Messages)
+	}
+	// A conversation nobody has to find again still opens without a slug.
+	anonymous := callCoord[conversationOutput](t, client, ToolConversationOpen, openConversationInput{
+		AgentToken: alice, Topic: "one-off"})
+	if anonymous.Reused || anonymous.Slug != "" || anonymous.ConversationID == opened.ConversationID {
+		t.Fatalf("unslugged open = %+v", anonymous)
+	}
+}
+
+// TestCoordinationFailureMapsEveryShapeOfError covers the two ends of the
+// mapping that a tool call cannot reach: an error the daemon never meant to
+// describe, and a domain sentinel that carries a code but no message.
+func TestCoordinationFailureMapsEveryShapeOfError(t *testing.T) {
+	t.Parallel()
+	opaque := coordinationFailure("req_opaque", errors.New("a storage detail nobody outside the daemon may read"))
+	if opaque.Code != string(domain.ErrorCodeInternal) || opaque.Category != string(domain.ErrorCategoryInternal) ||
+		!opaque.Retryable {
+		t.Fatalf("opaque failure = %+v, want a retryable INTERNAL", opaque)
+	}
+	if strings.Contains(opaque.Message, "storage detail") {
+		t.Fatalf("opaque failure leaked its cause: %+v", opaque)
+	}
+	sentinel := coordinationFailure("req_sentinel", fmt.Errorf("wrapped: %w", domain.ErrNotFound))
+	if sentinel.Code != string(domain.ErrorCodeNotFound) || sentinel.Message == "" || sentinel.Retryable {
+		t.Fatalf("sentinel failure = %+v, want NOT_FOUND with a message", sentinel)
+	}
+}
+
+// TestSoonestExpiryAdvisesTheShortestWaitThatCanClear covers the retry advice.
+// A shorter wait retries into the same refusal; a longer one idles past the
+// moment the path came free.
+func TestSoonestExpiryAdvisesTheShortestWaitThatCanClear(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name     string
+		blockers []reservationHolderOutput
+		expected int64
+	}{
+		{name: "no blockers advise no wait"},
+		{name: "one blocker advises its own remainder",
+			blockers: []reservationHolderOutput{{ExpiresInMS: 5000}}, expected: 5000},
+		{name: "many blockers advise the first to lapse",
+			blockers: []reservationHolderOutput{{ExpiresInMS: 5000}, {ExpiresInMS: 900}, {ExpiresInMS: 2000}},
+			expected: 900},
+		{name: "an overdue blocker advises no wait at all",
+			blockers: []reservationHolderOutput{{ExpiresInMS: 5000}, {ExpiresInMS: -1}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := soonestExpiry(testCase.blockers); got != testCase.expected {
+				t.Fatalf("soonestExpiry(%+v) = %d, want %d", testCase.blockers, got, testCase.expected)
+			}
+		})
+	}
+}
+
+func TestDescribeLeaseConflictUsesRequestedMode(t *testing.T) {
+	t.Parallel()
+
+	actor, err := domain.NewActorID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := application.NewLeaseSelector(application.LeaseSelectorExact, "src/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := application.LocalAgentSession{ActorID: actor}
+	for _, testCase := range []struct {
+		name string
+		mode application.LeaseMode
+		want application.LeaseMode
+	}{
+		{name: "shared waits only on writers", mode: application.LeaseShared, want: application.LeaseExclusive},
+		{name: "exclusive waits on everyone", mode: application.LeaseExclusive},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := &leaseConflictQueryStore{}
+			err := describeLeaseConflict(context.Background(), store, session, testCase.mode,
+				[]application.LeaseSelector{selector}, domain.ErrLeaseConflict)
+			if err == nil || !errors.Is(err, domain.ErrLeaseConflict) {
+				t.Fatalf("error = %v, want lease conflict", err)
+			}
+			if store.query.Mode != testCase.want {
+				t.Fatalf("query mode = %q, want %q", store.query.Mode, testCase.want)
+			}
+		})
+	}
+}
+
+type leaseConflictQueryStore struct {
+	application.LocalCoordinationStore
+	query application.AdminReservationsQuery
+}
+
+func (store *leaseConflictQueryStore) LocalAgentReservations(_ context.Context, _ application.LocalAgentSession,
+	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
+	store.query = query
+	return application.AdminReservationsPage{}, nil
+}
+
+func newCoordinationSession(t *testing.T, name string) (*sdkmcp.ClientSession, string, string) {
+	t.Helper()
+	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), name)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	server := newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
+		&testSessionBinder{session: parseSession(t)}, store)
+	client, closeMCP := connect(t, server)
+	t.Cleanup(closeMCP)
+	alice := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "alice"})
+	bob := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
+		registerAgentInput{ProjectKey: "/workspace/repo", AgentName: "bob"})
+	return client, alice.RegistrationToken, bob.RegistrationToken
+}
+
+func callCoordFailure(t *testing.T, session *sdkmcp.ClientSession, tool string, input any) coordinationFailureOutput {
+	t.Helper()
+	result, err := session.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: tool, Arguments: input})
+	if err != nil {
+		t.Fatalf("%s: %v", tool, err)
+	}
+	return coordinationFailureOf(t, result)
+}
+
+func coordinationFailureOf(t *testing.T, result *sdkmcp.CallToolResult) coordinationFailureOutput {
+	t.Helper()
+	if !result.IsError {
+		t.Fatalf("call succeeded where a failure was expected: %+v", result.StructuredContent)
+	}
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal failure: %v", err)
+	}
+	var failure coordinationFailureOutput
+	if err := json.Unmarshal(encoded, &failure); err != nil {
+		t.Fatalf("decode failure %s: %v", encoded, err)
+	}
+	if failure.Code == "" {
+		t.Fatalf("failure reached the agent without a code: %s", encoded)
+	}
+	return failure
 }
 
 // lockedBuffer is written from the server's goroutine and read from the test's.
@@ -606,6 +986,8 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		ToolThreadFetch:        {"after": float64(0), "limit": float64(50)},
 		ToolReservationAcquire: {"mode": "exclusive", "ttl_seconds": float64(3600)},
 		ToolReservationRenew:   {"ttl_seconds": float64(3600)},
+		ToolReservationsStatus: {"limit": float64(50)},
+		ToolWait:               {"await_mail": false, "mode": "exclusive", "timeout_seconds": float64(60)},
 	}
 	for toolName, defaults := range expectedDefaults {
 		tool, ok := tools[toolName]
@@ -663,6 +1045,60 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 		}
 	}
 
+	// A tool description and its parameter descriptions are the only
+	// documentation an agent ever reads: there is no manual to consult and no
+	// second call that explains the first. An undescribed parameter is guessed
+	// at, and a guessed parameter is a failed call.
+	for _, name := range coordinationToolNames {
+		tool := tools[name]
+		if len(tool.Description) < 40 {
+			t.Errorf("coordination tool %q has no usable description: %q", name, tool.Description)
+		}
+		encoded, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshal %s schema: %v", name, err)
+		}
+		var described struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(encoded, &described); err != nil {
+			t.Fatalf("decode %s schema: %v", name, err)
+		}
+		for property, value := range described.Properties {
+			if value.Description == "" {
+				t.Errorf("%s.%s has no description", name, property)
+			}
+		}
+	}
+
+	// The slug is the property a compacted agent cannot infer, so it has to be
+	// stated where the agent looks rather than in a commit message.
+	open := tools[ToolConversationOpen]
+	openSchema, err := json.Marshal(open.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal conversation_open schema: %v", err)
+	}
+	var openDecoded struct {
+		Properties struct {
+			Slug struct {
+				Description string `json:"description"`
+			} `json:"slug"`
+		} `json:"properties"`
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(openSchema, &openDecoded); err != nil {
+		t.Fatalf("decode conversation_open schema: %v", err)
+	}
+	if slicesContains(openDecoded.Required, "slug") {
+		t.Error("conversation_open requires a slug")
+	}
+	if !strings.Contains(openDecoded.Properties.Slug.Description, "same") {
+		t.Errorf("slug description does not say that reopening returns the same conversation: %q",
+			openDecoded.Properties.Slug.Description)
+	}
+
 	acquire := tools[ToolReservationAcquire]
 	acquireSchema, err := json.Marshal(acquire.InputSchema)
 	if err != nil {
@@ -701,6 +1137,69 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	for _, field := range []string{"held_reservations", "inbox", "open_conversations", "other_agents", "expires_in_ms"} {
 		if !bytes.Contains(registerOutput, []byte(`"`+field+`"`)) {
 			t.Errorf("agent_register output schema omits %q: %s", field, registerOutput)
+		}
+	}
+
+	// The wait ceiling is published as well as enforced, so a client discovers
+	// the bound instead of learning it from a budget that came back shorter than
+	// it asked for.
+	wait := tools[ToolWait]
+	waitSchema, err := json.Marshal(wait.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal wait schema: %v", err)
+	}
+	var waitDecoded struct {
+		Properties struct {
+			TimeoutSeconds struct {
+				Maximum *float64 `json:"maximum"`
+			} `json:"timeout_seconds"`
+			Mode struct {
+				Enum []any `json:"enum"`
+			} `json:"mode"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(waitSchema, &waitDecoded); err != nil {
+		t.Fatalf("decode wait schema: %v", err)
+	}
+	ceiling := application.MaxCoordinationWait.Seconds()
+	if maximum := waitDecoded.Properties.TimeoutSeconds.Maximum; maximum == nil || *maximum != ceiling {
+		t.Errorf("wait timeout maximum = %v, want the daemon ceiling %v", maximum, ceiling)
+	}
+	if modes := waitDecoded.Properties.Mode.Enum; !reflect.DeepEqual(modes, []any{"shared", "exclusive"}) {
+		t.Errorf("wait mode enum = %#v, want shared and exclusive", modes)
+	}
+	// The two new answers are only useful if an agent can tell what they carry
+	// without calling them: who holds a path, and for how much longer.
+	statusOutput, err := json.Marshal(tools[ToolReservationsStatus].OutputSchema)
+	if err != nil {
+		t.Fatalf("marshal reservations_status output schema: %v", err)
+	}
+	for _, field := range []string{"holder_agent_name", "expires_in_ms", "mode", "truncated"} {
+		if !bytes.Contains(statusOutput, []byte(`"`+field+`"`)) {
+			t.Errorf("reservations_status output schema omits %q: %s", field, statusOutput)
+		}
+	}
+	waitOutput, err := json.Marshal(wait.OutputSchema)
+	if err != nil {
+		t.Fatalf("marshal wait output schema: %v", err)
+	}
+	for _, field := range []string{"reason", "blockers", "pending_deliveries"} {
+		if !bytes.Contains(waitOutput, []byte(`"`+field+`"`)) {
+			t.Errorf("wait output schema omits %q: %s", field, waitOutput)
+		}
+	}
+	// Every coordination tool publishes the failure shape alongside its answer,
+	// so the fields an agent has to branch on are discoverable rather than
+	// learned by provoking a failure.
+	for _, name := range coordinationToolNames {
+		encoded, err := json.Marshal(tools[name].OutputSchema)
+		if err != nil {
+			t.Fatalf("marshal %s output schema: %v", name, err)
+		}
+		for _, field := range []string{"code", "request_id", "retryable"} {
+			if !bytes.Contains(encoded, []byte(`"`+field+`"`)) {
+				t.Errorf("%s output schema omits the failure field %q: %s", name, field, encoded)
+			}
 		}
 	}
 

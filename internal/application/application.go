@@ -6720,6 +6720,11 @@ func NewRecipient(actor domain.ActorID, kind RecipientKind) (Recipient, error) {
 func (recipient Recipient) ActorID() domain.ActorID { return recipient.actor }
 func (recipient Recipient) Kind() RecipientKind     { return recipient.kind }
 
+// MaxConversationSlugBytes bounds the caller-supplied alternate key. It is the
+// same bound as an agent name because a slug is the same kind of thing: a short
+// stable handle a person or a model types, not a payload.
+const MaxConversationSlugBytes = 128
+
 type OpenConversationParams struct {
 	ConversationID  domain.ConversationID
 	WorkspaceID     domain.WorkspaceID
@@ -6727,6 +6732,16 @@ type OpenConversationParams struct {
 	OpenedBy        domain.ActorID
 	OpenedBySession domain.ActorSessionID
 	Topic           string
+	// Slug is an optional caller-supplied alternate key, unique per workspace.
+	// Opening a slug that already exists returns that conversation instead of
+	// minting a second one: without it, an agent that reopens "the auth
+	// refactor" after a compaction gets a fresh UUID and a fresh thread, and
+	// every reply its teammates already wrote stays in the thread it can no
+	// longer name. The UUID remains the conversation's identity; the slug only
+	// addresses it, which is why a reused open returns an ID that differs from
+	// the one the caller proposed -- that difference is how a caller tells a
+	// reuse from a create without a second field to keep in step.
+	Slug string
 }
 
 type Conversation struct {
@@ -6735,16 +6750,24 @@ type Conversation struct {
 	run       domain.RunID
 	openedBy  domain.ActorID
 	topic     string
+	slug      string
 	openedAt  time.Time
 }
 
 func NewConversation(params OpenConversationParams, openedAt time.Time) (Conversation, error) {
 	if params.ConversationID.IsZero() || params.WorkspaceID.IsZero() || params.RunID.IsZero() ||
-		params.OpenedBy.IsZero() || params.OpenedBySession.IsZero() || !validOpaqueText(params.Topic, 512) || openedAt.IsZero() {
+		params.OpenedBy.IsZero() || params.OpenedBySession.IsZero() || !validOpaqueText(params.Topic, 512) ||
+		!ValidConversationSlug(params.Slug) || openedAt.IsZero() {
 		return Conversation{}, ErrInvalidCoordination
 	}
 	return Conversation{id: params.ConversationID, workspace: params.WorkspaceID, run: params.RunID,
-		openedBy: params.OpenedBy, topic: params.Topic, openedAt: openedAt.UTC()}, nil
+		openedBy: params.OpenedBy, topic: params.Topic, slug: params.Slug, openedAt: openedAt.UTC()}, nil
+}
+
+// ValidConversationSlug accepts the empty slug, which means "no alternate key"
+// and leaves conversation_open minting a fresh thread per call as it always did.
+func ValidConversationSlug(slug string) bool {
+	return slug == "" || validOpaqueText(slug, MaxConversationSlugBytes)
 }
 
 func (conversation Conversation) ID() domain.ConversationID       { return conversation.id }
@@ -6752,6 +6775,7 @@ func (conversation Conversation) WorkspaceID() domain.WorkspaceID { return conve
 func (conversation Conversation) RunID() domain.RunID             { return conversation.run }
 func (conversation Conversation) OpenedBy() domain.ActorID        { return conversation.openedBy }
 func (conversation Conversation) Topic() string                   { return conversation.topic }
+func (conversation Conversation) Slug() string                    { return conversation.slug }
 func (conversation Conversation) OpenedAt() time.Time             { return conversation.openedAt }
 
 type SendMessageParams struct {
@@ -7267,4 +7291,20 @@ type LocalCoordinationStore interface {
 	LocalAgentSnapshot(context.Context, LocalAgentSession) (LocalAgentSnapshot, error)
 	ListActiveLocalAgents(context.Context, LocalAgentSession) ([]ActiveAgent, error)
 	ResolveLocalAgentNames(context.Context, LocalAgentSession, []string) ([]domain.ActorID, error)
+	// LocalAgentReservations answers "who holds this path, in what mode, and
+	// for how much longer" for the caller's own workspace. The same question
+	// the loopback admin surface answers, reachable by the agent the answer is
+	// for: an agent refused a lease could otherwise only be told that it lost,
+	// never to whom, and the operator's CLI was the only way to find out.
+	//
+	// The query's ProjectKey is ignored and replaced with the session's, so
+	// this can never read across into another workspace. Everything else --
+	// path overlap on separator boundaries, the derived state, the
+	// server-computed ExpiresInMS -- is the admin query's, unchanged.
+	LocalAgentReservations(context.Context, LocalAgentSession, AdminReservationsQuery) (AdminReservationsPage, error)
+	// AwaitCoordination parks the caller until the path it wants is free, mail
+	// arrives for it, or the budget runs out, and says which. See
+	// CoordinationWaitRequest for why a bounded server-side wait is the only
+	// shape of this that a model on the far side of MCP can actually use.
+	AwaitCoordination(context.Context, LocalAgentSession, CoordinationWaitRequest) (CoordinationWaitResult, error)
 }

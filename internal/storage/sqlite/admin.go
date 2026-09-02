@@ -476,12 +476,63 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 	if query.Path != "" && !validLocalCoordinationText(query.Path, application.MaxLeaseSelectorBytes) {
 		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
 	}
+	return store.reservationsPage(ctx, query, state, limit, reservationScope{})
+}
+
+// LocalAgentReservations is the same read scoped to one agent's own workspace.
+// An agent refused a lease used to be told only that it lost; who holds the
+// path, in what mode, and for how much longer was reachable exclusively from
+// the operator's loopback CLI, which is not a surface the blocked agent has.
+//
+// The caller's project key and workspace both replace whatever the query
+// carried, so this cannot read across workspaces no matter what a transport
+// forwards, and the workspace predicate is applied to the lease row itself
+// rather than to the project it joins -- a lease whose project row is missing
+// must not fall out of a scoped read as if it were unscoped.
+func (store *Store) LocalAgentReservations(ctx context.Context, session application.LocalAgentSession,
+	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
+	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
+		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	}
+	query.ProjectKey = session.ProjectKey
+	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
+	if err != nil {
+		return application.AdminReservationsPage{}, err
+	}
+	state := query.State.Normalized()
+	if !state.Valid() || !application.ValidAdminReservationMode(query.Mode) {
+		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	}
+	if query.Path != "" && !validLocalCoordinationText(query.Path, application.MaxLeaseSelectorBytes) {
+		return application.AdminReservationsPage{}, application.ErrInvalidCoordination
+	}
+	return store.reservationsPage(ctx, query, state, limit,
+		reservationScope{workspaceID: session.WorkspaceID.String()})
+}
+
+// reservationsPage is the one body behind both surfaces, so the boundary-correct
+// path matching and the server-computed ExpiresInMS cannot drift between the
+// operator's answer and the agent's.
+// reservationScope is the part of a reservation read that no caller supplies:
+// the workspace the answer is confined to, and the holder whose own leases are
+// not blockers. Both are predicates rather than post-LIMIT filters, because a
+// page filtered after the fact comes back empty whenever the head of the
+// unfiltered result set is the wrong row.
+type reservationScope struct {
+	workspaceID   string
+	excludeHolder string
+}
+
+func (store *Store) reservationsPage(ctx context.Context, query application.AdminReservationsQuery,
+	state application.AdminReservationState, limit uint16,
+	scope reservationScope) (application.AdminReservationsPage, error) {
 	var reservations []application.AdminReservation
 	truncated := false
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
-		reservations, truncated, err = adminReservationRows(ctx, tx, query, state, limit, timeMicros(now))
-		if err != nil {
-			return err
+		var rowErr error
+		reservations, truncated, rowErr = adminReservationRows(ctx, tx, query, state, limit, timeMicros(now), scope)
+		if rowErr != nil {
+			return rowErr
 		}
 		for position := range reservations {
 			selectors, selectorErr := adminLeaseSelectors(ctx, tx, reservations[position].LeaseID)
@@ -531,8 +582,8 @@ const adminSelectorCoversPath = ` AND EXISTS (SELECT 1 FROM lease_selectors AS s
 // and pushed into the WHERE clause: filtering in Go after LIMIT would silently
 // return an empty page whenever the head of the result set is the wrong state.
 func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.AdminReservationsQuery,
-	state application.AdminReservationState, limit uint16,
-	nowMicros int64) ([]application.AdminReservation, bool, error) {
+	state application.AdminReservationState, limit uint16, nowMicros int64,
+	scope reservationScope) ([]application.AdminReservation, bool, error) {
 	statement := `SELECT l.lease_id, COALESCE(p.project_key, ''), l.workspace_id, COALESCE(a.agent_name, ''),
 		l.holder_actor_id, l.holder_session_id, l.mode, l.status, l.acquired_at_us, l.expires_at_us,
 		COALESCE(l.released_at_us, 0)
@@ -541,6 +592,14 @@ func adminReservationRows(ctx context.Context, tx *sql.Tx, query application.Adm
 		LEFT JOIN coordination_agents AS a ON a.actor_id = l.holder_actor_id
 		WHERE (? = '' OR p.project_key = ?) AND (? = '' OR a.agent_name = ?)`
 	arguments := []any{query.ProjectKey, query.ProjectKey, query.AgentName, query.AgentName}
+	if scope.workspaceID != "" {
+		statement += ` AND l.workspace_id = ?`
+		arguments = append(arguments, scope.workspaceID)
+	}
+	if scope.excludeHolder != "" {
+		statement += ` AND l.holder_actor_id <> ?`
+		arguments = append(arguments, scope.excludeHolder)
+	}
 	switch state {
 	case application.AdminReservationActive:
 		statement += adminReservationActive

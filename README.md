@@ -53,6 +53,7 @@ blackbird inbox --unread           # mail waiting on an agent
 blackbird reservations --state=expired
 blackbird events --limit=20        # tail the coordination journal
 blackbird logs --follow
+blackbird support-bundle           # one redacted document describing the whole install
 ```
 
 `status` handshakes with the running daemon rather than trusting the
@@ -60,6 +61,17 @@ supervisor, so a loaded-but-crashing job reports as crash-looping instead of
 running. `doctor` exits 5 when any check fails and 0 otherwise, so warnings stay
 advisory; `--strict` makes a warning fail too. Every finding names the exact
 command that resolves it.
+
+`support-bundle` collects what a bug report needs in one pass -- build
+identity, a deep `doctor` run, `status`, the gc report, the tail of each log
+stream, install paths, and each detected MCP client -- and redacts the daemon's
+admin token, credential-shaped assignments in free text, and the home directory
+prefix before emitting anything. It exits 0 whenever it produced a bundle, even
+when the `doctor` run inside it reports failures: the command you reach for when
+Blackbird is sick must not be the one that refuses to answer. `--out PATH`
+writes the JSON owner-only and prints a receipt; without it the bundle is the
+output. The document carries its own redaction policy, so whoever receives it
+can read what was kept rather than infer it.
 
 Shell completions come from the binary itself:
 
@@ -89,12 +101,22 @@ The daily-use MCP tools are:
 - `blackbird_inbox_fetch`, `blackbird_thread_fetch`,
   `blackbird_message_mark_read`, and `blackbird_message_acknowledge`; and
 - `blackbird_reservation_acquire`, `blackbird_reservation_renew`, and
-  `blackbird_reservation_release`.
+  `blackbird_reservation_release`; and
+- `blackbird_reservations_status` and `blackbird_wait`, the "who is blocking me
+  / queue behind it" pair.
 
 All tools except initial registration authenticate with the returned
 `agent_token`. Reserve the narrowest relevant paths before editing, use one
 conversation per work item, acknowledge required handoffs, and release
 reservations when work completes.
+
+A refused reservation does not have to end in a retry loop. The
+`LEASE_CONFLICT` failure names the agents holding the path and when their
+leases expire, `blackbird_reservations_status` answers the same question at any
+time, and `blackbird_wait` parks until the path frees or mail arrives, up to a
+server-enforced ceiling the tool schema publishes. It returns why it woke --
+`path_free`, `mail_arrived`, or `deadline` -- so a caller that ran out of budget
+still learns who to talk to rather than guessing.
 
 ## OpenCode Push Delivery
 

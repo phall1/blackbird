@@ -11,6 +11,23 @@ import (
 // Every roster projection, MCP or admin, must agree on it.
 const LocalAgentActiveWindow = 5 * time.Minute
 
+// LocalAgentHeartbeatInterval is how far behind the truth a session's durable
+// last_seen_at_us is allowed to fall. Authentication is the first statement of
+// every tool call, so writing the heartbeat on each one made every read pay a
+// durable commit and a turn of the daemon-wide write lock; the store therefore
+// coalesces it and flushes at most this often per session.
+//
+// The value is a tenth of LocalAgentActiveWindow, which is what makes the
+// coalescing invisible to every projection that consults it: a session can only
+// ever be reported staler than it really is, never fresher, and only by a
+// tenth of the horizon that decides the answer. That direction is the one that
+// matters for a crash, too. The in-memory flush record is lost with the
+// process, so a daemon that dies leaves a durable timestamp at most one
+// interval old and the next authentication writes a fresh one -- nothing can
+// make a dead session look alive, because nothing writes a heartbeat except a
+// call that just succeeded.
+const LocalAgentHeartbeatInterval = LocalAgentActiveWindow / 10
+
 // AdminDefaultPageSize is the page size applied when a query leaves Limit at
 // its zero value. Callers that reject an explicitly supplied zero do so at
 // their own edge; the store treats unset as "default".

@@ -43,6 +43,8 @@ type CLI struct {
 	GC     GCCmd     `cmd:"" name:"gc" group:"operate" help:"Report reclaimable database space."`
 	Logs   LogsCmd   `cmd:"" group:"operate" help:"Show daemon logs."`
 
+	SupportBundle SupportBundleCmd `cmd:"" name:"support-bundle" group:"operate" aliases:"support" help:"Collect a redacted diagnostic bundle to attach to a bug report."`
+
 	Overview     OverviewCmd     `cmd:"" group:"inspect" help:"Summarize projects, agents, mail, and reservations."`
 	Projects     ProjectsCmd     `cmd:"" group:"inspect" aliases:"project" help:"Inspect registered projects."`
 	Agents       AgentsCmd       `cmd:"" group:"inspect" aliases:"agent" help:"Inspect registered agents."`

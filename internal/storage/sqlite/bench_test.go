@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -209,6 +210,136 @@ func BenchmarkAcquireLeaseWithStaleLeases(b *testing.B) {
 				b.StopTimer()
 				discardLease(b, store, leaseID.String())
 				b.StartTimer()
+			}
+		})
+	}
+}
+
+// BenchmarkAuthenticateLocalAgent measures the statement every MCP tool call and
+// every HTTP local-API request executes first, so its cost is a floor under
+// everything the daemon does.
+//
+// The heartbeat-per-call arm is the shape this path used to have: the identical
+// lookup, wrapped in the BEGIN IMMEDIATE it needed only to stamp
+// last_seen_at_us. It is kept here as the control, because the read-only arm's
+// number means nothing without the durable commit it replaced -- and because a
+// future change that quietly reintroduces a write on this path shows up as the
+// two arms converging.
+func BenchmarkAuthenticateLocalAgent(b *testing.B) {
+	ctx := context.Background()
+	for _, variant := range []struct {
+		name         string
+		authenticate func(*Store, string) error
+	}{
+		{"coalesced-heartbeat", func(store *Store, token string) error {
+			_, err := store.AuthenticateLocalAgent(ctx, token)
+			return err
+		}},
+		{"heartbeat-per-call", func(store *Store, token string) error {
+			return authenticateWritingHeartbeat(ctx, store, token)
+		}},
+	} {
+		store := openBenchmarkStore(b, "authenticate-"+variant.name+".db")
+		_, token, err := store.RegisterLocalAgent(ctx, "/workspace/bench", "bench", "")
+		if err != nil {
+			b.Fatal(err)
+		}
+		foldSeedIntoDatabase(b, store)
+		b.Run(variant.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := variant.authenticate(store, token); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// authenticateWritingHeartbeat reproduces the retired authentication path --
+// the same lookup inside a write transaction that stamps the session heartbeat
+// unconditionally -- so the benchmark compares two real implementations rather
+// than a measurement against a remembered number.
+func authenticateWritingHeartbeat(ctx context.Context, store *Store, token string) error {
+	digest := sha256.Sum256([]byte(token))
+	return store.withImmediate(ctx, func(tx *sql.Tx) error {
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		var projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText string
+		var started, lastSeen int64
+		if err := tx.QueryRowContext(ctx, `SELECT project.project_key, agent.agent_name, project.workspace_id,
+			project.run_id, agent.actor_id, session.session_id, project.authority_epoch, session.started_at_us,
+			session.last_seen_at_us
+			FROM coordination_agents AS agent JOIN coordination_projects AS project USING(project_key)
+			JOIN coordination_agent_sessions AS session USING(actor_id)
+			WHERE agent.registration_token_digest = ? AND session.ended_at_us IS NULL
+			ORDER BY session.started_at_us DESC LIMIT 1`, digest[:]).Scan(&projectKey, &agentName, &workspaceText,
+			&runText, &actorText, &sessionText, &epochText, &started, &lastSeen); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE coordination_agent_sessions SET last_seen_at_us = ?
+			WHERE session_id = ?`, timeMicros(now), sessionText); err != nil {
+			return err
+		}
+		_, err = localAgentSession(projectKey, agentName, workspaceText, runText, actorText, sessionText, epochText,
+			started, timeMicros(now))
+		return err
+	})
+}
+
+// BenchmarkAwaitCoordination measures one poll of the bounded wait, which is
+// what a parked agent pays four times a second. The blocked arm is the case
+// that matters: the wait is reading conflicting reservations and their
+// selectors on every turn, and that read has to stay cheap enough that parked
+// agents do not become the load.
+func BenchmarkAwaitCoordination(b *testing.B) {
+	ctx := context.Background()
+	store := openBenchmarkStore(b, "await.db")
+	waiter, _, err := store.RegisterLocalAgent(ctx, "/workspace/await", "waiter", "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	holder, _, err := store.RegisterLocalAgent(ctx, "/workspace/await", "holder", "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	selector, err := application.NewLeaseSelector(application.LeaseSelectorSubtree, "internal/storage")
+	if err != nil {
+		b.Fatal(err)
+	}
+	leaseID, err := domain.NewLeaseID()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := store.AcquireLease(ctx, application.AcquireLeaseParams{LeaseID: leaseID,
+		WorkspaceID: holder.WorkspaceID, Holder: holder.ActorID, HolderSession: holder.ActorSessionID,
+		AuthorityEpoch: holder.AuthorityEpoch, Mode: application.LeaseExclusive,
+		Selectors: []application.LeaseSelector{selector}, TTL: time.Hour}); err != nil {
+		b.Fatal(err)
+	}
+	foldSeedIntoDatabase(b, store)
+
+	for _, variant := range []struct {
+		name    string
+		request application.CoordinationWaitRequest
+	}{
+		{"blocked-path", application.CoordinationWaitRequest{Path: "internal/storage/sqlite/sqlite.go"}},
+		{"free-path", application.CoordinationWaitRequest{Path: "internal/transport/mcp/mcp.go"}},
+		{"mail", application.CoordinationWaitRequest{AwaitMail: true}},
+	} {
+		b.Run(variant.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				// One observation rather than a whole wait: the loop's own cost
+				// is a sleep, and timing a sleep measures the clock.
+				if _, err := store.coordinationWaitState(ctx, waiter, variant.request,
+					application.LeaseExclusive); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

@@ -333,7 +333,12 @@ func TestOpenRejectsIdentityChecksumAndConfigurationDrift(t *testing.T) {
 		mutate func(*testing.T, string)
 	}{
 		{"application id", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA application_id = 1") }},
-		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 6") }},
+		// Derived rather than written down: a literal here silently stopped
+		// being a drifted version the moment SchemaVersion caught up with it,
+		// and the case went on passing while asserting nothing.
+		{"schema version", func(t *testing.T, path string) {
+			execRaw(t, path, "PRAGMA user_version = "+strconv.Itoa(SchemaVersion+1))
+		}},
 		{"migration checksum", func(t *testing.T, path string) {
 			execRaw(t, path, "DROP TRIGGER schema_migrations_no_update")
 			execRaw(t, path, "UPDATE schema_migrations SET checksum = zeroblob(32)")
