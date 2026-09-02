@@ -1246,6 +1246,35 @@ func TestRestartRotatesOversizedDaemonLogs(t *testing.T) {
 	}
 }
 
+func TestDarwinRestartRejectsGenuineBootoutFailure(t *testing.T) {
+	t.Parallel()
+
+	runner := &recordingRunner{outputs: []string{"Boot-out failed: 5: Input/output error"},
+		errs: []error{errors.New("exit status 5")}}
+	manager := testManager(t.TempDir(), "darwin", runner)
+	err := manager.restart(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "bootout") || !strings.Contains(err.Error(), "Input/output") {
+		t.Fatalf("restart error = %v", err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("commands = %v, bootstrap must not run after failed bootout", runner.commands)
+	}
+}
+
+func TestDarwinRestartAllowsAnUnloadedService(t *testing.T) {
+	t.Parallel()
+
+	runner := &recordingRunner{outputs: []string{"Could not find service"},
+		errs: []error{errors.New("exit status 113"), nil, nil}}
+	manager := testManager(t.TempDir(), "darwin", runner)
+	if err := manager.restart(context.Background()); err != nil {
+		t.Fatalf("restart = %v", err)
+	}
+	if len(runner.commands) != 3 || !strings.Contains(runner.commands[1], "bootstrap") {
+		t.Fatalf("commands = %v", runner.commands)
+	}
+}
+
 func TestRestartLeavesLogsAloneWhenAbsent(t *testing.T) {
 	home := t.TempDir()
 	manager := testManager(home, "linux", &recordingRunner{})

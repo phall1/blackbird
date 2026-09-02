@@ -83,6 +83,33 @@ func TestHealthCombinesLivenessAndReadiness(t *testing.T) {
 	}
 }
 
+func TestHealthReturnsDiscoveryFailureAfterProbingExplicitAddress(t *testing.T) {
+	t.Parallel()
+
+	server, _ := serve(t, func(request recordedRequest) (int, string) {
+		switch request.path {
+		case pathHealth:
+			return http.StatusOK, `{"status":"ok","version":"0.4.0"}`
+		case pathReady:
+			return http.StatusOK, `{"status":"ready","schema_version":4}`
+		default:
+			return http.StatusNotFound, `{}`
+		}
+	})
+	path := filepath.Join(t.TempDir(), "admin.json")
+	if err := os.WriteFile(path, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	health, err := New(path, addressOf(t, server)).Health(context.Background())
+	if !errors.Is(err, ErrStaleHandshake) {
+		t.Fatalf("Health() error = %v, want stale handshake", err)
+	}
+	if !health.Reachable || !health.Ready || health.Address != addressOf(t, server) || health.Detail == "" {
+		t.Fatalf("health = %#v, want probe facts plus discovery detail", health)
+	}
+}
+
 func TestHealthReportsAReachableDaemonWithFailingStorage(t *testing.T) {
 	t.Parallel()
 

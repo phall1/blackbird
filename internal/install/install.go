@@ -948,7 +948,9 @@ func (manager *Manager) rotateDaemonLogs() {
 func (manager *Manager) restart(ctx context.Context) error {
 	manager.rotateDaemonLogs()
 	if manager.config.GOOS == "darwin" {
-		_, _ = manager.config.Runner.Run(ctx, "launchctl", "bootout", manager.launchDomain(), manager.servicePath())
+		if err := manager.bootoutDaemon(ctx); err != nil {
+			return err
+		}
 		if _, err := manager.runRequired(ctx, "launchctl", "bootstrap", manager.launchDomain(), manager.servicePath()); err != nil {
 			return err
 		}
@@ -963,6 +965,15 @@ func (manager *Manager) restart(ctx context.Context) error {
 	}
 	_, err := manager.runRequired(ctx, "systemctl", "--user", "restart", "blackbird.service")
 	return err
+}
+
+func (manager *Manager) bootoutDaemon(ctx context.Context) error {
+	args := []string{"bootout", manager.launchDomain(), manager.servicePath()}
+	output, err := manager.config.Runner.Run(ctx, "launchctl", args...)
+	if err == nil || strings.Contains(strings.ToLower(output), "could not find service") {
+		return nil
+	}
+	return fmt.Errorf("run launchctl %s: %w: %s", strings.Join(args, " "), err, output)
 }
 
 func (manager *Manager) restartUpdater(ctx context.Context) error {

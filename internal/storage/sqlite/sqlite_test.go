@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +16,30 @@ import (
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 )
+
+func TestInvariantMismatchesNameEveryFailedCheck(t *testing.T) {
+	t.Parallel()
+
+	diagnostic := diagnosticInvariantMismatches(Diagnostics{JournalMode: "delete", Synchronous: "1",
+		BusyTimeout: -time.Second, TrustedSchema: true, ExtensionLoading: true,
+		ApplicationID: -1, SchemaVersion: -1})
+	joined := strings.Join(diagnostic, ",")
+	for _, name := range []string{"journal_mode", "foreign_keys", "synchronous", "busy_timeout", "trusted_schema",
+		"extension_loading", "fullfsync", "checkpoint_fullfsync", "application_id", "user_version"} {
+		if !strings.Contains(joined, name+"=") {
+			t.Errorf("diagnostic mismatches %q omit %s", joined, name)
+		}
+	}
+
+	physical := physicalInvariantMismatches("wrong", "wrong", "delete", "1", 0, 1, 1, 0, 0, 2*time.Second)
+	joined = strings.Join(physical, ",")
+	for _, name := range []string{"sqlite_version", "sqlite_source_id", "journal_mode", "foreign_keys", "synchronous",
+		"busy_timeout", "trusted_schema", "fullfsync", "checkpoint_fullfsync"} {
+		if !strings.Contains(joined, name+"=") {
+			t.Errorf("physical mismatches %q omit %s", joined, name)
+		}
+	}
+}
 
 func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	t.Parallel()

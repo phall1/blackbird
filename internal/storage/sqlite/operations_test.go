@@ -15,6 +15,21 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 )
 
+func TestCoordinationErrorConstructionFailuresAreReturned(t *testing.T) {
+	t.Parallel()
+
+	commandErr := coordinationError(domain.ErrorCode("invented"), "message")
+	if commandErr == nil || !errors.Is(commandErr, domain.ErrUnknownErrorCode) ||
+		!strings.Contains(commandErr.Error(), "construct coordination error") {
+		t.Fatalf("coordination error = %v", commandErr)
+	}
+	conflictErr := coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictFence, "message")
+	if conflictErr == nil || !errors.Is(conflictErr, domain.ErrInvalidConflictKind) ||
+		!strings.Contains(conflictErr.Error(), "construct coordination conflict") {
+		t.Fatalf("coordination conflict = %v", conflictErr)
+	}
+}
+
 func TestCheckpointReportsPassiveAndBoundedTruncate(t *testing.T) {
 	t.Parallel()
 	store := newOperationStore(t)

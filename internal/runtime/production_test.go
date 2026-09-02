@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -14,9 +15,51 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 )
+
+func TestRegisteringAuthenticationReturnsRevokeFailures(t *testing.T) {
+	t.Parallel()
+
+	revokeErr := errors.New("revoke failed")
+	nextErr := errors.New("prepare failed")
+	registry := &authenticationRegistryStub{revokeErr: revokeErr}
+	preparer := authenticationPreparerStub{err: nextErr}
+	_, err := (registeringAuthentication{registry: registry, next: preparer}).PrepareAuthentication(
+		context.Background(), application.AuthenticationRequest{})
+	if !errors.Is(err, nextErr) || !errors.Is(err, revokeErr) {
+		t.Fatalf("PrepareAuthentication() error = %v, want preparation and revoke failures", err)
+	}
+	if registry.registered != 1 || registry.revoked != 1 {
+		t.Fatalf("registry calls = register %d revoke %d", registry.registered, registry.revoked)
+	}
+}
+
+type authenticationRegistryStub struct {
+	registerErr error
+	revokeErr   error
+	registered  int
+	revoked     int
+}
+
+func (registry *authenticationRegistryStub) Register(application.AuthenticationRequest) error {
+	registry.registered++
+	return registry.registerErr
+}
+
+func (registry *authenticationRegistryStub) Revoke(application.AuthenticationRequest) error {
+	registry.revoked++
+	return registry.revokeErr
+}
+
+type authenticationPreparerStub struct{ err error }
+
+func (preparer authenticationPreparerStub) PrepareAuthentication(context.Context,
+	application.AuthenticationRequest) (application.AuthenticationDecision, error) {
+	return application.AuthenticationDecision{}, preparer.err
+}
 
 func TestProductionCompositionRoutesHealthAndAdminAheadOfTheCatchAll(t *testing.T) {
 	t.Parallel()

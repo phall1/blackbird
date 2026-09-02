@@ -83,9 +83,9 @@ func (client *Client) SetAddress(address string) { client.Address = address }
 // error. The returned Health still carries the address and Reachable, so a
 // caller that only wants to know where a daemon would be keeps that.
 func (client *Client) Health(ctx context.Context) (cli.Health, error) {
-	address, _, err := client.discover()
-	if err != nil && address == "" {
-		return cli.Health{}, err
+	address, _, discoveryErr := client.discover()
+	if discoveryErr != nil && address == "" {
+		return cli.Health{}, discoveryErr
 	}
 
 	health := cli.Health{Address: address}
@@ -95,7 +95,7 @@ func (client *Client) Health(ctx context.Context) (cli.Health, error) {
 	}
 	if err := client.fetch(ctx, address, pathHealth, nil, "", &live); err != nil {
 		health.Detail = err.Error()
-		return health, err
+		return health, errors.Join(discoveryErr, err)
 	}
 	health.Reachable = true
 	health.Version = live.Version
@@ -106,11 +106,14 @@ func (client *Client) Health(ctx context.Context) (cli.Health, error) {
 	}
 	if err := client.fetch(ctx, address, pathReady, nil, "", &ready); err != nil {
 		health.Detail = err.Error()
-		return health, err
+		return health, errors.Join(discoveryErr, err)
 	}
 	health.Ready = ready.Status == "ready"
 	health.SchemaVersion = ready.SchemaVersion
-	return health, nil
+	if discoveryErr != nil {
+		health.Detail = discoveryErr.Error()
+	}
+	return health, discoveryErr
 }
 
 func (client *Client) Identity(ctx context.Context) (cli.Identity, error) {

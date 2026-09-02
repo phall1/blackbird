@@ -644,11 +644,8 @@ func (store *Store) inspect(ctx context.Context) (Diagnostics, error) {
 	if result.SQLiteVersion != SQLiteVersion || result.SQLiteSourceID != SQLiteSourceID {
 		return Diagnostics{}, fmt.Errorf("%w: version=%q source_id=%q", ErrEngineMismatch, result.SQLiteVersion, result.SQLiteSourceID)
 	}
-	if !strings.EqualFold(result.JournalMode, "wal") || !result.ForeignKeys || result.Synchronous != "2" ||
-		result.BusyTimeout <= 0 || result.BusyTimeout > maximumBusyTimeout || result.TrustedSchema ||
-		result.ExtensionLoading || !result.FullFSync || !result.CheckpointFSync ||
-		result.ApplicationID != ApplicationID || result.SchemaVersion != SchemaVersion {
-		return Diagnostics{}, fmt.Errorf("%w: connection or schema invariants", ErrSchemaMismatch)
+	if mismatches := diagnosticInvariantMismatches(result); len(mismatches) > 0 {
+		return Diagnostics{}, fmt.Errorf("%w: %s", ErrSchemaMismatch, strings.Join(mismatches, ", "))
 	}
 	return result, nil
 }
@@ -689,13 +686,80 @@ func (store *Store) verifyPhysicalConnections(ctx context.Context, busyTimeout t
 				return fmt.Errorf("verify SQLite connection %s: %w", check.name, err)
 			}
 		}
-		if version != SQLiteVersion || sourceID != SQLiteSourceID || !strings.EqualFold(journalMode, "wal") ||
-			foreignKeys != 1 || synchronous != "2" || time.Duration(busyMilliseconds)*time.Millisecond != busyTimeout ||
-			trustedSchema != 0 || fullFSync != 1 || checkpointFSync != 1 {
-			return fmt.Errorf("%w: physical connection invariants", ErrEngineMismatch)
+		if mismatches := physicalInvariantMismatches(version, sourceID, journalMode, synchronous, foreignKeys,
+			busyMilliseconds, trustedSchema, fullFSync, checkpointFSync, busyTimeout); len(mismatches) > 0 {
+			return fmt.Errorf("%w: %s", ErrEngineMismatch, strings.Join(mismatches, ", "))
 		}
 	}
 	return nil
+}
+
+func diagnosticInvariantMismatches(result Diagnostics) []string {
+	mismatches := make([]string, 0, 10)
+	if !strings.EqualFold(result.JournalMode, "wal") {
+		mismatches = append(mismatches, invariantMismatch("journal_mode", result.JournalMode, "wal"))
+	}
+	if !result.ForeignKeys {
+		mismatches = append(mismatches, invariantMismatch("foreign_keys", result.ForeignKeys, true))
+	}
+	if result.Synchronous != "2" {
+		mismatches = append(mismatches, invariantMismatch("synchronous", result.Synchronous, "2"))
+	}
+	if result.BusyTimeout <= 0 || result.BusyTimeout > maximumBusyTimeout {
+		mismatches = append(mismatches, fmt.Sprintf("busy_timeout=%s want (0,%s]", result.BusyTimeout, maximumBusyTimeout))
+	}
+	if result.TrustedSchema {
+		mismatches = append(mismatches, invariantMismatch("trusted_schema", result.TrustedSchema, false))
+	}
+	if result.ExtensionLoading {
+		mismatches = append(mismatches, invariantMismatch("extension_loading", result.ExtensionLoading, false))
+	}
+	if !result.FullFSync {
+		mismatches = append(mismatches, invariantMismatch("fullfsync", result.FullFSync, true))
+	}
+	if !result.CheckpointFSync {
+		mismatches = append(mismatches, invariantMismatch("checkpoint_fullfsync", result.CheckpointFSync, true))
+	}
+	if result.ApplicationID != ApplicationID {
+		mismatches = append(mismatches, invariantMismatch("application_id", result.ApplicationID, ApplicationID))
+	}
+	if result.SchemaVersion != SchemaVersion {
+		mismatches = append(mismatches, invariantMismatch("user_version", result.SchemaVersion, SchemaVersion))
+	}
+	return mismatches
+}
+
+func physicalInvariantMismatches(version, sourceID, journalMode, synchronous string,
+	foreignKeys int, busyMilliseconds int64, trustedSchema, fullFSync, checkpointFSync int,
+	busyTimeout time.Duration) []string {
+	mismatches := make([]string, 0, 9)
+	checks := []struct {
+		name string
+		got  any
+		want any
+		bad  bool
+	}{
+		{"sqlite_version", version, SQLiteVersion, version != SQLiteVersion},
+		{"sqlite_source_id", sourceID, SQLiteSourceID, sourceID != SQLiteSourceID},
+		{"journal_mode", journalMode, "wal", !strings.EqualFold(journalMode, "wal")},
+		{"foreign_keys", foreignKeys, 1, foreignKeys != 1},
+		{"synchronous", synchronous, "2", synchronous != "2"},
+		{"busy_timeout", time.Duration(busyMilliseconds) * time.Millisecond, busyTimeout,
+			time.Duration(busyMilliseconds)*time.Millisecond != busyTimeout},
+		{"trusted_schema", trustedSchema, 0, trustedSchema != 0},
+		{"fullfsync", fullFSync, 1, fullFSync != 1},
+		{"checkpoint_fullfsync", checkpointFSync, 1, checkpointFSync != 1},
+	}
+	for _, check := range checks {
+		if check.bad {
+			mismatches = append(mismatches, invariantMismatch(check.name, check.got, check.want))
+		}
+	}
+	return mismatches
+}
+
+func invariantMismatch(name string, got, want any) string {
+	return fmt.Sprintf("%s=%v want %v", name, got, want)
 }
 
 func linkedDriverVersion() (string, bool, error) {

@@ -2519,10 +2519,16 @@ func localAgentSession(projectKey, agentName, workspaceText, runText, actorText,
 }
 
 func coordinationError(code domain.ErrorCode, message string) error {
-	result, _ := domain.NewCommandError(code, message, nil)
+	result, err := domain.NewCommandError(code, message, nil)
+	if err != nil {
+		return fmt.Errorf("construct coordination error: %w", err)
+	}
 	return result
 }
 func coordinationConflict(code domain.ErrorCode, kind domain.ConflictKind, message string) error {
-	result, _ := domain.NewConflictError(code, kind, message, nil)
+	result, err := domain.NewConflictError(code, kind, message, nil)
+	if err != nil {
+		return fmt.Errorf("construct coordination conflict: %w", err)
+	}
 	return result
 }

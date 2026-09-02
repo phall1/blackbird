@@ -327,22 +327,31 @@ func (policies *productionPolicies) CurrentPolicy(scope domain.AuthorityScope) (
 	return policies.revision, policies.digest, nil
 }
 
+type authenticationRegistry interface {
+	Register(application.AuthenticationRequest) error
+	Revoke(application.AuthenticationRequest) error
+}
+
 type registeringAuthentication struct {
-	registry *localsecurity.AuthenticationRegistry
+	registry authenticationRegistry
 	next     application.AuthenticationPreparer
 }
 
 func (authentication registeringAuthentication) PrepareAuthentication(
 	ctx context.Context,
 	request application.AuthenticationRequest,
-) (application.AuthenticationDecision, error) {
+) (decision application.AuthenticationDecision, err error) {
 	if authentication.registry == nil || authentication.next == nil {
 		return application.AuthenticationDecision{}, application.ErrInvalidApplicationContract
 	}
 	if err := authentication.registry.Register(request); err != nil {
 		return application.AuthenticationDecision{}, err
 	}
-	defer func() { _ = authentication.registry.Revoke(request) }()
+	defer func() {
+		if revokeErr := authentication.registry.Revoke(request); revokeErr != nil {
+			err = errors.Join(err, fmt.Errorf("revoke authentication registration: %w", revokeErr))
+		}
+	}()
 	return authentication.next.PrepareAuthentication(ctx, request)
 }
 
