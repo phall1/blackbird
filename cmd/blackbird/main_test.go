@@ -443,7 +443,7 @@ func TestReaderAdapterReportsAMissingDatabase(t *testing.T) {
 	}
 }
 
-func TestSourceBuiltDaemonStartsSQLiteAndServesW0Surfaces(t *testing.T) {
+func TestSourceBuiltDaemonStartsSQLiteAndServesCoordinationSurfaces(t *testing.T) {
 	stateDir := t.TempDir()
 	databasePath := filepath.Join(t.TempDir(), "blackbird.db")
 	httpAddress := availableAddress(t)
@@ -477,8 +477,8 @@ func TestSourceBuiltDaemonStartsSQLiteAndServesW0Surfaces(t *testing.T) {
 		return request, err
 	})
 	defer func() { _ = httpResponse.Body.Close() }()
-	if httpResponse.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("W0 HTTP status = %d, want %d", httpResponse.StatusCode, http.StatusUnauthorized)
+	if httpResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("removed W0 HTTP status = %d, want %d", httpResponse.StatusCode, http.StatusNotFound)
 	}
 
 	healthResponse := awaitRequest(t, processDone, &stderr, "http://"+httpAddress+"/healthz", func() (*http.Request, error) {

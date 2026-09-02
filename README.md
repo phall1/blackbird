@@ -13,9 +13,8 @@ The released product includes:
   read and acknowledgement facts, and To/Cc/Bcc privacy;
 - a private, tamper-evident coordination event journal with authenticated
   catch-up cursors and a wake-only SSE stream;
-- shared and exclusive exact/subtree file reservations with expiry, renewal,
-  overlap detection, and fencing tokens;
-- strict W0 identity and W1 work/run contracts with idempotent orchestration;
+- shared and exclusive exact/subtree advisory path claims with expiry, renewal,
+  overlap detection, and internal claim generations;
 - one per-user launchd or systemd daemon, unattended Homebrew updates, and
   idempotent MCP client configuration; and
 - reproducible native releases for Apple Silicon macOS and amd64/arm64 Linux.

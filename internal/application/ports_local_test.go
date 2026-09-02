@@ -1,12 +1,17 @@
 package application
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/phall1/blackbird/internal/domain"
 )
+
+func applicationUUID(index int) string {
+	return fmt.Sprintf("01b8e094-9888-7000-8000-%012x", index)
+}
 
 // TestConversationSlugIsAnOptionalAlternateKey pins the two halves of the
 // contract that make conversation_open idempotent: an empty slug is legal and

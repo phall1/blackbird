@@ -7,13 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	stdhttp "net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,312 +19,18 @@ import (
 	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
-	"github.com/phall1/blackbird/internal/transport/contracts"
-	httptransport "github.com/phall1/blackbird/internal/transport/http"
 )
 
-const testActorSessionID = "01b8e094-9888-7000-8000-00000000001f"
-
-// identityPlaneToolNames is the W0/W1 surface whose MCP registration is
-// conditional. The same operations stay reachable over HTTP either way.
-var identityPlaneToolNames = []string{
-	ToolInstallationBootstrap, ToolPrincipalRegister, ToolDevicePairingBegin, ToolDevicePair,
-	ToolWorkspaceCreate, ToolWorkspaceMemberInvite, ToolWorkspaceMembershipAccept, ToolActorCreate,
-	ToolActorDelegationPropose, ToolActorDelegationActivate, ToolSessionStart, ToolWorkRefObserve,
-	ToolObjectiveAndWorkCreate, ToolObjectiveActivate, ToolRunPlanWithBindings, ToolRunJoin,
-	ToolRunStart, ToolContextGet, ToolEventsSync,
-}
-
-// coordinationToolNames is the surface an agent actually gets over MCP, listed
-// once so the exposure count and the schema assertions cannot describe
-// different sets.
 var coordinationToolNames = []string{
 	ToolAgentRegister, ToolAgentsList, ToolConversationOpen, ToolMessageSend,
-	ToolInboxFetch, ToolThreadFetch, ToolMessageFact,
-	ToolReservationAcquire, ToolReservationChange, ToolReservationsStatus, ToolWait,
-}
-
-type testMCPAuthenticator struct{}
-
-func (testMCPAuthenticator) Authenticate(context.Context, string, string) (contracts.AuthenticationEvidence, *contracts.ErrorDTO, error) {
-	return validAuthenticationEvidence(), nil, nil
-}
-
-type testHTTPAuthenticator struct{}
-
-func (testHTTPAuthenticator) Authenticate(context.Context, *stdhttp.Request, string, string) (contracts.AuthenticationEvidence, *contracts.ErrorDTO, error) {
-	return validAuthenticationEvidence(), nil, nil
-}
-
-func validAuthenticationEvidence() contracts.AuthenticationEvidence {
-	principal, err := domain.ParsePrincipalID("01b8e094-9888-7000-8000-000000000004")
-	if err != nil {
-		panic(err)
-	}
-	authority, err := domain.ParseAuthorityID("01b8e094-9888-7000-8000-000000000003")
-	if err != nil {
-		panic(err)
-	}
-	binding, err := contracts.NewChannelBindingDigest(strings.Repeat("b", 64))
-	if err != nil {
-		panic(err)
-	}
-	audience, err := contracts.NewAuthenticationAudience("blackbird-mcp")
-	if err != nil {
-		panic(err)
-	}
-	provenance, err := contracts.NewAuthenticationAuditProvenance(authority, nil)
-	if err != nil {
-		panic(err)
-	}
-	evidence, err := contracts.NewAuthenticationEvidence(contracts.AuthenticationEvidenceParams{
-		PrincipalID: principal, PrincipalRevision: domain.InitialVersion(), ChannelBinding: binding,
-		Audience: audience, AuditProvenance: provenance, VerifiedAt: time.Now().Add(-time.Second),
-	})
-	if err != nil {
-		panic(err)
-	}
-	return evidence
-}
-
-type testSessionBinder struct {
-	session domain.ActorSessionID
-	called  atomic.Bool
-}
-
-func (binder *testSessionBinder) CurrentActorSession(context.Context, contracts.AuthenticationEvidence, string) (domain.ActorSessionID, *contracts.ErrorDTO, error) {
-	binder.called.Store(true)
-	return binder.session, nil, nil
-}
-
-type testHandlers struct {
-	contracts.InstallationBootstrapHandler
-	contracts.PrincipalRegisterHandler
-	contracts.DevicePairingBeginHandler
-	contracts.DevicePairHandler
-	contracts.WorkspaceCreateHandler
-	contracts.WorkspaceMemberInviteHandler
-	contracts.WorkspaceMembershipAcceptHandler
-	contracts.ActorCreateHandler
-	contracts.ActorDelegationProposeHandler
-	contracts.ActorDelegationActivateHandler
-	contracts.SessionStartHandler
-	contracts.WorkRefObserveHandler
-	contracts.ObjectiveAndWorkCreateHandler
-	contracts.ObjectiveActivateHandler
-	contracts.RunPlanWithBindingsHandler
-	contracts.RunJoinHandler
-	contracts.RunStartHandler
-	events  func(context.Context, contracts.AuthenticationEvidence, contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error)
-	context func(context.Context, contracts.AuthenticationEvidence, contracts.ContextGetRequestDTO) (contracts.ContextPageDTO, *contracts.ErrorDTO, error)
-}
-
-func (handlers *testHandlers) HandleEventsSync(ctx context.Context, evidence contracts.AuthenticationEvidence, request contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
-	return handlers.events(ctx, evidence, request)
-}
-
-func (handlers *testHandlers) HandleContextGet(ctx context.Context, evidence contracts.AuthenticationEvidence, request contracts.ContextGetRequestDTO) (contracts.ContextPageDTO, *contracts.ErrorDTO, error) {
-	return handlers.context(ctx, evidence, request)
-}
-
-func TestHTTPAndMCPSemanticEnvelopeParity(t *testing.T) {
-	t.Parallel()
-	session := parseSession(t)
-	request := contracts.EventsSyncRequestDTO{Schema: contracts.SchemaEventsSyncRequest, RequestID: "req-parity",
-		Operation: contracts.OperationEventsSync, ActorSessionID: session, AfterCursor: "bbec1_fixture", Limit: 64}
-
-	t.Run("success", func(t *testing.T) {
-		handlers := &testHandlers{events: successfulEvents, context: contextFailure}
-		httpBody, status := callHTTP(t, handlers, request)
-		if status != stdhttp.StatusOK {
-			t.Fatalf("HTTP status = %d, want 200: %s", status, httpBody)
-		}
-		mcpResult := callMCP(t, handlers, request)
-		if mcpResult.IsError {
-			t.Fatalf("MCP result is error: %+v", mcpResult)
-		}
-		mcpBody, err := json.Marshal(mcpResult.StructuredContent)
-		if err != nil {
-			t.Fatalf("marshal MCP structured content: %v", err)
-		}
-		httpPage, err := contracts.DecodeEventPage(httpBody)
-		if err != nil {
-			t.Fatalf("decode HTTP page: %v", err)
-		}
-		mcpPage, err := contracts.DecodeEventPage(mcpBody)
-		if err != nil {
-			t.Fatalf("decode MCP page: %v", err)
-		}
-		if !reflect.DeepEqual(httpPage, mcpPage) {
-			t.Fatalf("semantic envelopes differ\nHTTP: %+v\nMCP:  %+v", httpPage, mcpPage)
-		}
-	})
-
-	t.Run("typed error", func(t *testing.T) {
-		handlers := &testHandlers{events: eventsFailure, context: contextFailure}
-		httpBody, status := callHTTP(t, handlers, request)
-		if status != stdhttp.StatusGone {
-			t.Fatalf("HTTP status = %d, want 410: %s", status, httpBody)
-		}
-		var problem struct {
-			contracts.ErrorDTO
-		}
-		if err := json.Unmarshal(httpBody, &problem); err != nil {
-			t.Fatalf("decode HTTP problem: %v", err)
-		}
-		mcpResult := callMCP(t, handlers, request)
-		if !mcpResult.IsError {
-			t.Fatal("MCP typed failure did not set isError")
-		}
-		mcpBody, err := json.Marshal(mcpResult.StructuredContent)
-		if err != nil {
-			t.Fatalf("marshal MCP error: %v", err)
-		}
-		mcpError, err := contracts.DecodeError(mcpBody)
-		if err != nil {
-			t.Fatalf("decode MCP error: %v", err)
-		}
-		if !reflect.DeepEqual(problem.ErrorDTO, mcpError) {
-			t.Fatalf("error envelopes differ\nHTTP: %+v\nMCP:  %+v", problem.ErrorDTO, mcpError)
-		}
-	})
-}
-
-func TestMCPDiscoveryStrictnessResourcesAndCancellation(t *testing.T) {
-	t.Parallel()
-	session := parseSession(t)
-	started := make(chan struct{})
-	canceled := make(chan struct{})
-	var calls atomic.Int32
-	handlers := &testHandlers{context: contextFailure, events: func(ctx context.Context, _ contracts.AuthenticationEvidence, request contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
-		calls.Add(1)
-		close(started)
-		<-ctx.Done()
-		close(canceled)
-		return contracts.EventPageDTO{}, nil, ctx.Err()
-	}}
-	binder := &testSessionBinder{session: session}
-	server := newTestServer(t, handlers, binder)
-	clientSession, closeSessions := connect(t, server)
-	defer closeSessions()
-
-	tools, err := clientSession.ListTools(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("ListTools: %v", err)
-	}
-	if len(tools.Tools) != 19 {
-		t.Fatalf("tool count = %d, want 19", len(tools.Tools))
-	}
-	w1Tools := map[string]bool{
-		ToolWorkRefObserve:         false,
-		ToolObjectiveAndWorkCreate: false,
-		ToolObjectiveActivate:      false,
-		ToolRunPlanWithBindings:    false,
-		ToolRunJoin:                false,
-		ToolRunStart:               false,
-	}
-	for _, tool := range tools.Tools {
-		if _, ok := w1Tools[tool.Name]; ok {
-			w1Tools[tool.Name] = true
-		}
-		encoded, err := json.Marshal(tool.InputSchema)
-		if err != nil {
-			t.Fatalf("marshal schema for %s: %v", tool.Name, err)
-		}
-		if !bytes.Contains(encoded, []byte(`"additionalProperties":false`)) {
-			t.Fatalf("tool %s has permissive input schema: %s", tool.Name, encoded)
-		}
-		output, err := json.Marshal(tool.OutputSchema)
-		if err != nil {
-			t.Fatalf("marshal output schema for %s: %v", tool.Name, err)
-		}
-		if !bytes.Contains(output, []byte(`"type":"object"`)) {
-			t.Fatalf("tool %s output schema lacks Claude-compatible root object type: %s", tool.Name, output)
-		}
-	}
-	for name, found := range w1Tools {
-		if !found {
-			t.Errorf("W1 tool %q was not discovered", name)
-		}
-	}
-
-	resource, err := clientSession.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCurrentContext})
-	if err != nil {
-		t.Fatalf("ReadResource: %v", err)
-	}
-	if !binder.called.Load() || len(resource.Contents) != 1 || !strings.Contains(resource.Contents[0].Text, string(domain.ErrorCodeCursorExpired)) {
-		t.Fatalf("resource did not use bound actor session and typed result: %+v", resource)
-	}
-
-	malformed := struct {
-		contracts.EventsSyncRequestDTO
-		Unexpected string `json:"unexpected"`
-	}{EventsSyncRequestDTO: validEventsRequest(session), Unexpected: "forbidden"}
-	result, err := clientSession.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolEventsSync, Arguments: malformed})
-	if err != nil {
-		t.Fatalf("malformed CallTool: %v", err)
-	}
-	if !result.IsError || calls.Load() != 0 {
-		t.Fatalf("malformed request result/calls = %+v/%d", result, calls.Load())
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, callErr := clientSession.CallTool(ctx, &sdkmcp.CallToolParams{Name: ToolEventsSync, Arguments: validEventsRequest(session)})
-		done <- callErr
-	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler did not start")
-	}
-	cancel()
-	select {
-	case <-canceled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler did not receive request cancellation")
-	}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("client call did not finish after cancellation")
-	}
-}
-
-func TestStreamableHTTPHandler(t *testing.T) {
-	t.Parallel()
-
-	session := parseSession(t)
-	handlers := &testHandlers{events: successfulEvents, context: contextFailure}
-	server := newTestServer(t, handlers, &testSessionBinder{session: session})
-	httpServer := httptest.NewServer(server.HTTPHandler(&sdkmcp.StreamableHTTPOptions{
-		Stateless: true, JSONResponse: true, MaxRequestBodyBytes: contracts.MaxCommandJSONBytes,
-		PropagateRequestCancellation: true,
-	}))
-	defer httpServer.Close()
-
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "blackbird-http-test", Version: "v1"}, nil)
-	clientSession, err := client.Connect(context.Background(), &sdkmcp.StreamableClientTransport{
-		Endpoint: httpServer.URL, HTTPClient: httpServer.Client(), DisableStandaloneSSE: true,
-	}, nil)
-	if err != nil {
-		t.Fatalf("connect Streamable HTTP: %v", err)
-	}
-	defer func() { _ = clientSession.Close() }()
-	tools, err := clientSession.ListTools(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("list tools over Streamable HTTP: %v", err)
-	}
-	if len(tools.Tools) != 19 {
-		t.Fatalf("Streamable HTTP tool count = %d, want 19", len(tools.Tools))
-	}
+	ToolInboxFetch, ToolThreadFetch, ToolMessageFact, ToolReservationAcquire,
+	ToolReservationChange, ToolReservationsStatus, ToolWait,
 }
 
 func TestNewServerRequiresCompleteComposition(t *testing.T) {
 	t.Parallel()
 	if _, err := NewServer(Dependencies{}); err == nil {
-		t.Fatal("NewServer() error = nil, want incomplete-composition error")
+		t.Fatal("NewServer() error = nil")
 	}
 }
 
@@ -337,8 +40,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
-		&testSessionBinder{session: parseSession(t)}, store)
+	server := newTestServer(t, store)
 	client, closeMCP := connect(t, server)
 	assertCoordinationToolSchemas(t, client)
 
@@ -406,8 +108,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	server = newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
-		&testSessionBinder{session: parseSession(t)}, store)
+	server = newTestServer(t, store)
 	client, closeMCP = connect(t, server)
 	defer closeMCP()
 	aliceToken, bobToken := alice.RegistrationToken, bob.RegistrationToken
@@ -481,95 +182,53 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		Mode: "shared", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "docs/guide.md"}}})
 }
 
-func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
+func TestCoordinationSurfaceAndProtocol(t *testing.T) {
 	t.Parallel()
 	store, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "exposure.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	handlers := &testHandlers{events: successfulEvents, context: contextFailure}
-	binder := &testSessionBinder{session: parseSession(t)}
-	server := newServerExposing(t, false, handlers, binder, store)
-	client, closeMCP := connect(t, server)
+	client, closeMCP := connect(t, newTestServer(t, store))
 	defer closeMCP()
-
 	tools, err := client.ListTools(context.Background(), nil)
 	if err != nil {
-		t.Fatalf("ListTools: %v", err)
+		t.Fatal(err)
 	}
 	listed := make(map[string]bool, len(tools.Tools))
 	for _, tool := range tools.Tools {
 		listed[tool.Name] = true
 	}
-	for _, name := range identityPlaneToolNames {
-		if listed[name] {
-			t.Errorf("identity-plane tool %q was published on a transport that carries no credential", name)
-		}
-	}
 	for _, name := range coordinationToolNames {
 		if !listed[name] {
-			t.Errorf("coordination tool %q was not published", name)
+			t.Errorf("missing tool %q", name)
 		}
 	}
 	if len(listed) != len(coordinationToolNames) {
-		t.Fatalf("coordination surface = %d tools, want %d: %v", len(listed), len(coordinationToolNames), listed)
+		t.Fatalf("surface=%d want=%d", len(listed), len(coordinationToolNames))
 	}
-	discovery, err := json.Marshal(tools)
-	if err != nil {
-		t.Fatalf("marshal coordination tools/list: %v", err)
-	}
-	t.Logf("coordination tools/list: %d bytes for %d tools", len(discovery), len(listed))
+	discovery, _ := json.Marshal(tools)
 	if bytes.Contains(discovery, []byte(`"outputSchema"`)) {
-		t.Fatalf("coordination tools/list publishes redundant output schemas: %d bytes", len(discovery))
+		t.Fatal("redundant output schemas")
 	}
-	const maxCoordinationDiscoveryBytes = 16 << 10
-	if len(discovery) > maxCoordinationDiscoveryBytes {
-		t.Fatalf("coordination tools/list = %d bytes, want at most %d", len(discovery), maxCoordinationDiscoveryBytes)
+	if len(discovery) > 16<<10 {
+		t.Fatalf("discovery=%d bytes", len(discovery))
 	}
 	resources, err := client.ListResources(context.Background(), nil)
 	if err != nil {
-		t.Fatalf("ListResources: %v", err)
+		t.Fatal(err)
 	}
-	listedProtocol := false
-	for _, resource := range resources.Resources {
-		if resource.URI == ResourceCoordinationProtocol {
-			listedProtocol = true
-		}
+	if len(resources.Resources) != 1 || resources.Resources[0].URI != ResourceCoordinationProtocol {
+		t.Fatalf("resources=%+v", resources.Resources)
 	}
-	if !listedProtocol {
-		t.Fatalf("coordination protocol resource was not published: %+v", resources.Resources)
-	}
-	resourceDiscovery, err := json.Marshal(resources)
-	if err != nil {
-		t.Fatalf("marshal resources/list: %v", err)
-	}
-	t.Logf("resources/list: %d bytes for %d resources", len(resourceDiscovery), len(resources.Resources))
-
 	protocol, err := client.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCoordinationProtocol})
 	if err != nil {
-		t.Fatalf("read coordination protocol: %v", err)
+		t.Fatal(err)
 	}
-	if len(protocol.Contents) != 1 || protocol.Contents[0].MIMEType != mediaTypeMarkdown {
-		t.Fatalf("coordination protocol resource = %+v", protocol.Contents)
-	}
-	for _, required := range []string{ToolAgentRegister, ToolReservationAcquire, ToolConversationOpen,
-		ToolMessageFact, "LEASE_CONFLICT", "action=renew", "action=release"} {
+	for _, required := range []string{ToolAgentRegister, ToolReservationAcquire, ToolConversationOpen, ToolMessageFact, "LEASE_CONFLICT"} {
 		if !strings.Contains(protocol.Contents[0].Text, required) {
-			t.Errorf("coordination protocol does not name %q", required)
+			t.Errorf("protocol missing %q", required)
 		}
-	}
-	if binder.called.Load() {
-		t.Fatal("public coordination protocol attempted to bind an actor session")
-	}
-
-	// Session context resources remain available independently of the
-	// coordination protocol and still enforce their existing actor binding.
-	if _, err := client.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCurrentContext}); err != nil {
-		t.Fatalf("ReadResource: %v", err)
-	}
-	if !binder.called.Load() {
-		t.Fatal("resource did not resolve the bound actor session")
 	}
 }
 
@@ -621,18 +280,7 @@ func TestMCPToolFailuresReachTheLoggerWithoutArguments(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	sink := &lockedBuffer{}
-	server, err := NewServer(Dependencies{
-		Logger:        slog.New(slog.NewJSONHandler(sink, nil)),
-		Authenticator: testMCPAuthenticator{}, CurrentSession: &testSessionBinder{session: parseSession(t)},
-		Coordination:          store,
-		InstallationBootstrap: &testHandlers{}, PrincipalRegister: &testHandlers{},
-		DevicePairingBegin: &testHandlers{}, DevicePair: &testHandlers{}, WorkspaceCreate: &testHandlers{},
-		WorkspaceMemberInvite: &testHandlers{}, WorkspaceMembershipAccept: &testHandlers{},
-		ActorCreate: &testHandlers{}, ActorDelegationPropose: &testHandlers{}, ActorDelegationActivate: &testHandlers{},
-		SessionStart: &testHandlers{}, WorkRefObserve: &testHandlers{}, ObjectiveAndWorkCreate: &testHandlers{},
-		ObjectiveActivate: &testHandlers{}, RunPlanWithBindings: &testHandlers{}, RunJoin: &testHandlers{},
-		RunStart: &testHandlers{}, ContextGet: &testHandlers{}, EventsSync: &testHandlers{},
-	})
+	server, err := NewServer(Dependencies{Logger: slog.New(slog.NewJSONHandler(sink, nil)), Coordination: store})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -992,8 +640,7 @@ func newCoordinationSession(t *testing.T, name string) (*sdkmcp.ClientSession, s
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	server := newTestServer(t, &testHandlers{events: successfulEvents, context: contextFailure},
-		&testSessionBinder{session: parseSession(t)}, store)
+	server := newTestServer(t, store)
 	client, closeMCP := connect(t, server)
 	t.Cleanup(closeMCP)
 	alice := callCoord[agentSessionOutput](t, client, ToolAgentRegister,
@@ -1340,65 +987,9 @@ func callCoord[Output any](t *testing.T, session *sdkmcp.ClientSession, tool str
 	return output
 }
 
-func callHTTP(t *testing.T, handlers *testHandlers, request contracts.EventsSyncRequestDTO) ([]byte, int) {
+func newTestServer(t *testing.T, store application.LocalCoordinationStore) *Server {
 	t.Helper()
-	handler, err := httptransport.NewHandler(httptransport.Dependencies{
-		Authenticator: testHTTPAuthenticator{}, InstallationBootstrap: handlers, PrincipalRegister: handlers,
-		DevicePairingBegin: handlers, DevicePair: handlers, WorkspaceCreate: handlers, WorkspaceMemberInvite: handlers,
-		WorkspaceMembershipAccept: handlers, ActorCreate: handlers, ActorDelegationPropose: handlers,
-		ActorDelegationActivate: handlers, SessionStart: handlers, ContextGet: handlers, EventsSync: handlers,
-		WorkRefObserve: handlers, ObjectiveAndWorkCreate: handlers, ObjectiveActivate: handlers,
-		RunPlanWithBindings: handlers, RunJoin: handlers, RunStart: handlers,
-	})
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-	body, err := json.Marshal(request)
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-	httpRequest := httptest.NewRequest(stdhttp.MethodPost, httptransport.PathEventsSync, bytes.NewReader(body))
-	httpRequest.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httpRequest)
-	return response.Body.Bytes(), response.Code
-}
-
-func callMCP(t *testing.T, handlers *testHandlers, request contracts.EventsSyncRequestDTO) *sdkmcp.CallToolResult {
-	t.Helper()
-	server := newTestServer(t, handlers, &testSessionBinder{session: request.ActorSessionID})
-	clientSession, closeSessions := connect(t, server)
-	defer closeSessions()
-	result, err := clientSession.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: ToolEventsSync, Arguments: request})
-	if err != nil {
-		t.Fatalf("CallTool: %v", err)
-	}
-	return result
-}
-
-func newTestServer(t *testing.T, handlers *testHandlers, binder CurrentSessionBinder, coordination ...application.LocalCoordinationStore) *Server {
-	t.Helper()
-	return newServerExposing(t, true, handlers, binder, coordination...)
-}
-
-func newServerExposing(t *testing.T, identityPlane bool, handlers *testHandlers, binder CurrentSessionBinder,
-	coordination ...application.LocalCoordinationStore) *Server {
-	t.Helper()
-	var coordinationStore application.LocalCoordinationStore
-	if len(coordination) != 0 {
-		coordinationStore = coordination[0]
-	}
-	server, err := NewServer(Dependencies{
-		Authenticator: testMCPAuthenticator{}, CurrentSession: binder, InstallationBootstrap: handlers,
-		Coordination:        coordinationStore,
-		ExposeIdentityPlane: identityPlane,
-		PrincipalRegister:   handlers, DevicePairingBegin: handlers, DevicePair: handlers, WorkspaceCreate: handlers,
-		WorkspaceMemberInvite: handlers, WorkspaceMembershipAccept: handlers, ActorCreate: handlers,
-		ActorDelegationPropose: handlers, ActorDelegationActivate: handlers, SessionStart: handlers,
-		WorkRefObserve: handlers, ObjectiveAndWorkCreate: handlers, ObjectiveActivate: handlers,
-		RunPlanWithBindings: handlers, RunJoin: handlers, RunStart: handlers,
-		ContextGet: handlers, EventsSync: handlers,
-	})
+	server, err := NewServer(Dependencies{Coordination: store})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1422,40 +1013,4 @@ func connect(t *testing.T, server *Server) (*sdkmcp.ClientSession, func()) {
 		_ = clientSession.Close()
 		_ = serverSession.Close()
 	}
-}
-
-func parseSession(t *testing.T) domain.ActorSessionID {
-	t.Helper()
-	session, err := domain.ParseActorSessionID(testActorSessionID)
-	if err != nil {
-		t.Fatalf("parse session: %v", err)
-	}
-	return session
-}
-
-func validEventsRequest(session domain.ActorSessionID) contracts.EventsSyncRequestDTO {
-	return contracts.EventsSyncRequestDTO{Schema: contracts.SchemaEventsSyncRequest, RequestID: "req-parity",
-		Operation: contracts.OperationEventsSync, ActorSessionID: session, AfterCursor: "bbec1_fixture", Limit: 64}
-}
-
-func successfulEvents(_ context.Context, _ contracts.AuthenticationEvidence, request contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
-	return contracts.EventPageDTO{Schema: contracts.SchemaEventPage, RequestID: request.RequestID,
-		Operation: contracts.OperationEventsSync, Events: []contracts.RawEventEnvelopeDTO{},
-		NextCursor: request.AfterCursor, HeadCursor: "bbec1_head", HasMore: false}, nil, nil
-}
-
-func eventsFailure(_ context.Context, _ contracts.AuthenticationEvidence, request contracts.EventsSyncRequestDTO) (contracts.EventPageDTO, *contracts.ErrorDTO, error) {
-	failure := cursorFailure(request.RequestID)
-	return contracts.EventPageDTO{}, &failure, nil
-}
-
-func contextFailure(_ context.Context, _ contracts.AuthenticationEvidence, request contracts.ContextGetRequestDTO) (contracts.ContextPageDTO, *contracts.ErrorDTO, error) {
-	failure := cursorFailure(request.RequestID)
-	return contracts.ContextPageDTO{}, &failure, nil
-}
-
-func cursorFailure(requestID string) contracts.ErrorDTO {
-	return contracts.ErrorDTO{Schema: contracts.SchemaError, RequestID: requestID, Code: domain.ErrorCodeCursorExpired,
-		Category: domain.ErrorCategoryCursor, Message: "The cursor expired.",
-		Details: contracts.ErrorDetailsDTO{Recovery: contracts.RecoveryObtainCheckpoint}}
 }

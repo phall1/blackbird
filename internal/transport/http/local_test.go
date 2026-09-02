@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,28 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
+
+type logSink struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (sink *logSink) Write(data []byte) (int, error) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.Buffer.Write(data)
+}
+
+func (sink *logSink) String() string {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.Buffer.String()
+}
+
+func newLoggingSink() (*logSink, *slog.Logger) {
+	sink := &logSink{}
+	return sink, slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
 
 func TestLocalHTTPRegistrationSSEWakeAndCatchUp(t *testing.T) {
 	store := openLocalHTTPStore(t, filepath.Join(t.TempDir(), "coordination.db"))

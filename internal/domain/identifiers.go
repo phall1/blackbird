@@ -50,7 +50,6 @@ const (
 	IdentifierKindConversation        IdentifierKind = "conversation"
 	IdentifierKindMessage             IdentifierKind = "message"
 	IdentifierKindLease               IdentifierKind = "lease"
-	IdentifierKindObservation         IdentifierKind = "observation"
 )
 
 // IdentifierError reports a failed typed-ID boundary without weakening the
@@ -228,344 +227,129 @@ func (id *typedID[Marker]) UnmarshalJSON(data []byte) error {
 	return id.UnmarshalText([]byte(text))
 }
 
-type installationIDMarker struct{}
 type authorityIDMarker struct{}
-type workspaceIDMarker struct{}
-type principalIDMarker struct{}
-type deviceIDMarker struct{}
-type membershipIDMarker struct{}
-type actorIDMarker struct{}
-type actorDelegationIDMarker struct{}
-type actorSessionIDMarker struct{}
-type grantIDMarker struct{}
-type invitationIDMarker struct{}
-type ceremonyIDMarker struct{}
-type bootstrapGenerationIDMarker struct{}
-type commandIDMarker struct{}
-type receiptIDMarker struct{}
-type eventIDMarker struct{}
-type correlationIDMarker struct{}
-type clientInstanceIDMarker struct{}
-type workReferenceIDMarker struct{}
-type objectiveIDMarker struct{}
-type workUnitIDMarker struct{}
-type runIDMarker struct{}
-type runParticipationIDMarker struct{}
-type runtimeBindingIDMarker struct{}
-type runtimeEndpointIDMarker struct{}
-type conversationIDMarker struct{}
-type messageIDMarker struct{}
-type leaseIDMarker struct{}
 type observationIDMarker struct{}
 
-func (installationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindInstallation }
-func (authorityIDMarker) identifierKind() IdentifierKind       { return IdentifierKindAuthority }
-func (workspaceIDMarker) identifierKind() IdentifierKind       { return IdentifierKindWorkspace }
-func (principalIDMarker) identifierKind() IdentifierKind       { return IdentifierKindPrincipal }
-func (deviceIDMarker) identifierKind() IdentifierKind          { return IdentifierKindDevice }
-func (membershipIDMarker) identifierKind() IdentifierKind      { return IdentifierKindMembership }
-func (actorIDMarker) identifierKind() IdentifierKind           { return IdentifierKindActor }
-func (actorDelegationIDMarker) identifierKind() IdentifierKind { return IdentifierKindActorDelegation }
-func (actorSessionIDMarker) identifierKind() IdentifierKind    { return IdentifierKindActorSession }
-func (grantIDMarker) identifierKind() IdentifierKind           { return IdentifierKindGrant }
-func (invitationIDMarker) identifierKind() IdentifierKind      { return IdentifierKindInvitation }
-func (ceremonyIDMarker) identifierKind() IdentifierKind        { return IdentifierKindCeremony }
-func (bootstrapGenerationIDMarker) identifierKind() IdentifierKind {
-	return IdentifierKindBootstrapGeneration
-}
-func (commandIDMarker) identifierKind() IdentifierKind        { return IdentifierKindCommand }
-func (receiptIDMarker) identifierKind() IdentifierKind        { return IdentifierKindReceipt }
-func (eventIDMarker) identifierKind() IdentifierKind          { return IdentifierKindEvent }
-func (correlationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindCorrelation }
-func (clientInstanceIDMarker) identifierKind() IdentifierKind { return IdentifierKindClientInstance }
-func (workReferenceIDMarker) identifierKind() IdentifierKind  { return IdentifierKindWorkReference }
-func (objectiveIDMarker) identifierKind() IdentifierKind      { return IdentifierKindObjective }
-func (workUnitIDMarker) identifierKind() IdentifierKind       { return IdentifierKindWorkUnit }
-func (runIDMarker) identifierKind() IdentifierKind            { return IdentifierKindRun }
-func (runParticipationIDMarker) identifierKind() IdentifierKind {
-	return IdentifierKindRunParticipation
-}
-func (runtimeBindingIDMarker) identifierKind() IdentifierKind  { return IdentifierKindRuntimeBinding }
-func (runtimeEndpointIDMarker) identifierKind() IdentifierKind { return IdentifierKindRuntimeEndpoint }
-func (conversationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindConversation }
-func (messageIDMarker) identifierKind() IdentifierKind         { return IdentifierKindMessage }
-func (leaseIDMarker) identifierKind() IdentifierKind           { return IdentifierKindLease }
-func (observationIDMarker) identifierKind() IdentifierKind     { return IdentifierKindObservation }
+func (authorityIDMarker) identifierKind() IdentifierKind   { return "authority" }
+func (observationIDMarker) identifierKind() IdentifierKind { return "observation" }
 
-// The unique marker embedded in every wrapper makes both implicit assignment
-// and explicit cross-kind conversion fail at compile time.
-type InstallationID struct{ typedID[installationIDMarker] }
 type AuthorityID struct{ typedID[authorityIDMarker] }
-type WorkspaceID struct{ typedID[workspaceIDMarker] }
-type PrincipalID struct{ typedID[principalIDMarker] }
-type DeviceID struct{ typedID[deviceIDMarker] }
-type MembershipID struct{ typedID[membershipIDMarker] }
-type ActorID struct{ typedID[actorIDMarker] }
-type ActorDelegationID struct {
-	typedID[actorDelegationIDMarker]
-}
-type ActorSessionID struct{ typedID[actorSessionIDMarker] }
-type GrantID struct{ typedID[grantIDMarker] }
-type InvitationID struct{ typedID[invitationIDMarker] }
-type CeremonyID struct{ typedID[ceremonyIDMarker] }
-type BootstrapGenerationID struct {
-	typedID[bootstrapGenerationIDMarker]
-}
-type CommandID struct{ typedID[commandIDMarker] }
-type ReceiptID struct{ typedID[receiptIDMarker] }
-type EventID struct{ typedID[eventIDMarker] }
-type CorrelationID struct{ typedID[correlationIDMarker] }
-type ClientInstanceID struct {
-	typedID[clientInstanceIDMarker]
-}
-type WorkReferenceID struct{ typedID[workReferenceIDMarker] }
-type ObjectiveID struct{ typedID[objectiveIDMarker] }
-type WorkUnitID struct{ typedID[workUnitIDMarker] }
-type RunID struct{ typedID[runIDMarker] }
-type RunParticipationID struct {
-	typedID[runParticipationIDMarker]
-}
-type RuntimeBindingID struct {
-	typedID[runtimeBindingIDMarker]
-}
-type RuntimeEndpointID struct {
-	typedID[runtimeEndpointIDMarker]
-}
-type ConversationID struct{ typedID[conversationIDMarker] }
-type MessageID struct{ typedID[messageIDMarker] }
-type LeaseID struct{ typedID[leaseIDMarker] }
 
-// ObservationID names one row on the observation plane -- a model call or a
-// span. It is a fresh identity per stored row; idempotency is carried by the
-// (actor, dedupe key) unique index, not by this value.
+// ObservationID names one stored model call or span.
 type ObservationID struct{ typedID[observationIDMarker] }
 
-func ParseInstallationID(text string) (InstallationID, error) {
-	id, err := parseTypedID[installationIDMarker](text)
-	return InstallationID{typedID: id}, err
+func NewObservationID() (ObservationID, error) {
+	id, err := newTypedID[observationIDMarker]()
+	return ObservationID{typedID: id}, err
 }
+
 func ParseAuthorityID(text string) (AuthorityID, error) {
 	id, err := parseTypedID[authorityIDMarker](text)
 	return AuthorityID{typedID: id}, err
-}
-func ParseWorkspaceID(text string) (WorkspaceID, error) {
-	id, err := parseTypedID[workspaceIDMarker](text)
-	return WorkspaceID{typedID: id}, err
-}
-func ParsePrincipalID(text string) (PrincipalID, error) {
-	id, err := parseTypedID[principalIDMarker](text)
-	return PrincipalID{typedID: id}, err
-}
-func ParseDeviceID(text string) (DeviceID, error) {
-	id, err := parseTypedID[deviceIDMarker](text)
-	return DeviceID{typedID: id}, err
-}
-func ParseMembershipID(text string) (MembershipID, error) {
-	id, err := parseTypedID[membershipIDMarker](text)
-	return MembershipID{typedID: id}, err
-}
-func ParseActorID(text string) (ActorID, error) {
-	id, err := parseTypedID[actorIDMarker](text)
-	return ActorID{typedID: id}, err
-}
-func ParseActorDelegationID(text string) (ActorDelegationID, error) {
-	id, err := parseTypedID[actorDelegationIDMarker](text)
-	return ActorDelegationID{typedID: id}, err
-}
-func ParseActorSessionID(text string) (ActorSessionID, error) {
-	id, err := parseTypedID[actorSessionIDMarker](text)
-	return ActorSessionID{typedID: id}, err
-}
-func ParseGrantID(text string) (GrantID, error) {
-	id, err := parseTypedID[grantIDMarker](text)
-	return GrantID{typedID: id}, err
-}
-func ParseInvitationID(text string) (InvitationID, error) {
-	id, err := parseTypedID[invitationIDMarker](text)
-	return InvitationID{typedID: id}, err
-}
-func ParseCeremonyID(text string) (CeremonyID, error) {
-	id, err := parseTypedID[ceremonyIDMarker](text)
-	return CeremonyID{typedID: id}, err
-}
-func ParseBootstrapGenerationID(text string) (BootstrapGenerationID, error) {
-	id, err := parseTypedID[bootstrapGenerationIDMarker](text)
-	return BootstrapGenerationID{typedID: id}, err
-}
-func ParseCommandID(text string) (CommandID, error) {
-	id, err := parseTypedID[commandIDMarker](text)
-	return CommandID{typedID: id}, err
-}
-func ParseReceiptID(text string) (ReceiptID, error) {
-	id, err := parseTypedID[receiptIDMarker](text)
-	return ReceiptID{typedID: id}, err
-}
-func ParseEventID(text string) (EventID, error) {
-	id, err := parseTypedID[eventIDMarker](text)
-	return EventID{typedID: id}, err
-}
-func ParseCorrelationID(text string) (CorrelationID, error) {
-	id, err := parseTypedID[correlationIDMarker](text)
-	return CorrelationID{typedID: id}, err
-}
-func ParseClientInstanceID(text string) (ClientInstanceID, error) {
-	id, err := parseTypedID[clientInstanceIDMarker](text)
-	return ClientInstanceID{typedID: id}, err
-}
-func ParseWorkReferenceID(text string) (WorkReferenceID, error) {
-	id, err := parseTypedID[workReferenceIDMarker](text)
-	return WorkReferenceID{typedID: id}, err
-}
-func ParseObjectiveID(text string) (ObjectiveID, error) {
-	id, err := parseTypedID[objectiveIDMarker](text)
-	return ObjectiveID{typedID: id}, err
-}
-func ParseWorkUnitID(text string) (WorkUnitID, error) {
-	id, err := parseTypedID[workUnitIDMarker](text)
-	return WorkUnitID{typedID: id}, err
-}
-func ParseRunID(text string) (RunID, error) {
-	id, err := parseTypedID[runIDMarker](text)
-	return RunID{typedID: id}, err
-}
-func ParseRunParticipationID(text string) (RunParticipationID, error) {
-	id, err := parseTypedID[runParticipationIDMarker](text)
-	return RunParticipationID{typedID: id}, err
-}
-func ParseRuntimeBindingID(text string) (RuntimeBindingID, error) {
-	id, err := parseTypedID[runtimeBindingIDMarker](text)
-	return RuntimeBindingID{typedID: id}, err
-}
-func ParseRuntimeEndpointID(text string) (RuntimeEndpointID, error) {
-	id, err := parseTypedID[runtimeEndpointIDMarker](text)
-	return RuntimeEndpointID{typedID: id}, err
-}
-func ParseConversationID(text string) (ConversationID, error) {
-	id, err := parseTypedID[conversationIDMarker](text)
-	return ConversationID{typedID: id}, err
-}
-func ParseMessageID(text string) (MessageID, error) {
-	id, err := parseTypedID[messageIDMarker](text)
-	return MessageID{typedID: id}, err
-}
-func ParseLeaseID(text string) (LeaseID, error) {
-	id, err := parseTypedID[leaseIDMarker](text)
-	return LeaseID{typedID: id}, err
-}
-
-func NewInstallationID() (InstallationID, error) {
-	id, err := newTypedID[installationIDMarker]()
-	return InstallationID{typedID: id}, err
 }
 func NewAuthorityID() (AuthorityID, error) {
 	id, err := newTypedID[authorityIDMarker]()
 	return AuthorityID{typedID: id}, err
 }
+
+type workspaceIDMarker struct{}
+
+func (workspaceIDMarker) identifierKind() IdentifierKind { return "workspace" }
+
+type WorkspaceID struct{ typedID[workspaceIDMarker] }
+
+func ParseWorkspaceID(text string) (WorkspaceID, error) {
+	id, err := parseTypedID[workspaceIDMarker](text)
+	return WorkspaceID{typedID: id}, err
+}
 func NewWorkspaceID() (WorkspaceID, error) {
 	id, err := newTypedID[workspaceIDMarker]()
 	return WorkspaceID{typedID: id}, err
 }
-func NewPrincipalID() (PrincipalID, error) {
-	id, err := newTypedID[principalIDMarker]()
-	return PrincipalID{typedID: id}, err
-}
-func NewDeviceID() (DeviceID, error) {
-	id, err := newTypedID[deviceIDMarker]()
-	return DeviceID{typedID: id}, err
-}
-func NewMembershipID() (MembershipID, error) {
-	id, err := newTypedID[membershipIDMarker]()
-	return MembershipID{typedID: id}, err
+
+type actorIDMarker struct{}
+
+func (actorIDMarker) identifierKind() IdentifierKind { return "actor" }
+
+type ActorID struct{ typedID[actorIDMarker] }
+
+func ParseActorID(text string) (ActorID, error) {
+	id, err := parseTypedID[actorIDMarker](text)
+	return ActorID{typedID: id}, err
 }
 func NewActorID() (ActorID, error) {
 	id, err := newTypedID[actorIDMarker]()
 	return ActorID{typedID: id}, err
 }
-func NewActorDelegationID() (ActorDelegationID, error) {
-	id, err := newTypedID[actorDelegationIDMarker]()
-	return ActorDelegationID{typedID: id}, err
+
+type actorSessionIDMarker struct{}
+
+func (actorSessionIDMarker) identifierKind() IdentifierKind { return "actor_session" }
+
+type ActorSessionID struct{ typedID[actorSessionIDMarker] }
+
+func ParseActorSessionID(text string) (ActorSessionID, error) {
+	id, err := parseTypedID[actorSessionIDMarker](text)
+	return ActorSessionID{typedID: id}, err
 }
 func NewActorSessionID() (ActorSessionID, error) {
 	id, err := newTypedID[actorSessionIDMarker]()
 	return ActorSessionID{typedID: id}, err
 }
-func NewGrantID() (GrantID, error) {
-	id, err := newTypedID[grantIDMarker]()
-	return GrantID{typedID: id}, err
-}
-func NewInvitationID() (InvitationID, error) {
-	id, err := newTypedID[invitationIDMarker]()
-	return InvitationID{typedID: id}, err
-}
-func NewCeremonyID() (CeremonyID, error) {
-	id, err := newTypedID[ceremonyIDMarker]()
-	return CeremonyID{typedID: id}, err
-}
-func NewBootstrapGenerationID() (BootstrapGenerationID, error) {
-	id, err := newTypedID[bootstrapGenerationIDMarker]()
-	return BootstrapGenerationID{typedID: id}, err
-}
-func NewCommandID() (CommandID, error) {
-	id, err := newTypedID[commandIDMarker]()
-	return CommandID{typedID: id}, err
-}
-func NewReceiptID() (ReceiptID, error) {
-	id, err := newTypedID[receiptIDMarker]()
-	return ReceiptID{typedID: id}, err
-}
-func NewEventID() (EventID, error) {
-	id, err := newTypedID[eventIDMarker]()
-	return EventID{typedID: id}, err
-}
-func NewCorrelationID() (CorrelationID, error) {
-	id, err := newTypedID[correlationIDMarker]()
-	return CorrelationID{typedID: id}, err
-}
-func NewClientInstanceID() (ClientInstanceID, error) {
-	id, err := newTypedID[clientInstanceIDMarker]()
-	return ClientInstanceID{typedID: id}, err
-}
-func NewWorkReferenceID() (WorkReferenceID, error) {
-	id, err := newTypedID[workReferenceIDMarker]()
-	return WorkReferenceID{typedID: id}, err
-}
-func NewObjectiveID() (ObjectiveID, error) {
-	id, err := newTypedID[objectiveIDMarker]()
-	return ObjectiveID{typedID: id}, err
-}
-func NewWorkUnitID() (WorkUnitID, error) {
-	id, err := newTypedID[workUnitIDMarker]()
-	return WorkUnitID{typedID: id}, err
-}
-func NewRunID() (RunID, error) {
-	id, err := newTypedID[runIDMarker]()
+
+type runIDMarker struct{}
+
+func (runIDMarker) identifierKind() IdentifierKind { return "run" }
+
+type RunID struct{ typedID[runIDMarker] }
+
+func ParseRunID(text string) (RunID, error) {
+	id, err := parseTypedID[runIDMarker](text)
 	return RunID{typedID: id}, err
 }
-func NewRunParticipationID() (RunParticipationID, error) {
-	id, err := newTypedID[runParticipationIDMarker]()
-	return RunParticipationID{typedID: id}, err
-}
-func NewRuntimeBindingID() (RuntimeBindingID, error) {
-	id, err := newTypedID[runtimeBindingIDMarker]()
-	return RuntimeBindingID{typedID: id}, err
-}
-func NewRuntimeEndpointID() (RuntimeEndpointID, error) {
-	id, err := newTypedID[runtimeEndpointIDMarker]()
-	return RuntimeEndpointID{typedID: id}, err
+func NewRunID() (RunID, error) { id, err := newTypedID[runIDMarker](); return RunID{typedID: id}, err }
+
+type conversationIDMarker struct{}
+
+func (conversationIDMarker) identifierKind() IdentifierKind { return "conversation" }
+
+type ConversationID struct{ typedID[conversationIDMarker] }
+
+func ParseConversationID(text string) (ConversationID, error) {
+	id, err := parseTypedID[conversationIDMarker](text)
+	return ConversationID{typedID: id}, err
 }
 func NewConversationID() (ConversationID, error) {
 	id, err := newTypedID[conversationIDMarker]()
 	return ConversationID{typedID: id}, err
 }
+
+type messageIDMarker struct{}
+
+func (messageIDMarker) identifierKind() IdentifierKind { return "message" }
+
+type MessageID struct{ typedID[messageIDMarker] }
+
+func ParseMessageID(text string) (MessageID, error) {
+	id, err := parseTypedID[messageIDMarker](text)
+	return MessageID{typedID: id}, err
+}
 func NewMessageID() (MessageID, error) {
 	id, err := newTypedID[messageIDMarker]()
 	return MessageID{typedID: id}, err
 }
+
+type leaseIDMarker struct{}
+
+func (leaseIDMarker) identifierKind() IdentifierKind { return "lease" }
+
+type LeaseID struct{ typedID[leaseIDMarker] }
+
+func ParseLeaseID(text string) (LeaseID, error) {
+	id, err := parseTypedID[leaseIDMarker](text)
+	return LeaseID{typedID: id}, err
+}
 func NewLeaseID() (LeaseID, error) {
 	id, err := newTypedID[leaseIDMarker]()
 	return LeaseID{typedID: id}, err
-}
-func NewObservationID() (ObservationID, error) {
-	id, err := newTypedID[observationIDMarker]()
-	return ObservationID{typedID: id}, err
 }
