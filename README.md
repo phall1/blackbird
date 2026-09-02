@@ -194,6 +194,18 @@ half and cannot substitute for one.
 [gemini-a2a]: https://github.com/google-gemini/gemini-cli/blob/4963a4456a886bb6af7dcfb807ad6e3e46ce46fc/packages/a2a-server/src/http/app.ts
 [gemini-a2a-auth]: https://github.com/google-gemini/gemini-cli/issues/29001
 
+## Agent Host Protocol
+
+Microsoft's [Agent Host Protocol][ahp] represents a host's sessions, chats, and
+subagents to clients; it explicitly does not define peer identity,
+agent-to-agent messaging, task assignment, or coordination. Blackbird therefore
+does not adopt AHP as its core protocol: its repository-scoped agents, durable
+mail, and advisory path claims are complementary. If a supported host exposes a
+stable AHP endpoint, integrate it through a thin adapter rather than changing
+Blackbird's storage or delivery semantics.
+
+[ahp]: https://github.com/microsoft/agent-host-protocol
+
 ## Development
 
 ```sh
