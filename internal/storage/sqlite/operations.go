@@ -1819,6 +1819,10 @@ func coordinationPayload(value map[string]any) ([]byte, error) {
 }
 
 func leaseCoordinationPayload(lease application.Lease) ([]byte, error) {
+	return coordinationPayload(leaseCoordinationFields(lease))
+}
+
+func leaseCoordinationFields(lease application.Lease) map[string]any {
 	selectors := make([]map[string]string, 0, len(lease.Selectors()))
 	for _, selector := range lease.Selectors() {
 		selectors = append(selectors, map[string]string{"kind": string(selector.Kind()), "path": selector.Path()})
@@ -1827,8 +1831,8 @@ func leaseCoordinationPayload(lease application.Lease) ([]byte, error) {
 	for _, fence := range lease.Fences() {
 		fences = append(fences, map[string]any{"conflict_key": fence.ConflictKey(), "counter": fence.Counter()})
 	}
-	return coordinationPayload(map[string]any{"expires_at_us": timeMicros(lease.ExpiresAt()), "fences": fences,
-		"lease_id": lease.ID().String(), "mode": lease.Mode(), "selectors": selectors})
+	return map[string]any{"expires_at_us": timeMicros(lease.ExpiresAt()), "fences": fences,
+		"lease_id": lease.ID().String(), "mode": lease.Mode(), "selectors": selectors}
 }
 
 func (store *Store) SyncCoordinationEvents(ctx context.Context,

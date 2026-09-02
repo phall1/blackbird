@@ -53,8 +53,8 @@ type handshake struct {
 	Version     string `json:"version"`
 }
 
-// Client is a read-only admin client. Address overrides the handshake record so
-// a user can probe a daemon started on a non-default port.
+// Client talks to the authenticated admin surface. Address overrides the
+// handshake record so a user can probe a daemon started on a non-default port.
 type Client struct {
 	HandshakePath string
 	Address       string
@@ -176,6 +176,13 @@ func (client *Client) Reservations(ctx context.Context, query cli.ReservationQue
 	return page, client.get(ctx, pathReservations, values, &page)
 }
 
+func (client *Client) ForceReleaseReservation(ctx context.Context,
+	leaseID string) (cli.ReservationRelease, error) {
+	var result cli.ReservationRelease
+	path := pathReservations + "/" + url.PathEscape(leaseID) + "/release"
+	return result, client.post(ctx, path, &result)
+}
+
 func (client *Client) Events(ctx context.Context, query cli.EventQuery) (cli.EventsPage, error) {
 	values := url.Values{}
 	setNonEmpty(values, "project_key", query.ProjectKey)
@@ -209,9 +216,22 @@ func (client *Client) get(ctx context.Context, path string, values url.Values, p
 	return client.fetch(ctx, address, path, values, token, payload)
 }
 
-func (client *Client) fetch(
+func (client *Client) post(ctx context.Context, path string, payload any) error {
+	address, token, err := client.discover()
+	if err != nil {
+		return err
+	}
+	return client.request(ctx, http.MethodPost, address, path, nil, token, payload)
+}
+
+func (client *Client) fetch(ctx context.Context, address, path string, values url.Values,
+	token string, payload any) error {
+	return client.request(ctx, http.MethodGet, address, path, values, token, payload)
+}
+
+func (client *Client) request(
 	ctx context.Context,
-	address, path string,
+	method, address, path string,
 	values url.Values,
 	token string,
 	payload any,
@@ -227,7 +247,7 @@ func (client *Client) fetch(
 	if len(values) > 0 {
 		endpoint += "?" + values.Encode()
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -293,6 +294,76 @@ func TestAdminInboxRequiresProjectKey(t *testing.T) {
 		application.ErrInvalidCoordination) {
 		t.Fatalf("missing project key error=%v", err)
 	}
+}
+
+func TestForceReleaseAdminReservationClearsLeaseAndRecordsForcedFact(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCoordinationStore(t)
+	alice := registerAdminAgent(t, store, adminProjectA, "alice")
+	bob := registerAdminAgent(t, store, adminProjectA, "bob")
+	lease := acquireAdminLease(t, store, alice, "docs/live.md")
+
+	if _, err := store.AcquireLease(ctx, acquireAdminLeaseParams(t, bob, "docs/live.md")); !errors.Is(err, domain.ErrLeaseConflict) {
+		t.Fatalf("acquire before force release error=%v, want lease conflict", err)
+	}
+	released, err := store.ForceReleaseAdminReservation(ctx, lease.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasedAt, ok := released.ReleasedAt()
+	if !ok {
+		t.Fatal("force-released lease has no release instant")
+	}
+	if _, err := store.AcquireLease(ctx, acquireAdminLeaseParams(t, bob, "docs/live.md")); err != nil {
+		t.Fatalf("acquire after force release: %v", err)
+	}
+
+	events, err := store.ListAdminEvents(ctx, application.AdminEventsQuery{
+		EventType: application.CoordinationEventLeaseReleased})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events.Events) != 1 || events.Events[0].SubjectID != lease.ID().String() ||
+		events.Events[0].ActorID != alice.ActorID {
+		t.Fatalf("release events=%+v, want one fact for alice's lease", events.Events)
+	}
+	var payload struct {
+		Forced bool `json:"forced"`
+	}
+	if err := json.Unmarshal(events.Events[0].Payload, &payload); err != nil || !payload.Forced {
+		t.Fatalf("release payload=%s error=%v, want forced=true", events.Events[0].Payload, err)
+	}
+
+	repeated, err := store.ForceReleaseAdminReservation(ctx, lease.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeatedAt, ok := repeated.ReleasedAt()
+	if !ok || !repeatedAt.Equal(releasedAt) {
+		t.Fatalf("repeated release instant=%v present=%v, want %v", repeatedAt, ok, releasedAt)
+	}
+	events, err = store.ListAdminEvents(ctx, application.AdminEventsQuery{
+		EventType: application.CoordinationEventLeaseReleased})
+	if err != nil || len(events.Events) != 1 {
+		t.Fatalf("repeated release events=%d error=%v, want one", len(events.Events), err)
+	}
+}
+
+func acquireAdminLeaseParams(t *testing.T, holder application.LocalAgentSession,
+	path string) application.AcquireLeaseParams {
+	t.Helper()
+	leaseID, err := domain.NewLeaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := application.NewLeaseSelector(application.LeaseSelectorExact, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return application.AcquireLeaseParams{LeaseID: leaseID, WorkspaceID: holder.WorkspaceID,
+		Holder: holder.ActorID, HolderSession: holder.ActorSessionID, AuthorityEpoch: holder.AuthorityEpoch,
+		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour}
 }
 
 func TestListAdminReservationsDerivesExpiryFromStorageClock(t *testing.T) {

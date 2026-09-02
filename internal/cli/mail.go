@@ -206,9 +206,15 @@ func drawThread(doc *render.Document, report threadReport) {
 	doc.Line(render.RoleMuted, "Message bodies are private to their recipients and are not projected here.")
 }
 
-// ReservationsCmd inspects file reservations.
+// ReservationsCmd inspects and administratively releases file reservations.
 type ReservationsCmd struct {
-	List ReservationsListCmd `cmd:"" default:"withargs" help:"List file reservations."`
+	List    ReservationsListCmd    `cmd:"" default:"withargs" help:"List file reservations."`
+	Release ReservationsReleaseCmd `cmd:"" help:"Force-release a reservation held by a dead agent."`
+}
+
+type ReservationsReleaseCmd struct {
+	LeaseID string `arg:"" name:"lease-id" help:"Lease identifier shown by reservations list."`
+	Force   bool   `help:"Confirm release without the holder's credentials."`
 }
 
 type ReservationsListCmd struct {
@@ -250,6 +256,29 @@ func (cmd *ReservationsListCmd) Run(ctx context.Context, console *Console) error
 		}
 		return newView(reservationsReport(page), drawReservations), nil
 	})
+}
+
+func (cmd *ReservationsReleaseCmd) Run(ctx context.Context, console *Console) error {
+	if !cmd.Force {
+		return usageFault("reservation release requires --force")
+	}
+	admin, err := console.admin()
+	if err != nil {
+		return err
+	}
+	released, err := admin.ForceReleaseReservation(ctx, cmd.LeaseID)
+	if err != nil {
+		return daemonFault(err, "force-release reservation")
+	}
+	return console.present(newView(released, drawReservationRelease))
+}
+
+func drawReservationRelease(doc *render.Document, released ReservationRelease) {
+	doc.Status(render.StatusOK, "reservation force-released")
+	doc.Fields(render.Fields{Indent: 2, Items: []render.Field{
+		{Key: "lease", Value: released.LeaseID},
+		{Key: "released at", Value: released.ReleasedAt},
+	}})
 }
 
 func drawReservations(doc *render.Document, report reservationsReport) {

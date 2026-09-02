@@ -30,9 +30,10 @@ func writeHandshake(t *testing.T, address, token string) string {
 }
 
 type recordedRequest struct {
-	path  string
-	query url.Values
-	token string
+	method string
+	path   string
+	query  url.Values
+	token  string
 }
 
 func serve(t *testing.T, handler func(recordedRequest) (int, string)) (*httptest.Server, *[]recordedRequest) {
@@ -40,9 +41,10 @@ func serve(t *testing.T, handler func(recordedRequest) (int, string)) (*httptest
 	var seen []recordedRequest
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		record := recordedRequest{
-			path:  request.URL.Path,
-			query: request.URL.Query(),
-			token: strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "),
+			method: request.Method,
+			path:   request.URL.Path,
+			query:  request.URL.Query(),
+			token:  strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "),
 		}
 		seen = append(seen, record)
 		status, body := handler(record)
@@ -153,6 +155,27 @@ func TestHealthOnConnectionRefused(t *testing.T) {
 	}
 	if health.Address != "127.0.0.1:1" {
 		t.Fatalf("health.Address = %q, want the address the probe used", health.Address)
+	}
+}
+
+func TestForceReleaseReservationPostsToTheAdminMutation(t *testing.T) {
+	t.Parallel()
+
+	const leaseID = "01b8e094-9888-7000-8000-000000000123"
+	server, seen := serve(t, func(request recordedRequest) (int, string) {
+		return http.StatusOK, `{"lease_id":"` + leaseID + `","released_at":"2026-09-02T03:40:00Z","forced":true}`
+	})
+	client := New(writeHandshake(t, addressOf(t, server), "bba_token"), "")
+	result, err := client.ForceReleaseReservation(context.Background(), leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.LeaseID != leaseID || !result.Forced || result.ReleasedAt == "" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(*seen) != 1 || (*seen)[0].method != http.MethodPost ||
+		(*seen)[0].path != pathReservations+"/"+leaseID+"/release" || (*seen)[0].token != "bba_token" {
+		t.Fatalf("requests=%+v", *seen)
 	}
 }
 

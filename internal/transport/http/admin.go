@@ -217,6 +217,12 @@ type localAdminReservationsPage struct {
 	ObservedAt   string                  `json:"observed_at"`
 }
 
+type localAdminReservationRelease struct {
+	LeaseID    string `json:"lease_id"`
+	ReleasedAt string `json:"released_at"`
+	Forced     bool   `json:"forced"`
+}
+
 type localAdminEvent struct {
 	Position    uint64          `json:"position"`
 	ProjectKey  string          `json:"project_key"`
@@ -235,10 +241,10 @@ type localAdminEventsPage struct {
 	ObservedAt string            `json:"observed_at"`
 }
 
-// NewAdminHandler serves the read-only cross-agent admin projections. It is a
-// separate handler from NewLocalHandler so the admin surface is unreachable by
-// construction wherever the composition root does not register it, and so an
-// admin store can never be served without the token that gates it.
+// NewAdminHandler serves the cross-agent admin surface. It is a separate
+// handler from NewLocalHandler so its projections and force-release escape
+// hatch are unreachable wherever the composition root does not register it,
+// and so an admin store can never be served without the token that gates it.
 func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	if isNil(dependencies.Admin) {
 		return nil, errors.New("local admin HTTP transport requires an admin store")
@@ -256,6 +262,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("GET "+PathLocalAdminInbox, handler.inbox)
 	mux.HandleFunc("GET "+PathLocalAdminConversations, handler.conversations)
 	mux.HandleFunc("GET "+PathLocalAdminReservations, handler.reservations)
+	mux.HandleFunc("POST "+PathLocalAdminReservations+"/{lease_id}/release", handler.forceReleaseReservation)
 	mux.HandleFunc("GET "+PathLocalAdminEvents, handler.events)
 	return localSafety(mux), nil
 }
@@ -515,6 +522,31 @@ func (handler *adminHandler) reservations(writer stdhttp.ResponseWriter, request
 	}
 	writeLocalJSON(writer, stdhttp.StatusOK, localAdminReservationsPage{Reservations: reservations,
 		Truncated: page.Truncated, ObservedAt: localAdminInstant(page.ObservedAtUS)})
+}
+
+func (handler *adminHandler) forceReleaseReservation(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
+	if _, ok := handler.guard(writer, request); !ok {
+		return
+	}
+	leaseID, err := domain.ParseLeaseID(request.PathValue("lease_id"))
+	if err != nil {
+		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
+			"lease id is invalid")
+		return
+	}
+	lease, err := handler.admin.ForceReleaseAdminReservation(request.Context(), leaseID)
+	if err != nil {
+		writeLocalError(writer, err)
+		return
+	}
+	releasedAt, released := lease.ReleasedAt()
+	if !released {
+		writeLocalProblem(writer, stdhttp.StatusInternalServerError, domain.ErrorCodeInternal,
+			"released lease has no release time")
+		return
+	}
+	writeLocalJSON(writer, stdhttp.StatusOK, localAdminReservationRelease{
+		LeaseID: lease.ID().String(), ReleasedAt: releasedAt.Format(time.RFC3339Nano), Forced: true})
 }
 
 func (handler *adminHandler) events(writer stdhttp.ResponseWriter, request *stdhttp.Request) {

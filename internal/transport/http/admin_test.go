@@ -24,9 +24,12 @@ type stubAdminStore struct {
 	inbox         application.AdminInboxPage
 	conversations application.AdminConversationsPage
 	reservations  application.AdminReservationsPage
+	forcedLease   application.Lease
 	events        application.AdminEventsPage
 	schemaVersion int
 	err           error
+
+	forcedLeaseID domain.LeaseID
 
 	agentsQuery        application.AdminAgentsQuery
 	inboxQuery         application.AdminInboxQuery
@@ -73,6 +76,12 @@ func (store *stubAdminStore) ListAdminReservations(_ context.Context,
 	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
 	store.reservationsQuery = query
 	return store.reservations, store.err
+}
+
+func (store *stubAdminStore) ForceReleaseAdminReservation(_ context.Context,
+	leaseID domain.LeaseID) (application.Lease, error) {
+	store.forcedLeaseID = leaseID
+	return store.forcedLease, store.err
 }
 
 func (store *stubAdminStore) ListAdminEvents(_ context.Context,
@@ -335,6 +344,44 @@ func TestLocalAdminPassesFilterPredicatesToTheStore(t *testing.T) {
 	}
 }
 
+func TestLocalAdminForceReleaseRequiresTokenAndValidLease(t *testing.T) {
+	t.Parallel()
+	fixture := newAdminFixture(t)
+	handler := newAdminTestHandler(t, fixture.store)
+	target := PathLocalAdminReservations + "/" + fixture.leaseID.String() + "/release"
+
+	request := newLocalHTTPRequest(stdhttp.MethodPost, target, nil)
+	request.Header.Set("Authorization", "Bearer "+adminTestToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != stdhttp.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if fixture.store.forcedLeaseID != fixture.leaseID {
+		t.Fatalf("forced lease=%v, want %v", fixture.store.forcedLeaseID, fixture.leaseID)
+	}
+	var result localAdminReservationRelease
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.LeaseID != fixture.leaseID.String() || !result.Forced || result.ReleasedAt != fixture.observedAt {
+		t.Fatalf("release=%+v", result)
+	}
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, newLocalHTTPRequest(stdhttp.MethodPost, target, nil))
+	if unauthorized.Code != stdhttp.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
+	}
+	invalid := newLocalHTTPRequest(stdhttp.MethodPost, PathLocalAdminReservations+"/not-a-lease/release", nil)
+	invalid.Header.Set("Authorization", "Bearer "+adminTestToken)
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalid)
+	if invalidResponse.Code != stdhttp.StatusBadRequest {
+		t.Fatalf("invalid status=%d body=%s", invalidResponse.Code, invalidResponse.Body.String())
+	}
+}
+
 func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 	t.Parallel()
 	fixture := newAdminFixture(t)
@@ -529,6 +576,7 @@ type adminFixture struct {
 	runID       domain.RunID
 	actorID     domain.ActorID
 	sessionID   domain.ActorSessionID
+	leaseID     domain.LeaseID
 	observedAt  string
 	createdAt   string
 }
@@ -579,6 +627,21 @@ func newAdminFixture(t *testing.T) adminFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	authority, err := domain.NewAuthorityID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := domain.ParseAuthorityEpoch(authority.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forcedLease, err := application.NewLeaseView(application.LeaseViewParams{LeaseID: leaseID,
+		WorkspaceID: workspaceID, Holder: actorID, HolderSession: sessionID, AuthorityEpoch: epoch,
+		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{exact},
+		AcquiredAt: created, ExpiresAt: observed.Add(time.Hour), ReleasedAt: &observed})
+	if err != nil {
+		t.Fatal(err)
+	}
 	store := &stubAdminStore{
 		schemaVersion: 4,
 		identity: application.AdminStorageIdentity{StorageBackend: "sqlite", DatabasePath: "/state/blackbird.db",
@@ -613,6 +676,7 @@ func newAdminFixture(t *testing.T) adminFixture {
 				OpenedByAgentName: "alice", OpenedByActorID: actorID, Messages: 12, Participants: 3,
 				UnreadDeliveries: 2, OpenedAtUS: createdUS, LastMessageAtUS: observedUS,
 				LastMessageAuthor: "bob", LastMessageSubject: "handoff"}}},
+		forcedLease: forcedLease,
 		reservations: application.AdminReservationsPage{ObservedAtUS: observedUS,
 			Reservations: []application.AdminReservation{{LeaseID: leaseID, ProjectKey: "/repo",
 				WorkspaceID: workspaceID, HolderAgentName: "alice", HolderActorID: actorID,
@@ -631,7 +695,7 @@ func newAdminFixture(t *testing.T) adminFixture {
 		}},
 	}
 	return adminFixture{store: store, workspaceID: workspaceID, runID: runID, actorID: actorID, sessionID: sessionID,
-		observedAt: observed.Format(time.RFC3339Nano), createdAt: created.Format(time.RFC3339Nano)}
+		leaseID: leaseID, observedAt: observed.Format(time.RFC3339Nano), createdAt: created.Format(time.RFC3339Nano)}
 }
 
 func newAdminTestHandler(t *testing.T, store application.LocalAdminStore) stdhttp.Handler {

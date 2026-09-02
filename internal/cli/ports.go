@@ -241,14 +241,21 @@ type ReservationsPage struct {
 	Truncated    bool          `json:"truncated"`
 }
 
+type ReservationRelease struct {
+	LeaseID    string `json:"lease_id"`
+	ReleasedAt string `json:"released_at"`
+	Forced     bool   `json:"forced"`
+}
+
 type EventsPage struct {
 	Events    []Event `json:"events"`
 	Truncated bool    `json:"truncated"`
 }
 
-// AdminPort is the read-only loopback admin surface of a running daemon. Every
-// method is one authenticated GET; a nil AdminPort means the CLI was assembled
-// without a client and every command that needs one exits ExitUnavailable.
+// AdminPort is the authenticated loopback admin surface of a running daemon.
+// Reads are GETs; ForceReleaseReservation is the explicit operator mutation. A
+// nil AdminPort means the CLI was assembled without a client and every command
+// that needs one exits ExitUnavailable.
 type AdminPort interface {
 	// Health probes liveness and readiness. It returns an error whenever the
 	// probe did not complete — nothing answered, or the daemon refused the
@@ -265,6 +272,7 @@ type AdminPort interface {
 	Inbox(ctx context.Context, query InboxQuery) (Inbox, error)
 	Conversations(ctx context.Context, query ConversationQuery) (ConversationsPage, error)
 	Reservations(ctx context.Context, query ReservationQuery) (ReservationsPage, error)
+	ForceReleaseReservation(ctx context.Context, leaseID string) (ReservationRelease, error)
 	Events(ctx context.Context, query EventQuery) (EventsPage, error)
 }
 

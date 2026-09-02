@@ -357,10 +357,11 @@ type ReadinessProbe interface {
 	CheckReadiness(context.Context) (int, error)
 }
 
-// LocalAdminStore is the read-only, cross-agent projection behind the loopback
-// admin surface. Every method is a point-in-time snapshot taken against the
-// durable store's own clock; none of them mutate coordination state. An empty
-// ProjectKey means "every project" and an empty AgentName means "every agent".
+// LocalAdminStore is the cross-agent projection behind the loopback admin
+// surface. Reads are point-in-time snapshots against the durable store's own
+// clock. ForceReleaseAdminReservation is the one mutation: an authenticated
+// operator escape hatch for a lease whose holder is gone. An empty ProjectKey
+// means "every project" and an empty AgentName means "every agent".
 type LocalAdminStore interface {
 	ReadinessProbe
 	AdminStorageIdentity(context.Context) (AdminStorageIdentity, error)
@@ -370,5 +371,6 @@ type LocalAdminStore interface {
 	AdminInbox(context.Context, AdminInboxQuery) (AdminInboxPage, error)
 	ListAdminConversations(context.Context, AdminConversationsQuery) (AdminConversationsPage, error)
 	ListAdminReservations(context.Context, AdminReservationsQuery) (AdminReservationsPage, error)
+	ForceReleaseAdminReservation(context.Context, domain.LeaseID) (Lease, error)
 	ListAdminEvents(context.Context, AdminEventsQuery) (AdminEventsPage, error)
 }

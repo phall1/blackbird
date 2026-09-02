@@ -51,6 +51,7 @@ blackbird doctor                   # diagnose the installation and print remedie
 blackbird agents --project=$PWD    # who is registered, and what they hold
 blackbird inbox --unread           # mail waiting on an agent
 blackbird reservations --state=expired
+blackbird reservation release <lease-id> --force  # clear a dead agent's lease
 blackbird events --limit=20        # tail the coordination journal
 blackbird logs --follow
 blackbird support-bundle           # one redacted document describing the whole install

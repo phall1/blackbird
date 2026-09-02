@@ -59,9 +59,12 @@ type fakeAdmin struct {
 	inbox         Inbox
 	conversations []Conversation
 	reservations  []Reservation
+	release       ReservationRelease
 	events        []Event
 	truncated     bool
 	err           error
+
+	releasedLeaseID string
 
 	agentQuery        AgentQuery
 	inboxQuery        InboxQuery
@@ -139,6 +142,12 @@ func (admin *fakeAdmin) Reservations(_ context.Context, query ReservationQuery) 
 	return ReservationsPage{Reservations: admin.reservations, Truncated: admin.truncated}, nil
 }
 
+func (admin *fakeAdmin) ForceReleaseReservation(_ context.Context,
+	leaseID string) (ReservationRelease, error) {
+	admin.releasedLeaseID = leaseID
+	return admin.release, admin.err
+}
+
 func (admin *fakeAdmin) Events(_ context.Context, query EventQuery) (EventsPage, error) {
 	admin.eventQuery = query
 	if admin.err != nil {
@@ -163,6 +172,9 @@ func (panickingAdmin) Conversations(context.Context, ConversationQuery) (Convers
 }
 
 func (panickingAdmin) Reservations(context.Context, ReservationQuery) (ReservationsPage, error) {
+	panic("boom")
+}
+func (panickingAdmin) ForceReleaseReservation(context.Context, string) (ReservationRelease, error) {
 	panic("boom")
 }
 
@@ -1053,6 +1065,28 @@ func TestReservationsShowExpiryCountdown(t *testing.T) {
 	result := runCLI(t, deps, []string{"reservations", "--state=all"})
 	if !strings.Contains(result.stdout, "-2m5s") {
 		t.Fatalf("stdout = %q, want a negative countdown", result.stdout)
+	}
+}
+
+func TestReservationReleaseRequiresForceAndCallsAdmin(t *testing.T) {
+	t.Parallel()
+	const leaseID = "01b8e094-9888-7000-8000-000000000123"
+	admin := &fakeAdmin{release: ReservationRelease{LeaseID: leaseID,
+		ReleasedAt: "2026-09-02T03:40:00Z", Forced: true}}
+	deps := dependencies(t)
+	deps.Admin = admin
+
+	withoutForce := runCLI(t, deps, []string{"reservation", "release", leaseID})
+	if withoutForce.code != ExitUsage || admin.releasedLeaseID != "" ||
+		!strings.Contains(withoutForce.stderr, "requires --force") {
+		t.Fatalf("without force: code=%d released=%q stderr=%q",
+			withoutForce.code, admin.releasedLeaseID, withoutForce.stderr)
+	}
+	forced := runCLI(t, deps, []string{"reservation", "release", leaseID, "--force"})
+	if forced.code != ExitOK || admin.releasedLeaseID != leaseID ||
+		!strings.Contains(forced.stdout, "reservation force-released") {
+		t.Fatalf("forced: code=%d released=%q stdout=%q stderr=%q",
+			forced.code, admin.releasedLeaseID, forced.stdout, forced.stderr)
 	}
 }
 

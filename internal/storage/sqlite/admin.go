@@ -479,6 +479,56 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 	return store.reservationsPage(ctx, query, state, limit, reservationScope{})
 }
 
+// ForceReleaseAdminReservation is the operator escape hatch for a live lease
+// whose holder disappeared with its session credentials. The admin token is
+// the authorization boundary, so this deliberately bypasses holder and fence
+// checks while retaining the normal release row and journal fact.
+func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
+	leaseID domain.LeaseID) (application.Lease, error) {
+	if leaseID.IsZero() {
+		return application.Lease{}, application.ErrInvalidCoordination
+	}
+	var result application.Lease
+	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		lease, err := loadLease(ctx, tx, leaseID)
+		if err != nil {
+			return err
+		}
+		if _, released := lease.ReleasedAt(); released {
+			result = lease
+			return nil
+		}
+		now, err := sqliteNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		changed, err := tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ?
+			WHERE lease_id = ? AND status = 'active'`, timeMicros(now), leaseID.String())
+		if err != nil {
+			return fmt.Errorf("force release SQLite lease: %w", err)
+		}
+		if rows, err := changed.RowsAffected(); err != nil || rows != 1 {
+			if err != nil {
+				return fmt.Errorf("count force released SQLite leases: %w", err)
+			}
+			return application.ErrInvalidCoordination
+		}
+		result, err = loadLease(ctx, tx, leaseID)
+		if err != nil {
+			return err
+		}
+		fields := leaseCoordinationFields(result)
+		fields["forced"] = true
+		payload, err := coordinationPayload(fields)
+		if err != nil {
+			return err
+		}
+		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(),
+			application.CoordinationEventLeaseReleased, result.ID().String(), now, payload)
+	})
+	return result, err
+}
+
 // LocalAgentReservations is the same read scoped to one agent's own workspace.
 // An agent refused a lease used to be told only that it lost; who holds the
 // path, in what mode, and for how much longer was reachable exclusively from
