@@ -153,15 +153,24 @@ func (cmd *LeaseGuardCmd) stagedPaths(ctx context.Context) ([]string, error) {
 	return normalizeGuardPaths(strings.Split(string(output), "\n")), nil
 }
 
+// projectKey resolves the repository identity every agent working on this
+// repository shares.
+//
+// It is the MAIN worktree, never the caller's own. Worktree-per-writer is the
+// default here, and `git rev-parse --show-toplevel` answers with the worktree
+// you are standing in -- so keying on it would give every agent a private
+// project nobody else registers under, and the guard would report "clear"
+// forever while agents overwrote each other. `git worktree list` names the main
+// worktree first, which is the one identity all of them agree on.
 func (cmd *LeaseGuardCmd) projectKey(ctx context.Context) (string, error) {
 	if trimmed := strings.TrimSpace(cmd.Project); trimmed != "" {
 		return trimmed, nil
 	}
-	output, err := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel").Output()
+	output, err := exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return "", err
 	}
-	root := strings.TrimSpace(string(output))
+	root := mainWorktreePath(string(output))
 	if root == "" {
 		return "", fmt.Errorf("git reported no repository root")
 	}
@@ -171,6 +180,18 @@ func (cmd *LeaseGuardCmd) projectKey(ctx context.Context) (string, error) {
 		root = resolved
 	}
 	return root, nil
+}
+
+// mainWorktreePath reads the first "worktree" record of `git worktree list
+// --porcelain`, which git documents as the main worktree regardless of where
+// the command was run.
+func mainWorktreePath(listing string) string {
+	for _, line := range strings.Split(listing, "\n") {
+		if path, found := strings.CutPrefix(strings.TrimSpace(line), "worktree "); found {
+			return strings.TrimSpace(path)
+		}
+	}
+	return ""
 }
 
 // normalizeGuardPaths cleans and de-duplicates the incoming paths into the

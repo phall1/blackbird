@@ -1,6 +1,10 @@
 package cli
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -211,5 +215,82 @@ func TestGuardOverlapMatchesTheDaemon(t *testing.T) {
 	// prove nothing, so the table has to exercise both answers.
 	if overlaps == 0 || disjoint == 0 {
 		t.Fatalf("table produced %d overlaps and %d non-overlaps; it must exercise both", overlaps, disjoint)
+	}
+}
+
+func TestMainWorktreePathReadsTheFirstRecord(t *testing.T) {
+	listing := "worktree /repo/main\nHEAD abc\nbranch refs/heads/main\n\n" +
+		"worktree /tmp/agent-a\nHEAD def\ndetached\n\n" +
+		"worktree /tmp/agent-b\nHEAD 012\n"
+	if got := mainWorktreePath(listing); got != "/repo/main" {
+		t.Fatalf("mainWorktreePath=%q, want the first record", got)
+	}
+	if got := mainWorktreePath(""); got != "" {
+		t.Fatalf("mainWorktreePath(empty)=%q, want empty", got)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+}
+
+// Worktree-per-writer is the default for parallel agents here, which makes this
+// the regression that matters: every worktree must resolve to the one project
+// key its agents share. Keying on the caller's own worktree would give each
+// agent a private project nobody else registers under, and the guard would
+// report "clear" forever while agents overwrote each other -- a silent failure
+// that looks exactly like success.
+func TestProjectKeyResolvesToTheMainWorktree(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "main")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, main, "init", "--initial-branch=main", ".")
+	if err := os.WriteFile(filepath.Join(main, "seed.txt"), []byte("seed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, main, "add", "seed.txt")
+	runGit(t, main, "commit", "-m", "seed")
+
+	side := filepath.Join(root, "agent-a")
+	runGit(t, main, "worktree", "add", "--detach", side, "HEAD")
+
+	resolvedMain, err := filepath.EvalSymlinks(main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, dir := range map[string]string{"main worktree": main, "linked worktree": side} {
+		t.Run(name, func(t *testing.T) {
+			// Not parallel: t.Chdir is process-wide, and it restores on cleanup
+			// so the rest of the package still runs where it expects to.
+			t.Chdir(dir)
+
+			key, err := (&LeaseGuardCmd{}).projectKey(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if key != resolvedMain {
+				t.Fatalf("project key from %s = %q, want the main worktree %q", name, key, resolvedMain)
+			}
+		})
+	}
+}
+
+func TestProjectKeyPrefersAnExplicitOverride(t *testing.T) {
+	key, err := (&LeaseGuardCmd{Project: " /explicit/repo "}).projectKey(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "/explicit/repo" {
+		t.Fatalf("project key=%q, want the trimmed override", key)
 	}
 }

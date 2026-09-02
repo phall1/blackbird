@@ -339,8 +339,17 @@ agents do not clobber each other. The tool list your client exposes is
 authoritative for exact names and arguments; the sequence below is the part that
 matters.
 
-1. **Register once per session**, with `project_key` set to this repository's
-   absolute path and a stable agent name.
+0. **Write from your own worktree.** A second agent writing in the same checkout
+   shares your index: staging is repository-wide, so their `git add` takes
+   whatever you are holding, and a commit built that way has shipped a `main`
+   that did not compile. Reservations cannot prevent it — the daemon never sees
+   a commit. `make worktree NAME=<what-you-are-doing>` creates one; hooks and
+   config live in the shared git directory, so it inherits them. Read-only work
+   does not need one.
+1. **Register once per session**, with `project_key` set to the repository's
+   **main worktree** — `git worktree list | head -1` — and a stable agent name.
+   Keying on your own worktree gives you a private project nobody else registers
+   under, which silently disables every check below.
 2. **Keep the token.** Registration returns a `registration_token`, and every
    other tool takes that same string as `agent_token` — one value, two field
    names. Pass it back as `registration_token` to resume the same identity after
@@ -358,20 +367,15 @@ matters.
    acknowledge on another agent's behalf: read and acknowledgement facts belong
    to the recipient.
 
-**Claims are advisory, and the pre-commit guard does not change that.** A lease
-is an agreement between agents that choose to respect it; nothing in the daemon
-can stop a process from opening a file. `blackbird lease-guard` adds one local,
-opt-in place where a claim someone else already made becomes visible before you
-overwrite it — the staged set of a commit, which is where a shared checkout
-actually collides. It is installed with `make hooks`, it is not file locking,
-and `git commit --no-verify` walks past it.
-
-It fails open by design: an unreachable daemon, a missing admin credential, or a
-project the daemon has never seen all pass, because a hook that blocks commits
-when coordination is down is a hook people delete. It refuses only when it can
-name a live exclusive holder that is not you, which needs `BLACKBIRD_AGENT_NAME`
-to be your registered agent name — without it the guard warns instead, since it
-cannot tell your own lease from a teammate's.
+**Claims are advisory; isolation is what actually protects you.** A lease is an
+agreement between agents that choose to respect it, and nothing in the daemon
+can stop a process from opening a file or staging one. That is why step 0 is
+first: a worktree is the only part of this protocol that makes a collision
+impossible rather than merely visible. `blackbird lease-guard` is the backstop —
+it surfaces another agent's claim at the one moment a shared checkout collides,
+fails open whenever it cannot be sure, and is walked past by `--no-verify`. Run
+`blackbird lease-guard --help` for its modes rather than trusting a description
+here.
 
 On a lease conflict, do not retry blindly and do not widen your selector.
 Another agent holds an overlapping lease — coordinate through a conversation, or
