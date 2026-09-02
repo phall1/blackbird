@@ -50,6 +50,7 @@ const (
 	IdentifierKindConversation        IdentifierKind = "conversation"
 	IdentifierKindMessage             IdentifierKind = "message"
 	IdentifierKindLease               IdentifierKind = "lease"
+	IdentifierKindObservation         IdentifierKind = "observation"
 )
 
 // IdentifierError reports a failed typed-ID boundary without weakening the
@@ -255,6 +256,7 @@ type runtimeEndpointIDMarker struct{}
 type conversationIDMarker struct{}
 type messageIDMarker struct{}
 type leaseIDMarker struct{}
+type observationIDMarker struct{}
 
 func (installationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindInstallation }
 func (authorityIDMarker) identifierKind() IdentifierKind       { return IdentifierKindAuthority }
@@ -288,6 +290,7 @@ func (runtimeEndpointIDMarker) identifierKind() IdentifierKind { return Identifi
 func (conversationIDMarker) identifierKind() IdentifierKind    { return IdentifierKindConversation }
 func (messageIDMarker) identifierKind() IdentifierKind         { return IdentifierKindMessage }
 func (leaseIDMarker) identifierKind() IdentifierKind           { return IdentifierKindLease }
+func (observationIDMarker) identifierKind() IdentifierKind     { return IdentifierKindObservation }
 
 // The unique marker embedded in every wrapper makes both implicit assignment
 // and explicit cross-kind conversion fail at compile time.
@@ -331,6 +334,11 @@ type RuntimeEndpointID struct {
 type ConversationID struct{ typedID[conversationIDMarker] }
 type MessageID struct{ typedID[messageIDMarker] }
 type LeaseID struct{ typedID[leaseIDMarker] }
+
+// ObservationID names one row on the observation plane -- a model call or a
+// span. It is a fresh identity per stored row; idempotency is carried by the
+// (actor, dedupe key) unique index, not by this value.
+type ObservationID struct{ typedID[observationIDMarker] }
 
 func ParseInstallationID(text string) (InstallationID, error) {
 	id, err := parseTypedID[installationIDMarker](text)
@@ -556,4 +564,8 @@ func NewMessageID() (MessageID, error) {
 func NewLeaseID() (LeaseID, error) {
 	id, err := newTypedID[leaseIDMarker]()
 	return LeaseID{typedID: id}, err
+}
+func NewObservationID() (ObservationID, error) {
+	id, err := newTypedID[observationIDMarker]()
+	return ObservationID{typedID: id}, err
 }

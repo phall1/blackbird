@@ -114,8 +114,8 @@ func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 45 {
-		t.Fatalf("tables=%d, want 45", tables)
+	if tables != 47 {
+		t.Fatalf("tables=%d, want 47", tables)
 	}
 	if err := reopened.IntegrityCheck(context.Background()); err != nil {
 		t.Fatal(err)
