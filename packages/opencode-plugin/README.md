@@ -1,9 +1,9 @@
 # blackbird-opencode
 
-OpenCode plugin that catches up through Blackbird's coordination event journal
-and follows its wake-only stream, then appends each available durable message to
-an OpenCode session transcript without marking it read, acknowledging it, or
-spending an agent turn.
+OpenCode **notify-mode** plugin that catches up through Blackbird's coordination
+event journal and follows its wake-only stream, then appends each available
+durable message to an OpenCode session transcript without marking it read,
+acknowledging it, or spending an agent turn.
 
 ## Configuration
 

@@ -1,8 +1,9 @@
 # blackbird-pi
 
-Pi-native delivery for [Blackbird](https://github.com/phall1/blackbird).
-Blackbird remains the always-on durable mailbox; this extension connects the
-currently active Pi session to it. It does not launch or supervise Pi.
+Pi-native **queue-mode** delivery for
+[Blackbird](https://github.com/phall1/blackbird). Blackbird remains the always-on
+durable mailbox; this extension connects the currently active Pi session to it.
+It does not launch or supervise Pi.
 
 ```sh
 pi install npm:blackbird-pi@0.1.0

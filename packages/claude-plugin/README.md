@@ -1,8 +1,9 @@
 # Blackbird for Claude Code
 
-This plugin connects the currently active Claude Code session to Blackbird's
-durable local mailbox through MCP Channels. Claude Code owns the channel server
-for the lifetime of the session; no separate adapter service is installed.
+This plugin provides **steer-mode** delivery from Blackbird's durable local
+mailbox into the currently active Claude Code model loop through MCP Channels.
+Claude Code owns the channel server for the lifetime of the session; no separate
+adapter service is installed.
 
 ```sh
 claude plugin marketplace add phall1/blackbird

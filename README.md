@@ -118,7 +118,23 @@ server-enforced ceiling the tool schema publishes. It returns why it woke --
 `path_free`, `mail_arrived`, or `deadline` -- so a caller that ran out of budget
 still learns who to talk to rather than guessing.
 
-## OpenCode Push Delivery
+## Delivery modes
+
+"Push" says only that an adapter moved a message; it does not say what the host
+does to the model. Blackbird names that behavior with three verbs:
+
+- **notify** adds durable context without starting a model turn. OpenCode uses
+  this mode with `noReply: true`; a future Codex adapter can use
+  `thread/inject_items` for the same contract.
+- **steer** admits a message into the active model loop. Claude Code MCP
+  Channels provide this mid-turn path.
+- **queue** schedules an ordered follow-up that runs when the host can accept
+  another turn. Pi uses this mode while a session is busy.
+
+These are host behaviors, not Blackbird mailbox facts. Adapter delivery in any
+mode never marks a message read or acknowledged.
+
+## OpenCode Delivery (notify)
 
 The `blackbird-opencode` package appends each durable `message.available` event
 to an OpenCode session transcript without spending an agent turn — the message
@@ -158,19 +174,21 @@ plugin cache. Registration tokens, opaque cursors, deduplication facts, and
 conversation-to-session bindings are stored under `$XDG_STATE_HOME/blackbird`
 with private directory and file permissions.
 
-## Pi Delivery
+## Pi Delivery (queue)
 
 `blackbird-pi` is a Pi-native extension. It runs only inside an active Pi
-session and injects durable messages as ordered follow-ups:
+session and queues durable messages as ordered follow-ups that trigger a turn
+when Pi can accept one:
 
 ```sh
 pi install npm:blackbird-pi@0.1.1
 ```
 
-## Claude Code Delivery
+## Claude Code Delivery (steer)
 
-The `blackbird` Claude Code plugin uses MCP Channels. Claude owns its stdio
-channel server for the active session; there is no Blackbird adapter service.
+The `blackbird` Claude Code plugin uses MCP Channels to steer messages into the
+active model loop. Claude owns its stdio channel server for the active session;
+there is no Blackbird adapter service.
 
 ```sh
 claude plugin marketplace add phall1/blackbird
