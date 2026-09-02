@@ -182,13 +182,32 @@ async function register(options: RuntimeOptions, tokenPath: string, legacyToken:
     method: "POST", headers: { "content-type": "application/json" }, signal,
     body: JSON.stringify({ project_key: options.projectKey, agent_name: options.agentName, ...(token ? { registration_token: token } : {}) }),
   })
-  if (!response.ok) throw new Error(`blackbird: registration failed with HTTP ${response.status}`)
+  if (!response.ok) throw await blackbirdFailure(response, "registration")
   const result = object(await response.json())
   const issued = result?.["registration_token"]
   if (typeof issued === "string" && issued !== "") token = issued
   if (!token) throw new Error("blackbird: registration returned no reusable token")
   await atomicWrite(tokenPath, `${token}\n`)
   return token
+}
+
+// The daemon reports a failure as application/problem+json carrying a stable
+// error code and a message written for whoever made the call. Reporting only
+// the status discards both, so a user debugging this extension sees a bare
+// number where the server had already explained itself.
+export async function blackbirdFailure(response: Response, action: string): Promise<Error> {
+  let detail = ""
+  try {
+    const problem = object(await response.json())
+    const code = problem?.["code"]
+    if (typeof code === "string" && code !== "") {
+      const message = problem?.["message"]
+      detail = typeof message === "string" && message !== "" ? `: ${code}: ${message}` : `: ${code}`
+    }
+  } catch {
+    // A body that is absent or not JSON leaves the status as the only signal.
+  }
+  return new Error(`blackbird: ${action} failed with HTTP ${response.status}${detail}`)
 }
 
 export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, options: RuntimeOptions, signal: AbortSignal, dependencies: SupervisorDependencies = defaults): Promise<void> {
@@ -259,7 +278,7 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
         url.searchParams.set("limit", "100")
         if (state.cursor) url.searchParams.set("after", state.cursor)
         const response = await dependencies.fetch(url, { headers, signal })
-        if (!response.ok) throw new Error(`blackbird: catch-up failed with HTTP ${response.status}`)
+        if (!response.ok) throw await blackbirdFailure(response, "catch-up")
         const page = object(await response.json())
         if (!page || !Array.isArray(page["events"]) || typeof page["next_cursor"] !== "string") throw new Error("blackbird: invalid catch-up page")
         for (const value of page["events"]) {
@@ -267,7 +286,7 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
           if (event?.["type"] !== "message.available" || typeof event["subject"] !== "string") continue
           if (delivered.has(event["subject"]) || quarantined.has(event["subject"])) continue
           const messageResponse = await dependencies.fetch(new URL(`api/v1/local/messages/${encodeURIComponent(event["subject"])}`, options.baseURL), { headers, signal })
-          if (!messageResponse.ok) throw new Error(`blackbird: message fetch failed with HTTP ${messageResponse.status}`)
+          if (!messageResponse.ok) throw await blackbirdFailure(messageResponse, "message fetch")
           const message = parseMessage(await messageResponse.json())
           if (message.message_id !== event["subject"]) throw new Error("blackbird: message ID mismatch")
           await deliver(message)
@@ -285,7 +304,7 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
         const url = new URL("api/v1/local/coordination/events/stream", options.baseURL)
         if (state.cursor) url.searchParams.set("after", state.cursor)
         const response = await dependencies.fetch(url, { headers: { ...headers, accept: "text/event-stream" }, signal })
-        if (!response.ok) throw new Error(`blackbird: stream failed with HTTP ${response.status}`)
+        if (!response.ok) throw await blackbirdFailure(response, "stream")
         const reader = response.body?.getReader()
         if (!reader) throw new Error("blackbird: stream has no body")
         await reader.read()

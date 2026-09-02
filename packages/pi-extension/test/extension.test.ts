@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { resolveOptions, runSupervisor, type SupervisorDependencies } from "../extensions/index.js"
+import { blackbirdFailure, resolveOptions, runSupervisor, type SupervisorDependencies } from "../extensions/index.js"
 
 const controllers: AbortController[] = []
 afterEach(() => { for (const controller of controllers) controller.abort() })
@@ -151,5 +151,25 @@ describe("supervisor", () => {
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3))
     controller.abort()
     await expect(task).resolves.toBeUndefined()
+  })
+})
+
+describe("blackbirdFailure", () => {
+  it("carries the daemon's error code and message", async () => {
+    const response = new Response(JSON.stringify({ code: "LEASE_CONFLICT", message: "an active overlapping lease exists" }),
+      { status: 409, headers: { "content-type": "application/problem+json" } })
+    const error = await blackbirdFailure(response, "reservation")
+    expect(error.message).toBe("blackbird: reservation failed with HTTP 409: LEASE_CONFLICT: an active overlapping lease exists")
+  })
+
+  it("reports the code alone when the problem carries no message", async () => {
+    const response = new Response(JSON.stringify({ code: "UNAUTHENTICATED" }), { status: 401 })
+    expect((await blackbirdFailure(response, "registration")).message)
+      .toBe("blackbird: registration failed with HTTP 401: UNAUTHENTICATED")
+  })
+
+  it("falls back to the status when the body is not a problem document", async () => {
+    const response = new Response("<html>bad gateway</html>", { status: 502 })
+    expect((await blackbirdFailure(response, "stream")).message).toBe("blackbird: stream failed with HTTP 502")
   })
 })
