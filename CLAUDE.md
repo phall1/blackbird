@@ -303,6 +303,31 @@ that lets the real lookup run asserts something different on a workstation with
 Homebrew than on one without. `internal/install`'s test manager stubs it, and
 that is why every install assertion in the package is reproducible.
 
+## The observation plane
+
+`docs/OBSERVATION_PLANE.md` is the adapter contract for telemetry: token spend,
+latency, and span timing, ingested over `POST /api/v1/local/telemetry` from the
+harness adapters. Read it before touching `*/telemetry.go` or a package's
+emitter.
+
+Two invariants are worth carrying in your head, because both are silent when
+broken:
+
+- **Telemetry may never make a coordination write fail.** It is enforced
+  structurally -- a non-blocking bounded ring, one batched writer, no foreign
+  key from a telemetry table into a coordination table, and errors that are
+  counted rather than returned. If a change makes an observation able to block,
+  reject, or roll back a lease, a message, or a reservation, the change is
+  wrong regardless of what it buys.
+- **The token classes are disjoint and the names say so.** There is no
+  `input_tokens` column, because harnesses disagree about whether that word
+  includes cache and the disagreement does not show up in the numbers. Derive
+  the current set rather than trusting this line:
+
+  ```sh
+  grep -n 'tokens INTEGER' internal/storage/sqlite/migrations/0007_telemetry.sql
+  ```
+
 ## Agent coordination protocol
 
 Blackbird is wired into this repo over MCP. Follow this protocol so parallel
