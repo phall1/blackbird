@@ -466,7 +466,7 @@ func TestListAdminReservationsRejectsInvalidStateAndNormalizesZero(t *testing.T)
 	}
 }
 
-func TestListAdminEventsReturnsNewestFirstAndPreservesFanout(t *testing.T) {
+func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 	t.Parallel()
 	store := newCoordinationStore(t)
 	alice := registerAdminAgent(t, store, adminProjectA, "alice")
@@ -480,7 +480,7 @@ func TestListAdminEventsReturnsNewestFirstAndPreservesFanout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Events) != 3 || page.Events[0].EventType != application.CoordinationEventLeaseAcquired {
+	if len(page.Events) != 2 || page.Events[0].EventType != application.CoordinationEventLeaseAcquired {
 		t.Fatalf("events=%+v", page.Events)
 	}
 	for index := 1; index < len(page.Events); index++ {
@@ -493,19 +493,13 @@ func TestListAdminEventsReturnsNewestFirstAndPreservesFanout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(available.Events) != 2 {
-		t.Fatalf("per-recipient fan-out was collapsed: %+v", available.Events)
+	if len(available.Events) != 1 {
+		t.Fatalf("message fact was fanned out: %+v", available.Events)
 	}
-	actors := map[domain.ActorID]struct{}{}
-	for _, event := range available.Events {
-		if event.SubjectID != message.ID().String() || event.ProjectKey != adminProjectA ||
-			event.WorkspaceID != alice.WorkspaceID || len(event.Payload) == 0 {
-			t.Fatalf("event=%+v", event)
-		}
-		actors[event.ActorID] = struct{}{}
-	}
-	if len(actors) != 2 {
-		t.Fatalf("fan-out actors=%v", actors)
+	event := available.Events[0]
+	if event.SubjectID != message.ID().String() || event.ProjectKey != adminProjectA ||
+		event.WorkspaceID != alice.WorkspaceID || event.ActorID != alice.ActorID || len(event.Payload) == 0 {
+		t.Fatalf("event=%+v", event)
 	}
 	if _, err := store.ListAdminEvents(context.Background(),
 		application.AdminEventsQuery{EventType: "bogus"}); !errors.Is(err, application.ErrInvalidCoordination) {

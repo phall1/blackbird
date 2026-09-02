@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -197,7 +198,7 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	query, _ := application.NewCoordinationEventsQuery(workspace, recipient, application.CoordinationEventCursor{}, 1)
 	first, err := store.SyncCoordinationEvents(context.Background(), query)
 	if err != nil || len(first.Events()) != 1 || !first.HasMore() || first.NextCursor().IsZero() ||
-		first.Events()[0].EventType() != application.CoordinationEventMessageAvailable || first.Events()[0].ActorID() != recipient {
+		first.Events()[0].EventType() != application.CoordinationEventMessageAvailable || first.Events()[0].ActorID() != author {
 		t.Fatalf("first coordination page=%+v error=%v", first, err)
 	}
 	continued, _ := application.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
@@ -224,6 +225,120 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	}
 	if _, err := store.db.Exec(`DELETE FROM coordination_events`); err == nil {
 		t.Fatal("coordination event delete was accepted")
+	}
+	if _, err := store.db.Exec(`UPDATE coordination_event_recipients SET actor_id = ?`, other.String()); err == nil {
+		t.Fatal("coordination event recipient update was accepted")
+	}
+	if _, err := store.db.Exec(`DELETE FROM coordination_event_recipients`); err == nil {
+		t.Fatal("coordination event recipient delete was accepted")
+	}
+}
+
+func TestCoordinationJournalStoresOneMessageFactForAllRecipients(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	workspace := coordinationWorkspace(t, 330)
+	author := coordinationActor(t, 331)
+	toActor := coordinationActor(t, 332)
+	bccActor := coordinationActor(t, 333)
+	outsider := coordinationActor(t, 334)
+	session, _ := domain.ParseActorSessionID(coordinationUUID(335))
+	run, _ := domain.ParseRunID(coordinationUUID(336))
+	conversationID, _ := domain.ParseConversationID(coordinationUUID(337))
+	messageID, _ := domain.ParseMessageID(coordinationUUID(338))
+	if _, err := store.OpenConversation(context.Background(), application.OpenConversationParams{ConversationID: conversationID,
+		WorkspaceID: workspace, RunID: run, OpenedBy: author, OpenedBySession: session, Topic: "one fact"}); err != nil {
+		t.Fatal(err)
+	}
+	to, _ := application.NewRecipient(toActor, application.RecipientTo)
+	bcc, _ := application.NewRecipient(bccActor, application.RecipientBcc)
+	message, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+		ConversationID: conversationID, WorkspaceID: workspace, Author: author, AuthorSession: session,
+		Subject: "event", Body: "body", Recipients: []application.Recipient{to, bcc}, AcknowledgementRequired: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events, recipients int
+	if err := store.db.QueryRow(`SELECT count(*) FROM coordination_events WHERE subject_id = ?`, messageID.String()).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM coordination_event_recipients AS recipient
+		JOIN coordination_events AS event USING(position) WHERE event.subject_id = ?`, messageID.String()).Scan(&recipients); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || recipients != 2 {
+		t.Fatalf("message facts=%d recipients=%d, want one fact for two recipients", events, recipients)
+	}
+	for _, actor := range []domain.ActorID{toActor, bccActor} {
+		query, _ := application.NewCoordinationEventsQuery(workspace, actor, application.CoordinationEventCursor{}, 10)
+		page, syncErr := store.SyncCoordinationEvents(context.Background(), query)
+		if syncErr != nil || len(page.Events()) != 1 || page.Events()[0].ActorID() != author {
+			t.Fatalf("recipient %s page=%+v error=%v", actor, page, syncErr)
+		}
+		if bytes.Contains(page.Events()[0].Payload(), []byte(toActor.String())) ||
+			bytes.Contains(page.Events()[0].Payload(), []byte(bccActor.String())) {
+			t.Fatalf("recipient list leaked through message event payload: %s", page.Events()[0].Payload())
+		}
+	}
+	outsiderQuery, _ := application.NewCoordinationEventsQuery(workspace, outsider, application.CoordinationEventCursor{}, 10)
+	outsiderPage, err := store.SyncCoordinationEvents(context.Background(), outsiderQuery)
+	if err != nil || len(outsiderPage.Events()) != 0 {
+		t.Fatalf("outsider page=%+v error=%v", outsiderPage, err)
+	}
+	digest := message.Digest()
+	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: toActor, ActorSessionID: &session, Kind: application.DeliveryRead}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordDeliveryFact(context.Background(), application.RecordDeliveryFactParams{WorkspaceID: workspace,
+		MessageID: messageID, Recipient: toActor, ActorSessionID: &session, Kind: application.DeliveryAcknowledged,
+		MessageDigest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM coordination_events WHERE subject_id = ?`, messageID.String()).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("read/ack duplicated the durable delivery fact: event count=%d", events)
+	}
+}
+
+func TestCoordinationLeaseReleaseIsWorkspaceVisible(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	workspace := coordinationWorkspace(t, 340)
+	holder := coordinationActor(t, 341)
+	observer := coordinationActor(t, 342)
+	session, _ := domain.ParseActorSessionID(coordinationUUID(343))
+	epoch, _ := domain.ParseAuthorityEpoch(coordinationUUID(344))
+	selector, _ := application.NewLeaseSelector(application.LeaseSelectorExact, "src/main.go")
+	if _, err := store.db.Exec(`INSERT INTO scope_guards(scope_kind, scope_id, authority_id, authority_epoch,
+		write_status, guard_generation, updated_at_us) VALUES ('workspace', ?, ?, ?, 'open', 1, 1)`,
+		workspace.String(), coordinationUUID(345), epoch.String()); err != nil {
+		t.Fatal(err)
+	}
+	leaseID, _ := domain.ParseLeaseID(coordinationUUID(346))
+	lease, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+		WorkspaceID: workspace, Holder: holder, HolderSession: session, AuthorityEpoch: epoch,
+		Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query, _ := application.NewCoordinationEventsQuery(workspace, observer, application.CoordinationEventCursor{}, 10)
+	acquired, err := store.SyncCoordinationEvents(context.Background(), query)
+	if err != nil || len(acquired.Events()) != 1 || acquired.Events()[0].EventType() != application.CoordinationEventLeaseAcquired ||
+		acquired.Events()[0].ActorID() != holder {
+		t.Fatalf("observer acquired page=%+v error=%v", acquired, err)
+	}
+	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{LeaseID: lease.ID(),
+		HolderSession: session, AuthorityEpoch: epoch, Fences: lease.Fences()}); err != nil {
+		t.Fatal(err)
+	}
+	continued, _ := application.NewCoordinationEventsQuery(workspace, observer, acquired.NextCursor(), 10)
+	released, err := store.SyncCoordinationEvents(context.Background(), continued)
+	if err != nil || len(released.Events()) != 1 || released.Events()[0].EventType() != application.CoordinationEventLeaseReleased ||
+		released.Events()[0].ActorID() != holder {
+		t.Fatalf("observer release page=%+v error=%v", released, err)
 	}
 }
 

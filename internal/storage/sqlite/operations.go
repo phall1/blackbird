@@ -269,23 +269,26 @@ func (store *Store) SendMessage(ctx context.Context, params application.SendMess
 			return application.ErrInvalidCoordination
 		}
 		deliveries := make([]application.Delivery, 0, len(params.Recipients))
+		recipients := make([]domain.ActorID, 0, len(params.Recipients))
 		for _, recipient := range params.Recipients {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO message_deliveries(message_id, recipient_actor_id,
 				recipient_kind, acknowledgement_required, available_at_us) VALUES (?, ?, ?, ?, ?)`, params.MessageID.String(),
 				recipient.ActorID().String(), string(recipient.Kind()), params.AcknowledgementRequired, timeMicros(now)); err != nil {
 				return fmt.Errorf("insert SQLite message delivery: %w", err)
 			}
-			payload, payloadErr := coordinationPayload(map[string]any{"conversation_id": params.ConversationID.String(),
-				"message_id": params.MessageID.String(), "recipient_kind": recipient.Kind()})
-			if payloadErr != nil {
-				return payloadErr
-			}
-			if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, recipient.ActorID(),
-				application.CoordinationEventMessageAvailable, params.MessageID.String(), now, payload); err != nil {
-				return err
-			}
+			recipients = append(recipients, recipient.ActorID())
 			delivery, _ := application.NewDeliveryView(recipient, params.AcknowledgementRequired, &now, nil, nil)
 			deliveries = append(deliveries, delivery)
+		}
+		payload, payloadErr := coordinationPayload(map[string]any{"conversation_id": params.ConversationID.String(),
+			"message_id": params.MessageID.String()})
+		if payloadErr != nil {
+			return payloadErr
+		}
+		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Author,
+			application.CoordinationEventMessageAvailable, params.MessageID.String(), now, payload,
+			coordinationVisibilityRecipients, recipients); err != nil {
+			return err
 		}
 		result, err = application.NewMessageView(application.MessageViewParams{MessageID: params.MessageID,
 			ConversationID: params.ConversationID, WorkspaceID: params.WorkspaceID, Author: params.Author,
@@ -548,13 +551,10 @@ func (store *Store) RecordDeliveryFact(ctx context.Context, params application.R
 		if err != nil {
 			return err
 		}
-		changed := false
 		switch params.Kind {
 		case application.DeliveryAvailable:
-			changed = !available.Valid
 			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET available_at_us = COALESCE(available_at_us, ?) WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.MessageID.String(), params.Recipient.String())
 		case application.DeliveryRead:
-			changed = !read.Valid
 			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET read_at_us = COALESCE(read_at_us, ?) WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.MessageID.String(), params.Recipient.String())
 		case application.DeliveryAcknowledged:
 			if !bytes.Equal(digest, params.MessageDigest[:]) {
@@ -564,7 +564,6 @@ func (store *Store) RecordDeliveryFact(ctx context.Context, params application.R
 				!bytes.Equal(acknowledgedDigest, params.MessageDigest[:])) {
 				return coordinationConflict(domain.ErrorCodeStateConflict, domain.ConflictDeliveryFact, "acknowledgement fact already differs")
 			}
-			changed = !acknowledged.Valid
 			_, err = tx.ExecContext(ctx, `UPDATE message_deliveries SET acknowledged_at_us = COALESCE(acknowledged_at_us, ?),
 				acknowledged_by_session_id = COALESCE(acknowledged_by_session_id, ?), acknowledged_message_digest = COALESCE(acknowledged_message_digest, ?)
 				WHERE message_id = ? AND recipient_actor_id = ?`, timeMicros(now), params.ActorSessionID.String(), digest,
@@ -572,23 +571,6 @@ func (store *Store) RecordDeliveryFact(ctx context.Context, params application.R
 		}
 		if err != nil {
 			return err
-		}
-		if changed {
-			eventType := application.CoordinationEventMessageAvailable
-			switch params.Kind {
-			case application.DeliveryRead:
-				eventType = application.CoordinationEventMessageRead
-			case application.DeliveryAcknowledged:
-				eventType = application.CoordinationEventMessageAcknowledged
-			}
-			payload, payloadErr := coordinationPayload(map[string]any{"message_id": params.MessageID.String()})
-			if payloadErr != nil {
-				return payloadErr
-			}
-			if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Recipient, eventType,
-				params.MessageID.String(), now, payload); err != nil {
-				return err
-			}
 		}
 		if err := tx.QueryRowContext(ctx, `SELECT available_at_us, read_at_us, acknowledged_at_us FROM message_deliveries
 			WHERE message_id = ? AND recipient_actor_id = ?`, params.MessageID.String(), params.Recipient.String()).Scan(&available, &read, &acknowledged); err != nil {
@@ -746,7 +728,8 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			return err
 		}
 		return appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
-			application.CoordinationEventLeaseAcquired, params.LeaseID.String(), now, payload)
+			application.CoordinationEventLeaseAcquired, params.LeaseID.String(), now, payload,
+			coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
 }
@@ -798,7 +781,8 @@ func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.Acq
 			return err
 		}
 		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
-			application.CoordinationEventLeaseReleased, lease, now, payload); err != nil {
+			application.CoordinationEventLeaseReleased, lease, now, payload,
+			coordinationVisibilityWorkspace, nil); err != nil {
 			return err
 		}
 	}
@@ -894,7 +878,7 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 			eventType = application.CoordinationEventLeaseReleased
 		}
 		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(), eventType,
-			result.ID().String(), now, payload)
+			result.ID().String(), now, payload, coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
 }
@@ -1122,12 +1106,29 @@ func instantEvidence(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
 }
 
+const (
+	coordinationVisibilityRecipients = "recipients"
+	coordinationVisibilityWorkspace  = "workspace"
+)
+
 func appendCoordinationEvent(ctx context.Context, tx *sql.Tx, workspace domain.WorkspaceID, actor domain.ActorID,
-	eventType application.CoordinationEventType, subjectID string, occurredAt time.Time, payload []byte) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_events(workspace_id, actor_id, event_type,
-		subject_id, occurred_at_us, payload) VALUES (?, ?, ?, ?, ?, ?)`, workspace.String(), actor.String(),
-		string(eventType), subjectID, timeMicros(occurredAt), payload); err != nil {
+	eventType application.CoordinationEventType, subjectID string, occurredAt time.Time, payload []byte,
+	visibility string, recipients []domain.ActorID) error {
+	insert, err := tx.ExecContext(ctx, `INSERT INTO coordination_events(workspace_id, actor_id, event_type,
+		subject_id, occurred_at_us, payload, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)`, workspace.String(), actor.String(),
+		string(eventType), subjectID, timeMicros(occurredAt), payload, visibility)
+	if err != nil {
 		return fmt.Errorf("append SQLite coordination event: %w", err)
+	}
+	position, err := insert.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("read SQLite coordination event position: %w", err)
+	}
+	for _, recipient := range recipients {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_event_recipients(position, actor_id) VALUES (?, ?)`,
+			position, recipient.String()); err != nil {
+			return fmt.Errorf("append SQLite coordination event recipient: %w", err)
+		}
 	}
 	return nil
 }
@@ -1178,9 +1179,16 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 			return application.CoordinationEventsPage{}, err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT position, event_type, subject_id, occurred_at_us, payload
-		FROM coordination_events WHERE workspace_id = ? AND actor_id = ? AND position > ?
-		ORDER BY position LIMIT ?`, query.WorkspaceID().String(), query.ActorID().String(), after, int(query.Limit())+1)
+	rows, err := tx.QueryContext(ctx, `SELECT event.position, event.actor_id, event.event_type, event.subject_id,
+		event.occurred_at_us, event.payload FROM coordination_events AS event
+		WHERE event.workspace_id = ? AND event.position > ? AND (
+			event.visibility = 'workspace'
+			OR event.visibility = 'actor' AND event.actor_id = ?
+			OR event.visibility = 'recipients' AND EXISTS (
+				SELECT 1 FROM coordination_event_recipients AS recipient
+				WHERE recipient.position = event.position AND recipient.actor_id = ?))
+		ORDER BY event.position LIMIT ?`, query.WorkspaceID().String(), after, query.ActorID().String(),
+		query.ActorID().String(), int(query.Limit())+1)
 	if err != nil {
 		return application.CoordinationEventsPage{}, fmt.Errorf("query SQLite coordination events: %w", err)
 	}
@@ -1190,18 +1198,22 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 	nextPosition := after
 	for rows.Next() {
 		var position uint64
-		var eventType, subjectID string
+		var actorText, eventType, subjectID string
 		var occurredAt int64
 		var payload []byte
-		if err := rows.Scan(&position, &eventType, &subjectID, &occurredAt, &payload); err != nil {
+		if err := rows.Scan(&position, &actorText, &eventType, &subjectID, &occurredAt, &payload); err != nil {
 			return application.CoordinationEventsPage{}, err
 		}
 		if len(events) == int(query.Limit()) {
 			hasMore = true
 			break
 		}
+		actor, actorErr := domain.ParseActorID(actorText)
+		if actorErr != nil {
+			return application.CoordinationEventsPage{}, actorErr
+		}
 		event, eventErr := application.NewCoordinationEvent(application.CoordinationEventParams{Position: position,
-			Workspace: query.WorkspaceID(), Actor: query.ActorID(), EventType: application.CoordinationEventType(eventType),
+			Workspace: query.WorkspaceID(), Actor: actor, EventType: application.CoordinationEventType(eventType),
 			SubjectID: subjectID, OccurredAt: microsTime(occurredAt), Payload: payload})
 		if eventErr != nil {
 			return application.CoordinationEventsPage{}, eventErr
@@ -1211,6 +1223,16 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 	}
 	if err := rows.Err(); err != nil {
 		return application.CoordinationEventsPage{}, err
+	}
+	if !hasMore {
+		var head uint64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM coordination_events WHERE workspace_id = ?`,
+			query.WorkspaceID().String()).Scan(&head); err != nil {
+			return application.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination event head: %w", err)
+		}
+		if head > nextPosition {
+			nextPosition = head
+		}
 	}
 	next, err := encodeCoordinationCursor(ctx, tx, query.WorkspaceID(), query.ActorID(), nextPosition)
 	if err != nil {

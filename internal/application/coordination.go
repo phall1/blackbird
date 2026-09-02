@@ -355,8 +355,11 @@ func NewCoordinationEvent(params CoordinationEventParams) (CoordinationEvent, er
 		payload: append([]byte(nil), params.Payload...)}, nil
 }
 
-func (event CoordinationEvent) Position() uint64                 { return event.position }
-func (event CoordinationEvent) WorkspaceID() domain.WorkspaceID  { return event.workspace }
+func (event CoordinationEvent) Position() uint64                { return event.position }
+func (event CoordinationEvent) WorkspaceID() domain.WorkspaceID { return event.workspace }
+
+// ActorID is the actor that caused a recipient- or workspace-visible fact.
+// Legacy actor-visible rows retain their original audience actor.
 func (event CoordinationEvent) ActorID() domain.ActorID          { return event.actor }
 func (event CoordinationEvent) EventType() CoordinationEventType { return event.eventType }
 func (event CoordinationEvent) SubjectID() string                { return event.subjectID }

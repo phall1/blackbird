@@ -524,7 +524,8 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 			return err
 		}
 		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(),
-			application.CoordinationEventLeaseReleased, result.ID().String(), now, payload)
+			application.CoordinationEventLeaseReleased, result.ID().String(), now, payload,
+			coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
 }

@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/domain"
 )
 
 func execRaw(t *testing.T, path, statement string) {
@@ -122,8 +125,8 @@ func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 47 {
-		t.Fatalf("tables=%d, want 47", tables)
+	if tables != 48 {
+		t.Fatalf("tables=%d, want 48", tables)
 	}
 	if err := reopened.IntegrityCheck(context.Background()); err != nil {
 		t.Fatal(err)
@@ -207,6 +210,50 @@ func TestOpenClimbsMigrationLadderFromEveryKnownVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestV7ActorEventsAndCursorsSurviveVisibilityMigration(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "blackbird.db")
+	installLegacyDatabase(t, path, 7)
+	db, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, _ := domain.ParseWorkspaceID("01b8e094-9888-7000-8000-000000000701")
+	actor, _ := domain.ParseActorID("01b8e094-9888-7000-8000-000000000702")
+	if _, err := db.Exec(`INSERT INTO coordination_events(workspace_id, actor_id, event_type, subject_id, occurred_at_us, payload)
+		VALUES (?, ?, 'message.available', 'legacy-message', 1, ?)`, workspace.String(), actor.String(), []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := encodeCoordinationCursor(context.Background(), db, workspace, actor, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(context.Background(), Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	query, _ := application.NewCoordinationEventsQuery(workspace, actor, cursor, 10)
+	page, err := store.SyncCoordinationEvents(context.Background(), query)
+	if err != nil || len(page.Events()) != 1 || page.Events()[0].SubjectID() != "legacy-message" {
+		t.Fatalf("migrated legacy page=%+v error=%v", page, err)
+	}
+	var visibility string
+	var recipients int
+	if err := store.db.QueryRow(`SELECT visibility FROM coordination_events WHERE subject_id = 'legacy-message'`).Scan(&visibility); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM coordination_event_recipients`).Scan(&recipients); err != nil {
+		t.Fatal(err)
+	}
+	if visibility != "actor" || recipients != 0 {
+		t.Fatalf("legacy visibility=%q recipients=%d", visibility, recipients)
 	}
 }
 
