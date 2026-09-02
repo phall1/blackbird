@@ -1,9 +1,9 @@
 # blackbird-opencode
 
-OpenCode V2 Promise plugin that catches up through Blackbird's coordination
-event journal and follows its wake-only stream, then queues each available
-durable message into an OpenCode session without marking it read or acknowledging
-it.
+OpenCode plugin that catches up through Blackbird's coordination event journal
+and follows its wake-only stream, then appends each available durable message to
+an OpenCode session transcript without marking it read, acknowledging it, or
+spending an agent turn.
 
 ## Configuration
 
@@ -53,8 +53,20 @@ The authenticated SSE endpoint receives optional `after` and emits wakeups such
 as `{ "cursor": "..." }`. SSE data is never interpreted as a message body. A
 wakeup or disconnected stream starts another authoritative catch-up pass.
 
-Delivery uses a deterministic prompt and `msg_` ID with `ctx.session.prompt`,
-`delivery: "queue"`, and `resume: true`. Cursor and recent-message dedupe state
+Delivery posts one text part to `POST /session/{id}/message` with `noReply:
+true`, so OpenCode persists the message into the transcript and does *not* run
+an agent turn for it. A delivered message therefore costs the user nothing; the
+agent reads it as context the next time a turn runs (or on the running turn's
+next step, since the loop re-reads the transcript at every step). Nothing in
+this plugin ever starts a turn on the user's behalf.
+
+The message carries a deterministic `msg_` ID derived from the Blackbird message
+ID: OpenCode upserts on that ID, so a redelivery rewrites the same transcript
+entry instead of appending a duplicate. Blackbird's identifiers travel as the
+text part's `metadata` (`blackbird_message_id`, `blackbird_conversation_id`,
+`blackbird_position`).
+
+Cursor and recent-message dedupe state
 are atomically replaced with mode `0600` only after every event in a catch-up
 page has been admitted or deduplicated. This is deliberately at-least-once: a
 crash between OpenCode accepting a deterministic ID and the page state commit

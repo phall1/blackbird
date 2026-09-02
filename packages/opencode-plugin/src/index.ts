@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import { Plugin, type PluginOptions } from "@opencode-ai/plugin"
+import type { PluginInput, PluginModule, PluginOptions } from "@opencode-ai/plugin"
 
 type Cursor = string
 type MessagePosition = string | number
@@ -54,16 +54,72 @@ export interface BlackbirdOptions {
   }
 }
 
+/**
+ * The narrow slice of OpenCode this plugin needs. It exists so the supervisor
+ * can be tested without an OpenCode server, and so an OpenCode API change is a
+ * change to one adapter rather than to the delivery loop.
+ */
 export interface SessionClient {
-  create(input: { title: string; agent?: string; location: { directory: string } }): Promise<{ id: string }>
-  prompt(input: {
+  create(input: { title: string; directory: string }): Promise<{ id: string }>
+  /**
+   * Append a Blackbird message to a session's transcript *without* running an
+   * agent turn. Resolves only once OpenCode has durably accepted the message —
+   * the supervisor marks a message delivered on that promise and must not
+   * record delivery for a message OpenCode rejected.
+   */
+  deliver(input: {
     sessionID: string
-    id: string
+    messageID: string
     text: string
     metadata: Record<string, string | number>
-    delivery: "queue"
-    resume: true
-  }): Promise<unknown>
+    directory: string
+    agent?: string
+  }): Promise<void>
+}
+
+/**
+ * The generated OpenCode client resolves rather than rejects on a non-2xx
+ * response, handing back `{ data: undefined, error }`. Awaiting a call without
+ * this check would let a rejected delivery look successful, and the supervisor
+ * would record the message as delivered and never retry it.
+ */
+function unwrap<T>(result: { data: T | undefined; error: unknown; response: Response }, action: string): T {
+  if (result.error !== undefined || result.data === undefined) {
+    throw new Error(`blackbird: OpenCode ${action} failed with HTTP ${String(result.response.status)}`)
+  }
+  return result.data
+}
+
+export function createSessionClient(client: PluginInput["client"]): SessionClient {
+  return {
+    create: async ({ title, directory }) => {
+      const created = unwrap(await client.session.create({ body: { title }, query: { directory } }), "session create")
+      return { id: created.id }
+    },
+    deliver: async ({ sessionID, messageID, text, metadata, directory, agent }) => {
+      unwrap(
+        await client.session.prompt({
+          path: { id: sessionID },
+          query: { directory },
+          body: {
+            // OpenCode upserts the user message on this ID, so redelivering the
+            // same Blackbird message rewrites one transcript entry rather than
+            // appending a duplicate.
+            messageID,
+            // The whole point: OpenCode persists the message and skips the
+            // agent loop, so a delivered message costs the user no turn.
+            noReply: true,
+            ...(agent === undefined ? {} : { agent }),
+            // Part metadata is the only per-message metadata channel the stable
+            // API has; it is what carries Blackbird's identifiers into the
+            // transcript.
+            parts: [{ type: "text", text, metadata }],
+          },
+        }),
+        "message delivery",
+      )
+    },
+  }
 }
 
 export interface SupervisorDependencies {
@@ -376,8 +432,7 @@ export async function runSupervisor(
     if (existing !== undefined) return existing
     const created = await session.create({
       title: `Blackbird: ${message.subject}`.slice(0, 120),
-      location: { directory: options.projectKey },
-      ...(options.routing.agent === undefined ? {} : { agent: options.routing.agent }),
+      directory: options.projectKey,
     })
     state.sessions[message.conversation_id] = created.id
     await persist()
@@ -388,17 +443,22 @@ export async function runSupervisor(
     const sessionID = await targetSession(message)
     const previous = sessionQueues.get(sessionID) ?? Promise.resolve()
     const queued = previous.then(async () => {
-      await session.prompt({
+      await session.deliver({
         sessionID,
-        id: deterministicMessageID(message.message_id),
+        messageID: deterministicMessageID(message.message_id),
         text: promptText(message),
         metadata: {
           blackbird_message_id: message.message_id,
           blackbird_conversation_id: message.conversation_id,
           blackbird_position: message.position,
         },
-        delivery: "queue",
-        resume: true,
+        directory: options.projectKey,
+        // Only conversation routing owns its session, so only it may pin the
+        // agent. A fixed session belongs to the user; naming an agent there
+        // would switch the agent out from under them.
+        ...(options.routing.mode === "conversation" && options.routing.agent !== undefined
+          ? { agent: options.routing.agent }
+          : {}),
       })
       delivered.add(message.message_id)
     })
@@ -498,17 +558,22 @@ function releaseSupervisor(key: string, supervisor: SharedSupervisor): () => Pro
   }
 }
 
-export default Plugin.define({
+const plugin: PluginModule = {
   id: "phall1.blackbird",
-  setup: (ctx) => {
-    const options = resolveOptions(ctx.options)
-    const session: SessionClient = {
-      create: async (input) => ctx.session.create(input),
-      prompt: async (input) => ctx.session.prompt(input),
-    }
+  // Not `async`: registering the supervisor is synchronous, and the supervisor
+  // itself must keep running in the background rather than be awaited here.
+  server: (input, pluginOptions) => {
+    const raw = pluginOptions ?? {}
+    const options = resolveOptions(raw)
+    const session = createSessionClient(input.client)
     const key = `${options.baseUrl.toString()}\0${options.projectKey}\0${options.agentName}\0${options.stateDir}`
-    return acquireSupervisor(key, (signal) => runSupervisor(session, ctx.options, signal).catch((error: unknown) => {
+    const release = acquireSupervisor(key, (signal) => runSupervisor(session, raw, signal).catch((error: unknown) => {
       if (!signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
     }))
+    // OpenCode tears a plugin down through the returned hooks, so the shared
+    // supervisor's reference release has to hang off `dispose`.
+    return Promise.resolve({ dispose: release })
   },
-})
+}
+
+export default plugin

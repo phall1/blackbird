@@ -1,8 +1,9 @@
 import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
+import type { PluginInput } from "@opencode-ai/plugin"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { acquireSupervisor, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient } from "../src/index.js"
+import { acquireSupervisor, createSessionClient, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient } from "../src/index.js"
 
 const controllers: AbortController[] = []
 afterEach(() => { for (const controller of controllers) controller.abort() })
@@ -63,8 +64,8 @@ describe("supervisor", () => {
     const stateDir = await mkdtemp(join(tmpdir(), "blackbird-plugin-"))
     const controller = new AbortController()
     controllers.push(controller)
-    const prompt = vi.fn<SessionClient["prompt"]>(async () => undefined)
-    const session: SessionClient = { create: vi.fn<SessionClient["create"]>(async () => ({ id: "ses_created" })), prompt }
+    const deliver = vi.fn<SessionClient["deliver"]>(async () => undefined)
+    const session: SessionClient = { create: vi.fn<SessionClient["create"]>(async () => ({ id: "ses_created" })), deliver }
     const requests: { url: URL; init?: RequestInit }[] = []
     let catchUps = 0
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -98,14 +99,14 @@ describe("supervisor", () => {
       routing: { mode: "fixed", sessionID: "ses_fixed" },
       paths: { register: "/register", catchUp: "/events", stream: "/stream", message: "/messages" },
     }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => undefined })
-    await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce())
-    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+    await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce())
+    expect(deliver).toHaveBeenCalledWith({
       sessionID: "ses_fixed",
-      id: deterministicMessageID("message_1"),
-      delivery: "queue",
-      resume: true,
+      messageID: deterministicMessageID("message_1"),
+      directory: "/repo",
+      metadata: { blackbird_message_id: "message_1", blackbird_conversation_id: "conversation_1", blackbird_position: 1 },
       text: "[Blackbird message message_1 from unknown actor]\nSubject: Work\n\nDo it",
-    }))
+    })
     await vi.waitFor(() => expect(catchUps).toBeGreaterThan(1))
     controller.abort()
     await task
@@ -135,7 +136,7 @@ describe("supervisor", () => {
       controller.abort()
       throw new DOMException("Aborted", "AbortError")
     })
-    const session: SessionClient = { create: vi.fn(), prompt: vi.fn() }
+    const session: SessionClient = { create: vi.fn(), deliver: vi.fn() }
     await runSupervisor(session, {
       baseUrl: "https://blackbird.test", projectKey: "/repo", agentName: "agent", stateDir,
       paths: { register: "/register", catchUp: "/events", stream: "/stream" }, routing: { mode: "conversation" },
@@ -151,8 +152,8 @@ describe("supervisor", () => {
     await chmod(stateDir, 0o700)
     const controller = new AbortController()
     controllers.push(controller)
-    const prompt = vi.fn<SessionClient["prompt"]>(async ({ metadata }) => {
-      if (metadata["blackbird_message_id"] === "m2") throw new Error("queue unavailable")
+    const deliver = vi.fn<SessionClient["deliver"]>(async ({ metadata }) => {
+      if (metadata["blackbird_message_id"] === "m2") throw new Error("session unavailable")
     })
     const fetcher = vi.fn(async (input: string | URL | Request) => {
       const url = new URL(input instanceof Request ? input.url : input)
@@ -169,14 +170,126 @@ describe("supervisor", () => {
       return Response.json({ message_id: id, conversation_id: "conversation", subject: id, body: `body ${id}`, position: id === "m1" ? 1 : 2 })
     })
     const create = vi.fn<SessionClient["create"]>(async () => ({ id: "session" }))
-    await runSupervisor({ create, prompt }, {
+    await runSupervisor({ create, deliver }, {
       baseUrl: "https://blackbird.test", projectKey: "/repo", agentName: "agent", stateDir,
       paths: { register: "/register", catchUp: "/events", stream: "/stream", message: "/messages" },
       backoff: { minimumMs: 10, maximumMs: 10, jitter: 0 },
     }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => { controller.abort() } })
     const state = JSON.parse(await readFile(join(stateDir, "cursor.json"), "utf8")) as unknown
     expect(state).toMatchObject({ cursor: "" })
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({ location: { directory: "/repo" } }))
-    expect(prompt.mock.calls.map(([call]) => call.metadata["blackbird_message_id"])).toEqual(["m1", "m2"])
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ directory: "/repo" }))
+    expect(deliver.mock.calls.map(([call]) => call.metadata["blackbird_message_id"])).toEqual(["m1", "m2"])
+  })
+})
+
+type OpenCodeClient = PluginInput["client"]
+
+interface StubCall { readonly method: "create" | "prompt"; readonly options: Record<string, unknown> }
+
+function stubClient(
+  responses: { create?: unknown; prompt?: unknown } = {},
+): { client: OpenCodeClient; calls: StubCall[] } {
+  const calls: StubCall[] = []
+  const ok = (data: unknown): unknown => ({ data, error: undefined, response: new Response(null, { status: 200 }) })
+  const client = {
+    session: {
+      create: async (options: Record<string, unknown>) => {
+        calls.push({ method: "create", options })
+        return responses.create ?? ok({ id: "ses_new" })
+      },
+      prompt: async (options: Record<string, unknown>) => {
+        calls.push({ method: "prompt", options })
+        return responses.prompt ?? ok({ info: { id: "msg_x" }, parts: [] })
+      },
+    },
+  }
+  return { client: client as unknown as OpenCodeClient, calls }
+}
+
+describe("OpenCode adapter", () => {
+  it("delivers a message without spending an agent turn", async () => {
+    const { client, calls } = stubClient()
+    await createSessionClient(client).deliver({
+      sessionID: "ses_fixed",
+      messageID: deterministicMessageID("message_1"),
+      text: "hello",
+      metadata: { blackbird_message_id: "message_1", blackbird_position: 7 },
+      directory: "/repo",
+      agent: "build",
+    })
+    expect(calls).toEqual([{
+      method: "prompt",
+      options: {
+        path: { id: "ses_fixed" },
+        query: { directory: "/repo" },
+        body: {
+          messageID: deterministicMessageID("message_1"),
+          noReply: true,
+          agent: "build",
+          parts: [{ type: "text", text: "hello", metadata: { blackbird_message_id: "message_1", blackbird_position: 7 } }],
+        },
+      },
+    }])
+  })
+
+  it("omits the agent when routing does not pin one", async () => {
+    const { client, calls } = stubClient()
+    await createSessionClient(client).deliver({
+      sessionID: "ses_fixed", messageID: "msg_1", text: "hello", metadata: {}, directory: "/repo",
+    })
+    expect(calls[0]?.options["body"]).not.toHaveProperty("agent")
+  })
+
+  it("creates a titled session in the project directory", async () => {
+    const { client, calls } = stubClient()
+    expect(await createSessionClient(client).create({ title: "Blackbird: Work", directory: "/repo" })).toEqual({ id: "ses_new" })
+    expect(calls).toEqual([{ method: "create", options: { body: { title: "Blackbird: Work" }, query: { directory: "/repo" } } }])
+  })
+
+  it("rejects a refused delivery so the supervisor retries instead of recording it", async () => {
+    // The generated client resolves with `{ data: undefined, error }` on a
+    // non-2xx; a delivery that silently resolved here would be lost forever.
+    const refusal = { data: undefined, error: { message: "no such session" }, response: new Response(null, { status: 404 }) }
+    const { client } = stubClient({ prompt: refusal, create: refusal })
+    const adapter = createSessionClient(client)
+    await expect(adapter.deliver({
+      sessionID: "ses_gone", messageID: "msg_1", text: "hello", metadata: {}, directory: "/repo",
+    })).rejects.toThrow(/message delivery failed with HTTP 404/)
+    await expect(adapter.create({ title: "t", directory: "/repo" })).rejects.toThrow(/session create failed with HTTP 404/)
+  })
+
+  it("carries a streamed Blackbird message through the adapter as a no-turn delivery", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "blackbird-plugin-"))
+    const controller = new AbortController()
+    controllers.push(controller)
+    const { client, calls } = stubClient()
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : input)
+      if (url.pathname === "/register") return Response.json({ registration_token: "secret" })
+      if (url.pathname === "/events") {
+        return Response.json({
+          events: [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "2026-08-12T00:00:00Z" }],
+          next_cursor: "cursor-1",
+          has_more: false,
+        })
+      }
+      if (url.pathname === "/messages/m1") {
+        return Response.json({ message_id: "m1", conversation_id: "c1", subject: "Work", body: "Do it", position: 1, author_actor_id: "actor_1" })
+      }
+      controller.abort()
+      throw new DOMException("Aborted", "AbortError")
+    })
+    await runSupervisor(createSessionClient(client), {
+      baseUrl: "https://blackbird.test", projectKey: "/repo", agentName: "agent", stateDir,
+      paths: { register: "/register", catchUp: "/events", stream: "/stream", message: "/messages" },
+      routing: { mode: "conversation", agent: "build" },
+      backoff: { minimumMs: 10, maximumMs: 10, jitter: 0 },
+    }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => undefined })
+    expect(calls.map(({ method }) => method)).toEqual(["create", "prompt"])
+    const body = calls[1]?.options["body"] as { noReply: boolean; agent: string; parts: { metadata: Record<string, unknown> }[] }
+    expect(body.noReply).toBe(true)
+    expect(body.agent).toBe("build")
+    expect(body.parts[0]?.metadata).toEqual({ blackbird_message_id: "m1", blackbird_conversation_id: "c1", blackbird_position: 1 })
+    expect(JSON.parse(await readFile(join(stateDir, "cursor.json"), "utf8"))).toMatchObject({ delivered: ["m1"], sessions: { c1: "ses_new" } })
   })
 })

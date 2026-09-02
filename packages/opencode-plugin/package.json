@@ -43,7 +43,7 @@
   },
   "homepage": "https://github.com/phall1/blackbird/tree/main/packages/opencode-plugin#readme",
   "dependencies": {
-    "@opencode-ai/plugin": "0.0.0-next-17364"
+    "@opencode-ai/plugin": "1.18.26"
   },
   "devDependencies": {
     "@eslint/js": "9.33.0",
