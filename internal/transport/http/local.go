@@ -25,6 +25,7 @@ const (
 	PathLocalCoordinationEvents       = "/api/v1/local/coordination/events"
 	PathLocalCoordinationEventsStream = "/api/v1/local/coordination/events/stream"
 	PathLocalMessages                 = "/api/v1/local/messages/"
+	PathLocalTelemetry                = "/api/v1/local/telemetry"
 
 	localMaxJSONBytes = 8 << 10
 	localDefaultLimit = 100
@@ -33,8 +34,21 @@ const (
 	localWriteTimeout = 5 * time.Second
 )
 
+// TelemetryOffer is the observation plane's only entry point into this
+// package: a non-blocking hand-off that reports whether the observations were
+// queued. It is an interface rather than the concrete sink so that a handler
+// test can assert the drop path without running a drain goroutine, and so that
+// a daemon built without telemetry composes a nil here rather than a stub.
+type TelemetryOffer interface {
+	Offer(application.TelemetryEnvelope) bool
+}
+
 type LocalDependencies struct {
 	Coordination application.LocalCoordinationStore
+	// Telemetry is optional. A nil sink makes the ingest route answer
+	// DEPENDENCY_UNAVAILABLE instead of disappearing, so an adapter learns that
+	// this daemon does not collect rather than that it does not exist.
+	Telemetry TelemetryOffer
 	// Logger receives the causes the sanitized local problems drop, plus one
 	// access record per request. A nil Logger is silent rather than a
 	// composition error, so a test can exercise a route without a log sink.
@@ -45,11 +59,12 @@ type LocalDependencies struct {
 }
 
 type localHandler struct {
-	coordination application.LocalCoordinationStore
-	logger       *slog.Logger
-	pollInterval time.Duration
-	heartbeat    time.Duration
-	writeTimeout time.Duration
+	coordination  application.LocalCoordinationStore
+	telemetrySink TelemetryOffer
+	logger        *slog.Logger
+	pollInterval  time.Duration
+	heartbeat     time.Duration
+	writeTimeout  time.Duration
 }
 
 // localRequestIDKey carries the request's correlation id from the access
@@ -142,8 +157,12 @@ func NewLocalHandler(dependencies LocalDependencies) (stdhttp.Handler, error) {
 	handler := &localHandler{coordination: dependencies.Coordination, logger: logger,
 		pollInterval: dependencies.PollInterval,
 		heartbeat:    dependencies.Heartbeat, writeTimeout: dependencies.WriteTimeout}
+	if !isNil(dependencies.Telemetry) {
+		handler.telemetrySink = dependencies.Telemetry
+	}
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("POST "+PathLocalAgentRegister, handler.register)
+	mux.HandleFunc("POST "+PathLocalTelemetry, handler.telemetry)
 	mux.HandleFunc("GET "+PathLocalCoordinationEvents, handler.events)
 	mux.HandleFunc("GET "+PathLocalCoordinationEventsStream, handler.stream)
 	mux.HandleFunc("GET "+PathLocalMessages+"{message_id}", handler.message)
@@ -516,10 +535,18 @@ func strictJSONRequest(writer stdhttp.ResponseWriter, request *stdhttp.Request) 
 }
 
 func decodeLocalJSON(writer stdhttp.ResponseWriter, request *stdhttp.Request, destination any) error {
-	if request.ContentLength > localMaxJSONBytes {
+	return decodeLocalJSONWithin(writer, request, destination, localMaxJSONBytes)
+}
+
+// decodeLocalJSONWithin is decodeLocalJSON with the body limit named by the
+// caller. Telemetry submits batches and needs a larger ceiling than a
+// registration does; nothing else about the strictness changes.
+func decodeLocalJSONWithin(writer stdhttp.ResponseWriter, request *stdhttp.Request,
+	destination any, limit int64) error {
+	if request.ContentLength > limit {
 		return errors.New("request body is too large")
 	}
-	body, err := io.ReadAll(stdhttp.MaxBytesReader(writer, request.Body, localMaxJSONBytes))
+	body, err := io.ReadAll(stdhttp.MaxBytesReader(writer, request.Body, limit))
 	if err != nil {
 		return err
 	}

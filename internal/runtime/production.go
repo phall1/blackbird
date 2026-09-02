@@ -195,8 +195,17 @@ func composeProductionBundle(
 		return HandlerBundle{}, fmt.Errorf("compose HTTP transport: %w", err)
 	}
 	coordination := localCoordinationStore(storage)
+	// The observation plane (ADR-0001) composes only when the store offers it,
+	// and its absence is not a composition error: a daemon that coordinates
+	// without observing is a working daemon, while one that refuses to start
+	// because it cannot record token counts is not.
+	observations, _ := storage.(application.TelemetryStore)
+	var telemetryIngest *telemetryWorker
+	if observations != nil {
+		telemetryIngest = newTelemetryWorker(observations, logger)
+	}
 	localHTTPHandler, err := httptransport.NewLocalHandler(httptransport.LocalDependencies{
-		Coordination: coordination, Logger: logger,
+		Coordination: coordination, Logger: logger, Telemetry: telemetryOffer(telemetryIngest),
 	})
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose local HTTP transport: %w", err)
@@ -266,7 +275,7 @@ func composeProductionBundle(
 		slog.String("readiness_path", httptransport.PathReady))
 	return HandlerBundle{
 		HTTP:    telemetry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
-		Workers: []Worker{handshake},
+		Workers: telemetryWorkers(handshake, telemetryIngest),
 		// Without a session timeout the SDK never closes an idle session, so a
 		// crashed agent or a killed terminal leaks its map entry and goroutines
 		// for the daemon's lifetime.
@@ -283,6 +292,25 @@ func (worker *adminHandshakeWorker) SetBoundHTTPAddress(address string) {
 		return
 	}
 	worker.handshake.HTTPAddress = address
+}
+
+// telemetryOffer returns a nil interface rather than a typed nil pointer when
+// telemetry is absent, so the transport's nil check is the one that decides.
+func telemetryOffer(worker *telemetryWorker) httptransport.TelemetryOffer {
+	if worker == nil {
+		return nil
+	}
+	return worker.sink
+}
+
+// telemetryWorkers keeps the observation plane last in the worker slice.
+// Runtime stops workers in reverse order, so last here means stopped first --
+// the drain finishes before anything it might still be observing goes away.
+func telemetryWorkers(handshake Worker, telemetry *telemetryWorker) []Worker {
+	if telemetry == nil {
+		return []Worker{handshake}
+	}
+	return []Worker{handshake, telemetry}
 }
 
 func localCoordinationStore(storage Storage) application.LocalCoordinationStore {
