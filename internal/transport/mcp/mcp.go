@@ -55,10 +55,12 @@ const (
 	ToolReservationsStatus        = "blackbird_reservations_status"
 	ToolWait                      = "blackbird_wait"
 
-	ResourceCurrentContext = "blackbird://session/current/context"
-	ResourceContextDeltas  = "blackbird://session/current/context-deltas{?cursor,limit}"
+	ResourceCurrentContext       = "blackbird://session/current/context"
+	ResourceContextDeltas        = "blackbird://session/current/context-deltas{?cursor,limit}"
+	ResourceCoordinationProtocol = "blackbird://coordination/protocol"
 
 	mediaTypeJSON                = "application/json"
+	mediaTypeMarkdown            = "text/markdown"
 	defaultCoordinationPageLimit = 50
 	defaultReservationTTLSeconds = 3600
 	// maxCoordinationBlockers bounds the holders reported alongside a lease
@@ -153,6 +155,7 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	}
 	registerResources(sdk, dependencies)
 	if !isNil(dependencies.Coordination) {
+		registerCoordinationProtocol(sdk)
 		registerCoordinationTools(sdk, dependencies.Coordination, logger)
 	}
 	return server, nil
@@ -510,7 +513,8 @@ func (blocked *blockedError) Unwrap() error { return blocked.cause }
 
 func registerCoordinationTools(server *sdkmcp.Server, store application.LocalCoordinationStore, logger *slog.Logger) {
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolAgentRegister,
-		Description: "Start or resume a durable local agent session for a repository key and agent name. " +
+		Description: "Call this first. Read blackbird://coordination/protocol for the complete workflow. " +
+			"Start or resume a durable local agent session for a repository key and agent name. " +
 			"The result reports the state already bound to this agent: the reservations it still holds and " +
 			"the time left on each, its unread and unacknowledged mail, its open conversations, and the other " +
 			"agents present. A resuming agent must act on the reservations it is handed back."},
@@ -1274,6 +1278,33 @@ func registerTool[Request, Result any](server *sdkmcp.Server, name, operation st
 			StructuredContent: result,
 		}, nil
 	})
+}
+
+const coordinationProtocol = `# Blackbird coordination protocol
+
+1. Call blackbird_agent_register with a repository key and stable agent name. Persist its registration_token. On restart, call it again with that token and act on every reservation, message, and conversation returned in the snapshot. Pass the same value as agent_token to every other tool.
+2. Before editing, call blackbird_reservation_acquire with the narrowest exact files or subtree and an honest TTL. Shared claims coexist; an exclusive claim conflicts with every overlap.
+3. Use one blackbird_conversation_open slug per work item. Address peers by the names from blackbird_agents_list. Read mail with blackbird_inbox_fetch or blackbird_thread_fetch and record only your own delivery facts with blackbird_message_fact.
+4. On LEASE_CONFLICT, never retry blindly or widen the claim. Use the returned blockers or blackbird_reservations_status, then message the holder, narrow to a disjoint path, or call blackbird_wait once and reacquire when it returns path_free.
+5. Before expiry, call blackbird_reservation_change with action=renew and the latest fences. As soon as the edit is done, call it with action=release. Always replace saved fences with the newest result.
+
+Failures are structured. Branch on code and retryable; quote request_id in bug reports. Acknowledging a handoff is the recipient's action, never the sender's.
+`
+
+// registerCoordinationProtocol exposes the workflow before registration, when
+// the caller has no token and project-local instructions may not exist. The
+// tool descriptions remain the operation-level reference; this resource only
+// supplies their order and the recovery rules that span calls.
+func registerCoordinationProtocol(server *sdkmcp.Server) {
+	server.AddResource(&sdkmcp.Resource{URI: ResourceCoordinationProtocol, Name: "Blackbird coordination protocol",
+		MIMEType: mediaTypeMarkdown, Description: "Start, reserve, communicate, recover from conflicts, and release without relying on repository-local instructions."},
+		func(_ context.Context, request *sdkmcp.ReadResourceRequest) (*sdkmcp.ReadResourceResult, error) {
+			if request == nil || request.Params == nil || request.Params.URI != ResourceCoordinationProtocol {
+				return nil, sdkmcp.ResourceNotFoundError("")
+			}
+			return &sdkmcp.ReadResourceResult{Contents: []*sdkmcp.ResourceContents{{URI: ResourceCoordinationProtocol,
+				MIMEType: mediaTypeMarkdown, Text: coordinationProtocol}}}, nil
+		})
 }
 
 func registerResources(server *sdkmcp.Server, dependencies Dependencies) {

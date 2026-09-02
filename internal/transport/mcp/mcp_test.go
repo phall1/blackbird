@@ -527,8 +527,44 @@ func TestIdentityPlaneStaysOffMCPUnlessExposed(t *testing.T) {
 	if len(discovery) > maxCoordinationDiscoveryBytes {
 		t.Fatalf("coordination tools/list = %d bytes, want at most %d", len(discovery), maxCoordinationDiscoveryBytes)
 	}
-	// Resources are a fixed pair of URIs rather than a per-request token cost, so
-	// withholding the tools must not withhold them.
+	resources, err := client.ListResources(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	listedProtocol := false
+	for _, resource := range resources.Resources {
+		if resource.URI == ResourceCoordinationProtocol {
+			listedProtocol = true
+		}
+	}
+	if !listedProtocol {
+		t.Fatalf("coordination protocol resource was not published: %+v", resources.Resources)
+	}
+	resourceDiscovery, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources/list: %v", err)
+	}
+	t.Logf("resources/list: %d bytes for %d resources", len(resourceDiscovery), len(resources.Resources))
+
+	protocol, err := client.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCoordinationProtocol})
+	if err != nil {
+		t.Fatalf("read coordination protocol: %v", err)
+	}
+	if len(protocol.Contents) != 1 || protocol.Contents[0].MIMEType != mediaTypeMarkdown {
+		t.Fatalf("coordination protocol resource = %+v", protocol.Contents)
+	}
+	for _, required := range []string{ToolAgentRegister, ToolReservationAcquire, ToolConversationOpen,
+		ToolMessageFact, "LEASE_CONFLICT", "action=renew", "action=release"} {
+		if !strings.Contains(protocol.Contents[0].Text, required) {
+			t.Errorf("coordination protocol does not name %q", required)
+		}
+	}
+	if binder.called.Load() {
+		t.Fatal("public coordination protocol attempted to bind an actor session")
+	}
+
+	// Session context resources remain available independently of the
+	// coordination protocol and still enforce their existing actor binding.
 	if _, err := client.ReadResource(context.Background(), &sdkmcp.ReadResourceParams{URI: ResourceCurrentContext}); err != nil {
 		t.Fatalf("ReadResource: %v", err)
 	}
@@ -1161,6 +1197,9 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	register := tools[ToolAgentRegister]
 	if !strings.Contains(register.Description, "reservations") {
 		t.Errorf("agent_register description does not mention the reservations it returns: %q", register.Description)
+	}
+	if !strings.Contains(register.Description, ResourceCoordinationProtocol) {
+		t.Errorf("agent_register description does not point new agents to the protocol: %q", register.Description)
 	}
 
 	// The wait ceiling is published as well as enforced, so a client discovers
