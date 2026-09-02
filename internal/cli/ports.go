@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/phall1/blackbird/internal/adminapi"
 	"github.com/phall1/blackbird/internal/cli/render"
 	"github.com/phall1/blackbird/internal/install"
 )
@@ -46,78 +47,17 @@ type Health struct {
 	Detail        string `json:"detail,omitempty"`
 }
 
-type RuntimeMetrics struct {
-	Requests       map[string]map[string]int64 `json:"requests"`
-	LeaseConflicts int64                       `json:"lease_conflicts"`
-	SSEConnections int64                       `json:"sse_connections"`
-	DatabaseBytes  int64                       `json:"database_bytes"`
-	WALBytes       int64                       `json:"wal_bytes"`
-}
+type RuntimeMetrics = adminapi.RuntimeMetrics
 
-type Identity struct {
-	Version        string         `json:"version"`
-	Commit         string         `json:"commit"`
-	BuiltAt        string         `json:"built_at"`
-	PID            int            `json:"pid"`
-	StartedAt      string         `json:"started_at"`
-	UptimeMS       int64          `json:"uptime_ms"`
-	HTTPAddress    string         `json:"http_address"`
-	MCPAddress     string         `json:"mcp_address"`
-	StorageBackend string         `json:"storage_backend"`
-	DatabasePath   string         `json:"database_path"`
-	SchemaVersion  int            `json:"schema_version"`
-	ObservedAt     string         `json:"observed_at"`
-	Metrics        RuntimeMetrics `json:"metrics"`
-}
+type Identity = adminapi.Identity
 
-type Overview struct {
-	Projects            int    `json:"projects"`
-	Agents              int    `json:"agents"`
-	ActiveAgents        int    `json:"active_agents"`
-	Conversations       int    `json:"conversations"`
-	Messages            int    `json:"messages"`
-	Deliveries          int    `json:"deliveries"`
-	UnreadDeliveries    int    `json:"unread_deliveries"`
-	UnackedDeliveries   int    `json:"unacked_deliveries"`
-	ActiveReservations  int    `json:"active_reservations"`
-	ExpiredReservations int    `json:"expired_reservations"`
-	CoordinationEvents  int    `json:"coordination_events"`
-	ObservedAt          string `json:"observed_at"`
-}
+type Overview = adminapi.Overview
 
-type Project struct {
-	ProjectKey    string `json:"project_key"`
-	WorkspaceID   string `json:"workspace_id"`
-	RunID         string `json:"run_id,omitempty"`
-	Agents        int    `json:"agents"`
-	ActiveAgents  int    `json:"active_agents"`
-	Conversations int    `json:"conversations"`
-	CreatedAt     string `json:"created_at"`
-	LastEventAt   string `json:"last_event_at,omitempty"`
-}
+type Project = adminapi.Project
 
-type Agent struct {
-	ProjectKey        string `json:"project_key"`
-	AgentName         string `json:"agent_name"`
-	ActorID           string `json:"actor_id"`
-	SessionID         string `json:"session_id,omitempty"`
-	Active            bool   `json:"active"`
-	CreatedAt         string `json:"created_at"`
-	StartedAt         string `json:"started_at,omitempty"`
-	LastSeenAt        string `json:"last_seen_at,omitempty"`
-	UnreadDeliveries  int    `json:"unread_deliveries"`
-	UnackedDeliveries int    `json:"unacked_deliveries"`
-	ActiveLeases      int    `json:"active_leases"`
-}
+type Agent = adminapi.Agent
 
-type InboxSummary struct {
-	ProjectKey        string `json:"project_key"`
-	AgentName         string `json:"agent_name"`
-	ActorID           string `json:"actor_id"`
-	UnreadDeliveries  int    `json:"unread_deliveries"`
-	UnackedDeliveries int    `json:"unacked_deliveries"`
-	OldestUnreadAt    string `json:"oldest_unread_at,omitempty"`
-}
+type InboxSummary = adminapi.InboxSummary
 
 // InboxItem is one delivery attributed to its recipient. Message bodies are
 // never projected by the admin surface, so the CLI cannot render one.
@@ -158,10 +98,7 @@ type Conversation struct {
 	LastMessageSubject string `json:"last_message_subject,omitempty"`
 }
 
-type Selector struct {
-	Kind string `json:"kind"`
-	Path string `json:"path"`
-}
+type Selector = adminapi.Selector
 
 type Reservation struct {
 	LeaseID         string     `json:"lease_id"`
@@ -250,11 +187,7 @@ type ReservationsPage struct {
 	Truncated    bool          `json:"truncated"`
 }
 
-type ReservationRelease struct {
-	LeaseID    string `json:"lease_id"`
-	ReleasedAt string `json:"released_at"`
-	Forced     bool   `json:"forced"`
-}
+type ReservationRelease = adminapi.ReservationRelease
 
 type EventsPage struct {
 	Events    []Event `json:"events"`

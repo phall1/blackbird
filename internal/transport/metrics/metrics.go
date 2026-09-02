@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+
+	"github.com/phall1/blackbird/internal/adminapi"
 )
 
 // Registry is the dependency-free metrics surface for one daemon process.
@@ -20,13 +22,7 @@ type Registry struct {
 }
 
 // Snapshot is the authenticated admin wire shape consumed by status -v.
-type Snapshot struct {
-	Requests       map[string]map[string]int64 `json:"requests"`
-	LeaseConflicts int64                       `json:"lease_conflicts"`
-	SSEConnections int64                       `json:"sse_connections"`
-	DatabaseBytes  int64                       `json:"database_bytes"`
-	WALBytes       int64                       `json:"wal_bytes"`
-}
+type Snapshot = adminapi.RuntimeMetrics
 
 func New() *Registry { return &Registry{requests: make(map[string]map[string]int64)} }
 

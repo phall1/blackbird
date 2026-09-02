@@ -26,6 +26,7 @@ var outwardLayers = map[string]bool{
 }
 
 var allowedInternalLayers = map[string]bool{
+	"adminapi":         true,
 	"domain":           true,
 	"application":      true,
 	"storage":          true,
@@ -174,12 +175,14 @@ func TestBoundaryPolicyExamples(t *testing.T) {
 		{name: "storage application", importer: "storage", importPath: modulePath + "/internal/application"},
 		{name: "storage integration", importer: "storage", importPath: modulePath + "/internal/integration/phux", wantError: true},
 		{name: "storage runtime", importer: "storage", importPath: modulePath + "/internal/runtime", wantError: true},
+		{name: "transport admin API", importer: "transport", importPath: modulePath + "/internal/adminapi"},
 		{name: "runtime transport", importer: "runtime", importPath: modulePath + "/internal/transport/http"},
 		{name: "install same layer", importer: "install", importPath: modulePath + "/internal/install/probe"},
 		{name: "install domain", importer: "install", importPath: modulePath + "/internal/domain", wantError: true},
 		{name: "install application", importer: "install", importPath: modulePath + "/internal/application", wantError: true},
 		{name: "cli install", importer: "cli", importPath: modulePath + "/internal/install"},
 		{name: "cli same layer", importer: "cli", importPath: modulePath + "/internal/cli/render"},
+		{name: "cli admin API", importer: "cli", importPath: modulePath + "/internal/adminapi"},
 		{name: "cli domain", importer: "cli", importPath: modulePath + "/internal/domain", wantError: true},
 		{name: "cli application", importer: "cli", importPath: modulePath + "/internal/application", wantError: true},
 		{name: "cli runtime", importer: "cli", importPath: modulePath + "/internal/runtime", wantError: true},
@@ -206,6 +209,7 @@ func TestBoundaryPolicyExamples(t *testing.T) {
 		wantLayer string
 		wantKnown bool
 	}{
+		{directory: "internal/adminapi", wantLayer: "adminapi", wantKnown: true},
 		{directory: "internal/domain/identity", wantLayer: "domain", wantKnown: true},
 		{directory: "internal/architecturetest", wantLayer: "architecturetest", wantKnown: true},
 		{directory: "internal/experimental", wantLayer: "experimental", wantKnown: false},
@@ -268,8 +272,12 @@ func validateImport(importer, importPath string, standard map[string]bool) error
 		if imported != "domain" && imported != "application" {
 			return fmt.Errorf("application may import only its own layer and domain among Blackbird packages; found %s", imported)
 		}
+	case "adminapi":
+		if imported != "adminapi" {
+			return fmt.Errorf("adminapi may import only itself among Blackbird packages; found %s", imported)
+		}
 	case "storage", "integration", "transport":
-		if imported != "domain" && imported != "application" && imported != importer {
+		if imported != "adminapi" && imported != "domain" && imported != "application" && imported != importer {
 			return fmt.Errorf("%s may import inward layers or itself; found %s", importer, imported)
 		}
 	case "install":
@@ -277,8 +285,8 @@ func validateImport(importer, importPath string, standard map[string]bool) error
 			return fmt.Errorf("install may import only its own layer among Blackbird packages; found %s", imported)
 		}
 	case "cli":
-		if imported != "cli" && imported != "install" {
-			return fmt.Errorf("cli may import only its own layer and install among Blackbird packages; found %s", imported)
+		if imported != "adminapi" && imported != "cli" && imported != "install" {
+			return fmt.Errorf("cli may import only adminapi, its own layer, and install among Blackbird packages; found %s", imported)
 		}
 	default:
 		if outwardLayers[imported] && importer != "runtime" && importer != "cmd" {
