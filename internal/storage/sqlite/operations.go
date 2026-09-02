@@ -657,10 +657,8 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		for _, requested := range params.Selectors {
 			keys[requested.Key()] = struct{}{}
 			for _, prior := range existing {
-				// The holder's own selector key is deliberately left out of the
-				// fence set: bumping a counter this request does not name would
-				// supersede the holder's own still-valid fences on a lease this
-				// acquisition may not be replacing at all.
+				// Another claim by this actor is not a blocker. Its generation is
+				// advanced only when this request names the same selector key.
 				if prior.holder == params.Holder.String() || !application.LeaseSelectorsOverlap(requested, prior.selector) {
 					continue
 				}
@@ -691,7 +689,7 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 				return err
 			}
 		}
-		var fences []application.Fence
+		generations := make(map[string]uint64, len(selectors))
 		if params.Mode == application.LeaseExclusive {
 			ordered := make([]string, 0, len(keys))
 			for key := range keys {
@@ -713,13 +711,12 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 				if _, err := tx.ExecContext(ctx, `INSERT INTO lease_fences(lease_id, conflict_key, counter) VALUES (?, ?, ?)`, params.LeaseID.String(), key, counter); err != nil {
 					return err
 				}
-				fence, _ := application.NewFence(key, counter)
-				fences = append(fences, fence)
+				generations[key] = counter
 			}
 		}
 		result, err = application.NewLeaseView(application.LeaseViewParams{LeaseID: params.LeaseID, WorkspaceID: params.WorkspaceID,
 			Holder: params.Holder, HolderSession: params.HolderSession, AuthorityEpoch: params.AuthorityEpoch, Mode: params.Mode,
-			Selectors: selectors, Fences: fences, AcquiredAt: now, ExpiresAt: expires})
+			Selectors: selectors, ClaimGenerations: generations, AcquiredAt: now, ExpiresAt: expires})
 		if err != nil {
 			return err
 		}
@@ -746,14 +743,7 @@ func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.Acq
 	held map[string][]application.LeaseSelector, now time.Time) error {
 	superseded := make([]string, 0, len(held))
 	for lease, selectors := range held {
-		covered := true
-		for _, selector := range selectors {
-			if !coveredBySelectors(params.Selectors, selector) {
-				covered = false
-				break
-			}
-		}
-		if covered {
+		if sameSelectorSet(params.Selectors, selectors) {
 			superseded = append(superseded, lease)
 		}
 	}
@@ -789,13 +779,20 @@ func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.Acq
 	return nil
 }
 
-func coveredBySelectors(outer []application.LeaseSelector, inner application.LeaseSelector) bool {
-	for _, selector := range outer {
-		if application.LeaseSelectorCovers(selector, inner) {
-			return true
+func sameSelectorSet(left, right []application.LeaseSelector) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	keys := make(map[string]struct{}, len(left))
+	for _, selector := range left {
+		keys[selector.Key()] = struct{}{}
+	}
+	for _, selector := range right {
+		if _, ok := keys[selector.Key()]; !ok {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (store *Store) RenewLease(ctx context.Context, params application.ChangeLeaseParams) (application.Lease, error) {
@@ -813,59 +810,42 @@ func (store *Store) ReleaseLease(ctx context.Context, params application.ChangeL
 }
 
 func (store *Store) changeLease(ctx context.Context, params application.ChangeLeaseParams, release bool) (application.Lease, error) {
-	if params.LeaseID.IsZero() || params.HolderSession.IsZero() || params.AuthorityEpoch.IsZero() {
+	if params.WorkspaceID.IsZero() || params.Holder.IsZero() || params.HolderSession.IsZero() ||
+		params.AuthorityEpoch.IsZero() || len(params.Selectors) == 0 || len(params.Selectors) > application.MaxLeaseSelectors {
 		return application.Lease{}, application.ErrInvalidCoordination
 	}
 	var result application.Lease
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
-		lease, err := loadLease(ctx, tx, params.LeaseID)
+		if err := requireCurrentLeaseEpoch(ctx, tx, params.WorkspaceID, params.AuthorityEpoch); err != nil {
+			return err
+		}
+		lease, err := findHeldLease(ctx, tx, params)
 		if err != nil {
 			return err
-		}
-		if lease.HolderSession() != params.HolderSession {
-			return coordinationError(domain.ErrorCodeForbidden, "lease belongs to another holder")
-		}
-		if lease.AuthorityEpoch() != params.AuthorityEpoch {
-			return staleEpochError("lease", lease.AuthorityEpoch().String(), params.AuthorityEpoch.String())
-		}
-		if err := requireCurrentLeaseEpoch(ctx, tx, lease.WorkspaceID(), params.AuthorityEpoch); err != nil {
-			return err
-		}
-		if divergence, equal := compareFences(lease.Fences(), params.Fences); !equal {
-			return staleFenceError(divergence)
-		}
-		// A lease reaped for expiry is 'released' as well, so the idempotent
-		// answer belongs only to a lease released while it was still live. The
-		// timestamps separate them: an explicit release is only ever stamped
-		// before the deadline, because this function rejects one after it.
-		releasedAt, released := lease.ReleasedAt()
-		if released && releasedAt.Before(lease.ExpiresAt()) {
-			result = lease
-			return nil
 		}
 		now, err := sqliteNow(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if released || !now.Before(lease.ExpiresAt()) {
+		if !now.Before(lease.ExpiresAt()) {
 			return coordinationConflict(domain.ErrorCodeLeaseExpired, domain.ConflictLeaseTerminal,
-				fmt.Sprintf("lease has expired: lease %s expired at %s", params.LeaseID, instantEvidence(lease.ExpiresAt())))
+				fmt.Sprintf("claim has expired: selector set expired at %s", instantEvidence(lease.ExpiresAt())))
 		}
 		if release {
-			if _, err := tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ? WHERE lease_id = ? AND status = 'active'`, timeMicros(now), params.LeaseID.String()); err != nil {
-				return err
-			}
+			_, err = tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ? WHERE lease_id = ? AND status = 'active'`,
+				timeMicros(now), lease.ID().String())
 		} else {
 			expires := now.Add(params.TTL)
-			maximum := lease.AcquiredAt().Add(application.MaxLeaseLifetime)
-			if expires.After(maximum) {
+			if expires.After(lease.AcquiredAt().Add(application.MaxLeaseLifetime)) {
 				return application.ErrInvalidCoordination
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE leases SET expires_at_us = ? WHERE lease_id = ? AND status = 'active'`, timeMicros(expires), params.LeaseID.String()); err != nil {
-				return err
-			}
+			_, err = tx.ExecContext(ctx, `UPDATE leases SET holder_session_id = ?, expires_at_us = ? WHERE lease_id = ? AND status = 'active'`,
+				params.HolderSession.String(), timeMicros(expires), lease.ID().String())
 		}
-		result, err = loadLease(ctx, tx, params.LeaseID)
+		if err != nil {
+			return err
+		}
+		result, err = loadLease(ctx, tx, lease.ID())
 		if err != nil {
 			return err
 		}
@@ -883,69 +863,52 @@ func (store *Store) changeLease(ctx context.Context, params application.ChangeLe
 	return result, err
 }
 
-func (store *Store) ValidateFence(ctx context.Context, leaseID domain.LeaseID, epoch domain.AuthorityEpoch, fences []application.Fence) error {
-	if leaseID.IsZero() || epoch.IsZero() {
-		return application.ErrInvalidCoordination
-	}
-	// Authority is decided from one snapshot. Read outside a transaction and the
-	// lease, the workspace epoch and each fence counter arrive from whichever
-	// pooled connection is free, so an acquisition that supersedes the fence
-	// lands between two of the reads and the caller is told it still holds
-	// authority it has already lost. Read-only means SQLite defers the BEGIN, so
-	// this neither takes the write lock nor blocks one.
-	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+func findHeldLease(ctx context.Context, tx *sql.Tx, params application.ChangeLeaseParams) (application.Lease, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT lease_id FROM leases WHERE workspace_id = ? AND holder_actor_id = ?
+		AND authority_epoch = ? AND status = 'active' ORDER BY acquired_at_us DESC`,
+		params.WorkspaceID.String(), params.Holder.String(), params.AuthorityEpoch.String())
 	if err != nil {
-		return fmt.Errorf("begin SQLite fence validation: %w", err)
+		return application.Lease{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	lease, err := loadLease(ctx, tx, leaseID)
-	if err != nil {
-		return err
-	}
-	if lease.AuthorityEpoch() != epoch {
-		return staleEpochError("lease", lease.AuthorityEpoch().String(), epoch.String())
-	}
-	if divergence, equal := compareFences(lease.Fences(), fences); !equal {
-		return staleFenceError(divergence)
-	}
-	if err := requireCurrentLeaseEpoch(ctx, tx, lease.WorkspaceID(), epoch); err != nil {
-		return err
-	}
-	now, err := sqliteNow(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if releasedAt, released := lease.ReleasedAt(); released {
-		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
-			fmt.Sprintf("lease is not active: lease %s was released at %s", leaseID, instantEvidence(releasedAt)))
-	}
-	if !now.Before(lease.ExpiresAt()) {
-		return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
-			fmt.Sprintf("lease is not active: lease %s expired at %s", leaseID, instantEvidence(lease.ExpiresAt())))
-	}
-	for _, fence := range fences {
-		var current uint64
-		counterErr := tx.QueryRowContext(ctx, `SELECT counter FROM lease_fence_counters WHERE workspace_id = ? AND authority_epoch = ? AND conflict_key = ?`,
-			lease.WorkspaceID().String(), epoch.String(), fence.ConflictKey()).Scan(&current)
-		// Only a missing counter row is evidence about the fence. Any other
-		// failure -- a busy timeout, a cancelled context, an I/O error -- is the
-		// database being unavailable, and reporting it as a rejected fence tells
-		// the agent to abandon a reservation it still holds.
-		if counterErr != nil && !errors.Is(counterErr, sql.ErrNoRows) {
-			return fmt.Errorf("read SQLite lease fence counter: %w", counterErr)
+	defer func() { _ = rows.Close() }()
+	var ids []domain.LeaseID
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return application.Lease{}, err
 		}
-		if errors.Is(counterErr, sql.ErrNoRows) {
-			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
-				fmt.Sprintf("lease fence has been superseded: conflict key %s no longer has a counter, request supplied %d",
-					evidenceText(fence.ConflictKey()), fence.Counter()))
+		id, err := domain.ParseLeaseID(text)
+		if err != nil {
+			return application.Lease{}, err
 		}
-		if current != fence.Counter() {
-			return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
-				fmt.Sprintf("lease fence has been superseded: conflict key %s now stands at %d, request supplied %d",
-					evidenceText(fence.ConflictKey()), current, fence.Counter()))
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return application.Lease{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return application.Lease{}, err
+	}
+	partial := false
+	for _, id := range ids {
+		lease, err := loadLease(ctx, tx, id)
+		if err != nil {
+			return application.Lease{}, err
+		}
+		if sameSelectorSet(params.Selectors, lease.Selectors()) {
+			return lease, nil
+		}
+		for _, requested := range params.Selectors {
+			for _, held := range lease.Selectors() {
+				partial = partial || application.LeaseSelectorsOverlap(requested, held)
+			}
 		}
 	}
-	return nil
+	if partial {
+		return application.Lease{}, coordinationError(domain.ErrorCodeInvalidArgument,
+			"selectors must exactly match one active claim; partial release or renewal is not allowed")
+	}
+	return application.Lease{}, coordinationError(domain.ErrorCodeNotFound, "no active claim matches the exact selector set")
 }
 
 // coordinationQuery is satisfied by both the pool and a transaction, so a
@@ -999,80 +962,31 @@ func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) 
 	if err := selectorRows.Close(); err != nil {
 		return application.Lease{}, err
 	}
-	fenceRows, err := query.QueryContext(ctx, `SELECT conflict_key, counter FROM lease_fences WHERE lease_id = ? ORDER BY conflict_key`, id.String())
+	generationRows, err := query.QueryContext(ctx, `SELECT conflict_key, counter FROM lease_fences WHERE lease_id = ? ORDER BY conflict_key`, id.String())
 	if err != nil {
 		return application.Lease{}, err
 	}
-	defer func() { _ = fenceRows.Close() }()
-	var fences []application.Fence
-	for fenceRows.Next() {
+	defer func() { _ = generationRows.Close() }()
+	generations := make(map[string]uint64)
+	for generationRows.Next() {
 		var key string
 		var counter uint64
-		if err := fenceRows.Scan(&key, &counter); err != nil {
+		if err := generationRows.Scan(&key, &counter); err != nil {
 			return application.Lease{}, err
 		}
-		fence, err := application.NewFence(key, counter)
-		if err != nil {
-			return application.Lease{}, err
-		}
-		fences = append(fences, fence)
+		generations[key] = counter
 	}
-	if err := fenceRows.Err(); err != nil {
+	if err := generationRows.Err(); err != nil {
 		return application.Lease{}, err
 	}
 	params := application.LeaseViewParams{LeaseID: id, WorkspaceID: workspace, Holder: holder, HolderSession: session,
-		AuthorityEpoch: epoch, Mode: application.LeaseMode(mode), Selectors: selectors, Fences: fences,
+		AuthorityEpoch: epoch, Mode: application.LeaseMode(mode), Selectors: selectors, ClaimGenerations: generations,
 		AcquiredAt: microsTime(acquired), ExpiresAt: microsTime(expires), ReleasedAt: nullableTime(released)}
 	return application.NewLeaseView(params)
 }
 
-// fenceDivergence is the first place two fence sets differ: the conflict key
-// that diverged, the counter the daemon holds for it, and the counter the
-// caller supplied. A zero counter means that side does not carry the key at
-// all, which is what separates a caller holding a stale fence from one holding
-// a fence it never had.
-type fenceDivergence struct {
-	conflictKey string
-	held        uint64
-	supplied    uint64
-}
-
-// compareFences reports whether two fence sets match and, when they do not,
-// where. A bare bool answer throws away the only fact that lets a caller act:
-// which reservation moved out from under it.
-func compareFences(held, supplied []application.Fence) (fenceDivergence, bool) {
-	ordered := func(fences []application.Fence) []application.Fence {
-		result := append([]application.Fence(nil), fences...)
-		sort.Slice(result, func(i, j int) bool { return result[i].ConflictKey() < result[j].ConflictKey() })
-		return result
-	}
-	left, right := ordered(held), ordered(supplied)
-	for index := 0; index < len(left) || index < len(right); index++ {
-		switch {
-		case index >= len(right):
-			return fenceDivergence{conflictKey: left[index].ConflictKey(), held: left[index].Counter()}, false
-		case index >= len(left):
-			return fenceDivergence{conflictKey: right[index].ConflictKey(), supplied: right[index].Counter()}, false
-		case left[index].ConflictKey() < right[index].ConflictKey():
-			return fenceDivergence{conflictKey: left[index].ConflictKey(), held: left[index].Counter()}, false
-		case left[index].ConflictKey() > right[index].ConflictKey():
-			return fenceDivergence{conflictKey: right[index].ConflictKey(), supplied: right[index].Counter()}, false
-		case left[index].Counter() != right[index].Counter():
-			return fenceDivergence{conflictKey: left[index].ConflictKey(), held: left[index].Counter(),
-				supplied: right[index].Counter()}, false
-		}
-	}
-	return fenceDivergence{}, true
-}
-
-func staleFenceError(divergence fenceDivergence) error {
-	return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
-		fmt.Sprintf("lease fence is stale: conflict key %s stands at %d, request supplied %d",
-			evidenceText(divergence.conflictKey), divergence.held, divergence.supplied))
-}
-
 func staleEpochError(scope, current, supplied string) error {
-	return coordinationConflict(domain.ErrorCodeFenceRejected, domain.ConflictFence,
+	return coordinationConflict(domain.ErrorCodeStateConflict, domain.ConflictAuthorityMismatch,
 		fmt.Sprintf("%s authority epoch is stale: %s holds %s, request supplied %s", scope, scope,
 			evidenceText(current), evidenceText(supplied)))
 }
@@ -1146,15 +1060,12 @@ func leaseCoordinationPayload(lease application.Lease) ([]byte, error) {
 }
 
 func leaseCoordinationFields(lease application.Lease) map[string]any {
-	selectors := make([]map[string]string, 0, len(lease.Selectors()))
+	selectors := make([]map[string]any, 0, len(lease.Selectors()))
 	for _, selector := range lease.Selectors() {
-		selectors = append(selectors, map[string]string{"kind": string(selector.Kind()), "path": selector.Path()})
+		selectors = append(selectors, map[string]any{"kind": string(selector.Kind()), "path": selector.Path(),
+			"claim_generation": lease.ClaimGeneration(selector)})
 	}
-	fences := make([]map[string]any, 0, len(lease.Fences()))
-	for _, fence := range lease.Fences() {
-		fences = append(fences, map[string]any{"conflict_key": fence.ConflictKey(), "counter": fence.Counter()})
-	}
-	return map[string]any{"expires_at_us": timeMicros(lease.ExpiresAt()), "fences": fences,
+	return map[string]any{"expires_at_us": timeMicros(lease.ExpiresAt()),
 		"lease_id": lease.ID().String(), "mode": lease.Mode(), "selectors": selectors}
 }
 
@@ -1656,9 +1567,8 @@ func (store *Store) LocalAgentSnapshot(ctx context.Context,
 	return snapshot, nil
 }
 
-// The lease rows are read first and each one is then loaded whole, because the
-// fences a resuming agent needs in order to renew or release live in their own
-// table. Without them the agent can only wait the lease out.
+// The lease rows are read first and then loaded whole so each selector carries
+// its informational claim generation in the registration snapshot.
 func localAgentReservations(ctx context.Context, tx *sql.Tx, session application.LocalAgentSession,
 	now time.Time) ([]application.LocalAgentReservation, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT lease_id FROM leases
@@ -1692,8 +1602,12 @@ func localAgentReservations(ctx context.Context, tx *sql.Tx, session application
 		if loadErr != nil {
 			return nil, loadErr
 		}
+		generations := make(map[string]uint64, len(lease.Selectors()))
+		for _, selector := range lease.Selectors() {
+			generations[selector.Key()] = lease.ClaimGeneration(selector)
+		}
 		reservations = append(reservations, application.LocalAgentReservation{LeaseID: lease.ID(), Mode: lease.Mode(),
-			Selectors: lease.Selectors(), Fences: lease.Fences(),
+			Selectors: lease.Selectors(), ClaimGenerations: generations,
 			ExpiresInMS: lease.ExpiresAt().Sub(now).Milliseconds()})
 	}
 	return reservations, nil

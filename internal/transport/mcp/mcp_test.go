@@ -95,7 +95,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		"agent_token": alice.RegistrationToken,
 		"selectors":   []reservationSelectorInput{{Kind: "subtree", Path: "src"}},
 	})
-	if lease.LeaseID == "" || len(lease.Fences) == 0 {
+	if lease.LeaseID == "" || lease.Selectors[0].ClaimGeneration == 0 {
 		t.Fatalf("lease = %+v", lease)
 	}
 
@@ -123,9 +123,9 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	if len(resumed.HeldReservations) != 1 || resumed.HeldReservations[0].LeaseID != lease.LeaseID {
 		t.Fatalf("resumed reservations = %+v, want the lease held across the restart", resumed.HeldReservations)
 	}
-	if resumed.HeldReservations[0].ExpiresInMS <= 0 || len(resumed.HeldReservations[0].Fences) == 0 ||
-		len(resumed.HeldReservations[0].Selectors) != 1 || resumed.HeldReservations[0].Selectors[0].Path != "src" {
-		t.Fatalf("resumed reservation = %+v, want the time left, the fences and the selectors",
+	if resumed.HeldReservations[0].ExpiresInMS <= 0 || len(resumed.HeldReservations[0].Selectors) != 1 ||
+		resumed.HeldReservations[0].Selectors[0].Path != "src" || resumed.HeldReservations[0].Selectors[0].ClaimGeneration == 0 {
+		t.Fatalf("resumed reservation = %+v, want time left, generation and selectors",
 			resumed.HeldReservations[0])
 	}
 	if resumed.Inbox.Unread != 1 || len(resumed.Inbox.Recent) != 1 || resumed.Inbox.Recent[0].From != "bob" {
@@ -144,7 +144,7 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 		t.Fatalf("bob holds no reservation but was handed %+v", resumedBob.HeldReservations)
 	}
 	renewed := callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{
-		"agent_token": aliceToken, "lease_id": lease.LeaseID, "fences": lease.Fences, "action": "renew",
+		"agent_token": aliceToken, "selectors": lease.Selectors, "action": "renew",
 	})
 	if renewed.LeaseID != lease.LeaseID {
 		t.Fatalf("renewed lease = %+v", renewed)
@@ -169,11 +169,11 @@ func TestLocalCoordinationEndToEndSurvivesDaemonRestart(t *testing.T) {
 	assertCoordinationInputRejected(t, client, ToolReservationAcquire, map[string]any{"agent_token": bobToken,
 		"mode": "invalid", "selectors": []reservationSelectorInput{{Kind: "exact", Path: "other.go"}}})
 	assertCoordinationInputRejected(t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
-		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "action": "renew", "ttl_seconds": 0})
+		"selectors": renewed.Selectors, "action": "renew", "ttl_seconds": 0})
 	assertCoordinationInputRejected(t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
-		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "action": "release", "ttl_seconds": 1})
+		"selectors": renewed.Selectors, "action": "release", "ttl_seconds": 1})
 	callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{"agent_token": aliceToken,
-		"lease_id": renewed.LeaseID, "fences": renewed.Fences, "action": "release"})
+		"selectors": renewed.Selectors, "action": "release"})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: bobToken,
 		Mode: "exclusive", TTLSeconds: 300, Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 	callCoord[reservationOutput](t, client, ToolReservationAcquire, reservationAcquireInput{AgentToken: aliceToken,
@@ -398,14 +398,13 @@ func TestCoordinationFailuresCarryTheirCodeAndTheirBlockers(t *testing.T) {
 		invalid.Retryable {
 		t.Fatalf("invalid request failure = %+v, want a terminal INVALID_ARGUMENT", invalid)
 	}
-	stale := callCoordFailure(t, client, ToolReservationChange, map[string]any{"agent_token": alice,
-		"lease_id": held.LeaseID, "fences": []fenceOutput{{ConflictKey: held.Fences[0].ConflictKey, Counter: 1 << 20}},
-		"action": "release"})
-	if stale.Conflict != string(domain.ConflictFence) || stale.Retryable {
-		t.Fatalf("stale fence failure = %+v, want a terminal FenceConflict", stale)
+	partial := callCoordFailure(t, client, ToolReservationChange, map[string]any{"agent_token": alice,
+		"selectors": []reservationSelectorInput{{Kind: "subtree", Path: "src"}}, "action": "release"})
+	if partial.Code != string(domain.ErrorCodeInvalidArgument) || !strings.Contains(partial.Message, "exactly match") {
+		t.Fatalf("partial release = %+v, want precise exact-set guidance", partial)
 	}
-	if stale.RequestID == "" || stale.Message == "" {
-		t.Fatalf("failure omitted its identifier or its message: %+v", stale)
+	if partial.RequestID == "" {
+		t.Fatalf("failure omitted its identifier: %+v", partial)
 	}
 }
 
@@ -438,6 +437,15 @@ func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
 	if len(all.Reservations) != 2 {
 		t.Fatalf("unfiltered status = %+v, want both leases including the caller's own", all.Reservations)
 	}
+	var generation uint64
+	for _, reservation := range all.Reservations {
+		if reservation.HolderAgentName == "alice" {
+			generation = reservation.Selectors[0].ClaimGeneration
+		}
+	}
+	if generation == 0 {
+		t.Fatalf("exclusive claim status omitted claim_generation: %+v", all.Reservations)
+	}
 	free := callCoord[reservationsStatusOutput](t, client, ToolReservationsStatus,
 		reservationsStatusInput{AgentToken: bob, Path: "internal/other.go"})
 	if len(free.Reservations) != 0 {
@@ -466,7 +474,7 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 	// A holder that gave up its lease is not a blocker any more, and the waiter
 	// has to be told so rather than sitting out the rest of its budget.
 	callCoord[reservationOutput](t, client, ToolReservationChange, map[string]any{
-		"agent_token": alice, "lease_id": held.LeaseID, "fences": held.Fences, "action": "release"})
+		"agent_token": alice, "selectors": held.Selectors, "action": "release"})
 	freed := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 30})
 	if freed.Reason != string(application.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
@@ -578,8 +586,8 @@ func TestCoordinationFailureMapsEveryShapeOfError(t *testing.T) {
 	if sentinel.Code != string(domain.ErrorCodeNotFound) || sentinel.Message == "" || sentinel.Retryable {
 		t.Fatalf("sentinel failure = %+v, want NOT_FOUND with a message", sentinel)
 	}
-	invalid := coordinationFailure("req_invalid", invalidInput("lease_id must be a valid UUID"))
-	if invalid.Code != string(domain.ErrorCodeInvalidArgument) || invalid.Message != "lease_id must be a valid UUID" || invalid.Retryable {
+	invalid := coordinationFailure("req_invalid", invalidInput("selectors must exactly match one active claim"))
+	if invalid.Code != string(domain.ErrorCodeInvalidArgument) || invalid.Message != "selectors must exactly match one active claim" || invalid.Retryable {
 		t.Fatalf("invalid failure = %+v, want precise argument guidance", invalid)
 	}
 }

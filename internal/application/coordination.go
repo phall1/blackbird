@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"maps"
 	"path"
 	"strings"
 	"time"
@@ -545,39 +546,12 @@ func LeaseSelectorsOverlap(left, right LeaseSelector) bool {
 		right.kind == LeaseSelectorSubtree && strings.HasPrefix(left.value, right.value+"/")
 }
 
-// LeaseSelectorCovers reports whether outer protects everything inner does.
-// Overlap is symmetric and only says two selectors touch; supersession needs
-// containment, because retiring a prior lease that the new one does not fully
-// cover silently drops paths its holder still believes it has reserved. An
-// exact selector covers only the identical exact selector: it does not protect
-// the subtree a same-path subtree selector does.
-func LeaseSelectorCovers(outer, inner LeaseSelector) bool {
-	if outer.kind == LeaseSelectorSubtree {
-		return outer.value == inner.value || strings.HasPrefix(inner.value, outer.value+"/")
-	}
-	return inner.kind == LeaseSelectorExact && outer.value == inner.value
-}
-
 type LeaseMode string
 
 const (
 	LeaseShared    LeaseMode = "shared"
 	LeaseExclusive LeaseMode = "exclusive"
 )
-
-type Fence struct {
-	conflictKey string
-	counter     uint64
-}
-
-func NewFence(key string, counter uint64) (Fence, error) {
-	if !validOpaqueText(key, MaxLeaseSelectorBytes+16) || counter == 0 || counter > MaxCanonicalInteger {
-		return Fence{}, ErrInvalidCoordination
-	}
-	return Fence{conflictKey: key, counter: counter}, nil
-}
-func (fence Fence) ConflictKey() string { return fence.conflictKey }
-func (fence Fence) Counter() uint64     { return fence.counter }
 
 type AcquireLeaseParams struct {
 	LeaseID        domain.LeaseID
@@ -597,23 +571,23 @@ type Lease struct {
 	epoch         domain.AuthorityEpoch
 	mode          LeaseMode
 	selectors     []LeaseSelector
-	fences        []Fence
+	generations   map[string]uint64
 	acquiredAt    time.Time
 	expiresAt     time.Time
 	releasedAt    *time.Time
 }
 type LeaseViewParams struct {
-	LeaseID        domain.LeaseID
-	WorkspaceID    domain.WorkspaceID
-	Holder         domain.ActorID
-	HolderSession  domain.ActorSessionID
-	AuthorityEpoch domain.AuthorityEpoch
-	Mode           LeaseMode
-	Selectors      []LeaseSelector
-	Fences         []Fence
-	AcquiredAt     time.Time
-	ExpiresAt      time.Time
-	ReleasedAt     *time.Time
+	LeaseID          domain.LeaseID
+	WorkspaceID      domain.WorkspaceID
+	Holder           domain.ActorID
+	HolderSession    domain.ActorSessionID
+	AuthorityEpoch   domain.AuthorityEpoch
+	Mode             LeaseMode
+	Selectors        []LeaseSelector
+	ClaimGenerations map[string]uint64
+	AcquiredAt       time.Time
+	ExpiresAt        time.Time
+	ReleasedAt       *time.Time
 }
 
 func NewLeaseView(params LeaseViewParams) (Lease, error) {
@@ -625,7 +599,7 @@ func NewLeaseView(params LeaseViewParams) (Lease, error) {
 	}
 	return Lease{id: params.LeaseID, workspace: params.WorkspaceID, holder: params.Holder, holderSession: params.HolderSession,
 		epoch: params.AuthorityEpoch, mode: params.Mode, selectors: append([]LeaseSelector(nil), params.Selectors...),
-		fences: append([]Fence(nil), params.Fences...), acquiredAt: params.AcquiredAt.UTC(), expiresAt: params.ExpiresAt.UTC(),
+		generations: maps.Clone(params.ClaimGenerations), acquiredAt: params.AcquiredAt.UTC(), expiresAt: params.ExpiresAt.UTC(),
 		releasedAt: cloneOptional(params.ReleasedAt)}, nil
 }
 func ValidateAcquireLease(params AcquireLeaseParams) error {
@@ -665,16 +639,19 @@ func (lease Lease) Mode() LeaseMode                       { return lease.mode }
 func (lease Lease) Selectors() []LeaseSelector {
 	return append([]LeaseSelector(nil), lease.selectors...)
 }
-func (lease Lease) Fences() []Fence               { return append([]Fence(nil), lease.fences...) }
+func (lease Lease) ClaimGeneration(selector LeaseSelector) uint64 {
+	return lease.generations[selector.Key()]
+}
 func (lease Lease) AcquiredAt() time.Time         { return lease.acquiredAt }
 func (lease Lease) ExpiresAt() time.Time          { return lease.expiresAt }
 func (lease Lease) ReleasedAt() (time.Time, bool) { return optionalTime(lease.releasedAt) }
 
 type ChangeLeaseParams struct {
-	LeaseID        domain.LeaseID
+	WorkspaceID    domain.WorkspaceID
+	Holder         domain.ActorID
 	HolderSession  domain.ActorSessionID
 	AuthorityEpoch domain.AuthorityEpoch
-	Fences         []Fence
+	Selectors      []LeaseSelector
 	TTL            time.Duration
 }
 
@@ -687,7 +664,6 @@ type CoordinationStore interface {
 	AcquireLease(context.Context, AcquireLeaseParams) (Lease, error)
 	RenewLease(context.Context, ChangeLeaseParams) (Lease, error)
 	ReleaseLease(context.Context, ChangeLeaseParams) (Lease, error)
-	ValidateFence(context.Context, domain.LeaseID, domain.AuthorityEpoch, []Fence) error
 	SyncCoordinationEvents(context.Context, CoordinationEventsQuery) (CoordinationEventsPage, error)
 	CommitCoordinationConsumer(context.Context, CoordinationConsumerCommit) error
 }

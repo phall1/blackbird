@@ -46,9 +46,9 @@ func TestAwaitCoordinationReturnsWhenTheLeaseIsReleased(t *testing.T) {
 	go func() {
 		defer close(released)
 		time.Sleep(50 * time.Millisecond)
-		if _, err := fixture.store.ReleaseLease(ctx, application.ChangeLeaseParams{LeaseID: lease.ID(),
-			HolderSession: fixture.holder.ActorSessionID, AuthorityEpoch: fixture.holder.AuthorityEpoch,
-			Fences: lease.Fences()}); err != nil {
+		if _, err := fixture.store.ReleaseLease(ctx, application.ChangeLeaseParams{WorkspaceID: fixture.holder.WorkspaceID,
+			Holder: fixture.holder.ActorID, HolderSession: fixture.holder.ActorSessionID,
+			AuthorityEpoch: fixture.holder.AuthorityEpoch, Selectors: lease.Selectors()}); err != nil {
 			t.Error(err)
 		}
 	}()

@@ -51,9 +51,10 @@ registration rather than assuming.
 4. **Privacy.** To/Cc/Bcc visibility and read/acknowledgement facts are
    independent. Never expose a message body through a path that skips the
    privacy check, and never let one agent mark or acknowledge for another.
-5. **Reservations.** Fences are the conflict-detection mechanism. Renew and
-   release require current fences; a change that accepts stale fences removes
-   the safety property.
+5. **Reservations.** Claims are advisory filesystem coordination. Renew and
+   release require the authenticated holder's exact selector set; reject a
+   partial set rather than dropping unrelated paths. `claim_generation` is
+   status information, never an authorization credential.
 6. **OpenAPI drift.** If operations changed, confirm the generated document
    still matches.
 

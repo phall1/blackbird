@@ -38,7 +38,8 @@ Target: $ARGUMENTS
    - `selectors`: `{kind: "exact"|"subtree", path}` — prefer `exact` for single
      files, `subtree` only when the change genuinely spans a package
    - `ttl_seconds`: long enough for the work, not the whole session
-   Record the `lease_id` and `fences`; renewal and release both require them.
+   Record the exact selector set; renewal and release both use it. The returned
+   `claim_generation` is status information, not a credential.
 
 5. **On `LEASE_CONFLICT`**, do not retry blindly and do not widen your selector.
    The failure is structured and already tells you what to do next: read

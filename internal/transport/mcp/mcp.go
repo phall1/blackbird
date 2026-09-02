@@ -164,7 +164,7 @@ type agentSessionOutput struct {
 	ActorID           string                    `json:"actor_id"`
 	SessionID         string                    `json:"session_id"`
 	RegistrationToken string                    `json:"registration_token,omitempty"`
-	HeldReservations  []heldReservationOutput   `json:"held_reservations" jsonschema:"Reservations this agent still holds, now bound to this session. Renew or release each one with the lease_id and fences given here, or it blocks other agents until it expires."`
+	HeldReservations  []heldReservationOutput   `json:"held_reservations" jsonschema:"Reservations this agent still holds. Renew or release one by sending back its exact selector set."`
 	Inbox             inboxSummaryOutput        `json:"inbox" jsonschema:"Mailbox counts over the whole inbox, with the most recent pending deliveries; blackbird_inbox_fetch serves the rest."`
 	OpenConversations []agentConversationOutput `json:"open_conversations" jsonschema:"Open conversations this agent opened, wrote to, or was addressed in, most recent first."`
 	OtherAgents       []agentPeerOutput         `json:"other_agents" jsonschema:"Other agents with a live session in this repository right now."`
@@ -173,7 +173,6 @@ type heldReservationOutput struct {
 	LeaseID     string                     `json:"lease_id"`
 	Mode        string                     `json:"mode"`
 	Selectors   []reservationSelectorInput `json:"selectors"`
-	Fences      []fenceOutput              `json:"fences"`
 	ExpiresInMS int64                      `json:"expires_in_ms" jsonschema:"Milliseconds left on this lease, measured by the daemon. Negative means it is already overdue."`
 }
 type inboxSummaryOutput struct {
@@ -285,8 +284,9 @@ type deliveryFactOutput struct {
 	Acknowledged bool   `json:"acknowledged"`
 }
 type reservationSelectorInput struct {
-	Kind string `json:"kind" jsonschema:"exact for the one named file, subtree for a directory and everything beneath it."`
-	Path string `json:"path" jsonschema:"Repository-relative path the reservation covers."`
+	Kind            string `json:"kind" jsonschema:"exact for the one named file, subtree for a directory and everything beneath it."`
+	Path            string `json:"path" jsonschema:"Repository-relative path the reservation covers."`
+	ClaimGeneration uint64 `json:"claim_generation,omitempty" jsonschema:"Informational handoff count for this selector; never send it as authorization."`
 }
 type reservationAcquireInput struct {
 	AgentToken string                     `json:"agent_token"`
@@ -295,24 +295,16 @@ type reservationAcquireInput struct {
 	TTLSeconds uint32                     `json:"ttl_seconds,omitempty"`
 }
 
-// fenceOutput is both a result and an argument, so its descriptions have to read
-// correctly in either direction.
-type fenceOutput struct {
-	ConflictKey string `json:"conflict_key" jsonschema:"Opaque key naming one contended path; send it back unchanged when renewing or releasing."`
-	Counter     uint64 `json:"counter" jsonschema:"Fencing counter for that key. Renew and release must carry the value from the most recent acquire or renew; a stale one is rejected."`
-}
 type reservationChangeInput struct {
-	AgentToken string        `json:"agent_token"`
-	LeaseID    string        `json:"lease_id" jsonschema:"Lease returned by blackbird_reservation_acquire."`
-	Fences     []fenceOutput `json:"fences" jsonschema:"The lease's current fences, from the most recent acquire or change."`
-	Action     string        `json:"action" jsonschema:"renew extends the reservation and returns replacement fences; release gives it up immediately."`
-	TTLSeconds uint32        `json:"ttl_seconds,omitempty" jsonschema:"New lifetime for a renew action. Omit for release."`
+	AgentToken string                     `json:"agent_token"`
+	Selectors  []reservationSelectorInput `json:"selectors" jsonschema:"Exact selector set returned by acquire or registration; partial release is rejected."`
+	Action     string                     `json:"action" jsonschema:"renew extends the claim; release gives it up immediately."`
+	TTLSeconds uint32                     `json:"ttl_seconds,omitempty" jsonschema:"New lifetime for a renew action. Omit for release."`
 }
 type reservationOutput struct {
 	LeaseID    string                     `json:"lease_id"`
 	Mode       string                     `json:"mode"`
 	Selectors  []reservationSelectorInput `json:"selectors"`
-	Fences     []fenceOutput              `json:"fences"`
 	ExpiresAt  string                     `json:"expires_at"`
 	ReleasedAt string                     `json:"released_at,omitempty"`
 }
@@ -363,7 +355,7 @@ type coordinationFailureOutput struct {
 	Category     string                    `json:"category" jsonschema:"Family the code belongs to: validation, authentication, conflict, contention, capacity, timeout or internal."`
 	Message      string                    `json:"message"`
 	Retryable    bool                      `json:"retryable" jsonschema:"True when repeating the same call can succeed later. False means the call cannot work as sent; change something first."`
-	Conflict     string                    `json:"conflict,omitempty" jsonschema:"Which conflict was detected, when the failure is one. LeaseConflict means someone else holds the path; FenceConflict means your fences are stale, so re-acquire; LeaseTerminalConflict means your lease is gone."`
+	Conflict     string                    `json:"conflict,omitempty" jsonschema:"Which conflict was detected. LeaseConflict means someone else holds the path; LeaseTerminalConflict means the claim expired."`
 	RetryAfterMS int64                     `json:"retry_after_ms,omitempty" jsonschema:"How long to wait before retrying, when the daemon can say. On a lease conflict this is the blocking lease's remaining time; blackbird_wait spends it for you."`
 	Blockers     []reservationHolderOutput `json:"blockers,omitempty" jsonschema:"Leases that caused a LEASE_CONFLICT: who holds the path and for how much longer. Message a holder, wait with blackbird_wait, or narrow your selectors to a disjoint path."`
 }
@@ -687,12 +679,10 @@ func localAgentSessionOutput(session application.LocalAgentSession, issued strin
 		OtherAgents:       make([]agentPeerOutput, 0, len(snapshot.Peers))}
 	for _, reservation := range snapshot.Reservations {
 		held := heldReservationOutput{LeaseID: reservation.LeaseID.String(), Mode: string(reservation.Mode),
-			ExpiresInMS: reservation.ExpiresInMS, Selectors: []reservationSelectorInput{}, Fences: []fenceOutput{}}
+			ExpiresInMS: reservation.ExpiresInMS, Selectors: []reservationSelectorInput{}}
 		for _, selector := range reservation.Selectors {
-			held.Selectors = append(held.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path()})
-		}
-		for _, fence := range reservation.Fences {
-			held.Fences = append(held.Fences, fenceOutput{ConflictKey: fence.ConflictKey(), Counter: fence.Counter()})
+			held.Selectors = append(held.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path(),
+				ClaimGeneration: reservation.ClaimGenerations[selector.Key()]})
 		}
 		output.HeldReservations = append(output.HeldReservations, held)
 	}
@@ -811,13 +801,9 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 			if err != nil {
 				return reservationOutput{}, err
 			}
-			selectors := make([]application.LeaseSelector, 0, len(input.Selectors))
-			for _, raw := range input.Selectors {
-				selector, selectorErr := application.NewLeaseSelector(application.LeaseSelectorKind(raw.Kind), raw.Path)
-				if selectorErr != nil {
-					return reservationOutput{}, selectorErr
-				}
-				selectors = append(selectors, selector)
+			selectors, err := reservationSelectors(input.Selectors)
+			if err != nil {
+				return reservationOutput{}, err
 			}
 			leaseID, err := domain.NewLeaseID()
 			if err != nil {
@@ -835,13 +821,13 @@ func registerReservationTools(server *sdkmcp.Server, store application.LocalCoor
 		})
 	changeInputSchema := coordinationInputSchema[reservationChangeInput](func(properties map[string]*jsonschema.Schema) {
 		properties["action"].Enum = []any{"renew", "release"}
+		setSelectorKindSchema(properties["selectors"].Items.Properties["kind"])
 		setChangeTTLSchema(properties["ttl_seconds"])
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolReservationChange,
-		Description: "Renew or release a reservation you already hold, using the fences from the most recent " +
-			"acquire or change. action=renew extends work that outlives its lease and returns replacement fences. " +
-			"action=release gives the reservation up immediately and must omit ttl_seconds. A FENCE_REJECTED " +
-			"failure means the lease moved on without you: acquire it again rather than retrying.",
+		Description: "Renew or release a reservation you already hold by sending its exact selector set. " +
+			"action=renew extends work that outlives its lease; action=release gives it up immediately and must " +
+			"omit ttl_seconds. Partial selector sets are rejected so one path cannot release a multi-path claim.",
 		InputSchema: changeInputSchema},
 		func(ctx context.Context, input reservationChangeInput) (reservationOutput, error) {
 			return changeLocalReservation(ctx, store, input)
@@ -968,7 +954,8 @@ func reservationHolder(reservation application.AdminReservation) reservationHold
 		Mode: string(reservation.Mode), ExpiresInMS: reservation.ExpiresInMS,
 		Selectors: make([]reservationSelectorInput, 0, len(reservation.Selectors))}
 	for _, selector := range reservation.Selectors {
-		holder.Selectors = append(holder.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path()})
+		holder.Selectors = append(holder.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path(),
+			ClaimGeneration: reservation.ClaimGenerations[selector.Key()]})
 	}
 	return holder
 }
@@ -1047,20 +1034,13 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	if err != nil {
 		return reservationOutput{}, err
 	}
-	leaseID, err := domain.ParseLeaseID(input.LeaseID)
+	selectors, err := reservationSelectors(input.Selectors)
 	if err != nil {
-		return reservationOutput{}, invalidInput("lease_id must be a valid UUID")
+		return reservationOutput{}, err
 	}
-	fences := make([]application.Fence, 0, len(input.Fences))
-	for index, raw := range input.Fences {
-		fence, fenceErr := application.NewFence(raw.ConflictKey, raw.Counter)
-		if fenceErr != nil {
-			return reservationOutput{}, invalidInput(fmt.Sprintf("fences[%d] must contain a non-empty conflict_key and a counter from 1 to %d", index, application.MaxCanonicalInteger))
-		}
-		fences = append(fences, fence)
-	}
-	params := application.ChangeLeaseParams{LeaseID: leaseID, HolderSession: session.ActorSessionID,
-		AuthorityEpoch: session.AuthorityEpoch, Fences: fences, TTL: time.Duration(input.TTLSeconds) * time.Second}
+	params := application.ChangeLeaseParams{WorkspaceID: session.WorkspaceID, Holder: session.ActorID,
+		HolderSession: session.ActorSessionID, AuthorityEpoch: session.AuthorityEpoch, Selectors: selectors,
+		TTL: time.Duration(input.TTLSeconds) * time.Second}
 	var lease application.Lease
 	switch input.Action {
 	case "renew":
@@ -1076,14 +1056,24 @@ func changeLocalReservation(ctx context.Context, store application.LocalCoordina
 	return localReservationOutput(lease), nil
 }
 
+func reservationSelectors(raw []reservationSelectorInput) ([]application.LeaseSelector, error) {
+	selectors := make([]application.LeaseSelector, 0, len(raw))
+	for index, value := range raw {
+		selector, err := application.NewLeaseSelector(application.LeaseSelectorKind(value.Kind), value.Path)
+		if err != nil {
+			return nil, invalidInput(fmt.Sprintf("selectors[%d] must use kind exact or subtree and a canonical repository-relative path", index))
+		}
+		selectors = append(selectors, selector)
+	}
+	return selectors, nil
+}
+
 func localReservationOutput(lease application.Lease) reservationOutput {
 	result := reservationOutput{LeaseID: lease.ID().String(), Mode: string(lease.Mode()), ExpiresAt: lease.ExpiresAt().Format(time.RFC3339Nano),
-		Selectors: []reservationSelectorInput{}, Fences: []fenceOutput{}}
+		Selectors: []reservationSelectorInput{}}
 	for _, selector := range lease.Selectors() {
-		result.Selectors = append(result.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path()})
-	}
-	for _, fence := range lease.Fences() {
-		result.Fences = append(result.Fences, fenceOutput{ConflictKey: fence.ConflictKey(), Counter: fence.Counter()})
+		result.Selectors = append(result.Selectors, reservationSelectorInput{Kind: string(selector.Kind()), Path: selector.Path(),
+			ClaimGeneration: lease.ClaimGeneration(selector)})
 	}
 	if released, ok := lease.ReleasedAt(); ok {
 		result.ReleasedAt = released.Format(time.RFC3339Nano)
@@ -1106,7 +1096,7 @@ const coordinationProtocol = `# Blackbird coordination protocol
 2. Before editing, call blackbird_reservation_acquire with the narrowest exact files or subtree and an honest TTL. Shared claims coexist; an exclusive claim conflicts with every overlap.
 3. Use one blackbird_conversation_open slug per work item. Address peers by the names from blackbird_agents_list. Read mail with blackbird_inbox_fetch or blackbird_thread_fetch and record only your own delivery facts with blackbird_message_fact.
 4. On LEASE_CONFLICT, never retry blindly or widen the claim. Use the returned blockers or blackbird_reservations_status, then message the holder, narrow to a disjoint path, or call blackbird_wait once and reacquire when it returns path_free.
-5. Before expiry, call blackbird_reservation_change with action=renew and the latest fences. As soon as the edit is done, call it with action=release. Always replace saved fences with the newest result.
+5. Before expiry, call blackbird_reservation_change with action=renew and the exact selector set. As soon as the edit is done, call it with action=release. Claim generations are informational, never credentials.
 
 Failures are structured. Branch on code and retryable; quote request_id in bug reports. Acknowledging a handoff is the recipient's action, never the sender's.
 `

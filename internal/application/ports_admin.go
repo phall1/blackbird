@@ -216,20 +216,21 @@ type AdminReservationsQuery struct {
 // against the page's ObservedAtUS; ExpiresInMS is signed and goes negative once
 // a lease is overdue, so callers never consult their own clock.
 type AdminReservation struct {
-	LeaseID         domain.LeaseID
-	ProjectKey      string
-	WorkspaceID     domain.WorkspaceID
-	HolderAgentName string
-	HolderActorID   domain.ActorID
-	HolderSessionID domain.ActorSessionID
-	Mode            LeaseMode
-	State           AdminReservationState
-	Expired         bool
-	Selectors       []LeaseSelector
-	AcquiredAtUS    int64
-	ExpiresAtUS     int64
-	ReleasedAtUS    int64
-	ExpiresInMS     int64
+	LeaseID          domain.LeaseID
+	ProjectKey       string
+	WorkspaceID      domain.WorkspaceID
+	HolderAgentName  string
+	HolderActorID    domain.ActorID
+	HolderSessionID  domain.ActorSessionID
+	Mode             LeaseMode
+	State            AdminReservationState
+	Expired          bool
+	Selectors        []LeaseSelector
+	ClaimGenerations map[string]uint64
+	AcquiredAtUS     int64
+	ExpiresAtUS      int64
+	ReleasedAtUS     int64
+	ExpiresInMS      int64
 }
 
 type AdminReservationsPage struct {

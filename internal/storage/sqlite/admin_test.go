@@ -1125,8 +1125,8 @@ func TestAdminReservationBucketsSurviveTheExpiryReaper(t *testing.T) {
 	live := acquireAdminLease(t, store, alice, "docs/live.md")
 	releasedEarly := acquireAdminLease(t, store, alice, "docs/released.md")
 	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{
-		LeaseID: releasedEarly.ID(), HolderSession: alice.ActorSessionID,
-		AuthorityEpoch: alice.AuthorityEpoch, Fences: releasedEarly.Fences(),
+		WorkspaceID: alice.WorkspaceID, Holder: alice.ActorID, HolderSession: alice.ActorSessionID,
+		AuthorityEpoch: alice.AuthorityEpoch, Selectors: releasedEarly.Selectors(),
 	}); err != nil {
 		t.Fatal(err)
 	}

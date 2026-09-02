@@ -38,7 +38,7 @@ func statusFor(code domain.ErrorCode) int {
 		return stdhttp.StatusUnauthorized
 	case domain.ErrorCodeNotFound:
 		return stdhttp.StatusNotFound
-	case domain.ErrorCodeLeaseConflict, domain.ErrorCodeLeaseExpired, domain.ErrorCodeFenceRejected:
+	case domain.ErrorCodeLeaseConflict, domain.ErrorCodeLeaseExpired:
 		return stdhttp.StatusConflict
 	case domain.ErrorCodeCursorExpired:
 		return stdhttp.StatusGone

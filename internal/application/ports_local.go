@@ -35,17 +35,15 @@ type LocalAgentSnapshot struct {
 // stops there; blackbird_inbox_fetch and blackbird_thread_fetch carry the rest.
 const MaxLocalAgentSnapshotItems = 5
 
-// LocalAgentReservation is one lease the registering agent still holds. It
-// carries the lease's fences because a resuming agent that cannot renew or
-// release without them can only wait out the TTL, which is the failure the
-// snapshot exists to prevent. ExpiresInMS is signed and goes negative once a
-// lease is overdue, matching AdminReservation.
+// LocalAgentReservation is one lease the registering agent still holds.
+// ClaimGenerations are informational counters; renew and release are addressed
+// by the exact selector set. ExpiresInMS is signed and may go negative.
 type LocalAgentReservation struct {
-	LeaseID     domain.LeaseID
-	Mode        LeaseMode
-	Selectors   []LeaseSelector
-	Fences      []Fence
-	ExpiresInMS int64
+	LeaseID          domain.LeaseID
+	Mode             LeaseMode
+	Selectors        []LeaseSelector
+	ClaimGenerations map[string]uint64
+	ExpiresInMS      int64
 }
 
 // LocalAgentInbox summarizes the whole mailbox with counts and shows only the

@@ -24,7 +24,7 @@ func TestCoordinationErrorConstructionFailuresAreReturned(t *testing.T) {
 		!strings.Contains(commandErr.Error(), "construct coordination error") {
 		t.Fatalf("coordination error = %v", commandErr)
 	}
-	conflictErr := coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictFence, "message")
+	conflictErr := coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictAuthorityMismatch, "message")
 	if conflictErr == nil || !errors.Is(conflictErr, domain.ErrInvalidConflictKind) ||
 		!strings.Contains(conflictErr.Error(), "construct coordination conflict") {
 		t.Fatalf("coordination conflict = %v", conflictErr)
@@ -370,8 +370,8 @@ func TestCoordinationLeaseReleaseIsWorkspaceVisible(t *testing.T) {
 		acquired.Events()[0].ActorID() != holder {
 		t.Fatalf("observer acquired page=%+v error=%v", acquired, err)
 	}
-	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{LeaseID: lease.ID(),
-		HolderSession: session, AuthorityEpoch: epoch, Fences: lease.Fences()}); err != nil {
+	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{WorkspaceID: workspace,
+		Holder: holder, HolderSession: session, AuthorityEpoch: epoch, Selectors: lease.Selectors()}); err != nil {
 		t.Fatal(err)
 	}
 	continued, _ := application.NewCoordinationEventsQuery(workspace, observer, acquired.NextCursor(), 10)
@@ -382,7 +382,7 @@ func TestCoordinationLeaseReleaseIsWorkspaceVisible(t *testing.T) {
 	}
 }
 
-func TestCoordinationLeaseConcurrencyConflictAndFencing(t *testing.T) {
+func TestCoordinationLeaseConcurrencyAndClaimGeneration(t *testing.T) {
 	t.Parallel()
 	store := newCoordinationStore(t)
 	workspace := coordinationWorkspace(t, 20)
@@ -445,9 +445,7 @@ func TestCoordinationLeaseConcurrencyConflictAndFencing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ValidateFence(context.Background(), winner.ID(), epoch, winner.Fences()); err != nil {
-		t.Fatal(err)
-	}
+	winnerGeneration := winner.ClaimGeneration(selector)
 	if _, err := store.db.Exec(`UPDATE leases SET expires_at_us = acquired_at_us + 1 WHERE lease_id = ?`, winner.ID().String()); err != nil {
 		t.Fatal(err)
 	}
@@ -459,14 +457,8 @@ func TestCoordinationLeaseConcurrencyConflictAndFencing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ValidateFence(context.Background(), winner.ID(), epoch, winner.Fences()); !errors.Is(err, domain.ErrFenceRejected) {
-		t.Fatalf("stale fence error=%v", err)
-	}
-	if err := store.ValidateFence(context.Background(), replacement.ID(), epoch, replacement.Fences()); err != nil {
-		t.Fatal(err)
-	}
-	if replacement.Fences()[0].Counter() <= winner.Fences()[0].Counter() {
-		t.Fatal("replacement fence did not advance")
+	if replacement.ClaimGeneration(selector) <= winnerGeneration {
+		t.Fatal("replacement claim generation did not advance")
 	}
 }
 
@@ -843,30 +835,26 @@ func TestAcquireLeaseReapsExpiredLeases(t *testing.T) {
 		t.Fatalf("stale lease status=%q released=%v, want a released row", status, released)
 	}
 
-	// A reaped lease is terminal, not idempotently released: its holder must
-	// still be told the deadline passed rather than that its release succeeded.
-	renew := application.ChangeLeaseParams{LeaseID: stale.ID(), HolderSession: fixture.session,
-		AuthorityEpoch: fixture.epoch, Fences: stale.Fences(), TTL: time.Hour}
-	if _, err := fixture.store.RenewLease(context.Background(), renew); !errors.Is(err, domain.ErrLeaseExpired) {
+	// A reaped selector set is no longer an active claim.
+	renew := application.ChangeLeaseParams{WorkspaceID: fixture.workspace, Holder: fixture.holder,
+		HolderSession: fixture.session, AuthorityEpoch: fixture.epoch, Selectors: stale.Selectors(), TTL: time.Hour}
+	if _, err := fixture.store.RenewLease(context.Background(), renew); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("renew of a reaped lease error=%v", err)
 	}
 	renew.TTL = 0
-	if _, err := fixture.store.ReleaseLease(context.Background(), renew); !errors.Is(err, domain.ErrLeaseExpired) {
+	if _, err := fixture.store.ReleaseLease(context.Background(), renew); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("release of a reaped lease error=%v", err)
 	}
 
-	// An explicit release stays idempotent, which is what the reaper must not
-	// break: it is distinguished by having been stamped before the deadline.
+	// A live exact selector set can still be released normally.
 	live, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/live.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := application.ChangeLeaseParams{LeaseID: live.ID(), HolderSession: fixture.session,
-		AuthorityEpoch: fixture.epoch, Fences: live.Fences()}
-	for attempt := range 2 {
-		if _, err := fixture.store.ReleaseLease(context.Background(), release); err != nil {
-			t.Fatalf("release attempt %d error=%v", attempt, err)
-		}
+	release := application.ChangeLeaseParams{WorkspaceID: fixture.workspace, Holder: fixture.holder,
+		HolderSession: fixture.session, AuthorityEpoch: fixture.epoch, Selectors: live.Selectors()}
+	if _, err := fixture.store.ReleaseLease(context.Background(), release); err != nil {
+		t.Fatalf("release error=%v", err)
 	}
 }
 
@@ -925,11 +913,9 @@ func TestAcquireLeaseRetryByItsOwnHolderExtendsInsteadOfConflicting(t *testing.T
 	}
 }
 
-// TestAcquireLeaseSupersedesOnlyWhatItCovers pins the boundary of the retry
-// rule. Skipping a self-conflict must not retire a reservation the new request
-// does not fully cover, or an agent narrowing its scope silently loses the
-// paths it still believes it holds.
-func TestAcquireLeaseSupersedesOnlyWhatItCovers(t *testing.T) {
+// TestAcquireLeaseSupersedesOnlyExactSelectorSet pins the path-addressed retry
+// rule: neither narrowing nor widening may silently drop a separate claim.
+func TestAcquireLeaseSupersedesOnlyExactSelectorSet(t *testing.T) {
 	t.Parallel()
 	fixture := newLeaseFixture(t, 1000)
 	wide, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorSubtree, "docs")
@@ -944,8 +930,7 @@ func TestAcquireLeaseSupersedesOnlyWhatItCovers(t *testing.T) {
 		t.Fatalf("subtree lease status=%q after a narrower re-claim, want it left alone", status)
 	}
 
-	// Widening the other way does supersede: everything the exact lease
-	// protected is inside the subtree the holder now reserves.
+	// Widening also leaves the distinct exact claim active.
 	narrow, err := fixture.acquire(t, fixture.holder, application.LeaseShared, application.LeaseSelectorExact, "pkg/a.go")
 	if err != nil {
 		t.Fatal(err)
@@ -954,8 +939,8 @@ func TestAcquireLeaseSupersedesOnlyWhatItCovers(t *testing.T) {
 		application.LeaseSelectorSubtree, "pkg"); err != nil {
 		t.Fatalf("exclusive re-claim over the holder's own shared lease: %v", err)
 	}
-	if status, _ := fixture.status(t, narrow); status != "released" {
-		t.Fatalf("covered lease status=%q after the wider re-claim, want it retired", status)
+	if status, _ := fixture.status(t, narrow); status != "active" {
+		t.Fatalf("exact lease status=%q after the wider re-claim, want it left alone", status)
 	}
 
 	// A shared lease held by somebody else still refuses the same widening, so
@@ -1024,10 +1009,8 @@ func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
 		len(held.Selectors) != 1 || held.Selectors[0].Path() != "internal/storage" {
 		t.Fatalf("held reservation = %+v", held)
 	}
-	// The fences travel with it, because an agent that cannot renew or release
-	// without them can only wait the reservation out.
-	if len(held.Fences) != len(lease.Fences()) || held.Fences[0].ConflictKey() != lease.Fences()[0].ConflictKey() {
-		t.Fatalf("held fences = %+v, want the lease's own %+v", held.Fences, lease.Fences())
+	if held.ClaimGenerations[selector.Key()] == 0 {
+		t.Fatalf("held claim generations = %+v, want informational handoff counter", held.ClaimGenerations)
 	}
 	if held.ExpiresInMS <= 0 || held.ExpiresInMS > (20*time.Minute).Milliseconds() {
 		t.Fatalf("expires_in_ms = %d, want the remaining time on a twenty minute lease", held.ExpiresInMS)
@@ -1050,10 +1033,10 @@ func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
 
 	// A released lease leaves the snapshot, so the projection cannot keep
 	// telling a resuming agent to clean up something it already cleaned up.
-	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{LeaseID: lease.ID(),
-		HolderSession: resumed.ActorSessionID, AuthorityEpoch: resumed.AuthorityEpoch,
-		Fences: held.Fences}); err != nil {
-		t.Fatalf("release with the fences the snapshot handed back: %v", err)
+	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{WorkspaceID: resumed.WorkspaceID,
+		Holder: resumed.ActorID, HolderSession: resumed.ActorSessionID, AuthorityEpoch: resumed.AuthorityEpoch,
+		Selectors: held.Selectors}); err != nil {
+		t.Fatalf("release with the selector set the snapshot handed back: %v", err)
 	}
 	after, err := store.LocalAgentSnapshot(context.Background(), resumed)
 	if err != nil {
@@ -1095,150 +1078,6 @@ func seedSnapshotMail(t *testing.T, store *Store, author, recipient application.
 		t.Fatal(err)
 	}
 	return conversation, message
-}
-
-// TestValidateFenceSeparatesFailureFromSupersession is the regression that
-// matters most: a fence rejection tells an agent to abandon its reservation, so
-// a busy database or a cancelled call must never be reported as one.
-func TestValidateFenceSeparatesFailureFromSupersession(t *testing.T) {
-	t.Parallel()
-	for _, testCase := range []struct {
-		name        string
-		mutate      func(*testing.T, *leaseFixture, application.Lease)
-		supply      func(application.Lease) []application.Fence
-		cancel      bool
-		wantRejects bool
-		wantText    []string
-	}{
-		{name: "a current fence validates", wantRejects: false},
-		{name: "a superseded counter is rejected", wantRejects: true,
-			wantText: []string{"superseded", "stands at"},
-			mutate: func(t *testing.T, fixture *leaseFixture, lease application.Lease) {
-				t.Helper()
-				if _, err := fixture.store.db.Exec(`UPDATE lease_fence_counters SET counter = counter + 1
-					WHERE workspace_id = ? AND authority_epoch = ?`, fixture.workspace.String(), fixture.epoch.String()); err != nil {
-					t.Fatal(err)
-				}
-			}},
-		{name: "a missing counter row is rejected", wantRejects: true,
-			wantText: []string{"superseded", "no longer has a counter"},
-			mutate: func(t *testing.T, fixture *leaseFixture, lease application.Lease) {
-				t.Helper()
-				if _, err := fixture.store.db.Exec(`DELETE FROM lease_fence_counters WHERE workspace_id = ?
-					AND authority_epoch = ?`, fixture.workspace.String(), fixture.epoch.String()); err != nil {
-					t.Fatal(err)
-				}
-			}},
-		{name: "a fence the caller never held is rejected", wantRejects: true,
-			wantText: []string{"stale", "exact:src/elsewhere.go"},
-			supply: func(lease application.Lease) []application.Fence {
-				fence, _ := application.NewFence("exact:src/elsewhere.go", 1)
-				return []application.Fence{fence}
-			}},
-		{name: "a cancelled call is not a fence rejection", cancel: true, wantRejects: false},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			fixture := newLeaseFixture(t, 800)
-			lease, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/fenced.go")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if testCase.mutate != nil {
-				testCase.mutate(t, fixture, lease)
-			}
-			fences := lease.Fences()
-			if testCase.supply != nil {
-				fences = testCase.supply(lease)
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			if testCase.cancel {
-				cancel()
-			}
-			defer cancel()
-			err = fixture.store.ValidateFence(ctx, lease.ID(), fixture.epoch, fences)
-			if errors.Is(err, domain.ErrFenceRejected) != testCase.wantRejects {
-				t.Fatalf("validation error=%v, want rejection=%v", err, testCase.wantRejects)
-			}
-			if testCase.cancel && !errors.Is(err, context.Canceled) {
-				t.Fatalf("cancelled validation error=%v, want a cancellation", err)
-			}
-			if !testCase.wantRejects {
-				return
-			}
-			message := commandMessage(t, err)
-			for _, want := range testCase.wantText {
-				if !strings.Contains(message, want) {
-					t.Fatalf("rejection message %q omits %q", message, want)
-				}
-			}
-		})
-	}
-}
-
-// TestCompareFencesReportsFirstDivergence covers the accessor that turns a bare
-// mismatch into something an agent can name: which key moved, and both counters.
-func TestCompareFencesReportsFirstDivergence(t *testing.T) {
-	t.Parallel()
-	fence := func(t *testing.T, key string, counter uint64) application.Fence {
-		t.Helper()
-		value, err := application.NewFence(key, counter)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return value
-	}
-	for _, testCase := range []struct {
-		name      string
-		held      []string
-		supplied  []string
-		wantEqual bool
-		wantKey   string
-		wantHeld  uint64
-		wantGiven uint64
-	}{
-		{name: "identical sets match", held: []string{"exact:a", "exact:b"}, supplied: []string{"exact:a", "exact:b"},
-			wantEqual: true},
-		{name: "order does not matter", held: []string{"exact:b", "exact:a"}, supplied: []string{"exact:a", "exact:b"},
-			wantEqual: true},
-		{name: "a moved counter names its key", held: []string{"exact:a", "exact:b"}, supplied: []string{"exact:a", "exact:b"},
-			wantKey: "exact:b", wantHeld: 2, wantGiven: 9},
-		{name: "a fence the caller omitted", held: []string{"exact:a", "exact:b"}, supplied: []string{"exact:a"},
-			wantKey: "exact:b", wantHeld: 2},
-		{name: "a fence the caller never held", held: []string{"exact:a"}, supplied: []string{"exact:a", "exact:z"},
-			wantKey: "exact:z", wantGiven: 26},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			// The counter follows the key rather than the position, so a case
-			// can reorder a set without also changing what it holds.
-			counterFor := func(key string) uint64 { return uint64(key[len(key)-1]-'a') + 1 }
-			held := make([]application.Fence, 0, len(testCase.held))
-			for _, key := range testCase.held {
-				held = append(held, fence(t, key, counterFor(key)))
-			}
-			supplied := make([]application.Fence, 0, len(testCase.supplied))
-			for _, key := range testCase.supplied {
-				counter := counterFor(key)
-				if key == testCase.wantKey && testCase.wantGiven != 0 {
-					counter = testCase.wantGiven
-				}
-				supplied = append(supplied, fence(t, key, counter))
-			}
-			divergence, equal := compareFences(held, supplied)
-			if equal != testCase.wantEqual {
-				t.Fatalf("equal=%v, want %v", equal, testCase.wantEqual)
-			}
-			if testCase.wantEqual {
-				return
-			}
-			if divergence.conflictKey != testCase.wantKey || divergence.held != testCase.wantHeld ||
-				divergence.supplied != testCase.wantGiven {
-				t.Fatalf("divergence=%+v, want key=%q held=%d supplied=%d", divergence, testCase.wantKey,
-					testCase.wantHeld, testCase.wantGiven)
-			}
-		})
-	}
 }
 
 // TestEvidenceTextStaysInsideTheMessageBudget guards the interpolation itself:

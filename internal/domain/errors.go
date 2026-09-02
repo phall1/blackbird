@@ -30,7 +30,6 @@ const (
 	ErrorCodeCommandInProgress     ErrorCode = "COMMAND_IN_PROGRESS"
 	ErrorCodeLeaseConflict         ErrorCode = "LEASE_CONFLICT"
 	ErrorCodeLeaseExpired          ErrorCode = "LEASE_EXPIRED"
-	ErrorCodeFenceRejected         ErrorCode = "FENCE_REJECTED"
 	ErrorCodeCursorInvalid         ErrorCode = "CURSOR_INVALID"
 	ErrorCodeCursorScopeMismatch   ErrorCode = "CURSOR_SCOPE_MISMATCH"
 	ErrorCodeCursorExpired         ErrorCode = "CURSOR_EXPIRED"
@@ -72,8 +71,7 @@ func (code ErrorCode) Category() (ErrorCategory, bool) {
 		ErrorCodeIdempotencyKeyReused,
 		ErrorCodeCommandIDReused,
 		ErrorCodeLeaseConflict,
-		ErrorCodeLeaseExpired,
-		ErrorCodeFenceRejected:
+		ErrorCodeLeaseExpired:
 		return ErrorCategoryConflict, true
 	case ErrorCodeCommandInProgress:
 		return ErrorCategoryContention, true
@@ -100,8 +98,8 @@ func (code ErrorCode) Valid() bool {
 // DefaultRetryable reports the stable retry posture of a code. LEASE_CONFLICT
 // belongs here because a lease has a bounded TTL: the failure clears on its own
 // once the holder's lease expires, so the same request is worth repeating after
-// the delay the failure reports. LEASE_EXPIRED and FENCE_REJECTED do not,
-// because the caller must re-acquire the lease and refresh its fences first.
+// the delay the failure reports. LEASE_EXPIRED does not, because the caller
+// must acquire the selector set again.
 func (code ErrorCode) DefaultRetryable() bool {
 	switch code {
 	case ErrorCodeStaleVersion,
@@ -133,7 +131,6 @@ const (
 	ConflictDeliveryFact        ConflictKind = "DeliveryFactConflict"
 	ConflictLease               ConflictKind = "LeaseConflict"
 	ConflictLeaseTerminal       ConflictKind = "LeaseTerminalConflict"
-	ConflictFence               ConflictKind = "FenceConflict"
 	ConflictLeaseScope          ConflictKind = "LeaseScopeConflict"
 	ConflictProviderObservation ConflictKind = "ProviderObservationConflict"
 )
@@ -152,7 +149,6 @@ func (kind ConflictKind) Valid() bool {
 		ConflictDeliveryFact,
 		ConflictLease,
 		ConflictLeaseTerminal,
-		ConflictFence,
 		ConflictLeaseScope,
 		ConflictProviderObservation:
 		return true
@@ -215,8 +211,6 @@ func (kind ConflictKind) errorCode() ErrorCode {
 		return ErrorCodeLeaseConflict
 	case ConflictLeaseTerminal:
 		return ErrorCodeLeaseExpired
-	case ConflictFence:
-		return ErrorCodeFenceRejected
 	case ConflictLeaseScope:
 		return ErrorCodeInvalidArgument
 	default:
@@ -305,7 +299,6 @@ var (
 	ErrCommandInProgress     = commandErrorSentinel(ErrorCodeCommandInProgress)
 	ErrLeaseConflict         = commandErrorSentinel(ErrorCodeLeaseConflict)
 	ErrLeaseExpired          = commandErrorSentinel(ErrorCodeLeaseExpired)
-	ErrFenceRejected         = commandErrorSentinel(ErrorCodeFenceRejected)
 	ErrCursorInvalid         = commandErrorSentinel(ErrorCodeCursorInvalid)
 	ErrCursorScopeMismatch   = commandErrorSentinel(ErrorCodeCursorScopeMismatch)
 	ErrCursorExpired         = commandErrorSentinel(ErrorCodeCursorExpired)

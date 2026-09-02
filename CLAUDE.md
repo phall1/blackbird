@@ -357,9 +357,9 @@ matters.
 3. **Reserve before editing.** Acquire `exclusive` for writes and `shared` for
    reads, with selectors naming the narrowest path that covers your edit —
    `exact` for a single file, `subtree` only when the change genuinely spans a
-   package. Hold the returned lease ID and fences.
-4. **Renew long work** with the lease ID and the *current* fences. Stale fences
-   are rejected; that is the fencing token doing its job, not a bug.
+   package. Hold the exact selector set you sent.
+4. **Renew long work** with that exact selector set. `claim_generation` reports
+   how often a path changed hands; it is status information, not a credential.
 5. **Release when done** rather than letting a lease expire — an expiring lease
    blocks other agents for its whole TTL.
 6. **One conversation per work item.** Open a conversation, then send and reply

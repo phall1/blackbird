@@ -481,8 +481,8 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 
 // ForceReleaseAdminReservation is the operator escape hatch for a live lease
 // whose holder disappeared with its session credentials. The admin token is
-// the authorization boundary, so this deliberately bypasses holder and fence
-// checks while retaining the normal release row and journal fact.
+// the authorization boundary, so this deliberately bypasses holder checks
+// while retaining the normal release row and journal fact.
 func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 	leaseID domain.LeaseID) (application.Lease, error) {
 	if leaseID.IsZero() {
@@ -591,6 +591,11 @@ func (store *Store) reservationsPage(ctx context.Context, query application.Admi
 				return selectorErr
 			}
 			reservations[position].Selectors = selectors
+			generations, generationErr := adminClaimGenerations(ctx, tx, reservations[position].LeaseID)
+			if generationErr != nil {
+				return generationErr
+			}
+			reservations[position].ClaimGenerations = generations
 		}
 		return nil
 	})
@@ -718,6 +723,24 @@ func adminReservationState(status string, expiresAtUS, nowMicros int64) applicat
 	default:
 		return application.AdminReservationExpired
 	}
+}
+
+func adminClaimGenerations(ctx context.Context, tx *sql.Tx, lease domain.LeaseID) (map[string]uint64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT conflict_key, counter FROM lease_fences WHERE lease_id = ?`, lease.String())
+	if err != nil {
+		return nil, fmt.Errorf("query SQLite admin claim generations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	generations := make(map[string]uint64)
+	for rows.Next() {
+		var key string
+		var generation uint64
+		if err := rows.Scan(&key, &generation); err != nil {
+			return nil, fmt.Errorf("scan SQLite admin claim generation: %w", err)
+		}
+		generations[key] = generation
+	}
+	return generations, rows.Err()
 }
 
 func adminLeaseSelectors(ctx context.Context, tx *sql.Tx, lease domain.LeaseID) ([]application.LeaseSelector, error) {

@@ -21,7 +21,7 @@ Close out the current work item. Hand off to: $ARGUMENTS
    - anything that surprised you about the codebase
 
 3. **Release every lease** with `blackbird_reservation_change`, passing
-   `action: "release"`, the `lease_id`, and current `fences`. Release rather
+   `action: "release"` and its exact selector set. Release rather
    than letting leases expire —
    an expiring lease blocks other agents for its whole TTL.
 
