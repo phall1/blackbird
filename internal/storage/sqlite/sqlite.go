@@ -28,20 +28,21 @@ import (
 )
 
 const (
-	ApplicationID       = 0x42424d4c
-	SchemaVersion       = 6
-	DriverVersion       = "v1.56.0"
-	SQLiteVersion       = "3.53.3"
-	SQLiteSourceID      = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
-	defaultBusyTimeout  = 5 * time.Second
-	maximumBusyTimeout  = 30 * time.Second
-	maximumReadPoolSize = 5
-	schemaChecksumHex   = "2d8ee10115bb382ce8068d6d92dbeb62deaf1cf7c9badd1bfba30a3518157806"
-	schemaV1ChecksumHex = "370ba0de329fa9fdf77d027d2ebc85be6747a28bd79ad4ba892fe8884eb3622a"
-	schemaV2ChecksumHex = "2e0c68a7f203a9c245aed614b5586c4136bd2d1a6764fc8ca3f69e89522ba975"
-	schemaV3ChecksumHex = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
-	schemaV4ChecksumHex = "78700880f092ecb28b261bcab7fa71d2755062a047d3c4ad51f8c426253f3427"
-	schemaV5ChecksumHex = "3ffd7c6bc3139822119815c2fa417d8ad8fd209b41522d87a9284142274e3cb4"
+	ApplicationID             = 0x42424d4c
+	SchemaVersion             = 6
+	DriverVersion             = "v1.56.0"
+	SQLiteVersion             = "3.53.3"
+	SQLiteSourceID            = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
+	defaultBusyTimeout        = 5 * time.Second
+	maximumBusyTimeout        = 30 * time.Second
+	maximumReadPoolSize       = 5
+	passiveCheckpointInterval = time.Minute
+	schemaChecksumHex         = "2d8ee10115bb382ce8068d6d92dbeb62deaf1cf7c9badd1bfba30a3518157806"
+	schemaV1ChecksumHex       = "370ba0de329fa9fdf77d027d2ebc85be6747a28bd79ad4ba892fe8884eb3622a"
+	schemaV2ChecksumHex       = "2e0c68a7f203a9c245aed614b5586c4136bd2d1a6764fc8ca3f69e89522ba975"
+	schemaV3ChecksumHex       = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
+	schemaV4ChecksumHex       = "78700880f092ecb28b261bcab7fa71d2755062a047d3c4ad51f8c426253f3427"
+	schemaV5ChecksumHex       = "3ffd7c6bc3139822119815c2fa417d8ad8fd209b41522d87a9284142274e3cb4"
 )
 
 // migrationRung is one step of the upgrade ladder: the embedded migration that
@@ -121,15 +122,17 @@ type Diagnostics struct {
 }
 
 type Store struct {
-	db           *sql.DB
-	path         string
-	writes       writeArbiter
-	heartbeats   heartbeatLedger
-	securityLane chan struct{}
-	diagnostics  Diagnostics
-	closeOnce    sync.Once
-	closeErr     error
-	releasePath  func()
+	db               *sql.DB
+	path             string
+	writes           writeArbiter
+	heartbeats       heartbeatLedger
+	securityLane     chan struct{}
+	diagnostics      Diagnostics
+	checkpointCancel context.CancelFunc
+	checkpointDone   chan struct{}
+	closeOnce        sync.Once
+	closeErr         error
+	releasePath      func()
 }
 
 // heartbeatLedger remembers when each open session's liveness was last written
@@ -222,8 +225,34 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	}
 	diagnostics.UncleanCheckRan = uncleanCheckRan
 	store.diagnostics = diagnostics
+	store.startPassiveCheckpoints()
 	opened = true
 	return store, nil
+}
+
+func (store *Store) startPassiveCheckpoints() {
+	ctx, cancel := context.WithCancel(context.Background())
+	store.checkpointCancel = cancel
+	store.checkpointDone = make(chan struct{})
+	go func() {
+		defer close(store.checkpointDone)
+		passiveCheckpointLoop(ctx, passiveCheckpointInterval, func(ctx context.Context) {
+			_, _ = store.Checkpoint(ctx, CheckpointPassive)
+		})
+	}()
+}
+
+func passiveCheckpointLoop(ctx context.Context, interval time.Duration, checkpoint func(context.Context)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			checkpoint(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func claimProcessPath(path string) (func(), error) {
@@ -1517,6 +1546,8 @@ func (store *Store) Path() string { return store.path }
 
 func (store *Store) Close() error {
 	store.closeOnce.Do(func() {
+		store.checkpointCancel()
+		<-store.checkpointDone
 		ctx, cancel := context.WithTimeout(context.Background(), defaultBusyTimeout)
 		defer cancel()
 		if err := store.withImmediate(ctx, func(tx *sql.Tx) error {

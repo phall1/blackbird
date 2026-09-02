@@ -119,6 +119,36 @@ func TestDoctorReadsTheDatabaseFactsItIsHanded(t *testing.T) {
 			want:     checkPass,
 		},
 		{
+			name:  "large disproportionate WAL warns",
+			check: "database.wal",
+			database: func(database Database) Database {
+				database.SizeBytes = 2 << 20
+				database.WALBytes = walWarningFloorBytes
+				return database
+			},
+			want: checkWarn, wantDetail: "not keeping", wantRemedy: "gc --checkpoint",
+		},
+		{
+			name:  "large proportional WAL passes",
+			check: "database.wal",
+			database: func(database Database) Database {
+				database.SizeBytes = walWarningFloorBytes
+				database.WALBytes = walWarningFloorBytes
+				return database
+			},
+			want: checkPass, wantDetail: "wal=64 MiB",
+		},
+		{
+			name:  "small disproportionate WAL passes",
+			check: "database.wal",
+			database: func(database Database) Database {
+				database.SizeBytes = 4 << 10
+				database.WALBytes = 1 << 20
+				return database
+			},
+			want: checkPass, wantDetail: "wal=1 MiB",
+		},
+		{
 			name:  "free space under the floor warns",
 			check: "disk.free",
 			database: func(database Database) Database {

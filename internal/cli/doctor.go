@@ -118,7 +118,7 @@ func (cmd *DoctorCmd) groups() []checkGroup {
 		{names: []string{"service.state", "service.definition", "updater"}, run: cmd.serviceChecks},
 		{names: []string{"daemon.liveness"}, run: cmd.daemonChecks},
 		{names: []string{"database.file", "database.permissions", "database.read", "database.schema",
-			"database.shutdown", "disk.free", "reservations.expired", "database.integrity"},
+			"database.shutdown", "database.wal", "disk.free", "reservations.expired", "database.integrity"},
 			run: cmd.databaseChecks},
 		{names: []string{"clients"}, run: cmd.clientChecks},
 	}
@@ -326,7 +326,7 @@ func (cmd *DoctorCmd) databaseChecks(ctx context.Context, console *Console, daem
 	schema := schemaCheck(database)
 
 	checks := []checkResult{file, permissionsCheck(database, path), read, schema,
-		cmd.shutdownCheck(ctx, console, daemon, database), diskCheck(database), expiredLeaseCheck(database)}
+		cmd.shutdownCheck(ctx, console, daemon, database), walCheck(database), diskCheck(database), expiredLeaseCheck(database)}
 	if cmd.Deep && database.Present {
 		integrity := checkResult{Name: "database.integrity", Status: checkPass,
 			Detail: "quick_check=" + orAbsent(database.QuickCheck) + " foreign_key_failures=" + itoa(database.ForeignKeyFailures)}
@@ -414,6 +414,12 @@ const (
 	// whatever the owner bits say.
 	ownerOnlyMode = "-rw-------"
 
+	// A WAL smaller than this is cheap even when it dwarfs a nearly empty
+	// database. Above it, a large ratio means a reader may be pinning frames
+	// despite the daemon's periodic passive checkpoints.
+	walWarningFloorBytes = 64 << 20
+	walSizeMultiple      = 16
+
 	// Expired-but-unreleased leases block nobody: the daemon's conflict test
 	// compares expiry against now, so an expired lease is already invisible to
 	// an acquire. They measure whether agents release what they reserve, and a
@@ -422,6 +428,19 @@ const (
 	// one line of warning and no more.
 	expiredLeaseBacklog = 25
 )
+
+func walCheck(database Database) checkResult {
+	check := checkResult{Name: "database.wal", Status: checkPass,
+		Detail: "wal=" + render.Bytes(database.WALBytes) + " database=" + render.Bytes(database.SizeBytes)}
+	if database.WALBytes < walWarningFloorBytes ||
+		database.SizeBytes > 0 && database.WALBytes <= walSizeMultiple*database.SizeBytes {
+		return check
+	}
+	check.Status = checkWarn
+	check.Detail += ": passive checkpoints are not keeping the write-ahead log bounded"
+	check.Remedy = "wait one minute; if it remains this large, stop the daemon and run \"blackbird gc --checkpoint\""
+	return check
+}
 
 // permissionsCheck fails rather than warns: the database holds every message
 // body on the machine, and a mode that lets another account read them is not a
