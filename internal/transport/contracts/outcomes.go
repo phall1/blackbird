@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -38,6 +39,19 @@ const (
 	StateConsumed = "consumed"
 
 	MaxRetryAfterMS uint32 = 5 * 60 * 1000
+
+	// MaxLeaseExpiresInMS bounds the remaining-lease evidence a coordination
+	// failure may report. No lease outlives the application's maximum TTL, so a
+	// larger remaining time is evidence the producer measured against the wrong
+	// clock rather than evidence of a longer-lived lease.
+	MaxLeaseExpiresInMS uint32 = uint32(application.MaxLeaseTTL / time.Millisecond)
+
+	// These mirror the bounds application.NewLeaseSelector and
+	// application.NewFence already enforce, so every conflict the daemon can
+	// construct is one this contract admits. A fence key is a selector prefixed
+	// by its kind, which is what the extra bytes cover.
+	maxLeaseSelectorPathBytes = application.MaxLeaseSelectorBytes
+	maxFenceConflictKeyBytes  = application.MaxLeaseSelectorBytes + 16
 )
 
 type CommandResultMetadataDTO struct {
@@ -846,6 +860,9 @@ type ErrorDetailsDTO struct {
 	Dependency       string                `json:"dependency,omitempty"`
 	CurrentState     string                `json:"current_state,omitempty"`
 	CurrentAuthority *AuthorityRouteDTO    `json:"current_authority,omitempty"`
+	LeaseHolder      *LeaseHolderDTO       `json:"lease_holder,omitempty"`
+	ExpiredLease     *ExpiredLeaseDTO      `json:"expired_lease,omitempty"`
+	FenceConflict    *FenceConflictDTO     `json:"fence_conflict,omitempty"`
 }
 
 type RecoveryAction string
@@ -885,6 +902,36 @@ type AggregateConflictDTO struct {
 	ID              string               `json:"id"`
 	ExpectedVersion *domain.Version      `json:"expected_version,omitempty"`
 	ActualVersion   *domain.Version      `json:"actual_version,omitempty"`
+}
+
+// LeaseHolderDTO is the LEASE_CONFLICT evidence: which agent holds the lease
+// that blocked the request, which of its selectors overlapped, and how long
+// that lease still has to run. The expiry is relative, like the admin
+// reservation view, so a caller with a skewed clock still waits the right
+// amount of time rather than forever or not at all.
+type LeaseHolderDTO struct {
+	LeaseID       domain.LeaseID                `json:"lease_id"`
+	HolderActorID domain.ActorID                `json:"holder_actor_id"`
+	SelectorKind  application.LeaseSelectorKind `json:"selector_kind"`
+	SelectorPath  string                        `json:"selector_path"`
+	ExpiresInMS   uint32                        `json:"expires_in_ms"`
+}
+
+// ExpiredLeaseDTO is the LEASE_EXPIRED evidence: the lease the caller was
+// still holding fences for, and the instant it stopped being authoritative.
+type ExpiredLeaseDTO struct {
+	LeaseID   domain.LeaseID `json:"lease_id"`
+	ExpiredAt time.Time      `json:"expired_at"`
+}
+
+// FenceConflictDTO is the FENCE_REJECTED evidence: the conflict key whose
+// fence moved, the counter the daemon holds, and the counter the caller
+// supplied. Both counters are reported so a caller can tell a stale fence from
+// a fence it never held.
+type FenceConflictDTO struct {
+	ConflictKey     string `json:"conflict_key"`
+	ExpectedCounter uint64 `json:"expected_counter"`
+	SuppliedCounter uint64 `json:"supplied_counter"`
 }
 
 func DecodeError(data []byte) (ErrorDTO, error) {
@@ -988,6 +1035,21 @@ func (result ErrorDTO) Validate() error {
 			return err
 		}
 	}
+	if result.Details.LeaseHolder != nil {
+		if err := result.Details.LeaseHolder.validate(); err != nil {
+			return err
+		}
+	}
+	if result.Details.ExpiredLease != nil {
+		if err := result.Details.ExpiredLease.validate(); err != nil {
+			return err
+		}
+	}
+	if result.Details.FenceConflict != nil {
+		if err := result.Details.FenceConflict.validate(); err != nil {
+			return err
+		}
+	}
 	return result.validateCodeDetails()
 }
 
@@ -1049,8 +1111,62 @@ func (aggregate AggregateConflictDTO) validate() error {
 	return nil
 }
 
+func (lease LeaseHolderDTO) validate() error {
+	if err := validateRequiredID("details.lease_holder.lease_id", lease.LeaseID); err != nil {
+		return err
+	}
+	if err := validateRequiredID("details.lease_holder.holder_actor_id", lease.HolderActorID); err != nil {
+		return err
+	}
+	if lease.SelectorKind != application.LeaseSelectorExact && lease.SelectorKind != application.LeaseSelectorSubtree {
+		return invalid("details.lease_holder.selector_kind", "is not a stable lease selector kind")
+	}
+	if err := validateText("details.lease_holder.selector_path", lease.SelectorPath, maxLeaseSelectorPathBytes, true); err != nil {
+		return err
+	}
+	if lease.ExpiresInMS == 0 || lease.ExpiresInMS > MaxLeaseExpiresInMS {
+		return invalid("details.lease_holder.expires_in_ms", fmt.Sprintf("must be within 1..%d", MaxLeaseExpiresInMS))
+	}
+	return nil
+}
+
+func (lease ExpiredLeaseDTO) validate() error {
+	if err := validateRequiredID("details.expired_lease.lease_id", lease.LeaseID); err != nil {
+		return err
+	}
+	return validateUTCInstant("details.expired_lease.expired_at", lease.ExpiredAt)
+}
+
+func (fence FenceConflictDTO) validate() error {
+	if err := validateText("details.fence_conflict.conflict_key", fence.ConflictKey, maxFenceConflictKeyBytes, true); err != nil {
+		return err
+	}
+	if err := validateFenceCounter("details.fence_conflict.expected_counter", fence.ExpectedCounter); err != nil {
+		return err
+	}
+	return validateFenceCounter("details.fence_conflict.supplied_counter", fence.SuppliedCounter)
+}
+
+func validateFenceCounter(field string, counter uint64) error {
+	if counter == 0 || counter > domain.MaxCanonicalInteger {
+		return invalid(field, fmt.Sprintf("must be within 1..%d", domain.MaxCanonicalInteger))
+	}
+	return nil
+}
+
+// leaseRetryAfterMS is the wait a LEASE_CONFLICT must advise: exactly the
+// holder's remaining lease time, so a caller that honours it retries once the
+// conflict has actually cleared, capped at the envelope's retry ceiling.
+func leaseRetryAfterMS(expiresInMS uint32) uint32 {
+	if expiresInMS > MaxRetryAfterMS {
+		return MaxRetryAfterMS
+	}
+	return expiresInMS
+}
+
 func (result ErrorDTO) validateRetryDelay() error {
 	requiresDelay := result.Code == domain.ErrorCodeCommandInProgress ||
+		result.Code == domain.ErrorCodeLeaseConflict ||
 		result.Code == domain.ErrorCodeRateLimited ||
 		result.Code == domain.ErrorCodeBackpressure ||
 		result.Code == domain.ErrorCodeDependencyUnavailable
@@ -1080,6 +1196,9 @@ const (
 	detailDependency
 	detailCurrentState
 	detailCurrentAuthority
+	detailLeaseHolder
+	detailExpiredLease
+	detailFenceConflict
 )
 
 func (result ErrorDTO) validateCodeDetails() error {
@@ -1172,8 +1291,42 @@ func (result ErrorDTO) validateCodeDetails() error {
 			detailRecovery|detailIdempotencyKey,
 			detailRecovery|detailIdempotencyKey,
 		)
-	case domain.ErrorCodeLeaseConflict, domain.ErrorCodeLeaseExpired, domain.ErrorCodeFenceRejected:
-		return invalid("code", "does not have a frozen W0 typed evidence schema")
+	case domain.ErrorCodeLeaseConflict:
+		if details.DomainConflict != domain.ConflictLease {
+			return invalid("details.domain_conflict", "must equal LeaseConflict for LEASE_CONFLICT")
+		}
+		if details.Recovery != RecoveryRetryAfterDelay {
+			return invalid("details.recovery", "must equal retry_after_delay for LEASE_CONFLICT")
+		}
+		if err := details.requireAndAllow(
+			detailDomainConflict|detailRecovery|detailLeaseHolder,
+			detailDomainConflict|detailRecovery|detailLeaseHolder,
+		); err != nil {
+			return err
+		}
+		// The advised wait is the holder's remaining lease time, not a guess: a
+		// shorter wait retries into the same conflict, and a longer one idles an
+		// agent past the moment the path became free.
+		if result.RetryAfterMS == nil || *result.RetryAfterMS != leaseRetryAfterMS(details.LeaseHolder.ExpiresInMS) {
+			return invalid("retry_after_ms", "must equal the holder's remaining lease time, capped at the retry ceiling")
+		}
+		return nil
+	case domain.ErrorCodeLeaseExpired:
+		if details.DomainConflict != domain.ConflictLeaseTerminal {
+			return invalid("details.domain_conflict", "must equal LeaseTerminalConflict for LEASE_EXPIRED")
+		}
+		return details.requireAndAllow(
+			detailDomainConflict|detailExpiredLease,
+			detailDomainConflict|detailExpiredLease,
+		)
+	case domain.ErrorCodeFenceRejected:
+		if details.DomainConflict != domain.ConflictFence {
+			return invalid("details.domain_conflict", "must equal FenceConflict for FENCE_REJECTED")
+		}
+		return details.requireAndAllow(
+			detailDomainConflict|detailFenceConflict,
+			detailDomainConflict|detailFenceConflict,
+		)
 	case domain.ErrorCodeCursorInvalid:
 		if details.Recovery != RecoveryDiscardCursor {
 			return invalid("details.recovery", "must equal discard_cursor for CURSOR_INVALID")
@@ -1259,6 +1412,15 @@ func (details ErrorDetailsDTO) presentMask() errorDetailMask {
 	}
 	if details.CurrentAuthority != nil {
 		present |= detailCurrentAuthority
+	}
+	if details.LeaseHolder != nil {
+		present |= detailLeaseHolder
+	}
+	if details.ExpiredLease != nil {
+		present |= detailExpiredLease
+	}
+	if details.FenceConflict != nil {
+		present |= detailFenceConflict
 	}
 	return present
 }

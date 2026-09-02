@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -335,6 +336,8 @@ func applyTypeContract(object schema, valueType reflect.Type) {
 		setConst(properties, "schema", SchemaContextCheckpoint)
 	case "IssuedCeremonyDTO":
 		setEnum(properties, "purpose", "membership_acceptance", "delegation_activation", "device_pairing", "actor_session_start")
+	case "LeaseHolderDTO":
+		setEnum(properties, "selector_kind", string(application.LeaseSelectorExact), string(application.LeaseSelectorSubtree))
 	case "ErrorDTO":
 		applyErrorContract(object)
 	case "EmptyExtensionsDTO":
@@ -391,6 +394,14 @@ func applyNamedProperty(name string, property schema) {
 		target["minimum"], target["maximum"] = 1, maxSyncPageCount
 	case "retry_after_ms":
 		target["minimum"], target["maximum"] = 1, MaxRetryAfterMS
+	case "expires_in_ms":
+		target["minimum"], target["maximum"] = 1, MaxLeaseExpiresInMS
+	case "selector_path":
+		stringBounds(target, 1, maxLeaseSelectorPathBytes)
+	case "conflict_key":
+		stringBounds(target, 1, maxFenceConflictKeyBytes)
+	case "expected_counter", "supplied_counter":
+		target["minimum"] = 1
 	case "message", "detail":
 		stringBounds(target, 1, 512)
 	case "field":

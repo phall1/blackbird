@@ -12,9 +12,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/phall1/blackbird/internal/domain"
 )
 
-const productOpenAPIGoldenSHA256 = "38acbcfd29d0dbd0981e5e064f6605299d2f80254ceb2151ab90b467323513f0"
+const productOpenAPIGoldenSHA256 = "dd32f749ae40ff34d6d4b1934fcc1fb7a7a00f7115ac617fe8787c7da90a8c0b"
 
 func TestProductOpenAPI31IsDeterministicAndComplete(t *testing.T) {
 	t.Parallel()
@@ -160,6 +162,39 @@ func TestStandaloneJSONSchemasAreDeterministic(t *testing.T) {
 		}
 		if bytes.Contains(document, []byte("#/components/schemas/")) {
 			t.Fatalf("standalone schema %s contains an OpenAPI-only reference", name)
+		}
+	}
+}
+
+func TestCoordinationEvidenceSchemasAreConstrained(t *testing.T) {
+	t.Parallel()
+	components, err := contractSchemas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	details := components["ErrorDetails"].(schema)["properties"].(schema)
+	for _, name := range []string{"lease_holder", "expired_lease", "fence_conflict"} {
+		if _, described := details[name]; !described {
+			t.Fatalf("error details omit %s evidence", name)
+		}
+	}
+	holder := components["LeaseHolder"].(schema)["properties"].(schema)
+	if expiry := holder["expires_in_ms"].(schema); expiry["minimum"] != 1 || expiry["maximum"] != MaxLeaseExpiresInMS {
+		t.Fatalf("holder expiry bounds = %#v", expiry)
+	}
+	if kind := holder["selector_kind"].(schema); !reflect.DeepEqual(kind["enum"], []any{"exact", "subtree"}) {
+		t.Fatalf("holder selector kind = %#v", kind)
+	}
+	if selector := holder["selector_path"].(schema); selector["minLength"] != 1 || selector["maxLength"] != maxLeaseSelectorPathBytes {
+		t.Fatalf("holder selector path bounds = %#v", selector)
+	}
+	fence := components["FenceConflict"].(schema)["properties"].(schema)
+	if key := fence["conflict_key"].(schema); key["minLength"] != 1 || key["maxLength"] != maxFenceConflictKeyBytes {
+		t.Fatalf("fence conflict key bounds = %#v", key)
+	}
+	for _, name := range []string{"expected_counter", "supplied_counter"} {
+		if counter := fence[name].(schema); counter["minimum"] != 1 || counter["maximum"] != domain.MaxCanonicalInteger {
+			t.Fatalf("fence %s bounds = %#v", name, counter)
 		}
 	}
 }

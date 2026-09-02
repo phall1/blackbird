@@ -352,7 +352,7 @@ func TestErrorCodeSpecificDetailsRejectAmbiguity(t *testing.T) {
 			value.Details.DomainConflict = domain.ConflictLease
 			return value
 		}()},
-		{name: "lease code unavailable", value: func() ErrorDTO {
+		{name: "lease conflict without holder evidence or wait", value: func() ErrorDTO {
 			value := base(domain.ErrorCodeLeaseConflict)
 			value.Details.DomainConflict = domain.ConflictLease
 			return value
@@ -410,6 +410,233 @@ func TestErrorCodeSpecificDetailsRejectAmbiguity(t *testing.T) {
 		if _, err := DecodeError(mutated); err == nil {
 			t.Fatalf("DecodeError() accepted missing required member %s", member.name)
 		}
+	}
+}
+
+func TestCoordinationErrorsCarryTypedEvidence(t *testing.T) {
+	t.Parallel()
+
+	const idLease = "01b8e094-9888-7000-8000-000000000053"
+	leaseID, err := domain.ParseLeaseID(idLease)
+	if err != nil {
+		t.Fatalf("ParseLeaseID() error = %v", err)
+	}
+	holder := mustParseActorID(t, idActor)
+	base := func(code domain.ErrorCode) ErrorDTO {
+		category, _ := code.Category()
+		return ErrorDTO{
+			Schema:    SchemaError,
+			RequestID: "req-coordination",
+			Code:      code,
+			Category:  category,
+			Message:   "Safe failure.",
+			Retryable: code.DefaultRetryable(),
+		}
+	}
+	holderEvidence := func() *LeaseHolderDTO {
+		return &LeaseHolderDTO{
+			LeaseID:       leaseID,
+			HolderActorID: holder,
+			SelectorKind:  application.LeaseSelectorSubtree,
+			SelectorPath:  "internal/transport/contracts",
+			ExpiresInMS:   30_000,
+		}
+	}
+
+	leaseConflict := base(domain.ErrorCodeLeaseConflict)
+	leaseConflict.RetryAfterMS = pointer(uint32(30_000))
+	leaseConflict.Details = ErrorDetailsDTO{
+		DomainConflict: domain.ConflictLease,
+		Recovery:       RecoveryRetryAfterDelay,
+		LeaseHolder:    holderEvidence(),
+	}
+	if err := leaseConflict.Validate(); err != nil {
+		t.Fatalf("valid LEASE_CONFLICT error = %v", err)
+	}
+	encoded := mustMarshal(t, leaseConflict)
+	if _, err := DecodeError(encoded); err != nil {
+		t.Fatalf("DecodeError() error = %v", err)
+	}
+	want := `{"schema":"blackbird.error/1","request_id":"req-coordination","code":"LEASE_CONFLICT","category":"conflict","message":"Safe failure.","retryable":true,"retry_after_ms":30000,"details":{"domain_conflict":"LeaseConflict","recovery":"retry_after_delay","lease_holder":{"lease_id":"` + idLease + `","holder_actor_id":"` + idActor + `","selector_kind":"subtree","selector_path":"internal/transport/contracts","expires_in_ms":30000}}}`
+	if string(encoded) != want {
+		t.Fatalf("JSON changed\n got: %s\nwant: %s", encoded, want)
+	}
+
+	// A lease may outlive the retry ceiling, so the advised wait saturates
+	// there rather than promising a delay the envelope cannot express.
+	cappedWait := base(domain.ErrorCodeLeaseConflict)
+	cappedWait.RetryAfterMS = pointer(MaxRetryAfterMS)
+	cappedWait.Details = ErrorDetailsDTO{
+		DomainConflict: domain.ConflictLease,
+		Recovery:       RecoveryRetryAfterDelay,
+		LeaseHolder:    holderEvidence(),
+	}
+	cappedWait.Details.LeaseHolder.ExpiresInMS = MaxLeaseExpiresInMS
+	if err := cappedWait.Validate(); err != nil {
+		t.Fatalf("valid capped LEASE_CONFLICT error = %v", err)
+	}
+
+	leaseExpired := base(domain.ErrorCodeLeaseExpired)
+	leaseExpired.Details = ErrorDetailsDTO{
+		DomainConflict: domain.ConflictLeaseTerminal,
+		ExpiredLease:   &ExpiredLeaseDTO{LeaseID: leaseID, ExpiredAt: fixtureTime},
+	}
+	if err := leaseExpired.Validate(); err != nil {
+		t.Fatalf("valid LEASE_EXPIRED error = %v", err)
+	}
+	if _, err := DecodeError(mustMarshal(t, leaseExpired)); err != nil {
+		t.Fatalf("DecodeError() LEASE_EXPIRED error = %v", err)
+	}
+
+	fenceRejected := base(domain.ErrorCodeFenceRejected)
+	fenceRejected.Details = ErrorDetailsDTO{
+		DomainConflict: domain.ConflictFence,
+		FenceConflict: &FenceConflictDTO{
+			ConflictKey:     "subtree:internal/transport/contracts",
+			ExpectedCounter: 7,
+			SuppliedCounter: 6,
+		},
+	}
+	if err := fenceRejected.Validate(); err != nil {
+		t.Fatalf("valid FENCE_REJECTED error = %v", err)
+	}
+	if _, err := DecodeError(mustMarshal(t, fenceRejected)); err != nil {
+		t.Fatalf("DecodeError() FENCE_REJECTED error = %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		value ErrorDTO
+	}{
+		{name: "lease conflict without holder evidence", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.LeaseHolder = nil
+			return value
+		}()},
+		{name: "lease conflict without a wait", value: func() ErrorDTO {
+			value := leaseConflict
+			value.RetryAfterMS = nil
+			return value
+		}()},
+		{name: "lease conflict retried before the holder expires", value: func() ErrorDTO {
+			value := leaseConflict
+			value.RetryAfterMS = pointer(uint32(29_999))
+			return value
+		}()},
+		{name: "lease conflict retried after the path is free", value: func() ErrorDTO {
+			value := leaseConflict
+			value.RetryAfterMS = pointer(uint32(30_001))
+			return value
+		}()},
+		{name: "lease conflict reported as terminal", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.DomainConflict = domain.ConflictLeaseTerminal
+			return value
+		}()},
+		{name: "lease conflict without a retry recovery", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.Recovery = RecoveryRetrySameCommand
+			return value
+		}()},
+		{name: "lease conflict marked unretryable", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Retryable = false
+			return value
+		}()},
+		{name: "lease conflict with an already expired holder", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.LeaseHolder = holderEvidence()
+			value.Details.LeaseHolder.ExpiresInMS = 0
+			return value
+		}()},
+		{name: "lease conflict outliving the maximum lease", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.LeaseHolder = holderEvidence()
+			value.Details.LeaseHolder.ExpiresInMS = MaxLeaseExpiresInMS + 1
+			return value
+		}()},
+		{name: "lease conflict with an unknown selector kind", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.LeaseHolder = holderEvidence()
+			value.Details.LeaseHolder.SelectorKind = "glob"
+			return value
+		}()},
+		{name: "lease conflict without a selector path", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.LeaseHolder = holderEvidence()
+			value.Details.LeaseHolder.SelectorPath = ""
+			return value
+		}()},
+		{name: "lease conflict without a holder", value: func() ErrorDTO {
+			value := leaseConflict
+			value.Details.LeaseHolder = holderEvidence()
+			value.Details.LeaseHolder.HolderActorID = domain.ActorID{}
+			return value
+		}()},
+		{name: "lease expired without an expiry instant", value: func() ErrorDTO {
+			value := leaseExpired
+			value.Details.ExpiredLease = &ExpiredLeaseDTO{LeaseID: leaseID}
+			return value
+		}()},
+		{name: "lease expired outside UTC", value: func() ErrorDTO {
+			value := leaseExpired
+			value.Details.ExpiredLease = &ExpiredLeaseDTO{
+				LeaseID:   leaseID,
+				ExpiredAt: fixtureTime.In(time.FixedZone("UTC+2", 2*60*60)),
+			}
+			return value
+		}()},
+		{name: "lease expired reported as contention", value: func() ErrorDTO {
+			value := leaseExpired
+			value.Details.DomainConflict = domain.ConflictLease
+			return value
+		}()},
+		{name: "lease expired carrying holder evidence", value: func() ErrorDTO {
+			value := leaseExpired
+			value.Details.LeaseHolder = holderEvidence()
+			return value
+		}()},
+		{name: "lease expired advising a wait", value: func() ErrorDTO {
+			value := leaseExpired
+			value.RetryAfterMS = pointer(uint32(1_000))
+			return value
+		}()},
+		{name: "fence rejected without a conflict key", value: func() ErrorDTO {
+			value := fenceRejected
+			value.Details.FenceConflict = &FenceConflictDTO{ExpectedCounter: 7, SuppliedCounter: 6}
+			return value
+		}()},
+		{name: "fence rejected without an expected counter", value: func() ErrorDTO {
+			value := fenceRejected
+			value.Details.FenceConflict = &FenceConflictDTO{ConflictKey: "exact:go.mod", SuppliedCounter: 6}
+			return value
+		}()},
+		{name: "fence rejected beyond the canonical integer range", value: func() ErrorDTO {
+			value := fenceRejected
+			value.Details.FenceConflict = &FenceConflictDTO{
+				ConflictKey:     "exact:go.mod",
+				ExpectedCounter: domain.MaxCanonicalInteger + 1,
+				SuppliedCounter: 6,
+			}
+			return value
+		}()},
+		{name: "fence rejected reported as a lease conflict", value: func() ErrorDTO {
+			value := fenceRejected
+			value.Details.DomainConflict = domain.ConflictLease
+			return value
+		}()},
+		{name: "fence rejected carrying lease evidence", value: func() ErrorDTO {
+			value := fenceRejected
+			value.Details.ExpiredLease = &ExpiredLeaseDTO{LeaseID: leaseID, ExpiredAt: fixtureTime}
+			return value
+		}()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.value.Validate(); !errors.Is(err, ErrInvalidContract) {
+				t.Fatalf("Validate() error = %v, want ErrInvalidContract", err)
+			}
+		})
 	}
 }
 

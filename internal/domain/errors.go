@@ -97,10 +97,16 @@ func (code ErrorCode) Valid() bool {
 	return valid
 }
 
+// DefaultRetryable reports the stable retry posture of a code. LEASE_CONFLICT
+// belongs here because a lease has a bounded TTL: the failure clears on its own
+// once the holder's lease expires, so the same request is worth repeating after
+// the delay the failure reports. LEASE_EXPIRED and FENCE_REJECTED do not,
+// because the caller must re-acquire the lease and refresh its fences first.
 func (code ErrorCode) DefaultRetryable() bool {
 	switch code {
 	case ErrorCodeStaleVersion,
 		ErrorCodeCommandInProgress,
+		ErrorCodeLeaseConflict,
 		ErrorCodeRateLimited,
 		ErrorCodeBackpressure,
 		ErrorCodeDependencyUnavailable,
@@ -272,6 +278,16 @@ func (e *CommandError) Category() ErrorCategory {
 		return ""
 	}
 	return e.category
+}
+
+// Message exposes the safe, transport-neutral failure text the constructor
+// validated. Transports that discard it fall back to a per-code generic string
+// and lose the precision the domain already paid for.
+func (e *CommandError) Message() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
 }
 
 func (e *CommandError) Retryable() bool { return e != nil && e.retryable }
