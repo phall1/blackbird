@@ -37,17 +37,51 @@ const (
 	maximumBusyTimeout  = 30 * time.Second
 	maximumReadPoolSize = 5
 	schemaChecksumHex   = "78700880f092ecb28b261bcab7fa71d2755062a047d3c4ad51f8c426253f3427"
+	schemaV1ChecksumHex = "370ba0de329fa9fdf77d027d2ebc85be6747a28bd79ad4ba892fe8884eb3622a"
+	schemaV2ChecksumHex = "2e0c68a7f203a9c245aed614b5586c4136bd2d1a6764fc8ca3f69e89522ba975"
 	schemaV3ChecksumHex = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
 )
 
-var migrationIDs = [...]string{"0001_w0.sql", "0002_w2_coordination.sql", "0003_local_coordination.sql", "0004_coordination_event_journal.sql"}
+// migrationRung is one step of the upgrade ladder: the embedded migration that
+// carries a database to this rung's version, the hex-encoded schema checksum the
+// database must hash to once that migration has run, and any state a migration
+// cannot express in DDL.
+type migrationRung struct {
+	migrationID    string
+	schemaChecksum string
+	seed           func(context.Context, *sql.Tx) error
+}
+
+// migrationLadder is the whole upgrade path, rung index k taking a database from
+// schema version k to k+1. Every version this build knows therefore converges on
+// SchemaVersion by replaying only the rungs it has not run, which is what stops a
+// machine that skipped releases from dead-ending on a schema it can never leave.
+// The array length is SchemaVersion so that bumping the version without adding a
+// rung fails to compile rather than deleting an upgrade path. A new rung must
+// also widen the schema_manifest version CHECK, since every rung records the
+// version it reached.
+var migrationLadder = [SchemaVersion]migrationRung{
+	{migrationID: "0001_w0.sql", schemaChecksum: schemaV1ChecksumHex},
+	{migrationID: "0002_w2_coordination.sql", schemaChecksum: schemaV2ChecksumHex},
+	{migrationID: "0003_local_coordination.sql", schemaChecksum: schemaV3ChecksumHex},
+	{migrationID: "0004_coordination_event_journal.sql", schemaChecksum: schemaChecksumHex, seed: seedCoordinationCursorKey},
+}
+
+var migrationIDs = ladderMigrationIDs()
 
 var (
 	ErrInvalidConfiguration = errors.New("invalid SQLite configuration")
 	ErrEngineMismatch       = errors.New("SQLite engine mismatch")
 	ErrSchemaMismatch       = errors.New("SQLite schema mismatch")
-	ErrCommitIndeterminate  = errors.New("SQLite commit outcome is indeterminate")
-	errSecurityNoCommit     = errors.New("SQLite security transaction requires rollback")
+	// ErrSchemaFromFuture and ErrSchemaUnknown separate the two directions a
+	// version can be wrong, because the remedies are opposite: a database from a
+	// newer build is fixed by upgrading Blackbird, while a version no rung
+	// describes can only be restored or recreated. Both wrap ErrSchemaMismatch so
+	// callers that only care that the schema is unusable keep working.
+	ErrSchemaFromFuture    = errors.New("SQLite database was written by a newer Blackbird")
+	ErrSchemaUnknown       = errors.New("SQLite schema version is not on the migration ladder")
+	ErrCommitIndeterminate = errors.New("SQLite commit outcome is indeterminate")
+	errSecurityNoCommit    = errors.New("SQLite security transaction requires rollback")
 
 	//go:embed migrations/*.sql
 	migrations embed.FS
@@ -296,115 +330,124 @@ func (store *Store) initializeOrVerify(ctx context.Context) error {
 		return fmt.Errorf("inspect SQLite schema: %w", err)
 	}
 	if applicationID == 0 && schemaVersion == 0 && objectCount == 0 {
-		return store.applyInitialMigration(ctx)
-	}
-	if applicationID == ApplicationID && schemaVersion == SchemaVersion-1 {
-		if err := store.applyIncrementalMigration(ctx); err != nil {
+		if err := store.climbMigrationLadder(ctx, 0); err != nil {
 			return err
 		}
 		return store.verifyMigrationLedger(ctx)
 	}
-	if applicationID != ApplicationID || schemaVersion != SchemaVersion {
-		return fmt.Errorf("%w: application_id=%d user_version=%d", ErrSchemaMismatch, applicationID, schemaVersion)
+	if applicationID != ApplicationID {
+		return fmt.Errorf("%w: %w: application_id=%d want=%d",
+			ErrSchemaMismatch, ErrSchemaUnknown, applicationID, ApplicationID)
+	}
+	switch {
+	case schemaVersion > SchemaVersion:
+		// Downgrade stays fail-closed: this build cannot know what the newer one
+		// wrote, and guessing would corrupt data it cannot even read.
+		return fmt.Errorf("%w: %w: user_version=%d, this build understands up to %d",
+			ErrSchemaMismatch, ErrSchemaFromFuture, schemaVersion, SchemaVersion)
+	case schemaVersion < 1:
+		return fmt.Errorf("%w: %w: user_version=%d", ErrSchemaMismatch, ErrSchemaUnknown, schemaVersion)
+	case schemaVersion < SchemaVersion:
+		if err := store.climbMigrationLadder(ctx, schemaVersion); err != nil {
+			return err
+		}
 	}
 	return store.verifyMigrationLedger(ctx)
 }
 
-func (store *Store) applyIncrementalMigration(ctx context.Context) error {
+// climbMigrationLadder brings a database at fromVersion up to SchemaVersion in a
+// single transaction, so a machine that skipped releases converges in one open
+// rather than dead-ending. fromVersion 0 is an empty database; any other value
+// must already be exactly the schema that rung left behind, which is proved
+// before the first new rung runs.
+func (store *Store) climbMigrationLadder(ctx context.Context, fromVersion int) error {
 	return store.withImmediate(ctx, func(tx *sql.Tx) error {
-		if err := verifyMigrationLedgerVersion(ctx, tx, migrationIDs[:len(migrationIDs)-1], SchemaVersion-1,
-			expectedSchemaChecksumHex(schemaV3ChecksumHex)); err != nil {
-			return err
+		if fromVersion > 0 {
+			if err := verifyMigrationLedgerVersion(ctx, tx, migrationIDs[:fromVersion], fromVersion,
+				migrationLadder[fromVersion-1].expectedSchema()); err != nil {
+				return err
+			}
 		}
-		migrationID := migrationIDs[len(migrationIDs)-1]
-		body, checksum, err := migration(migrationID)
-		if err != nil {
-			return err
+		for offset, rung := range migrationLadder[fromVersion:] {
+			if err := applyMigrationRung(ctx, tx, rung, fromVersion+offset+1); err != nil {
+				return err
+			}
 		}
-		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			return fmt.Errorf("apply SQLite migration %s: %w", migrationID, err)
-		}
-		key := make([]byte, sha256.Size)
-		if _, err := rand.Read(key); err != nil {
-			return fmt.Errorf("generate SQLite coordination cursor key: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_event_cursor_keys(singleton, key, created_at_us)
-			VALUES (1, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER))`, key); err != nil {
-			return fmt.Errorf("initialize SQLite coordination cursor key: %w", err)
-		}
-		liveChecksum, err := schemaChecksum(ctx, tx)
-		if err != nil {
-			return err
-		}
-		if liveChecksum != expectedSchemaChecksum() {
-			return fmt.Errorf("%w: migrated schema checksum=%x want=%x", ErrSchemaMismatch, liveChecksum, expectedSchemaChecksum())
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_manifest(schema_version, checksum) VALUES (?, ?)`,
-			SchemaVersion, liveChecksum[:]); err != nil {
-			return fmt.Errorf("record SQLite schema manifest: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state)
-			VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')`, migrationID, checksum[:]); err != nil {
-			return fmt.Errorf("record SQLite migration %s: %w", migrationID, err)
-		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(SchemaVersion)); err != nil {
-			return fmt.Errorf("set SQLite schema version: %w", err)
+		if fromVersion == 0 {
+			if _, err := tx.ExecContext(ctx, "PRAGMA application_id = "+strconv.Itoa(ApplicationID)); err != nil {
+				return fmt.Errorf("set SQLite application id: %w", err)
+			}
 		}
 		return nil
 	})
 }
 
-func (store *Store) applyInitialMigration(ctx context.Context) error {
-	return store.withImmediate(ctx, func(tx *sql.Tx) error {
-		checksums := make(map[string][sha256.Size]byte, len(migrationIDs))
-		for _, migrationID := range migrationIDs {
-			body, checksum, err := migration(migrationID)
-			if err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-				return fmt.Errorf("apply SQLite migration %s: %w", migrationID, err)
-			}
-			checksums[migrationID] = checksum
-		}
-		key := make([]byte, sha256.Size)
-		if _, err := rand.Read(key); err != nil {
-			return fmt.Errorf("generate SQLite coordination cursor key: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_event_cursor_keys(singleton, key, created_at_us)
-			VALUES (1, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER))`, key); err != nil {
-			return fmt.Errorf("initialize SQLite coordination cursor key: %w", err)
-		}
-		liveChecksum, err := schemaChecksum(ctx, tx)
-		if err != nil {
+// applyMigrationRung runs one rung and proves the result before recording it. The
+// ledger it writes is append-only by trigger, so every rung a database climbs
+// leaves its own row rather than rewriting the previous one.
+func applyMigrationRung(ctx context.Context, tx *sql.Tx, rung migrationRung, version int) error {
+	body, checksum, err := migration(rung.migrationID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+		return fmt.Errorf("apply SQLite migration %s: %w", rung.migrationID, err)
+	}
+	if rung.seed != nil {
+		if err := rung.seed(ctx, tx); err != nil {
 			return err
 		}
-		expectedChecksum := expectedSchemaChecksum()
-		if liveChecksum != expectedChecksum {
-			return fmt.Errorf("%w: embedded schema checksum=%x want=%x", ErrSchemaMismatch, liveChecksum, expectedChecksum)
-		}
-		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO schema_manifest(schema_version, checksum) VALUES (?, ?)", SchemaVersion, liveChecksum[:],
-		); err != nil {
-			return fmt.Errorf("record SQLite schema manifest: %w", err)
-		}
-		for _, migrationID := range migrationIDs {
-			checksum := checksums[migrationID]
-			if _, err := tx.ExecContext(ctx,
-				"INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state) VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')",
-				migrationID, checksum[:],
-			); err != nil {
-				return fmt.Errorf("record SQLite migration %s: %w", migrationID, err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA application_id = "+strconv.Itoa(ApplicationID)); err != nil {
-			return fmt.Errorf("set SQLite application id: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(SchemaVersion)); err != nil {
-			return fmt.Errorf("set SQLite schema version: %w", err)
-		}
-		return nil
-	})
+	}
+	liveChecksum, err := schemaChecksum(ctx, tx)
+	if err != nil {
+		return err
+	}
+	expectedChecksum := rung.expectedSchema()
+	if liveChecksum != expectedChecksum {
+		return fmt.Errorf("%w: schema checksum after migration %s=%x want=%x",
+			ErrSchemaMismatch, rung.migrationID, liveChecksum, expectedChecksum)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO schema_manifest(schema_version, checksum) VALUES (?, ?)", version, liveChecksum[:],
+	); err != nil {
+		return fmt.Errorf("record SQLite schema manifest: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state) VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')",
+		rung.migrationID, checksum[:],
+	); err != nil {
+		return fmt.Errorf("record SQLite migration %s: %w", rung.migrationID, err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(version)); err != nil {
+		return fmt.Errorf("set SQLite schema version: %w", err)
+	}
+	return nil
+}
+
+// seedCoordinationCursorKey supplies the one row the coordination event journal
+// needs and DDL cannot express, so the rung that creates the table also fills it.
+func seedCoordinationCursorKey(ctx context.Context, tx *sql.Tx) error {
+	key := make([]byte, sha256.Size)
+	if _, err := rand.Read(key); err != nil {
+		return fmt.Errorf("generate SQLite coordination cursor key: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_event_cursor_keys(singleton, key, created_at_us)
+		VALUES (1, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER))`, key); err != nil {
+		return fmt.Errorf("initialize SQLite coordination cursor key: %w", err)
+	}
+	return nil
+}
+
+func (rung migrationRung) expectedSchema() [sha256.Size]byte {
+	return expectedSchemaChecksumHex(rung.schemaChecksum)
+}
+
+func ladderMigrationIDs() []string {
+	ids := make([]string, len(migrationLadder))
+	for index, rung := range migrationLadder {
+		ids[index] = rung.migrationID
+	}
+	return ids
 }
 
 func migration(migrationID string) ([]byte, [sha256.Size]byte, error) {

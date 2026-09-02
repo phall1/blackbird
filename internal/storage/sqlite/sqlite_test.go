@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,56 +64,216 @@ func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	}
 }
 
-func TestOpenIncrementallyMigratesInstalledSchemaThree(t *testing.T) {
+// TestMigrationLadderChecksumsMatchEmbeddedMigrations pins every rung's schema
+// checksum to what the embedded migrations actually produce. A new rung whose
+// constant is a guess, or an edit to a migration that already shipped, fails
+// here instead of stranding an installed database that can no longer be climbed.
+func TestMigrationLadderChecksumsMatchEmbeddedMigrations(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(t.TempDir(), "blackbird-v3.db")
-	db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
-	if err != nil {
-		t.Fatal(err)
+	directory := t.TempDir()
+	for index, rung := range migrationLadder {
+		version := index + 1
+		t.Run(rung.migrationID, func(t *testing.T) {
+			path := filepath.Join(directory, "ladder-v"+strconv.Itoa(version)+".db")
+			installLegacyDatabase(t, path, version)
+			db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			live, err := schemaChecksum(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if expected := rung.expectedSchema(); live != expected {
+				t.Fatalf("schema after %s=%x, ladder records %x", rung.migrationID, live, expected)
+			}
+		})
 	}
-	for _, migrationID := range migrationIDs[:3] {
-		body, checksum, migrationErr := migration(migrationID)
-		if migrationErr != nil {
-			t.Fatal(migrationErr)
-		}
-		if _, migrationErr = db.Exec(string(body)); migrationErr != nil {
-			t.Fatal(migrationErr)
-		}
-		if _, migrationErr = db.Exec(`INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state)
-			VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')`, migrationID, checksum[:]); migrationErr != nil {
-			t.Fatal(migrationErr)
-		}
+}
+
+// TestOpenClimbsMigrationLadderFromEveryKnownVersion covers the reason the ladder
+// exists: Homebrew updates often enough that a shelved machine skips versions, so
+// every version this build knows must converge on the current one rather than
+// only the immediately preceding rung.
+func TestOpenClimbsMigrationLadderFromEveryKnownVersion(t *testing.T) {
+	t.Parallel()
+	for version := 1; version < SchemaVersion; version++ {
+		t.Run("v"+strconv.Itoa(version), func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "blackbird.db")
+			installLegacyDatabase(t, path, version)
+			store, err := Open(context.Background(), Config{Path: path})
+			if err != nil {
+				t.Fatalf("open at user_version=%d: %v", version, err)
+			}
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if store.Diagnostics().SchemaVersion != SchemaVersion {
+				t.Fatalf("schema version=%d, want %d", store.Diagnostics().SchemaVersion, SchemaVersion)
+			}
+			var migrations, manifests, keys int
+			for _, count := range []struct {
+				query string
+				dest  *int
+			}{
+				{"SELECT count(*) FROM schema_migrations", &migrations},
+				{"SELECT count(*) FROM schema_manifest", &manifests},
+				{"SELECT count(*) FROM coordination_event_cursor_keys", &keys},
+			} {
+				if err := store.db.QueryRow(count.query).Scan(count.dest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The ledger is append-only, so the climb leaves one manifest row per
+			// rung on top of the row the shelved build had already recorded.
+			if migrations != len(migrationIDs) || manifests != SchemaVersion-version+1 || keys != 1 {
+				t.Fatalf("migration rows=%d manifest rows=%d cursor keys=%d", migrations, manifests, keys)
+			}
+			if err := store.IntegrityCheck(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
-	v3 := expectedSchemaChecksumHex(schemaV3ChecksumHex)
-	if _, err = db.Exec(`INSERT INTO schema_manifest(schema_version, checksum) VALUES (3, ?)`, v3[:]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(`PRAGMA application_id = 1111641420`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(`PRAGMA user_version = 3`); err != nil {
-		t.Fatal(err)
-	}
-	if err = db.Close(); err != nil {
-		t.Fatal(err)
-	}
+}
+
+func TestOpenLeavesCurrentSchemaUntouched(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "blackbird.db")
 	store, err := Open(context.Background(), Config{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
-	if store.Diagnostics().SchemaVersion != SchemaVersion {
-		t.Fatalf("schema version=%d", store.Diagnostics().SchemaVersion)
-	}
-	var migrations, keys int
-	if err := store.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&migrations); err != nil {
+	migrations, manifests, key := schemaLedgerFacts(t, store)
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.db.QueryRow(`SELECT count(*) FROM coordination_event_cursor_keys`).Scan(&keys); err != nil {
+	reopened, err := Open(context.Background(), Config{Path: path})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 4 || keys != 1 {
-		t.Fatalf("migration rows=%d cursor keys=%d", migrations, keys)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	reopenedMigrations, reopenedManifests, reopenedKey := schemaLedgerFacts(t, reopened)
+	if reopenedMigrations != migrations || reopenedManifests != manifests || reopenedKey != key {
+		t.Fatalf("reopen rewrote the ledger: migrations %d->%d manifest %d->%d key changed=%t",
+			migrations, reopenedMigrations, manifests, reopenedManifests, reopenedKey != key)
+	}
+}
+
+// TestOpenSeparatesUnreadableSchemaDirections keeps downgrade fail-closed while
+// naming which direction failed, because the remedies differ: a newer database
+// needs a newer Blackbird, and no update can rescue a version off the ladder.
+func TestOpenSeparatesUnreadableSchemaDirections(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		statement string
+		want      error
+		reject    error
+	}{
+		{"newer than binary", "PRAGMA user_version = " + strconv.Itoa(SchemaVersion+1), ErrSchemaFromFuture, ErrSchemaUnknown},
+		{"version off the ladder", "PRAGMA user_version = 0", ErrSchemaUnknown, ErrSchemaFromFuture},
+		{"foreign application", "PRAGMA application_id = 1", ErrSchemaUnknown, ErrSchemaFromFuture},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "blackbird.db")
+			store, err := Open(context.Background(), Config{Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			execRaw(t, path, test.statement)
+			_, err = Open(context.Background(), Config{Path: path})
+			if !errors.Is(err, ErrSchemaMismatch) || !errors.Is(err, test.want) || errors.Is(err, test.reject) {
+				t.Fatalf("error=%v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func schemaLedgerFacts(t *testing.T, store *Store) (int, int, string) {
+	t.Helper()
+	var migrations, manifests int
+	var key string
+	if err := store.db.QueryRow("SELECT count(*) FROM schema_migrations").Scan(&migrations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow("SELECT count(*) FROM schema_manifest").Scan(&manifests); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow("SELECT hex(key) FROM coordination_event_cursor_keys").Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	return migrations, manifests, key
+}
+
+// installLegacyDatabase writes the database a build pinned at version would have
+// left behind: the rungs up to that version applied and recorded, and a manifest
+// naming only the version it stopped at.
+func installLegacyDatabase(t *testing.T, path string, version int) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, rung := range migrationLadder[:version] {
+		body, checksum, migrationErr := migration(rung.migrationID)
+		if migrationErr != nil {
+			t.Fatal(migrationErr)
+		}
+		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+			t.Fatal(err)
+		}
+		if rung.seed != nil {
+			if err := rung.seed(ctx, tx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(migration_id, checksum, applied_at_us, state)
+			VALUES (?, ?, CAST(unixepoch('subsec') * 1000000 AS INTEGER), 'applied')`,
+			rung.migrationID, checksum[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorded := migrationLadder[version-1].expectedSchema()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_manifest(schema_version, checksum) VALUES (?, ?)`, version, recorded[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA application_id = "+strconv.Itoa(ApplicationID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(version)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 
