@@ -15,9 +15,12 @@ journal, and injects visible messages into the current session. Messages are
 queued as follow-ups while Pi is busy. Delivery does not mark Blackbird facts
 read or acknowledged.
 
-State is private under `$XDG_STATE_HOME/blackbird/pi-extension`. On first use,
-the extension imports the registration token and completed/quarantined delivery
-facts from the retired `blackbird-pi` companion state when present.
+Blackbird stores delivery progress under the authenticated `pi-extension`
+consumer and advances it only after Pi admits the custom message. The local
+state under `$XDG_STATE_HOME/blackbird/pi-extension` keeps only the registration
+token and host-specific quarantine facts. On first use, the extension imports
+the retired companion cursor once into the server consumer and retains its
+quarantine state.
 
 Environment overrides:
 

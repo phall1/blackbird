@@ -18,7 +18,8 @@ func TestHookDeliversAndPersistsCursor(t *testing.T) {
 
 	var lock sync.Mutex
 	registrations := 0
-	eventCursors := []string{}
+	eventConsumers := []string{}
+	acknowledged := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		lock.Lock()
 		defer lock.Unlock()
@@ -44,14 +45,24 @@ func TestHookDeliversAndPersistsCursor(t *testing.T) {
 			if request.Header.Get("Authorization") != "Bearer bbm_test" {
 				t.Errorf("authorization = %q", request.Header.Get("Authorization"))
 			}
-			eventCursors = append(eventCursors, request.URL.Query().Get("after"))
-			if len(eventCursors) == 1 {
+			eventConsumers = append(eventConsumers, request.URL.Query().Get("consumer"))
+			if len(eventConsumers) == 1 {
 				writeHookFixture(writer, map[string]any{"events": []map[string]any{{
-					"type": "message.available", "subject": "message-1",
+					"type": "message.available", "subject": "message-1", "cursor": "cursor-1",
 				}}, "next_cursor": "cursor-1", "has_more": false})
 				return
 			}
 			writeHookFixture(writer, map[string]any{"events": []any{}, "next_cursor": "cursor-2", "has_more": false})
+		case "/api/v1/local/coordination/events/ack":
+			var body map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			if body["consumer_id"] != "hook-claude" {
+				t.Errorf("consumer = %q", body["consumer_id"])
+			}
+			acknowledged = append(acknowledged, body["cursor"])
+			writer.WriteHeader(http.StatusNoContent)
 		case "/api/v1/local/messages/message-1":
 			writeHookFixture(writer, map[string]any{
 				"message_id": "message-1", "conversation_id": "conversation-1", "author_actor_id": "actor-1",
@@ -93,6 +104,14 @@ func TestHookDeliversAndPersistsCursor(t *testing.T) {
 	if mode := info.Mode().Perm(); mode != fs.FileMode(0o600) {
 		t.Fatalf("state mode=%v", mode)
 	}
+	var savedState map[string]any
+	encodedState, err := os.ReadFile(stateFiles[0])
+	if err != nil || json.Unmarshal(encodedState, &savedState) != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if _, exists := savedState["cursor"]; exists {
+		t.Fatalf("adapter cursor remained in local state: %v", savedState)
+	}
 	directory, err := os.Stat(filepath.Dir(stateFiles[0]))
 	if err != nil {
 		t.Fatal(err)
@@ -110,8 +129,9 @@ func TestHookDeliversAndPersistsCursor(t *testing.T) {
 	}
 	lock.Lock()
 	defer lock.Unlock()
-	if registrations != 2 || len(eventCursors) != 2 || eventCursors[0] != "" || eventCursors[1] != "cursor-1" {
-		t.Fatalf("registrations=%d cursors=%v", registrations, eventCursors)
+	if registrations != 2 || len(eventConsumers) != 2 || eventConsumers[0] != "hook-claude" || eventConsumers[1] != "hook-claude" ||
+		len(acknowledged) != 1 || acknowledged[0] != "cursor-1" {
+		t.Fatalf("registrations=%d consumers=%v acknowledged=%v", registrations, eventConsumers, acknowledged)
 	}
 }
 

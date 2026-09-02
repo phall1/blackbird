@@ -11,12 +11,11 @@ host invokes it; an external Blackbird message cannot wake the host. Network,
 state, and malformed-input failures are fail-open (`{}` on stdout and a
 diagnostic on stderr), so a down daemon never blocks a user prompt.
 
-Private registration tokens and cursors live under
-`$XDG_STATE_HOME/blackbird/hooks` with mode `0600`. Override the loopback origin
-with `BLACKBIRD_API_URL`, the stable recipient name with
-`BLACKBIRD_HOOK_AGENT_NAME`, or the state root with
-`BLACKBIRD_HOOK_STATE_DIR`. Do not run a hook and another Blackbird adapter under
-the same agent name unless they share the same state directory.
+Private registration tokens live under `$XDG_STATE_HOME/blackbird/hooks` with
+mode `0600`; delivery positions live in Blackbird under distinct
+`hook-claude`, `hook-cursor`, and `hook-copilot` consumers. Override the loopback
+origin with `BLACKBIRD_API_URL`, the stable recipient name with
+`BLACKBIRD_HOOK_AGENT_NAME`, or the state root with `BLACKBIRD_HOOK_STATE_DIR`.
 
 ## Claude Code
 

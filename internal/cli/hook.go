@@ -51,7 +51,9 @@ type hookInput struct {
 
 type hookState struct {
 	RegistrationToken string `json:"registration_token"`
-	Cursor            string `json:"cursor,omitempty"`
+	// LegacyCursor is imported once into the server-side consumer position and
+	// then omitted from all subsequent state writes.
+	LegacyCursor string `json:"cursor,omitempty"`
 	// TranscriptPath and TranscriptOffset are the observation plane's watermark
 	// into Claude Code's transcript. The path is stored beside the offset
 	// because an offset into a different file is meaningless.
@@ -66,12 +68,11 @@ type hookRegisterResponse struct {
 type hookEvent struct {
 	Type    string `json:"type"`
 	Subject string `json:"subject"`
+	Cursor  string `json:"cursor"`
 }
 
 type hookEventsPage struct {
-	Events     []hookEvent `json:"events"`
-	NextCursor string      `json:"next_cursor"`
-	HasMore    bool        `json:"has_more"`
+	Events []hookEvent `json:"events"`
 }
 
 type hookMessage struct {
@@ -117,14 +118,29 @@ func (cmd *HookCmd) Run(ctx context.Context, console *Console) error {
 	if err := saveHookState(statePath, state); err != nil {
 		return cmd.failOpen(console, err)
 	}
-	page, messages, err := fetchHookMessages(ctx, client, origin, state)
+	consumer := "hook-" + cmd.Host
+	if state.LegacyCursor != "" {
+		if err := acknowledgeHookEvents(ctx, client, origin, state.RegistrationToken, consumer, state.LegacyCursor); err != nil {
+			return cmd.failOpen(console, fmt.Errorf("migrate hook cursor: %w", err))
+		}
+		state.LegacyCursor = ""
+		if err := saveHookState(statePath, state); err != nil {
+			return cmd.failOpen(console, err)
+		}
+	}
+	page, messages, err := fetchHookMessages(ctx, client, origin, state.RegistrationToken, consumer)
 	if err != nil {
 		return cmd.failOpen(console, err)
 	}
 	if err := writeHookOutput(console.Out, cmd.Host, input.HookEventName, messages); err != nil {
 		return err
 	}
-	state.Cursor = page.NextCursor
+	for _, event := range page.Events {
+		if err := acknowledgeHookEvents(ctx, client, origin, state.RegistrationToken, consumer, event.Cursor); err != nil {
+			_, _ = fmt.Fprintf(console.Err, "blackbird hook: acknowledge delivery: %v\n", err)
+			break
+		}
+	}
 	// The observation plane runs last, on purpose. The host already has its
 	// output, so a daemon that is slow, down, or not collecting costs this hook
 	// a log line rather than a delayed turn.
@@ -315,16 +331,14 @@ func registerHookAgent(ctx context.Context, client *http.Client, origin *url.URL
 }
 
 func fetchHookMessages(ctx context.Context, client *http.Client, origin *url.URL,
-	state hookState) (hookEventsPage, []hookMessage, error) {
+	token, consumer string) (hookEventsPage, []hookMessage, error) {
 	eventsURL := origin.ResolveReference(&url.URL{Path: "api/v1/local/coordination/events"})
 	query := eventsURL.Query()
 	query.Set("limit", fmt.Sprint(hookPageLimit))
-	if state.Cursor != "" {
-		query.Set("after", state.Cursor)
-	}
+	query.Set("consumer", consumer)
 	eventsURL.RawQuery = query.Encode()
 	var page hookEventsPage
-	if err := hookJSON(ctx, client, http.MethodGet, eventsURL, state.RegistrationToken, nil, &page); err != nil {
+	if err := hookJSON(ctx, client, http.MethodGet, eventsURL, token, nil, &page); err != nil {
 		return page, nil, fmt.Errorf("fetch events: %w", err)
 	}
 	messages := make([]hookMessage, 0, len(page.Events))
@@ -334,12 +348,22 @@ func fetchHookMessages(ctx context.Context, client *http.Client, origin *url.URL
 		}
 		messageURL := origin.ResolveReference(&url.URL{Path: "api/v1/local/messages/" + url.PathEscape(event.Subject)})
 		var message hookMessage
-		if err := hookJSON(ctx, client, http.MethodGet, messageURL, state.RegistrationToken, nil, &message); err != nil {
+		if err := hookJSON(ctx, client, http.MethodGet, messageURL, token, nil, &message); err != nil {
 			return page, nil, fmt.Errorf("fetch message %s: %w", event.Subject, err)
 		}
 		messages = append(messages, message)
 	}
 	return page, messages, nil
+}
+
+func acknowledgeHookEvents(ctx context.Context, client *http.Client, origin *url.URL,
+	token, consumer, cursor string) error {
+	if cursor == "" {
+		return errors.New("event cursor is empty")
+	}
+	endpoint := origin.ResolveReference(&url.URL{Path: "api/v1/local/coordination/events/ack"})
+	return hookJSON(ctx, client, http.MethodPost, endpoint, token,
+		map[string]string{"consumer_id": consumer, "cursor": cursor}, nil)
 }
 
 func hookJSON(ctx context.Context, client *http.Client, method string, endpoint *url.URL, token string,

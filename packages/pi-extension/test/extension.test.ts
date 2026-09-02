@@ -48,6 +48,7 @@ describe("supervisor", () => {
     const sent: Record<string, unknown>[] = []
     const connected = vi.fn()
     let catchUps = 0
+    const acknowledgements: unknown[] = []
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : input)
       if (url.pathname.endsWith("/agents/register")) {
@@ -57,7 +58,7 @@ describe("supervisor", () => {
       if (url.pathname.endsWith("/coordination/events")) {
         catchUps += 1
         return Response.json({
-          events: catchUps === 1 ? [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "now" }] : [],
+          events: catchUps === 1 ? [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "now", cursor: "event-1" }] : [],
           next_cursor: "cursor-1", has_more: false,
         })
       }
@@ -65,6 +66,10 @@ describe("supervisor", () => {
         message_id: "m1", conversation_id: "c1", author_actor_id: "a1", subject: "Work", body: "Do it",
         body_digest: "digest", sent_at: "now",
       })
+      if (url.pathname.endsWith("/coordination/events/ack")) {
+        acknowledgements.push(JSON.parse(String(init?.body)) as unknown)
+        return new Response(null, { status: 204 })
+      }
       controller.abort()
       throw new DOMException("Aborted", "AbortError")
     })
@@ -75,7 +80,9 @@ describe("supervisor", () => {
     expect(sent).toEqual([expect.objectContaining({ customType: "blackbird-inbox", details: {
       blackbirdMessageId: "m1", blackbirdConversationId: "c1", blackbirdBodyDigest: "digest",
     } })])
-    expect(JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"))).toMatchObject({ cursor: "cursor-1", delivered: ["m1"] })
+    expect(JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"))).toEqual({ quarantined: [] })
+    expect(acknowledgements).toEqual([{ consumer_id: "pi-extension", cursor: "event-1" }])
+    expect(fetcher.mock.calls.some(([input]) => new URL(input instanceof Request ? input.url : input).searchParams.get("consumer") === "pi-extension")).toBe(true)
     expect((await stat(join(stateDir, "token"))).mode & 0o777).toBe(0o600)
     expect((await stat(stateDir)).mode & 0o777).toBe(0o700)
   })
@@ -85,6 +92,7 @@ describe("supervisor", () => {
     const controller = new AbortController()
     controllers.push(controller)
     let registration: unknown
+    const acknowledgements: unknown[] = []
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : input)
       if (url.pathname.endsWith("/agents/register")) {
@@ -92,9 +100,13 @@ describe("supervisor", () => {
         return Response.json({})
       }
       if (url.pathname.endsWith("/coordination/events")) return Response.json({
-        events: ["delivered", "ambiguous"].map((subject) => ({ type: "message.available", subject, payload: {}, occurred_at: "now" })),
+        events: ["delivered", "ambiguous"].map((subject, index) => ({ type: "message.available", subject, payload: {}, occurred_at: "now", cursor: `event-${String(index + 1)}` })),
         next_cursor: "legacy-cursor", has_more: false,
       })
+      if (url.pathname.endsWith("/coordination/events/ack")) {
+        acknowledgements.push(JSON.parse(String(init?.body)) as unknown)
+        return new Response(null, { status: 204 })
+      }
       controller.abort()
       throw new DOMException("Aborted", "AbortError")
     })
@@ -106,6 +118,10 @@ describe("supervisor", () => {
     })))
     expect(registration).toMatchObject({ registration_token: "legacy-token" })
     expect(sendMessage).not.toHaveBeenCalled()
+    expect(acknowledgements).toEqual([
+      { consumer_id: "pi-extension", cursor: "legacy-cursor" },
+      { consumer_id: "pi-extension", cursor: "event-1" },
+    ])
     expect(fetcher.mock.calls.some(([input]) => new URL(input instanceof Request ? input.url : input).pathname.includes("/messages/"))).toBe(false)
   })
 
@@ -113,12 +129,17 @@ describe("supervisor", () => {
     const stateDir = await mkdtemp(join(tmpdir(), "blackbird-pi-"))
     const controller = new AbortController()
     controllers.push(controller)
-    const fetcher = vi.fn(async (input: string | URL | Request) => {
+    const acknowledgements: unknown[] = []
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : input)
       if (url.pathname.endsWith("/agents/register")) return Response.json({ registration_token: "token" })
       if (url.pathname.endsWith("/coordination/events")) return Response.json({
-        events: [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "now" }], next_cursor: "cursor", has_more: false,
+        events: [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "now", cursor: "event-1" }], next_cursor: "cursor", has_more: false,
       })
+      if (url.pathname.endsWith("/coordination/events/ack")) {
+        acknowledgements.push(JSON.parse(String(init?.body)) as unknown)
+        return new Response(null, { status: 204 })
+      }
       controller.abort()
       throw new DOMException("Aborted", "AbortError")
     })
@@ -128,6 +149,7 @@ describe("supervisor", () => {
     } }]), { ...resolveOptions("/repo", { XDG_STATE_HOME: "/unused" }), stateDir, legacyStateDir: join(stateDir, "legacy") },
     controller.signal, dependencies(fetcher as typeof fetch))
     expect(sendMessage).not.toHaveBeenCalled()
+    expect(acknowledgements).toEqual([{ consumer_id: "pi-extension", cursor: "event-1" }])
   })
 
   it("stops promptly when Pi shuts down before a queued message is admitted", async () => {
@@ -138,7 +160,7 @@ describe("supervisor", () => {
       const url = new URL(input instanceof Request ? input.url : input)
       if (url.pathname.endsWith("/agents/register")) return Response.json({ registration_token: "token" })
       if (url.pathname.endsWith("/coordination/events")) return Response.json({
-        events: [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "now" }], next_cursor: "cursor", has_more: false,
+        events: [{ type: "message.available", subject: "m1", payload: {}, occurred_at: "now", cursor: "event-1" }], next_cursor: "cursor", has_more: false,
       })
       if (url.pathname.endsWith("/messages/m1")) return Response.json({
         message_id: "m1", conversation_id: "c1", author_actor_id: "a1", subject: "Work", body: "Do it", body_digest: "digest", sent_at: "now",

@@ -182,9 +182,10 @@ jq -r '"\(.name)@\(.version)"' packages/*/package.json
 ```
 
 OpenCode installs the package and its production dependencies in its isolated
-plugin cache. Registration tokens, opaque cursors, deduplication facts, and
-conversation-to-session bindings are stored under `$XDG_STATE_HOME/blackbird`
-with private directory and file permissions.
+plugin cache. Blackbird stores each adapter's delivery cursor server-side;
+registration tokens, conversation-to-session bindings, and host-specific
+quarantine state remain under `$XDG_STATE_HOME/blackbird` with private directory
+and file permissions.
 
 ## Pi Delivery (queue)
 

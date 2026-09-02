@@ -5,7 +5,8 @@ import { dirname, join } from "node:path"
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 
 const CUSTOM_TYPE = "blackbird-inbox"
-const MAX_DELIVERED = 4096
+const CONSUMER_ID = "pi-extension"
+const MAX_QUARANTINED = 4096
 
 interface DeliveryDetails {
   blackbirdMessageId: string
@@ -14,9 +15,12 @@ interface DeliveryDetails {
 }
 
 interface State {
-  cursor: string
-  delivered: string[]
   quarantined: string[]
+}
+
+interface LoadedState extends State {
+  legacyCursor: string
+  legacyDelivered: string[]
 }
 
 interface Message {
@@ -101,17 +105,21 @@ async function atomicWrite(path: string, content: string): Promise<void> {
   await rename(temporary, path)
 }
 
-async function loadState(path: string): Promise<State> {
+async function loadState(path: string): Promise<LoadedState> {
   try {
     const value = object(JSON.parse(await readFile(path, "utf8")))
-    if (!value || typeof value["cursor"] !== "string") throw new Error("invalid state")
+    if (!value) throw new Error("invalid state")
     return {
-      cursor: value["cursor"],
-      delivered: Array.isArray(value["delivered"]) ? value["delivered"].filter((item): item is string => typeof item === "string") : [],
-      quarantined: Array.isArray(value["quarantined"]) ? value["quarantined"].filter((item): item is string => typeof item === "string") : [],
+      legacyCursor: typeof value["cursor"] === "string" ? value["cursor"] : "",
+      legacyDelivered: Array.isArray(value["delivered"])
+        ? value["delivered"].filter((item): item is string => typeof item === "string")
+        : [],
+      quarantined: Array.isArray(value["quarantined"])
+        ? value["quarantined"].filter((item): item is string => typeof item === "string")
+        : [],
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { cursor: "", delivered: [], quarantined: [] }
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { legacyCursor: "", legacyDelivered: [], quarantined: [] }
     throw error
   }
 }
@@ -217,10 +225,13 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
   const releaseLock = await acquireLock(join(options.stateDir, "active.lock"))
   const statePath = join(options.stateDir, "state.json")
   try {
-    const state = await loadState(statePath)
+    const loaded = await loadState(statePath)
+    const state: State = { quarantined: loaded.quarantined }
     const legacy = await dependencies.importLegacy(join(options.legacyStateDir, "deliveries.db"))
-    if (state.cursor === "" && legacy.cursor) state.cursor = legacy.cursor
-    const delivered = new Set([...legacy.delivered, ...state.delivered])
+    const legacyCursor = loaded.legacyCursor || legacy.cursor || ""
+    // Transcript-derived IDs remain an in-memory host idempotency check. The
+    // durable delivery position itself now belongs to the server consumer.
+    const delivered = new Set([...legacy.delivered, ...loaded.legacyDelivered])
     const quarantined = new Set([...legacy.quarantined, ...state.quarantined])
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type === "custom_message" && entry.customType === CUSTOM_TYPE) {
@@ -231,16 +242,25 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
     let persistChain = Promise.resolve()
     const persist = async (): Promise<void> => {
       persistChain = persistChain.then(async () => {
-        state.delivered = [...delivered].slice(-MAX_DELIVERED)
-        state.quarantined = [...quarantined].slice(-MAX_DELIVERED)
+        state.quarantined = [...quarantined].slice(-MAX_QUARANTINED)
         await atomicWrite(statePath, `${JSON.stringify(state)}\n`)
       })
       await persistChain
     }
-    await persist()
     const token = await register(options, join(options.stateDir, "token"), legacy.token, dependencies.fetch, signal)
     dependencies.connected()
     const headers = { authorization: `Bearer ${token}`, accept: "application/json" }
+    const acknowledge = async (cursor: string): Promise<void> => {
+      const response = await dependencies.fetch(new URL("api/v1/local/coordination/events/ack", options.baseURL), {
+        method: "POST", headers: { ...headers, "content-type": "application/json" }, signal,
+        body: JSON.stringify({ consumer_id: CONSUMER_ID, cursor }),
+      })
+      if (!response.ok) throw await blackbirdFailure(response, "cursor acknowledgement")
+    }
+    if (legacyCursor !== "") await acknowledge(legacyCursor)
+    // This state rewrite retires the old cursor/delivered arrays only after the
+    // server has accepted their position.
+    await persist()
     const admitted = new Map<string, { resolve(): void; reject(error: Error): void }>()
     const onMessageEnd = (event: { message: unknown }): void => {
       const message = object(event.message)
@@ -250,7 +270,6 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
       delivered.add(details.blackbirdMessageId)
       admitted.get(details.blackbirdMessageId)?.resolve()
       admitted.delete(details.blackbirdMessageId)
-      void persist()
     }
     pi.on("message_end", onMessageEnd)
 
@@ -330,24 +349,32 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
       while (!signal.aborted) {
         const url = new URL("api/v1/local/coordination/events", options.baseURL)
         url.searchParams.set("limit", "100")
-        if (state.cursor) url.searchParams.set("after", state.cursor)
+        url.searchParams.set("consumer", CONSUMER_ID)
         const response = await dependencies.fetch(url, { headers, signal })
         if (!response.ok) throw await blackbirdFailure(response, "catch-up")
         const page = object(await response.json())
-        if (!page || !Array.isArray(page["events"]) || typeof page["next_cursor"] !== "string") throw new Error("blackbird: invalid catch-up page")
+        if (!page || !Array.isArray(page["events"])) throw new Error("blackbird: invalid catch-up page")
         for (const value of page["events"]) {
           const event = object(value)
-          if (event?.["type"] !== "message.available" || typeof event["subject"] !== "string") continue
-          if (delivered.has(event["subject"]) || quarantined.has(event["subject"])) continue
-          const messageResponse = await dependencies.fetch(new URL(`api/v1/local/messages/${encodeURIComponent(event["subject"])}`, options.baseURL), { headers, signal })
-          if (!messageResponse.ok) throw await blackbirdFailure(messageResponse, "message fetch")
-          const message = parseMessage(await messageResponse.json())
-          if (message.message_id !== event["subject"]) throw new Error("blackbird: message ID mismatch")
-          await deliver(message)
+          const cursor = event?.["cursor"]
+          if (!event || typeof cursor !== "string" || cursor === "") throw new Error("blackbird: invalid event cursor")
+          if (event["type"] === "message.available") {
+            const subject = event["subject"]
+            if (typeof subject !== "string" || subject === "") throw new Error("blackbird: invalid message event")
+            // An ambiguous host delivery is intentionally not acknowledged. It
+            // remains quarantined at the head until an operator reconciles it.
+            if (quarantined.has(subject)) return
+            if (!delivered.has(subject)) {
+              const messageResponse = await dependencies.fetch(new URL(`api/v1/local/messages/${encodeURIComponent(subject)}`, options.baseURL), { headers, signal })
+              if (!messageResponse.ok) throw await blackbirdFailure(messageResponse, "message fetch")
+              const message = parseMessage(await messageResponse.json())
+              if (message.message_id !== subject) throw new Error("blackbird: message ID mismatch")
+              await deliver(message)
+            }
+          }
+          await acknowledge(cursor)
         }
-        if (page["has_more"] === true && page["next_cursor"] === state.cursor) throw new Error("blackbird: cursor did not advance")
-        state.cursor = page["next_cursor"]
-        await persist()
+        if (page["has_more"] === true && page["events"].length === 0) throw new Error("blackbird: catch-up page did not advance")
         if (page["has_more"] !== true) return
       }
     }
@@ -356,7 +383,7 @@ export async function runSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, opt
       try {
         await catchUp()
         const url = new URL("api/v1/local/coordination/events/stream", options.baseURL)
-        if (state.cursor) url.searchParams.set("after", state.cursor)
+        url.searchParams.set("consumer", CONSUMER_ID)
         const response = await dependencies.fetch(url, { headers: { ...headers, accept: "text/event-stream" }, signal })
         if (!response.ok) throw await blackbirdFailure(response, "stream")
         const reader = response.body?.getReader()

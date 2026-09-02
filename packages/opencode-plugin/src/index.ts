@@ -18,10 +18,14 @@ export interface BlackbirdMessage {
 }
 
 interface State {
-  cursor: Cursor
-  delivered: string[]
   sessions: Record<string, string>
 }
+
+interface LoadedState extends State {
+  legacyCursor: Cursor
+}
+
+const CONSUMER_ID = "opencode-plugin"
 
 interface RoutingFixed {
   readonly mode: "fixed"
@@ -44,6 +48,7 @@ export interface BlackbirdOptions {
     readonly register?: string
     readonly catchUp?: string
     readonly stream?: string
+    readonly ack?: string
     readonly message?: string
   }
   readonly catchUpLimit?: number
@@ -148,6 +153,7 @@ interface ResolvedOptions {
   readonly registerPath: string
   readonly catchUpPath: string
   readonly streamPath: string
+  readonly ackPath: string
   readonly messagePath: string
   readonly catchUpLimit: number
   readonly minimumMs: number
@@ -232,6 +238,7 @@ export function resolveOptions(raw: PluginOptions | BlackbirdOptions, environmen
     registerPath: typeof paths?.["register"] === "string" ? paths["register"] : "/api/v1/local/agents/register",
     catchUpPath: typeof paths?.["catchUp"] === "string" ? paths["catchUp"] : "/api/v1/local/coordination/events",
     streamPath: typeof paths?.["stream"] === "string" ? paths["stream"] : "/api/v1/local/coordination/events/stream",
+    ackPath: typeof paths?.["ack"] === "string" ? paths["ack"] : "/api/v1/local/coordination/events/ack",
     messagePath: typeof paths?.["message"] === "string" ? paths["message"] : "/api/v1/local/messages",
     catchUpLimit: optionalNumber(source["catchUpLimit"], 100, 1, 256, "catchUpLimit"),
     minimumMs: optionalNumber(backoff?.["minimumMs"], 250, 10, 60_000, "backoff.minimumMs"),
@@ -274,18 +281,17 @@ async function writeAtomic(path: string, contents: string, mode: number): Promis
   try { await directory.sync() } finally { await directory.close() }
 }
 
-async function readState(path: string): Promise<State> {
+async function readState(path: string): Promise<LoadedState> {
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"))
     const source = record(value)
-    if (!source || typeof source["cursor"] !== "string") throw new Error("invalid state")
-    const delivered = Array.isArray(source["delivered"]) ? source["delivered"].filter((item): item is string => typeof item === "string") : []
+    if (!source) throw new Error("invalid state")
     const sessionsSource = record(source["sessions"]) ?? {}
     const sessions = Object.fromEntries(Object.entries(sessionsSource).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
-    return { cursor: source["cursor"], delivered, sessions }
+    return { sessions, legacyCursor: typeof source["cursor"] === "string" ? source["cursor"] : "" }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { cursor: "", delivered: [], sessions: {} }
-    throw new Error(`blackbird: cannot read cursor state ${path}`, { cause: error })
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { sessions: {}, legacyCursor: "" }
+    throw new Error(`blackbird: cannot read adapter state ${path}`, { cause: error })
   }
 }
 
@@ -348,9 +354,9 @@ function promptText(message: BlackbirdMessage): string {
   return `[Blackbird message ${message.message_id} from ${author}]\nSubject: ${message.subject}\n\n${message.body}`
 }
 
-function urlWithCursor(base: URL, path: string, cursor: Cursor, limit?: number): URL {
+function consumerURL(base: URL, path: string, limit?: number): URL {
   const url = new URL(path, base)
-  if (cursor !== "") url.searchParams.set("after", cursor)
+  url.searchParams.set("consumer", CONSUMER_ID)
   if (limit !== undefined) url.searchParams.set("limit", String(limit))
   return url
 }
@@ -362,13 +368,14 @@ function messageURL(base: URL, path: string, messageID: string): URL {
 interface CoordinationEvent {
   readonly type: string
   readonly subject: string
+  readonly cursor: Cursor
 }
 
 function parseEvent(value: unknown): CoordinationEvent {
   const source = record(value)
   if (!source || !Object.hasOwn(source, "payload")) throw new Error("blackbird: coordination event is invalid")
   requiredString(source, "occurred_at")
-  return { type: requiredString(source, "type"), subject: requiredString(source, "subject") }
+  return { type: requiredString(source, "type"), subject: requiredString(source, "subject"), cursor: requiredString(source, "cursor") }
 }
 
 async function* parseSSE(response: Response, signal: AbortSignal): AsyncGenerator<{ data: unknown; id?: string }> {
@@ -413,8 +420,11 @@ export async function runSupervisor(
   const options = resolveOptions(rawOptions)
   if (options.maximumMs < options.minimumMs) throw new Error("blackbird: backoff.maximumMs must not be less than minimumMs")
   await ensurePrivateDirectory(options.stateDir)
+  // Only host routing remains local. Delivery progress belongs to Blackbird's
+  // authenticated consumer, not to another adapter-owned cursor file.
   const statePath = join(options.stateDir, "cursor.json")
-  const state = await readState(statePath)
+  const loaded = await readState(statePath)
+  const state: State = { sessions: loaded.sessions }
   let token: string | undefined
   let tokenAttempt = 0
   while (!signal.aborted && token === undefined) {
@@ -440,11 +450,9 @@ export async function runSupervisor(
     )
     signal.addEventListener("abort", () => { releaseTelemetry?.() }, { once: true })
   }
-  const delivered = new Set(state.delivered)
   const sessionQueues = new Map<string, Promise<void>>()
 
   const persist = async (): Promise<void> => {
-    state.delivered = [...delivered].slice(-2048)
     await writeAtomic(statePath, `${JSON.stringify(state)}\n`, 0o600)
   }
   const targetSession = async (message: BlackbirdMessage): Promise<string> => {
@@ -460,7 +468,6 @@ export async function runSupervisor(
     return created.id
   }
   const deliver = async (message: BlackbirdMessage): Promise<void> => {
-    if (delivered.has(message.message_id)) return
     const sessionID = await targetSession(message)
     const previous = sessionQueues.get(sessionID) ?? Promise.resolve()
     const queued = previous.then(async () => {
@@ -481,12 +488,24 @@ export async function runSupervisor(
           ? { agent: options.routing.agent }
           : {}),
       })
-      delivered.add(message.message_id)
     })
     sessionQueues.set(sessionID, queued)
     try { await queued } finally { if (sessionQueues.get(sessionID) === queued) sessionQueues.delete(sessionID) }
   }
   const headers = { authorization: `Bearer ${token}`, accept: "application/json" }
+  const acknowledge = async (cursor: Cursor): Promise<void> => {
+    const response = await dependencies.fetch(new URL(options.ackPath, options.baseUrl), {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ consumer_id: CONSUMER_ID, cursor }),
+      signal,
+    })
+    if (!response.ok) throw new Error(`blackbird: cursor acknowledgement failed with HTTP ${String(response.status)}`)
+  }
+  // Upgrade old installations without replaying their entire history. Once the
+  // server accepts the old opaque cursor, the next state write drops it.
+  if (loaded.legacyCursor !== "") await acknowledge(loaded.legacyCursor)
+  await persist()
   const fetchMessage = async (messageID: string): Promise<BlackbirdMessage> => {
     const response = await dependencies.fetch(messageURL(options.baseUrl, options.messagePath, messageID), { headers, signal })
     if (!response.ok) throw new Error(`blackbird: message fetch failed with HTTP ${String(response.status)}`)
@@ -496,18 +515,19 @@ export async function runSupervisor(
   }
   const catchUp = async (): Promise<void> => {
     while (!signal.aborted) {
-      const response = await dependencies.fetch(urlWithCursor(options.baseUrl, options.catchUpPath, state.cursor, options.catchUpLimit), { headers, signal })
+      const response = await dependencies.fetch(consumerURL(options.baseUrl, options.catchUpPath, options.catchUpLimit), { headers, signal })
       if (!response.ok) throw new Error(`blackbird: catch-up failed with HTTP ${String(response.status)}`)
       const page = record(await response.json())
-      if (!page || !Array.isArray(page["events"]) || typeof page["next_cursor"] !== "string") throw new Error("blackbird: invalid catch-up response")
+      if (!page || !Array.isArray(page["events"])) throw new Error("blackbird: invalid catch-up response")
       const events = page["events"].map(parseEvent)
       for (const event of events) {
-        if (event.type === "message.available" && !delivered.has(event.subject)) await deliver(await fetchMessage(event.subject))
+        if (event.type === "message.available") await deliver(await fetchMessage(event.subject))
+        // The host promise above is the durable acceptance boundary. A failure
+        // leaves the server cursor untouched and the deterministic host ID
+        // makes the retry idempotent.
+        await acknowledge(event.cursor)
       }
-      const next = page["next_cursor"]
-      if (page["has_more"] === true && next === state.cursor) throw new Error("blackbird: catch-up cursor did not advance")
-      state.cursor = next
-      await persist()
+      if (page["has_more"] === true && events.length === 0) throw new Error("blackbird: catch-up page did not advance")
       if (page["has_more"] !== true) return
     }
   }
@@ -516,7 +536,7 @@ export async function runSupervisor(
   while (!signal.aborted) {
     try {
       await catchUp()
-      const response = await dependencies.fetch(urlWithCursor(options.baseUrl, options.streamPath, state.cursor), {
+      const response = await dependencies.fetch(consumerURL(options.baseUrl, options.streamPath), {
         headers: { ...headers, accept: "text/event-stream" },
         signal,
       })
