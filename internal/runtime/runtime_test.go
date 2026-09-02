@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/storage/postgres"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
 
@@ -268,34 +267,9 @@ func TestListenerErrorFailsClosedDuringCancellation(t *testing.T) {
 	}
 }
 
-func TestPostgreSQLUsesSecretSource(t *testing.T) {
-	t.Parallel()
-	secret := PostgreSQLSecrets{DSN: "postgres://secret", MigrationDSN: "postgres://migration-secret"}
-	daemon, err := NewDaemon(BuildInfo{}, Config{
-		Storage: StoragePostgreSQL, HTTPAddress: ":1", MCPAddress: ":2",
-	}, Dependencies{
-		Secrets: testSecrets{value: secret},
-		Logger:  slog.New(slog.DiscardHandler),
-		Compose: func(context.Context, Storage) (HandlerBundle, error) { return HandlerBundle{}, errors.New("stop") },
-		OpenPostgreSQL: func(_ context.Context, config postgresConfig) (Storage, error) {
-			if config.DSN != secret.DSN || config.MigrationDSN != secret.MigrationDSN {
-				t.Fatalf("PostgreSQL config = %#v", config)
-			}
-			return &testStore{}, nil
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewDaemon() error = %v", err)
-	}
-	if err := daemon.Run(context.Background()); err == nil {
-		t.Fatal("Run() error = nil")
-	}
-}
-
-// Aliases keep lifecycle tests focused on runtime contracts while still
-// verifying the concrete production factory signatures.
+// The alias keeps lifecycle tests focused on runtime contracts while still
+// verifying the concrete production factory signature.
 type sqliteConfig = sqlite.Config
-type postgresConfig = postgres.Config
 
 func newTestDaemon(t *testing.T, dependencies Dependencies) *Daemon {
 	t.Helper()
@@ -455,12 +429,6 @@ func equalStrings(left, right []string) bool {
 		}
 	}
 	return true
-}
-
-type testSecrets struct{ value PostgreSQLSecrets }
-
-func (source testSecrets) PostgreSQL(context.Context) (PostgreSQLSecrets, error) {
-	return source.value, nil
 }
 
 func TestLogSeverityIsAdjustableWithoutARestart(t *testing.T) {

@@ -21,7 +21,7 @@ const (
 )
 
 func TestCrashRecoveryRollsBackEveryUncommittedPublicationBoundary(t *testing.T) {
-	for _, scenario := range []string{"after-receipt", "after-event", "after-outbox"} {
+	for _, scenario := range []string{"after-receipt", "after-event", "after-audit"} {
 		t.Run(scenario, func(t *testing.T) {
 			path := newCrashDatabase(t)
 			output, err := runCrashHelper(t, path, scenario)
@@ -215,11 +215,11 @@ func TestSQLiteCrashHelperProcess(t *testing.T) {
 		if scenario == "after-event" {
 			os.Exit(crashExitCode)
 		}
-		if err := insertCrashOutbox(tx); err != nil {
+		if err := insertCrashAudit(tx); err != nil {
 			return err
 		}
 		switch scenario {
-		case "after-outbox":
+		case "after-audit":
 			os.Exit(crashExitCode)
 		case "before-commit":
 			fmt.Println("transaction-ready")
@@ -305,7 +305,7 @@ func assertPublicationCounts(t *testing.T, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, expected [3]int) {
 	t.Helper()
-	for index, table := range []string{"command_receipts", "domain_events", "outbox_jobs"} {
+	for index, table := range []string{"command_receipts", "domain_events", "audit_entries"} {
 		var count int
 		if err := query.QueryRowContext(context.Background(), "SELECT count(*) FROM "+table).Scan(&count); err != nil {
 			t.Fatal(err)
@@ -347,13 +347,10 @@ func insertCrashEvent(tx *sql.Tx) error {
 	return err
 }
 
-func insertCrashOutbox(tx *sql.Tx) error {
-	_, err := tx.Exec(`INSERT INTO outbox_jobs(
-		job_id, command_id, event_id, handler, handler_contract_version, destination_key, effect_ordinal, effect_kind,
-		idempotency_key, payload, metadata_digest, status, attempt_count, available_at_us, created_at_us, updated_at_us
-	) VALUES (?, ?, ?, 'crash-evidence', 1, 'local', 0, 'publish', 'crash-effect', X'00', zeroblob(32),
-		'pending', 0, 1, 1, 1)`,
-		"01b8e094-9888-7000-8000-000000000109", "01b8e094-9888-7000-8000-000000000101",
-		"01b8e094-9888-7000-8000-000000000105")
+func insertCrashAudit(tx *sql.Tx) error {
+	_, err := tx.Exec(`INSERT INTO audit_entries(
+		scope_kind, scope_id, audit_sequence, previous_entry_hash, entry_hash, canonical_entry, recorded_at_us
+	) VALUES ('workspace', ?, 1, zeroblob(32), randomblob(32), X'7b7d', 1)`,
+		"01b8e094-9888-7000-8000-000000000102")
 	return err
 }

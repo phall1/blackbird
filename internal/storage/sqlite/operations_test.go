@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -227,7 +226,14 @@ func TestCoordinationLeaseConcurrencyConflictAndFencing(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Each contender is its own actor. A lease never conflicts with its own
+	// holder -- that is what makes a retry safe -- so one actor racing itself
+	// would measure nothing but that rule.
 	const contenders = 24
+	contendingHolders := make([]domain.ActorID, contenders)
+	for index := range contenders {
+		contendingHolders[index] = coordinationActor(t, 300+index)
+	}
 	start := make(chan struct{})
 	results := make(chan error, contenders)
 	var wait sync.WaitGroup
@@ -238,7 +244,7 @@ func TestCoordinationLeaseConcurrencyConflictAndFencing(t *testing.T) {
 			<-start
 			leaseID, _ := domain.ParseLeaseID(coordinationUUID(100 + index))
 			_, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
-				WorkspaceID: workspace, Holder: holder, HolderSession: session, AuthorityEpoch: epoch,
+				WorkspaceID: workspace, Holder: contendingHolders[index], HolderSession: session, AuthorityEpoch: epoch,
 				Mode: application.LeaseExclusive, Selectors: []application.LeaseSelector{selector}, TTL: time.Hour})
 			results <- err
 		}(index)
@@ -326,23 +332,6 @@ func newCoordinationStore(t *testing.T) *Store {
 	return store
 }
 
-func TestFullIntegrityCheckReportsAdministrativeOperation(t *testing.T) {
-	t.Parallel()
-	store := newOperationStore(t)
-	if _, err := store.FullIntegrityCheck(context.Background()); err == nil {
-		t.Fatal("unbounded full integrity check was accepted")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	report, err := store.FullIntegrityCheck(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !report.Full || report.Duration <= 0 {
-		t.Fatalf("integrity report=%+v", report)
-	}
-}
-
 func TestPassiveCheckpointReportsFramesPinnedByLongReader(t *testing.T) {
 	t.Parallel()
 	store := newOperationStore(t)
@@ -406,47 +395,10 @@ func TestPassiveCheckpointReportsFramesPinnedByLongReader(t *testing.T) {
 	}
 }
 
-func TestQualifyFilesystemReportsOwnershipPermissionsSpaceAndLocks(t *testing.T) {
-	t.Parallel()
-	root := filepath.Join(t.TempDir(), "authority")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(root, "blackbird.db")
-	artifacts := filepath.Join(root, "artifacts")
-	if err := os.Mkdir(artifacts, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	store := newOperationStoreAt(t, path)
-
-	report, err := QualifyFilesystem(path, artifacts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = store
-	if !report.DatabaseDirectory.Exists || !report.DatabaseDirectory.Directory ||
-		!report.Database.Exists || !report.Database.LockVerified || !report.Artifacts.Exists ||
-		!report.Artifacts.Directory || !report.SameOwner || !report.Local ||
-		report.Database.OwnerUID != uint32(os.Geteuid()) || report.Database.FreeBytes == 0 ||
-		report.QualifiedAt.IsZero() {
-		t.Fatalf("qualification=%+v", report)
-	}
-	if report.WAL.Path != path+"-wal" || report.SharedMemory.Path != path+"-shm" {
-		t.Fatalf("sidecar paths: wal=%q shm=%q", report.WAL.Path, report.SharedMemory.Path)
-	}
-	if report.WAL.Exists && report.WAL.Directory || report.SharedMemory.Exists && report.SharedMemory.Directory {
-		t.Fatalf("sidecar file types: wal=%+v shm=%+v", report.WAL, report.SharedMemory)
-	}
-}
-
 func newOperationStore(t *testing.T) *Store {
 	t.Helper()
-	return newOperationStoreAt(t, filepath.Join(t.TempDir(), "blackbird.db"))
-}
-
-func newOperationStoreAt(t *testing.T, path string) *Store {
-	t.Helper()
-	db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	path := filepath.Join(t.TempDir(), "blackbird.db")
+	db, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,43 +410,9 @@ func newOperationStoreAt(t *testing.T, path string) *Store {
 	if err := db.PingContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	store := &Store{db: db, path: path}
 	store.writes.changed = make(chan struct{})
 	return store
-}
-
-func TestQualifyFilesystemRejectsUnsafePathsAndPermissions(t *testing.T) {
-	t.Parallel()
-	if _, err := QualifyFilesystem("relative.db", t.TempDir()); !errors.Is(err, ErrFilesystemQualification) {
-		t.Fatalf("relative path error=%v", err)
-	}
-
-	root := t.TempDir()
-	path := filepath.Join(root, "blackbird.db")
-	artifacts := filepath.Join(root, "artifacts")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(artifacts, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := QualifyFilesystem(path, artifacts); !errors.Is(err, ErrFilesystemQualification) {
-		t.Fatalf("unsafe permissions error=%v", err)
-	}
-
-	link := filepath.Join(root, "linked.db")
-	if err := os.Symlink(path, link); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(artifacts, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := QualifyFilesystem(link, artifacts); !errors.Is(err, ErrFilesystemQualification) {
-		t.Fatalf("symlink error=%v", err)
-	}
 }
 
 // mailFixture is a conversation with one author, one recipient, and one actor
@@ -802,6 +720,211 @@ func TestAcquireLeaseConflictCarriesRecoveryEvidence(t *testing.T) {
 			t.Fatalf("conflict message %q omits %q", message, want)
 		}
 	}
+}
+
+// TestAcquireLeaseRetryByItsOwnHolderExtendsInsteadOfConflicting is the
+// regression for the commonest acquisition path there is. The overlap scan
+// compared selectors and never the holder, so an agent retrying after a timeout
+// or a lost response was refused by a reservation it already owned, with no
+// recovery but waiting out its own TTL.
+func TestAcquireLeaseRetryByItsOwnHolderExtendsInsteadOfConflicting(t *testing.T) {
+	t.Parallel()
+	fixture := newLeaseFixture(t, 900)
+	first, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorExact, "src/main.go")
+	if err != nil {
+		t.Fatalf("the holder was refused by its own lease: %v", err)
+	}
+	if !retry.ExpiresAt().After(first.ExpiresAt()) {
+		t.Fatalf("retry expires at %s, want a deadline past the original %s", retry.ExpiresAt(), first.ExpiresAt())
+	}
+
+	// The superseded lease is retired inside the same acquisition. Leaving it
+	// active would reserve the same paths against everyone else for its whole
+	// TTL after the agent released the lease it was actually handed.
+	status, released := fixture.status(t, first)
+	if status != "released" || !released.Valid || released.Int64 >= timeMicros(first.ExpiresAt()) {
+		t.Fatalf("superseded lease status=%q released=%v, want an explicit release before its deadline", status, released)
+	}
+	if _, err := fixture.acquire(t, fixture.other, application.LeaseExclusive,
+		application.LeaseSelectorExact, "src/main.go"); !errors.Is(err, domain.ErrLeaseConflict) {
+		t.Fatalf("another actor was not refused by the retry's lease: %v", err)
+	}
+}
+
+// TestAcquireLeaseSupersedesOnlyWhatItCovers pins the boundary of the retry
+// rule. Skipping a self-conflict must not retire a reservation the new request
+// does not fully cover, or an agent narrowing its scope silently loses the
+// paths it still believes it holds.
+func TestAcquireLeaseSupersedesOnlyWhatItCovers(t *testing.T) {
+	t.Parallel()
+	fixture := newLeaseFixture(t, 1000)
+	wide, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive, application.LeaseSelectorSubtree, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive,
+		application.LeaseSelectorExact, "docs/guide.md"); err != nil {
+		t.Fatalf("narrowing re-claim was refused by the holder's own subtree lease: %v", err)
+	}
+	if status, _ := fixture.status(t, wide); status != "active" {
+		t.Fatalf("subtree lease status=%q after a narrower re-claim, want it left alone", status)
+	}
+
+	// Widening the other way does supersede: everything the exact lease
+	// protected is inside the subtree the holder now reserves.
+	narrow, err := fixture.acquire(t, fixture.holder, application.LeaseShared, application.LeaseSelectorExact, "pkg/a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive,
+		application.LeaseSelectorSubtree, "pkg"); err != nil {
+		t.Fatalf("exclusive re-claim over the holder's own shared lease: %v", err)
+	}
+	if status, _ := fixture.status(t, narrow); status != "released" {
+		t.Fatalf("covered lease status=%q after the wider re-claim, want it retired", status)
+	}
+
+	// A shared lease held by somebody else still refuses the same widening, so
+	// the holder check narrows nothing but the holder's own reservations.
+	if _, err := fixture.acquire(t, fixture.other, application.LeaseShared,
+		application.LeaseSelectorExact, "web/app.ts"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.acquire(t, fixture.holder, application.LeaseExclusive,
+		application.LeaseSelectorSubtree, "web"); !errors.Is(err, domain.ErrLeaseConflict) {
+		t.Fatalf("another actor's shared lease did not refuse the exclusive claim: %v", err)
+	}
+}
+
+// TestLocalAgentSnapshotReportsWhatRegistrationRebound covers the state a
+// resuming agent cannot recover on its own. Registration moves the agent's
+// live leases onto its new session; reporting only identifiers left a restarted
+// agent holding an exclusive reservation it could neither renew nor release.
+func TestLocalAgentSnapshotReportsWhatRegistrationRebound(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	const project = "/workspace/snapshot"
+	alice, aliceToken, err := store.RegisterLocalAgent(context.Background(), project, "alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, _, err := store.RegisterLocalAgent(context.Background(), project, "bob", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseID, err := domain.NewLeaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := application.NewLeaseSelector(application.LeaseSelectorSubtree, "internal/storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireLease(context.Background(), application.AcquireLeaseParams{LeaseID: leaseID,
+		WorkspaceID: alice.WorkspaceID, Holder: alice.ActorID, HolderSession: alice.ActorSessionID,
+		AuthorityEpoch: alice.AuthorityEpoch, Mode: application.LeaseExclusive,
+		Selectors: []application.LeaseSelector{selector}, TTL: 20 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, message := seedSnapshotMail(t, store, bob, alice)
+
+	// The restart: the same agent name registers again with its token, which is
+	// the moment the leases are rebound and the agent has forgotten them.
+	resumed, issued, err := store.RegisterLocalAgent(context.Background(), project, "alice", aliceToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued != "" || resumed.ActorSessionID == alice.ActorSessionID {
+		t.Fatalf("resumed session=%v issued=%q, want a new session and no second token", resumed.ActorSessionID, issued)
+	}
+	snapshot, err := store.LocalAgentSnapshot(context.Background(), resumed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Reservations) != 1 {
+		t.Fatalf("reservations=%+v, want the lease registration just rebound", snapshot.Reservations)
+	}
+	held := snapshot.Reservations[0]
+	if held.LeaseID != lease.ID() || held.Mode != application.LeaseExclusive ||
+		len(held.Selectors) != 1 || held.Selectors[0].Path() != "internal/storage" {
+		t.Fatalf("held reservation = %+v", held)
+	}
+	// The fences travel with it, because an agent that cannot renew or release
+	// without them can only wait the reservation out.
+	if len(held.Fences) != len(lease.Fences()) || held.Fences[0].ConflictKey() != lease.Fences()[0].ConflictKey() {
+		t.Fatalf("held fences = %+v, want the lease's own %+v", held.Fences, lease.Fences())
+	}
+	if held.ExpiresInMS <= 0 || held.ExpiresInMS > (20*time.Minute).Milliseconds() {
+		t.Fatalf("expires_in_ms = %d, want the remaining time on a twenty minute lease", held.ExpiresInMS)
+	}
+	if snapshot.Inbox.UnreadDeliveries != 1 || snapshot.Inbox.UnackedDeliveries != 1 ||
+		len(snapshot.Inbox.Recent) != 1 || snapshot.Inbox.Recent[0].MessageID != message.ID() ||
+		snapshot.Inbox.Recent[0].AuthorAgentName != "bob" {
+		t.Fatalf("inbox = %+v", snapshot.Inbox)
+	}
+	if len(snapshot.Conversations) != 1 || snapshot.Conversations[0].ConversationID != conversation.ID() ||
+		snapshot.Conversations[0].Messages != 1 {
+		t.Fatalf("conversations = %+v", snapshot.Conversations)
+	}
+	if len(snapshot.Peers) != 1 || snapshot.Peers[0].Name != "bob" {
+		t.Fatalf("peers = %+v, want the other agent present in this project", snapshot.Peers)
+	}
+	if snapshot.ObservedAtUS <= 0 {
+		t.Fatal("snapshot carries no observation instant")
+	}
+
+	// A released lease leaves the snapshot, so the projection cannot keep
+	// telling a resuming agent to clean up something it already cleaned up.
+	if _, err := store.ReleaseLease(context.Background(), application.ChangeLeaseParams{LeaseID: lease.ID(),
+		HolderSession: resumed.ActorSessionID, AuthorityEpoch: resumed.AuthorityEpoch,
+		Fences: held.Fences}); err != nil {
+		t.Fatalf("release with the fences the snapshot handed back: %v", err)
+	}
+	after, err := store.LocalAgentSnapshot(context.Background(), resumed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Reservations) != 0 {
+		t.Fatalf("reservations after release = %+v", after.Reservations)
+	}
+}
+
+// seedSnapshotMail sends one acknowledgement-required message from author to
+// recipient, which is the shape a resuming agent most needs to be told about.
+func seedSnapshotMail(t *testing.T, store *Store, author, recipient application.LocalAgentSession,
+) (application.Conversation, application.Message) {
+	t.Helper()
+	conversationID, err := domain.NewConversationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := store.OpenConversation(context.Background(), application.OpenConversationParams{
+		ConversationID: conversationID, WorkspaceID: author.WorkspaceID, RunID: author.RunID,
+		OpenedBy: author.ActorID, OpenedBySession: author.ActorSessionID, Topic: "handoff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := application.NewRecipient(recipient.ActorID, application.RecipientTo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := store.SendMessage(context.Background(), application.SendMessageParams{MessageID: messageID,
+		ConversationID: conversationID, WorkspaceID: author.WorkspaceID, Author: author.ActorID,
+		AuthorSession: author.ActorSessionID, Subject: "storage rewrite", Body: "please pick this up",
+		Recipients: []application.Recipient{to}, AcknowledgementRequired: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conversation, message
 }
 
 // TestValidateFenceSeparatesFailureFromSupersession is the regression that

@@ -102,7 +102,7 @@ func TestUnitOfWorkAtomicPersistenceRolesArePresent(t *testing.T) {
 	})
 
 	for _, table := range []string{
-		"command_receipts", "domain_events", "audit_entries", "outbox_jobs",
+		"command_receipts", "domain_events", "audit_entries",
 	} {
 		var count int
 		if err := store.db.QueryRowContext(context.Background(),

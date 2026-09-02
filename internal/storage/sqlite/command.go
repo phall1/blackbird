@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -752,9 +751,6 @@ func (store *Store) commitAppliedCommand(ctx context.Context, tx *sql.Tx, state 
 	if err := appendCommandAudit(ctx, tx, state, decision.Audit()); err != nil {
 		return application.CommandTransactionExecution{}, err
 	}
-	if err := insertOutboxEffects(ctx, tx, spec.CommandID(), decision.Effects(), state.time.Value()); err != nil {
-		return application.CommandTransactionExecution{}, err
-	}
 	if err := verifyFinalCommandState(ctx, tx, state, decision); err != nil {
 		return application.CommandTransactionExecution{}, fmt.Errorf("verify final SQLite command state: %w", err)
 	}
@@ -1159,44 +1155,6 @@ func appendCommandAudit(ctx context.Context, tx *sql.Tx, state lockedCommandStat
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO audit_entries(scope_kind, scope_id, audit_sequence, previous_entry_hash, entry_hash, canonical_entry, recorded_at_us) VALUES (?, ?, ?, ?, ?, ?, ?)`, string(state.spec.Scope().Kind()), state.spec.Scope().ID(), state.stream.nextAudit, state.stream.auditHead[:], digest[:], canonical, timeMicros(state.time.Value()))
 	return err
-}
-
-func insertOutboxEffects(
-	ctx context.Context,
-	tx *sql.Tx,
-	commandID domain.CommandID,
-	effects application.EffectSet,
-	now time.Time,
-) error {
-	for _, effect := range effects.Intents() {
-		metadata := effect.Metadata()
-		seed := []byte("blackbird.outbox-job/v1\x00" + commandID.String() + "\x00" + effect.Handler() + "\x00" +
-			uintText(uint64(effect.ContractMajor().Uint16())) + "\x00" + effect.DestinationKey() + "\x00" +
-			uintText(uint64(effect.Ordinal())))
-		sum := sha256.Sum256(seed)
-		jobID := digestUUID(sum)
-		idempotency := hex.EncodeToString(sum[:])
-		metadataDigest := effect.MetadataDigest()
-		_, err := tx.ExecContext(ctx, `INSERT INTO outbox_jobs(job_id, command_id, event_id, handler,
-			handler_contract_version, destination_key, effect_ordinal, effect_kind, idempotency_key, payload,
-			metadata_digest, status, attempt_count, available_at_us, created_at_us, updated_at_us)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 'command_effect', ?, ?, ?, 'pending', 0, ?, ?, ?)`,
-			jobID, commandID.String(), effect.CausingEventID().String(), effect.Handler(), effect.ContractMajor().Uint16(),
-			effect.DestinationKey(), effect.Ordinal(), idempotency, metadata, metadataDigest[:],
-			timeMicros(now), timeMicros(now), timeMicros(now))
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func digestUUID(sum [sha256.Size]byte) string {
-	value := sum
-	value[6] = (value[6] & 0x0f) | 0x40
-	value[8] = (value[8] & 0x3f) | 0x80
-	text := hex.EncodeToString(value[:16])
-	return text[:8] + "-" + text[8:12] + "-" + text[12:16] + "-" + text[16:20] + "-" + text[20:32]
 }
 
 func commandReferenceConflict(message string) error {
@@ -2610,7 +2568,6 @@ func loadCeremonyWithStatus(ctx context.Context, tx *sql.Tx, id string, historic
 	return domain.RehydrateCeremonyChallenge(params)
 }
 
-func uintText(value uint64) string { return strconv.FormatUint(value, 10) }
 func capabilitiesJSON(set domain.CapabilitySet) ([]byte, error) {
 	values := set.Values()
 	text := make([]string, len(values))

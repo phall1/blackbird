@@ -56,8 +56,8 @@ func TestOpenMigratesOnlyEmptyDatabaseAndReportsPinnedRuntime(t *testing.T) {
 	).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
-	if tables != 46 {
-		t.Fatalf("tables=%d, want 46", tables)
+	if tables != 45 {
+		t.Fatalf("tables=%d, want 45", tables)
 	}
 	if err := reopened.IntegrityCheck(context.Background()); err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestMigrationLadderChecksumsMatchEmbeddedMigrations(t *testing.T) {
 		t.Run(rung.migrationID, func(t *testing.T) {
 			path := filepath.Join(directory, "ladder-v"+strconv.Itoa(version)+".db")
 			installLegacyDatabase(t, path, version)
-			db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+			db, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -228,7 +228,7 @@ func schemaLedgerFacts(t *testing.T, store *Store) (int, int, string) {
 func installLegacyDatabase(t *testing.T, path string, version int) {
 	t.Helper()
 	ctx := context.Background()
-	db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	db, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestOpenRejectsSecondOwnerAndLiveSchemaDrift(t *testing.T) {
 	if _, err := Open(context.Background(), Config{Path: path}); !errors.Is(err, ErrInvalidConfiguration) {
 		t.Fatalf("second owner error=%v", err)
 	}
-	if _, err := store.db.Exec("DROP INDEX outbox_jobs_ready_idx"); err != nil {
+	if _, err := store.db.Exec("DROP INDEX domain_events_aggregate_idx"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -333,7 +333,7 @@ func TestOpenRejectsIdentityChecksumAndConfigurationDrift(t *testing.T) {
 		mutate func(*testing.T, string)
 	}{
 		{"application id", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA application_id = 1") }},
-		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 5") }},
+		{"schema version", func(t *testing.T, path string) { execRaw(t, path, "PRAGMA user_version = 6") }},
 		{"migration checksum", func(t *testing.T, path string) {
 			execRaw(t, path, "DROP TRIGGER schema_migrations_no_update")
 			execRaw(t, path, "UPDATE schema_migrations SET checksum = zeroblob(32)")
@@ -358,8 +358,6 @@ func TestOpenRejectsIdentityChecksumAndConfigurationDrift(t *testing.T) {
 	}
 	for _, config := range []Config{
 		{}, {Path: "relative.db"}, {Path: filepath.Join(t.TempDir(), "database")},
-		{Path: filepath.Join(t.TempDir(), "database.db"), BusyTimeout: maximumBusyTimeout + time.Millisecond},
-		{Path: filepath.Join(t.TempDir(), "database.db"), BusyTimeout: time.Microsecond},
 	} {
 		if _, err := Open(context.Background(), config); !errors.Is(err, ErrInvalidConfiguration) {
 			t.Fatalf("config=%+v error=%v", config, err)

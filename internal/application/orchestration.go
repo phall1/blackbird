@@ -574,7 +574,6 @@ type OrchestrationService struct {
 	replayDisclosure    ReplayDisclosureAuthorization
 	denialPolicy        DenialSecurityPolicy
 	signers             RecoveryCapsuleSignerLookup
-	effects             EffectPlanner
 	bootstrapProofs     BootstrapProofVerifier
 	ceremonyProofs      CeremonyProofVerifier
 	pairingRedemptions  PairingRedemptionVerifier
@@ -589,7 +588,6 @@ type OrchestrationDependencies struct {
 	ReplayDisclosure    ReplayDisclosureAuthorization
 	DenialPolicy        DenialSecurityPolicy
 	SignerLookup        RecoveryCapsuleSignerLookup
-	EffectPlanner       EffectPlanner
 	BootstrapProofs     BootstrapProofVerifier
 	CeremonyProofs      CeremonyProofVerifier
 	PairingRedemptions  PairingRedemptionVerifier
@@ -658,7 +656,7 @@ func NewOrchestrationService(dependencies OrchestrationDependencies) (*Orchestra
 	if isNilInterface(dependencies.UnitOfWork) || isNilInterface(dependencies.Authentication) ||
 		isNilInterface(dependencies.Policy) || isNilInterface(dependencies.LockedAuthorization) ||
 		isNilInterface(dependencies.ReplayDisclosure) || isNilInterface(dependencies.DenialPolicy) ||
-		isNilInterface(dependencies.SignerLookup) || isNilInterface(dependencies.EffectPlanner) ||
+		isNilInterface(dependencies.SignerLookup) ||
 		isNilInterface(dependencies.BootstrapProofs) || isNilInterface(dependencies.CeremonyProofs) ||
 		isNilInterface(dependencies.PairingRedemptions) || isNilInterface(dependencies.Presentations) {
 		return nil, ErrInvalidApplicationContract
@@ -667,8 +665,8 @@ func NewOrchestrationService(dependencies OrchestrationDependencies) (*Orchestra
 		uow: dependencies.UnitOfWork, authentication: dependencies.Authentication, policy: dependencies.Policy,
 		lockedAuthorization: dependencies.LockedAuthorization, replayDisclosure: dependencies.ReplayDisclosure,
 		denialPolicy: dependencies.DenialPolicy, signers: dependencies.SignerLookup,
-		effects: dependencies.EffectPlanner, bootstrapProofs: dependencies.BootstrapProofs,
-		ceremonyProofs: dependencies.CeremonyProofs, pairingRedemptions: dependencies.PairingRedemptions,
+		bootstrapProofs: dependencies.BootstrapProofs,
+		ceremonyProofs:  dependencies.CeremonyProofs, pairingRedemptions: dependencies.PairingRedemptions,
 		presentations: dependencies.Presentations,
 	}, nil
 }
@@ -828,15 +826,7 @@ func (service *OrchestrationService) executePreparedCommand(
 			return CommandDecision{}, auditErr
 		}
 		audit = bindCommandAuditContext(audit, request, authentication)
-		planningInput, planningErr := NewEffectPlanningInput(request.Spec.CommandID(), commit.facts)
-		if planningErr != nil {
-			return CommandDecision{}, planningErr
-		}
-		effects, planningErr := service.effects.PlanEffects(planningInput)
-		if planningErr != nil {
-			return CommandDecision{}, planningErr
-		}
-		return ApplyCommand(locked, commit, audit, effects)
+		return ApplyCommand(locked, commit, audit)
 	})
 	if err := ValidateCommandTransactionResult(transaction, transactionErr); err != nil {
 		return CommandExecution{}, err
@@ -1069,15 +1059,7 @@ func (service *OrchestrationService) executeBootstrapCommand(
 			return CommandDecision{}, auditErr
 		}
 		audit = bindCommandAuditContext(audit, request, authentication)
-		planningInput, planningErr := NewEffectPlanningInput(request.Spec.CommandID(), commit.facts)
-		if planningErr != nil {
-			return CommandDecision{}, planningErr
-		}
-		effects, planningErr := service.effects.PlanEffects(planningInput)
-		if planningErr != nil {
-			return CommandDecision{}, planningErr
-		}
-		return ApplyCommand(locked, commit, audit, effects)
+		return ApplyCommand(locked, commit, audit)
 	})
 	if err := ValidateCommandTransactionResult(transaction, transactionErr); err != nil {
 		return CommandExecution{}, err

@@ -143,7 +143,6 @@ func composeProductionBundle(
 		ReplayDisclosure:    security.ReplayDisclosure,
 		DenialPolicy:        security.DenialPolicy,
 		SignerLookup:        security.SignerLookup,
-		EffectPlanner:       security.EffectPlanner,
 		BootstrapProofs:     proofs,
 		CeremonyProofs:      proofs,
 		PairingRedemptions:  proofs,
@@ -233,6 +232,7 @@ func composeProductionBundle(
 	httpMux.Handle("/api/v1/local/", localHTTPHandler)
 	httpMux.Handle("/", httpHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
+		Logger:        logger,
 		Authenticator: mcpIngressAuthenticator{ingress}, CurrentSession: productionCurrentSession{},
 		// The W0/W1 plane stays off MCP: nothing on this transport can attach a
 		// verified ingress credential, so those tools could only answer

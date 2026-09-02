@@ -399,18 +399,6 @@ var w0OperationInventory = []string{
 // W0OperationInventory returns the closed public command catalog in stable order.
 func W0OperationInventory() []string { return append([]string(nil), w0OperationInventory...) }
 
-var w1OperationInventory = []string{
-	OperationWorkRefObserve,
-	OperationObjectiveAndWorkCreate,
-	OperationObjectiveActivate,
-	OperationRunPlanWithBindings,
-	OperationRunJoin,
-	OperationRunStart,
-}
-
-// W1OperationInventory returns the W1 command catalog in stable order.
-func W1OperationInventory() []string { return append([]string(nil), w1OperationInventory...) }
-
 // CommandMetadataDTO is common retry, attribution, authority, and deadline
 // metadata for the three pre-session W0.2 commands. Authentication still comes
 // from the paired channel; none of these fields is credential evidence.

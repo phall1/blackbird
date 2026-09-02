@@ -156,7 +156,7 @@ func TestOpenReaderStaleFallbackBypassesWAL(t *testing.T) {
 	registerAdminAgent(t, store, adminProjectA, "alice")
 	registerAdminAgent(t, store, adminProjectA, "bob")
 
-	reader, err := openReaderMode(context.Background(), store.path, ReadModeStale, defaultBusyTimeout)
+	reader, err := openReaderMode(context.Background(), store.path, ReadModeStale)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestOpenReaderDegradesOnSchemaMismatch(t *testing.T) {
 	store := newCoordinationStore(t)
 	registerAdminAgent(t, store, adminProjectA, "alice")
 	path := copyDatabaseForReader(t, store)
-	writable, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	writable, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestReaderIntegrityReportsForeignKeyFailures(t *testing.T) {
 	store := newCoordinationStore(t)
 	alice := registerAdminAgent(t, store, adminProjectA, "alice")
 	path := copyDatabaseForReader(t, store)
-	writable, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	writable, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,30 +314,6 @@ func TestReaderCoordinationCountsAndRows(t *testing.T) {
 	if state.OpenSessions != 3 || state.StaleOpenSessions != 1 {
 		t.Fatalf("sessions=%+v", state)
 	}
-
-	leases, err := reader.ExpiredLeases(context.Background(), time.Now().UTC(), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(leases) != 1 || leases[0].LeaseID != stale.ID().String() || leases[0].Mode != "exclusive" ||
-		leases[0].Holder != bob.ActorID.String() || leases[0].ExpiresAt.IsZero() {
-		t.Fatalf("expired leases=%+v", leases)
-	}
-	agents, err := reader.AgentNames(context.Background(), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(agents) != 3 || agents[0].AgentName != "alice" || !agents[0].Open || agents[0].LastSeenAt.IsZero() {
-		t.Fatalf("agents=%+v", agents)
-	}
-	sessions, err := reader.StaleSessions(context.Background(), time.Now().UTC().Add(-24*time.Hour), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sessions) != 1 || sessions[0].AgentName != "bob" ||
-		sessions[0].SessionID != bob.ActorSessionID.String() {
-		t.Fatalf("stale sessions=%+v", sessions)
-	}
 }
 
 func TestOpenReaderDoesNotBlockCheckpoint(t *testing.T) {
@@ -371,7 +347,7 @@ func TestOpenReaderDoesNotBlockCheckpoint(t *testing.T) {
 func TestReaderCoordinationDegradesWithoutCoordinationTables(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "bare.db")
-	bare, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout}))
+	bare, err := sql.Open("sqlite", databaseURL(Config{Path: path}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,40 +373,6 @@ func TestReaderCoordinationDegradesWithoutCoordinationTables(t *testing.T) {
 	}
 	if state != (CoordinationState{}) {
 		t.Fatalf("coordination=%+v", state)
-	}
-	leases, err := reader.ExpiredLeases(context.Background(), time.Now().UTC(), 10)
-	if err != nil || leases != nil {
-		t.Fatalf("leases=%+v error=%v", leases, err)
-	}
-	agents, err := reader.AgentNames(context.Background(), 10)
-	if err != nil || agents != nil {
-		t.Fatalf("agents=%+v error=%v", agents, err)
-	}
-	sessions, err := reader.StaleSessions(context.Background(), time.Now().UTC(), 10)
-	if err != nil || sessions != nil {
-		t.Fatalf("sessions=%+v error=%v", sessions, err)
-	}
-}
-
-func TestOpenReaderRejectsInvalidBusyTimeout(t *testing.T) {
-	t.Parallel()
-	store := newCoordinationStore(t)
-
-	for _, testCase := range []struct {
-		name    string
-		timeout time.Duration
-	}{
-		{name: "negative", timeout: -time.Millisecond},
-		{name: "too large", timeout: maximumBusyTimeout + time.Millisecond},
-		{name: "sub-millisecond", timeout: time.Microsecond},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := OpenReader(context.Background(), ReaderConfig{Path: store.path,
-				BusyTimeout: testCase.timeout}); !errors.Is(err, ErrInvalidConfiguration) {
-				t.Fatalf("error=%v", err)
-			}
-		})
 	}
 }
 

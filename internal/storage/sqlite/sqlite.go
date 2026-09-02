@@ -29,17 +29,18 @@ import (
 
 const (
 	ApplicationID       = 0x42424d4c
-	SchemaVersion       = 4
+	SchemaVersion       = 5
 	DriverVersion       = "v1.56.0"
 	SQLiteVersion       = "3.53.3"
 	SQLiteSourceID      = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
 	defaultBusyTimeout  = 5 * time.Second
 	maximumBusyTimeout  = 30 * time.Second
 	maximumReadPoolSize = 5
-	schemaChecksumHex   = "78700880f092ecb28b261bcab7fa71d2755062a047d3c4ad51f8c426253f3427"
+	schemaChecksumHex   = "3ffd7c6bc3139822119815c2fa417d8ad8fd209b41522d87a9284142274e3cb4"
 	schemaV1ChecksumHex = "370ba0de329fa9fdf77d027d2ebc85be6747a28bd79ad4ba892fe8884eb3622a"
 	schemaV2ChecksumHex = "2e0c68a7f203a9c245aed614b5586c4136bd2d1a6764fc8ca3f69e89522ba975"
 	schemaV3ChecksumHex = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
+	schemaV4ChecksumHex = "78700880f092ecb28b261bcab7fa71d2755062a047d3c4ad51f8c426253f3427"
 )
 
 // migrationRung is one step of the upgrade ladder: the embedded migration that
@@ -64,7 +65,8 @@ var migrationLadder = [SchemaVersion]migrationRung{
 	{migrationID: "0001_w0.sql", schemaChecksum: schemaV1ChecksumHex},
 	{migrationID: "0002_w2_coordination.sql", schemaChecksum: schemaV2ChecksumHex},
 	{migrationID: "0003_local_coordination.sql", schemaChecksum: schemaV3ChecksumHex},
-	{migrationID: "0004_coordination_event_journal.sql", schemaChecksum: schemaChecksumHex, seed: seedCoordinationCursorKey},
+	{migrationID: "0004_coordination_event_journal.sql", schemaChecksum: schemaV4ChecksumHex, seed: seedCoordinationCursorKey},
+	{migrationID: "0005_drop_outbox_jobs.sql", schemaChecksum: schemaChecksumHex},
 }
 
 var migrationIDs = ladderMigrationIDs()
@@ -92,8 +94,7 @@ var (
 )
 
 type Config struct {
-	Path        string
-	BusyTimeout time.Duration
+	Path string
 }
 
 type Diagnostics struct {
@@ -141,9 +142,6 @@ type writeArbiter struct {
 func Open(ctx context.Context, config Config) (*Store, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
-	}
-	if config.BusyTimeout == 0 {
-		config.BusyTimeout = defaultBusyTimeout
 	}
 	if err := os.MkdirAll(filepath.Dir(config.Path), 0o700); err != nil {
 		return nil, fmt.Errorf("%w: create database directory: %v", ErrInvalidConfiguration, err)
@@ -291,8 +289,7 @@ func verifyIntegrity(ctx context.Context, query interface {
 }
 
 func validateConfig(config Config) error {
-	if config.Path == "" || !filepath.IsAbs(config.Path) || config.BusyTimeout < 0 ||
-		config.BusyTimeout > maximumBusyTimeout || config.BusyTimeout%time.Millisecond != 0 {
+	if config.Path == "" || !filepath.IsAbs(config.Path) {
 		return ErrInvalidConfiguration
 	}
 	clean := filepath.Clean(config.Path)
@@ -304,7 +301,7 @@ func validateConfig(config Config) error {
 
 func databaseURL(config Config) string {
 	query := url.Values{}
-	query.Set("_busy_timeout", strconv.FormatInt(config.BusyTimeout.Milliseconds(), 10))
+	query.Set("_busy_timeout", strconv.FormatInt(defaultBusyTimeout.Milliseconds(), 10))
 	query.Set("_foreign_keys", "on")
 	query.Set("_journal_mode", "wal")
 	query.Set("_synchronous", "full")

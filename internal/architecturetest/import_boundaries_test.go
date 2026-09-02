@@ -33,9 +33,26 @@ var allowedInternalLayers = map[string]bool{
 	"transport":        true,
 	"runtime":          true,
 	"install":          true,
-	"companion":        true,
 	"cli":              true,
 	"architecturetest": true,
+}
+
+// TestDeclaredLayersAllExist keeps the allow-list from rotting in the direction
+// the import rules cannot see. A new top-level directory under internal/ fails
+// loudly because it is undeclared, but a deleted one leaves an entry that
+// silently authorizes a layer nobody can import — and the next reader takes the
+// list as a description of the tree. Derive the layers from the tree instead of
+// trusting the list: internal/companion outlived its own deletion here.
+func TestDeclaredLayersAllExist(t *testing.T) {
+	t.Parallel()
+
+	root := moduleRoot(t)
+	for layer := range allowedInternalLayers {
+		info, err := os.Stat(filepath.Join(root, "internal", layer))
+		if err != nil || !info.IsDir() {
+			t.Errorf("allowedInternalLayers declares %q, but internal/%s is not a directory", layer, layer)
+		}
+	}
 }
 
 func TestProductionImportBoundaries(t *testing.T) {

@@ -127,20 +127,6 @@ type InstallationBootstrapVersionsDTO struct {
 	Grant      domain.Version `json:"grant"`
 }
 
-func DecodeInstallationBootstrapResult(data []byte) (InstallationBootstrapResultDTO, error) {
-	var result InstallationBootstrapResultDTO
-	if err := decodeOutput(data, MaxOutcomeJSONBytes, &result); err != nil {
-		return InstallationBootstrapResultDTO{}, err
-	}
-	if err := requireTopLevelJSONMembers(data, "idempotent_replay"); err != nil {
-		return InstallationBootstrapResultDTO{}, err
-	}
-	if err := result.Validate(); err != nil {
-		return InstallationBootstrapResultDTO{}, err
-	}
-	return result, nil
-}
-
 func (result InstallationBootstrapResultDTO) Validate() error {
 	if err := result.validate(OperationInstallationBootstrap, 3); err != nil {
 		return err
@@ -205,20 +191,6 @@ type WorkspaceCreateResourceDTO struct {
 	AuthorityID       domain.AuthorityID    `json:"authority_id"`
 	AuthorityEpoch    domain.AuthorityEpoch `json:"authority_epoch"`
 	PolicyRevision    string                `json:"policy_revision"`
-}
-
-func DecodeWorkspaceCreateResult(data []byte) (WorkspaceCreateResultDTO, error) {
-	var result WorkspaceCreateResultDTO
-	if err := decodeOutput(data, MaxOutcomeJSONBytes, &result); err != nil {
-		return WorkspaceCreateResultDTO{}, err
-	}
-	if err := requireTopLevelJSONMembers(data, "idempotent_replay"); err != nil {
-		return WorkspaceCreateResultDTO{}, err
-	}
-	if err := result.Validate(); err != nil {
-		return WorkspaceCreateResultDTO{}, err
-	}
-	return result, nil
 }
 
 func (result WorkspaceCreateResultDTO) Validate() error {
@@ -448,61 +420,6 @@ func (result SessionStartResultDTO) Validate() error {
 	return validateUTCInstant("resource.absolute_expiry", result.Resource.AbsoluteExpiry)
 }
 
-func decodeCommandResult[T any](data []byte, result *T, validate func() error) error {
-	if err := decodeOutput(data, MaxOutcomeJSONBytes, result); err != nil {
-		return err
-	}
-	if err := requireTopLevelJSONMembers(data, "idempotent_replay"); err != nil {
-		return err
-	}
-	return validate()
-}
-func DecodePrincipalRegisterResult(data []byte) (PrincipalRegisterResultDTO, error) {
-	var value PrincipalRegisterResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeDevicePairingBeginResult(data []byte) (DevicePairingBeginResultDTO, error) {
-	var value DevicePairingBeginResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeDevicePairResult(data []byte) (DevicePairResultDTO, error) {
-	var value DevicePairResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeWorkspaceMemberInviteResult(data []byte) (WorkspaceMemberInviteResultDTO, error) {
-	var value WorkspaceMemberInviteResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeWorkspaceMembershipAcceptResult(data []byte) (WorkspaceMembershipAcceptResultDTO, error) {
-	var value WorkspaceMembershipAcceptResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeActorCreateResult(data []byte) (ActorCreateResultDTO, error) {
-	var value ActorCreateResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeActorDelegationProposeResult(data []byte) (ActorDelegationProposeResultDTO, error) {
-	var value ActorDelegationProposeResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeActorDelegationActivateResult(data []byte) (ActorDelegationActivateResultDTO, error) {
-	var value ActorDelegationActivateResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-func DecodeSessionStartResult(data []byte) (SessionStartResultDTO, error) {
-	var value SessionStartResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-
 type WorkRefObserveResultDTO struct {
 	CommandResultMetadataDTO
 	Resource WorkRefObserveResourceDTO `json:"resource"`
@@ -517,12 +434,6 @@ type WorkRefObserveResourceDTO struct {
 	ProviderLocator    string                 `json:"provider_locator"`
 	ProviderVersion    string                 `json:"provider_version"`
 	ObservedAt         time.Time              `json:"observed_at"`
-}
-
-func DecodeWorkRefObserveResult(data []byte) (WorkRefObserveResultDTO, error) {
-	var value WorkRefObserveResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
 }
 
 func (result WorkRefObserveResultDTO) Validate() error {
@@ -569,12 +480,6 @@ type ObjectiveAndWorkCreateResourceDTO struct {
 	WorkReferenceID  domain.WorkReferenceID `json:"work_reference_id"`
 }
 
-func DecodeObjectiveAndWorkCreateResult(data []byte) (ObjectiveAndWorkCreateResultDTO, error) {
-	var value ObjectiveAndWorkCreateResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-
 func (result ObjectiveAndWorkCreateResultDTO) Validate() error {
 	if err := result.validate(OperationObjectiveAndWorkCreate, 2); err != nil {
 		return err
@@ -610,12 +515,6 @@ type ObjectiveActivateResourceDTO struct {
 	ObjectiveID     domain.ObjectiveID `json:"objective_id"`
 	ObjectiveState  string             `json:"objective_state"`
 	ResourceVersion domain.Version     `json:"resource_version"`
-}
-
-func DecodeObjectiveActivateResult(data []byte) (ObjectiveActivateResultDTO, error) {
-	var value ObjectiveActivateResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
 }
 
 func (result ObjectiveActivateResultDTO) Validate() error {
@@ -665,12 +564,6 @@ type RuntimeBindingResourceDTO struct {
 	RuntimeEndpointID domain.RuntimeEndpointID  `json:"runtime_endpoint_id"`
 	BindingState      string                    `json:"binding_state"`
 	ResourceVersion   domain.Version            `json:"resource_version"`
-}
-
-func DecodeRunPlanWithBindingsResult(data []byte) (RunPlanWithBindingsResultDTO, error) {
-	var value RunPlanWithBindingsResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
 }
 
 func (result RunPlanWithBindingsResultDTO) Validate() error {
@@ -767,12 +660,6 @@ type RunJoinResourceDTO struct {
 	ResourceVersion    domain.Version            `json:"resource_version"`
 }
 
-func DecodeRunJoinResult(data []byte) (RunJoinResultDTO, error) {
-	var value RunJoinResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
-}
-
 func (result RunJoinResultDTO) Validate() error {
 	if err := result.validate(OperationRunJoin, 1); err != nil {
 		return err
@@ -804,12 +691,6 @@ type RunStartResourceDTO struct {
 	RunState    string             `json:"run_state"`
 	RunVersion  domain.Version     `json:"run_version"`
 	OperatorID  domain.ActorID     `json:"operator_id"`
-}
-
-func DecodeRunStartResult(data []byte) (RunStartResultDTO, error) {
-	var value RunStartResultDTO
-	err := decodeCommandResult(data, &value, func() error { return value.Validate() })
-	return value, err
 }
 
 func (result RunStartResultDTO) Validate() error {

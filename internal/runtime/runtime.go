@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phall1/blackbird/internal/storage/postgres"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
 
@@ -29,13 +28,10 @@ const (
 // StorageBackend identifies the durable storage implementation selected at startup.
 type StorageBackend string
 
-const (
-	StorageSQLite     StorageBackend = "sqlite"
-	StoragePostgreSQL StorageBackend = "postgres"
-)
+const StorageSQLite StorageBackend = "sqlite"
 
-// Config contains non-secret process configuration. PostgreSQL credentials are
-// deliberately obtained through SecretSource and can never be supplied here.
+// Config contains non-secret process configuration. It carries no credentials:
+// SQLite is the only backend, and its path is not a secret.
 type Config struct {
 	Storage         StorageBackend
 	SQLitePath      string
@@ -48,10 +44,10 @@ type Config struct {
 
 // Validate rejects configurations that cannot safely start a complete daemon.
 func (config Config) Validate() error {
-	if config.Storage != StorageSQLite && config.Storage != StoragePostgreSQL {
-		return fmt.Errorf("storage must be %q or %q", StorageSQLite, StoragePostgreSQL)
+	if config.Storage != StorageSQLite {
+		return fmt.Errorf("storage must be %q", StorageSQLite)
 	}
-	if config.Storage == StorageSQLite && config.SQLitePath == "" {
+	if config.SQLitePath == "" {
 		return errors.New("SQLite path is required")
 	}
 	if config.HTTPAddress == "" || config.MCPAddress == "" {
@@ -133,19 +129,7 @@ func (config Config) normalized() Config {
 	return config
 }
 
-// PostgreSQLSecrets is the credential-bearing portion of PostgreSQL startup
-// configuration. Implementations should load it from a protected secret source.
-type PostgreSQLSecrets struct {
-	DSN          string
-	MigrationDSN string
-}
-
-// SecretSource supplies credentials without exposing them through argv or Config.
-type SecretSource interface {
-	PostgreSQL(context.Context) (PostgreSQLSecrets, error)
-}
-
-// Storage is the narrow process-lifetime contract shared by both durable stores.
+// Storage is the narrow process-lifetime contract of the durable store.
 type Storage interface {
 	Close() error
 }
@@ -188,18 +172,16 @@ type IngressServer interface {
 // Dependencies contains lifecycle seams. Zero-valued storage and network
 // factories use their production implementations; Composer is always required.
 type Dependencies struct {
-	Secrets SecretSource
-	Logger  *slog.Logger
+	Logger *slog.Logger
 	// LogSeverity is the level control behind Logger. Supplying it alongside a
 	// caller-built Logger is what makes SetLogLevel able to move that logger;
 	// runtime cannot recover a handler's level control from the handler.
-	LogSeverity    *slog.LevelVar
-	Compose        Composer
-	OpenSQLite     func(context.Context, sqlite.Config) (Storage, error)
-	OpenPostgreSQL func(context.Context, postgres.Config) (Storage, error)
-	Listen         func(string, string) (net.Listener, error)
-	NewServer      func(string, http.Handler) IngressServer
-	Ready          func()
+	LogSeverity *slog.LevelVar
+	Compose     Composer
+	OpenSQLite  func(context.Context, sqlite.Config) (Storage, error)
+	Listen      func(string, string) (net.Listener, error)
+	NewServer   func(string, http.Handler) IngressServer
+	Ready       func()
 }
 
 // BuildInfo identifies the executable without implying product capabilities.
@@ -261,17 +243,9 @@ func NewDaemon(build BuildInfo, config Config, dependencies Dependencies) (*Daem
 	if dependencies.Compose == nil {
 		return nil, errors.New("runtime requires a complete handler composer")
 	}
-	if config.Storage == StoragePostgreSQL && isNil(dependencies.Secrets) {
-		return nil, errors.New("PostgreSQL storage requires a secret source")
-	}
 	if dependencies.OpenSQLite == nil {
 		dependencies.OpenSQLite = func(ctx context.Context, config sqlite.Config) (Storage, error) {
 			return sqlite.Open(ctx, config)
-		}
-	}
-	if dependencies.OpenPostgreSQL == nil {
-		dependencies.OpenPostgreSQL = func(ctx context.Context, config postgres.Config) (Storage, error) {
-			return postgres.Open(ctx, config)
 		}
 	}
 	if dependencies.Listen == nil {
@@ -503,21 +477,7 @@ func (daemon *Daemon) bind(address, name string) (net.Listener, error) {
 }
 
 func (daemon *Daemon) openStorage(ctx context.Context) (Storage, error) {
-	if daemon.config.Storage == StorageSQLite {
-		return daemon.dependencies.OpenSQLite(ctx, sqlite.Config{Path: daemon.config.SQLitePath})
-	}
-	secrets, err := daemon.dependencies.Secrets.PostgreSQL(ctx)
-	if err != nil {
-		daemon.logger.Error("load PostgreSQL secrets", slog.Any("error", err))
-		return nil, fmt.Errorf("load PostgreSQL secrets: %w", err)
-	}
-	if secrets.DSN == "" {
-		daemon.logger.Error("PostgreSQL secret source returned an empty application DSN")
-		return nil, errors.New("PostgreSQL secret source returned an empty application DSN")
-	}
-	return daemon.dependencies.OpenPostgreSQL(ctx, postgres.Config{
-		DSN: secrets.DSN, MigrationDSN: secrets.MigrationDSN,
-	})
+	return daemon.dependencies.OpenSQLite(ctx, sqlite.Config{Path: daemon.config.SQLitePath})
 }
 
 // Shutdown is safe to call concurrently and more than once.

@@ -36,9 +36,8 @@ var readerCoordinationTables = [...]string{"coordination_projects", "coordinatio
 	"lease_selectors", "coordination_events"}
 
 type ReaderConfig struct {
-	Path        string
-	BusyTimeout time.Duration
-	AllowStale  bool
+	Path       string
+	AllowStale bool
 }
 
 type Reader struct {
@@ -122,32 +121,6 @@ type CoordinationState struct {
 	StaleOpenSessions        int
 }
 
-type LeaseRow struct {
-	LeaseID     string
-	WorkspaceID string
-	Holder      string
-	Mode        string
-	AcquiredAt  time.Time
-	ExpiresAt   time.Time
-}
-
-type AgentNameRow struct {
-	ProjectKey string
-	AgentName  string
-	ActorID    string
-	CreatedAt  time.Time
-	LastSeenAt time.Time
-	Open       bool
-}
-
-type SessionRow struct {
-	SessionID  string
-	ActorID    string
-	AgentName  string
-	StartedAt  time.Time
-	LastSeenAt time.Time
-}
-
 // OpenReader opens an existing database for diagnostics only: no directory or
 // permission repair, no migration, and no database_runtime claim. The default
 // mode is mode=ro plus query_only(ON), never immutable=1 — an immutable handle
@@ -157,9 +130,6 @@ type SessionRow struct {
 // disk changes: SQLite creates and updates the -shm wal-index for any WAL
 // reader. What it guarantees is that no database content is written.
 func OpenReader(ctx context.Context, config ReaderConfig) (*Reader, error) {
-	if config.BusyTimeout == 0 {
-		config.BusyTimeout = defaultBusyTimeout
-	}
 	if err := validateReaderConfig(config); err != nil {
 		return nil, err
 	}
@@ -170,14 +140,14 @@ func OpenReader(ctx context.Context, config ReaderConfig) (*Reader, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: database path is not a regular file", ErrInvalidConfiguration)
 	}
-	live, liveErr := openReaderMode(ctx, config.Path, ReadModeLive, config.BusyTimeout)
+	live, liveErr := openReaderMode(ctx, config.Path, ReadModeLive)
 	if liveErr == nil {
 		return live, nil
 	}
 	if !config.AllowStale {
 		return nil, liveErr
 	}
-	stale, staleErr := openReaderMode(ctx, config.Path, ReadModeStale, config.BusyTimeout)
+	stale, staleErr := openReaderMode(ctx, config.Path, ReadModeStale)
 	if staleErr != nil {
 		return nil, errors.Join(liveErr, staleErr)
 	}
@@ -185,8 +155,7 @@ func OpenReader(ctx context.Context, config ReaderConfig) (*Reader, error) {
 }
 
 func validateReaderConfig(config ReaderConfig) error {
-	if config.Path == "" || !filepath.IsAbs(config.Path) || config.BusyTimeout < 0 ||
-		config.BusyTimeout > maximumBusyTimeout || config.BusyTimeout%time.Millisecond != 0 {
+	if config.Path == "" || !filepath.IsAbs(config.Path) {
 		return ErrInvalidConfiguration
 	}
 	if filepath.Clean(config.Path) != config.Path || filepath.Ext(config.Path) == "" {
@@ -195,8 +164,8 @@ func validateReaderConfig(config ReaderConfig) error {
 	return nil
 }
 
-func openReaderMode(ctx context.Context, path string, mode ReadMode, busyTimeout time.Duration) (*Reader, error) {
-	dsn := sqliteFileURIWithTimeout(path, true, busyTimeout)
+func openReaderMode(ctx context.Context, path string, mode ReadMode) (*Reader, error) {
+	dsn := sqliteFileURIWithTimeout(path, true, defaultBusyTimeout)
 	if mode == ReadModeStale {
 		dsn = staleReaderURI(path)
 	}
@@ -513,92 +482,6 @@ func (reader *Reader) Coordination(ctx context.Context) (CoordinationState, erro
 		state.LargestProjectKey, state.AgentsInLargestProject = key.String, int(agents.Int64)
 	}
 	return state, nil
-}
-
-func (reader *Reader) ExpiredLeases(ctx context.Context, now time.Time, limit int) ([]LeaseRow, error) {
-	present, err := reader.presentTables(ctx)
-	if err != nil || !present["leases"] {
-		return nil, err
-	}
-	rows, err := reader.db.QueryContext(ctx, `SELECT lease_id, workspace_id, holder_actor_id, mode,
-		acquired_at_us, expires_at_us FROM leases WHERE status = 'active' AND expires_at_us <= ?
-		ORDER BY expires_at_us LIMIT ?`, timeMicros(now), limit)
-	if err != nil {
-		return nil, fmt.Errorf("query SQLite expired leases: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var leases []LeaseRow
-	for rows.Next() {
-		var lease LeaseRow
-		var acquired, expires int64
-		if err := rows.Scan(&lease.LeaseID, &lease.WorkspaceID, &lease.Holder, &lease.Mode,
-			&acquired, &expires); err != nil {
-			return nil, fmt.Errorf("scan SQLite expired lease: %w", err)
-		}
-		lease.AcquiredAt, lease.ExpiresAt = microsTime(acquired), microsTime(expires)
-		leases = append(leases, lease)
-	}
-	return leases, rows.Err()
-}
-
-func (reader *Reader) AgentNames(ctx context.Context, limit int) ([]AgentNameRow, error) {
-	present, err := reader.presentTables(ctx)
-	if err != nil || !present["coordination_agents"] || !present["coordination_agent_sessions"] {
-		return nil, err
-	}
-	rows, err := reader.db.QueryContext(ctx, `SELECT a.project_key, a.agent_name, a.actor_id, a.created_at_us,
-		COALESCE((SELECT max(s.last_seen_at_us) FROM coordination_agent_sessions AS s
-		  WHERE s.actor_id = a.actor_id), 0),
-		EXISTS (SELECT 1 FROM coordination_agent_sessions AS s
-		  WHERE s.actor_id = a.actor_id AND s.ended_at_us IS NULL)
-		FROM coordination_agents AS a ORDER BY a.project_key, a.agent_name LIMIT ?`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query SQLite coordination agents: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var agents []AgentNameRow
-	for rows.Next() {
-		var agent AgentNameRow
-		var created, lastSeen int64
-		if err := rows.Scan(&agent.ProjectKey, &agent.AgentName, &agent.ActorID, &created,
-			&lastSeen, &agent.Open); err != nil {
-			return nil, fmt.Errorf("scan SQLite coordination agent: %w", err)
-		}
-		agent.CreatedAt = microsTime(created)
-		if lastSeen != 0 {
-			agent.LastSeenAt = microsTime(lastSeen)
-		}
-		agents = append(agents, agent)
-	}
-	return agents, rows.Err()
-}
-
-func (reader *Reader) StaleSessions(ctx context.Context, cutoff time.Time, limit int) ([]SessionRow, error) {
-	present, err := reader.presentTables(ctx)
-	if err != nil || !present["coordination_agent_sessions"] || !present["coordination_agents"] {
-		return nil, err
-	}
-	rows, err := reader.db.QueryContext(ctx, `SELECT s.session_id, s.actor_id, COALESCE(a.agent_name, ''),
-		s.started_at_us, s.last_seen_at_us FROM coordination_agent_sessions AS s
-		LEFT JOIN coordination_agents AS a ON a.actor_id = s.actor_id
-		WHERE s.ended_at_us IS NULL AND s.last_seen_at_us < ?
-		ORDER BY s.last_seen_at_us LIMIT ?`, timeMicros(cutoff), limit)
-	if err != nil {
-		return nil, fmt.Errorf("query SQLite stale sessions: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var sessions []SessionRow
-	for rows.Next() {
-		var session SessionRow
-		var started, lastSeen int64
-		if err := rows.Scan(&session.SessionID, &session.ActorID, &session.AgentName,
-			&started, &lastSeen); err != nil {
-			return nil, fmt.Errorf("scan SQLite stale session: %w", err)
-		}
-		session.StartedAt, session.LastSeenAt = microsTime(started), microsTime(lastSeen)
-		sessions = append(sessions, session)
-	}
-	return sessions, rows.Err()
 }
 
 func (reader *Reader) presentTables(ctx context.Context) (map[string]bool, error) {

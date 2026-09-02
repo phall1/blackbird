@@ -3,8 +3,10 @@ package contracts
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,22 +52,85 @@ var productAPIOperations = []apiOperation{
 	{"/api/v1/queries/events.sync", OperationEventsSync, "EventsSyncRequest", "EventPage", reflect.TypeFor[EventsSyncRequestDTO](), reflect.TypeFor[EventPageDTO]()},
 }
 
-var errorStatuses = []string{"400", "401", "403", "404", "409", "410", "422", "429", "500", "503", "504"}
+// httpStatusByErrorCode is the single mapping from a typed error code to the
+// HTTP status that reports it. The OpenAPI document and the HTTP transport both
+// read it through HTTPStatusForErrorCode, because a second copy drifts silently:
+// a new code or a changed status lands in one table, and the published document
+// then describes an API the daemon does not serve.
+var httpStatusByErrorCode = map[domain.ErrorCode]int{
+	domain.ErrorCodeInvalidArgument:       http.StatusBadRequest,
+	domain.ErrorCodeCursorInvalid:         http.StatusBadRequest,
+	domain.ErrorCodeCursorScopeMismatch:   http.StatusBadRequest,
+	domain.ErrorCodeUnauthenticated:       http.StatusUnauthorized,
+	domain.ErrorCodeSessionExpired:        http.StatusUnauthorized,
+	domain.ErrorCodeForbidden:             http.StatusForbidden,
+	domain.ErrorCodeCapabilityRequired:    http.StatusForbidden,
+	domain.ErrorCodeNotFound:              http.StatusNotFound,
+	domain.ErrorCodeStaleVersion:          http.StatusConflict,
+	domain.ErrorCodeStateConflict:         http.StatusConflict,
+	domain.ErrorCodeIdempotencyKeyReused:  http.StatusConflict,
+	domain.ErrorCodeCommandIDReused:       http.StatusConflict,
+	domain.ErrorCodeCommandInProgress:     http.StatusConflict,
+	domain.ErrorCodeLeaseConflict:         http.StatusConflict,
+	domain.ErrorCodeLeaseExpired:          http.StatusConflict,
+	domain.ErrorCodeFenceRejected:         http.StatusConflict,
+	domain.ErrorCodeCursorExpired:         http.StatusGone,
+	domain.ErrorCodeInvalidSchema:         http.StatusUnprocessableEntity,
+	domain.ErrorCodeRateLimited:           http.StatusTooManyRequests,
+	domain.ErrorCodeInternal:              http.StatusInternalServerError,
+	domain.ErrorCodeBackpressure:          http.StatusServiceUnavailable,
+	domain.ErrorCodeDependencyUnavailable: http.StatusServiceUnavailable,
+	domain.ErrorCodeDeadlineExceeded:      http.StatusGatewayTimeout,
+}
 
-var errorStatusByCode = schema{
-	"INVALID_ARGUMENT": 400, "CURSOR_INVALID": 400, "CURSOR_SCOPE_MISMATCH": 400,
-	"UNAUTHENTICATED": 401, "SESSION_EXPIRED": 401,
-	"FORBIDDEN": 403, "CAPABILITY_REQUIRED": 403,
-	"NOT_FOUND":     404,
-	"STALE_VERSION": 409, "STATE_CONFLICT": 409, "IDEMPOTENCY_KEY_REUSED": 409,
-	"COMMAND_ID_REUSED": 409, "COMMAND_IN_PROGRESS": 409, "LEASE_CONFLICT": 409,
-	"LEASE_EXPIRED": 409, "FENCE_REJECTED": 409,
-	"CURSOR_EXPIRED": 410,
-	"INVALID_SCHEMA": 422,
-	"RATE_LIMITED":   429,
-	"INTERNAL":       500,
-	"BACKPRESSURE":   503, "DEPENDENCY_UNAVAILABLE": 503,
-	"DEADLINE_EXCEEDED": 504,
+// HTTPStatusForErrorCode reports the HTTP status a typed error code is served
+// with. An unmapped code answers 500, which is the only safe reading: a code
+// this table does not know is not one a client should be told to retry, redeem,
+// or re-read on the strength of a more specific status.
+func HTTPStatusForErrorCode(code domain.ErrorCode) int {
+	if status, mapped := httpStatusByErrorCode[code]; mapped {
+		return status
+	}
+	return http.StatusInternalServerError
+}
+
+// The document repeats the status set three ways — as the response keys of every
+// operation, as the x-blackbird-error-statuses matrix, and as the Problem
+// status enum — so all three are projected from the one table above.
+var errorStatusCodes = distinctErrorStatusCodes()
+
+var errorStatuses = errorStatusStrings()
+
+var errorStatusByCode = errorStatusMatrix()
+
+func distinctErrorStatusCodes() []int {
+	seen := map[int]struct{}{}
+	statuses := make([]int, 0, len(httpStatusByErrorCode))
+	for _, status := range httpStatusByErrorCode {
+		if _, duplicate := seen[status]; duplicate {
+			continue
+		}
+		seen[status] = struct{}{}
+		statuses = append(statuses, status)
+	}
+	sort.Ints(statuses)
+	return statuses
+}
+
+func errorStatusStrings() []string {
+	statuses := make([]string, 0, len(errorStatusCodes))
+	for _, status := range errorStatusCodes {
+		statuses = append(statuses, strconv.Itoa(status))
+	}
+	return statuses
+}
+
+func errorStatusMatrix() schema {
+	matrix := make(schema, len(httpStatusByErrorCode))
+	for code, status := range httpStatusByErrorCode {
+		matrix[string(code)] = status
+	}
+	return matrix
 }
 
 // ProductOpenAPI31 returns the canonical deterministic OpenAPI 3.1 document.
@@ -544,7 +609,11 @@ func applyProblemSchema(components schema) {
 	}
 	properties["type"] = schema{"type": "string", "format": "uri", "pattern": `^https://blackbird\.local/problems/[A-Z_]+$`}
 	properties["title"] = schema{"type": "string", "minLength": 1, "maxLength": 64}
-	properties["status"] = schema{"type": "integer", "enum": []any{400, 401, 403, 404, 409, 410, 422, 429, 500, 503, 504}}
+	statusEnum := make([]any, 0, len(errorStatusCodes))
+	for _, status := range errorStatusCodes {
+		statusEnum = append(statusEnum, status)
+	}
+	properties["status"] = schema{"type": "integer", "enum": statusEnum}
 	properties["detail"] = schema{"type": "string", "minLength": 1, "maxLength": 512}
 	required := append([]string(nil), errorSchema["required"].([]string)...)
 	required = append(required, "type", "title", "status", "detail")

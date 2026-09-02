@@ -13,37 +13,20 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 )
 
-func TestCommandResultsStrictBoundary(t *testing.T) {
+// TestCommandResultVersionBindings pins the version each command result is
+// allowed to report. An aggregate the command created must still be at its
+// initial version, and one it advanced must not be — reversing either is how a
+// replayed or misattributed result reads as a fresh execution.
+func TestCommandResultVersionBindings(t *testing.T) {
 	t.Parallel()
 
 	bootstrap := fixtureBootstrapResult(t)
-	if _, err := DecodeInstallationBootstrapResult(mustMarshal(t, bootstrap)); err != nil {
-		t.Fatalf("DecodeInstallationBootstrapResult() error = %v", err)
+	if err := bootstrap.Validate(); err != nil {
+		t.Fatalf("InstallationBootstrapResultDTO.Validate() error = %v", err)
 	}
 	workspace := fixtureWorkspaceResult(t)
-	if _, err := DecodeWorkspaceCreateResult(mustMarshal(t, workspace)); err != nil {
-		t.Fatalf("DecodeWorkspaceCreateResult() error = %v", err)
-	}
-	additive := addTopLevelJSONField(mustMarshal(t, workspace), `"future_optional":true`)
-	if _, err := DecodeWorkspaceCreateResult(additive); err != nil {
-		t.Fatalf("additive output field error = %v, want nil", err)
-	}
-	wrongKind := bytes.Replace(
-		mustMarshal(t, workspace),
-		[]byte(`"resource_version":1`),
-		[]byte(`"resource_version":"1"`),
-		1,
-	)
-	if _, err := DecodeWorkspaceCreateResult(wrongKind); !errors.Is(err, ErrInvalidJSON) {
-		t.Fatalf("wrong kind error = %v, want ErrInvalidJSON", err)
-	}
-	if _, err := DecodeInstallationBootstrapResult(bytes.Repeat([]byte("x"), MaxOutcomeJSONBytes+1)); !errors.Is(err, ErrPayloadTooLarge) {
-		t.Fatalf("oversize error = %v, want ErrPayloadTooLarge", err)
-	}
-
-	missingReplay := removeJSONField(mustMarshal(t, workspace), `"idempotent_replay":false,`)
-	if _, err := DecodeWorkspaceCreateResult(missingReplay); !errors.Is(err, ErrInvalidContract) {
-		t.Fatalf("missing replay member error = %v, want ErrInvalidContract", err)
+	if err := workspace.Validate(); err != nil {
+		t.Fatalf("WorkspaceCreateResultDTO.Validate() error = %v", err)
 	}
 	wrongInitial := workspace
 	wrongInitial.ResourceVersion = mustVersion(t, 2)
@@ -75,7 +58,7 @@ func TestCommandResultsStrictBoundary(t *testing.T) {
 	}
 }
 
-func TestPrincipalRegisterResultForwardCompatibilityAndPresence(t *testing.T) {
+func TestPrincipalRegisterResultValidation(t *testing.T) {
 	t.Parallel()
 
 	result := PrincipalRegisterResultDTO{
@@ -86,17 +69,13 @@ func TestPrincipalRegisterResultForwardCompatibilityAndPresence(t *testing.T) {
 			ResourceVersion: domain.InitialVersion(),
 		},
 	}
-	encoded := mustMarshal(t, result)
-	if _, err := DecodePrincipalRegisterResult(encoded); err != nil {
-		t.Fatalf("DecodePrincipalRegisterResult() error = %v", err)
+	if err := result.Validate(); err != nil {
+		t.Fatalf("PrincipalRegisterResultDTO.Validate() error = %v", err)
 	}
-	additive := addTopLevelJSONField(encoded, `"future":true`)
-	if _, err := DecodePrincipalRegisterResult(additive); err != nil {
-		t.Fatalf("additive result error = %v", err)
-	}
-	missingReplay := removeJSONField(encoded, `"idempotent_replay":false,`)
-	if _, err := DecodePrincipalRegisterResult(missingReplay); !errors.Is(err, ErrInvalidContract) {
-		t.Fatalf("missing idempotent_replay error = %v, want ErrInvalidContract", err)
+	consumed := result
+	consumed.Resource.PrincipalState = StateConsumed
+	if err := consumed.Validate(); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("non-active principal state error = %v, want ErrInvalidContract", err)
 	}
 }
 
@@ -384,7 +363,7 @@ func TestErrorCodeSpecificDetailsRejectAmbiguity(t *testing.T) {
 		}()},
 		{name: "forbidden unrelated detail", value: func() ErrorDTO {
 			value := inProgress
-			value.Details.Dependency = "postgres"
+			value.Details.Dependency = "unrelated-dependency"
 			return value
 		}()},
 	}
@@ -1295,25 +1274,17 @@ func TestIJSONIntegerBoundsAcrossTransportPaths(t *testing.T) {
 	if _, err := DecodeInstallationBootstrappedEvent(unsafeKnownAdditivePayload); !errors.Is(err, ErrInvalidJSON) {
 		t.Fatalf("known additive payload past maximum error = %v, want ErrInvalidJSON", err)
 	}
-	safeAdditiveOutcome := addTopLevelJSONField(
-		mustMarshal(t, fixtureWorkspaceResult(t)),
-		`"future_integer":`+maximum,
-	)
-	if _, err := DecodeWorkspaceCreateResult(safeAdditiveOutcome); err != nil {
+	outcomeJSON := mustMarshal(t, fixtureContextCheckpointPage(t))
+	safeAdditiveOutcome := addTopLevelJSONField(outcomeJSON, `"future_integer":`+maximum)
+	if _, err := DecodeContextPage(safeAdditiveOutcome); err != nil {
 		t.Fatalf("discarded additive output at maximum error = %v", err)
 	}
-	unsafeAdditiveOutcome := addTopLevelJSONField(
-		mustMarshal(t, fixtureWorkspaceResult(t)),
-		`"future_integer":`+unsafe,
-	)
-	if _, err := DecodeWorkspaceCreateResult(unsafeAdditiveOutcome); !errors.Is(err, ErrInvalidJSON) {
+	unsafeAdditiveOutcome := addTopLevelJSONField(outcomeJSON, `"future_integer":`+unsafe)
+	if _, err := DecodeContextPage(unsafeAdditiveOutcome); !errors.Is(err, ErrInvalidJSON) {
 		t.Fatalf("discarded additive output past maximum error = %v, want ErrInvalidJSON", err)
 	}
-	negativeAdditiveOutcome := addTopLevelJSONField(
-		mustMarshal(t, fixtureWorkspaceResult(t)),
-		`"future_integer":-1`,
-	)
-	if _, err := DecodeWorkspaceCreateResult(negativeAdditiveOutcome); !errors.Is(err, ErrInvalidJSON) {
+	negativeAdditiveOutcome := addTopLevelJSONField(outcomeJSON, `"future_integer":-1`)
+	if _, err := DecodeContextPage(negativeAdditiveOutcome); !errors.Is(err, ErrInvalidJSON) {
 		t.Fatalf("discarded negative additive output error = %v, want ErrInvalidJSON", err)
 	}
 

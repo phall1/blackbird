@@ -275,8 +275,7 @@ func buildBootstrapFixture(t *testing.T) bootstrapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	effects, _ := NewEffectSet()
-	decision, err := ApplyCommand(commandContext, commit, audit, effects)
+	decision, err := ApplyCommand(commandContext, commit, audit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +463,7 @@ func TestCommandContractAcceptsExactBootstrapShapeAndOwnsCopies(t *testing.T) {
 	t.Parallel()
 	fixture := buildBootstrapFixture(t)
 	if fixture.decision.Kind() != CommandDecisionApplied || len(fixture.decision.Writes()) != 4 ||
-		len(fixture.decision.Facts()) != 3 || len(fixture.decision.Effects().Intents()) != 0 {
+		len(fixture.decision.Facts()) != 3 {
 		t.Fatalf("unexpected applied decision shape")
 	}
 	writes := fixture.decision.Writes()
@@ -925,7 +924,7 @@ func TestCommandDecisionRejectsEveryShapeMismatch(t *testing.T) {
 			commit := fixture.commit
 			commit.writes, commit.facts = writes, facts
 			_, err := ApplyCommand(
-				fixture.context, commit, fixture.decision.Audit(), fixture.decision.Effects(),
+				fixture.context, commit, fixture.decision.Audit(),
 			)
 			if !errors.Is(err, ErrInvalidCommandDecision) {
 				t.Fatalf("error = %v", err)
@@ -958,14 +957,6 @@ func TestIJSONBoundsAndBoundedPayloads(t *testing.T) {
 		_, err := NewResultEnvelope(document)
 		if !errors.Is(err, ErrInvalidApplicationContract) {
 			t.Errorf("forged result size %d error=%v", size, err)
-		}
-	}
-	eventID, _ := domain.ParseEventID(applicationUUID(101))
-	major, _ := NewOperationMajor(1)
-	for _, size := range []int{MaxEffectMetadataBytes - 1, MaxEffectMetadataBytes, MaxEffectMetadataBytes + 1} {
-		_, err := NewEffectIntent(eventID, "projection", major, "destination", 0, []byte(strings.Repeat("x", size)))
-		if (err == nil) != (size <= MaxEffectMetadataBytes) {
-			t.Errorf("effect size %d error=%v", size, err)
 		}
 	}
 }
@@ -1247,18 +1238,6 @@ func TestCeremonyClaimsDeclareGlobalAbsenceAndOneUseCAS(t *testing.T) {
 		if storedIssuedCeremoniesMatchSpec([]domain.CeremonyChallenge{challenge}, []CeremonyClaim{reserve}) {
 			t.Fatal("stored ceremony mismatch passed exact replay binding")
 		}
-	}
-}
-
-func TestEffectLogicalIdentityExcludesCausingEvent(t *testing.T) {
-	t.Parallel()
-	first, _ := domain.ParseEventID(applicationUUID(130))
-	second, _ := domain.ParseEventID(applicationUUID(131))
-	major, _ := NewOperationMajor(1)
-	left, _ := NewEffectIntent(first, "projection", major, "same-destination", 0, []byte(`{"a":1}`))
-	right, _ := NewEffectIntent(second, "projection", major, "same-destination", 0, []byte(`{"a":2}`))
-	if _, err := NewEffectSet(left, right); !errors.Is(err, ErrInvalidApplicationContract) {
-		t.Fatalf("duplicate logical effect error=%v", err)
 	}
 }
 
@@ -2964,7 +2943,7 @@ func TestAllW0OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
 			badCommit := pipeline.commit
 			badCommit.facts = nil
 			if _, err := ApplyCommand(
-				pipeline.context, badCommit, pipeline.decision.Audit(), pipeline.decision.Effects(),
+				pipeline.context, badCommit, pipeline.decision.Audit(),
 			); !errors.Is(err, ErrInvalidCommandDecision) {
 				t.Fatalf("fact-shape mutation error=%v", err)
 			}
@@ -2981,7 +2960,7 @@ func TestAllW0OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
 		crossOperationCommit.operation = next.caseDefinition.operation
 		if _, err := ApplyCommand(
 			completed[index].context, crossOperationCommit,
-			completed[index].decision.Audit(), completed[index].decision.Effects(),
+			completed[index].decision.Audit(),
 		); !errors.Is(err, ErrInvalidCommandDecision) {
 			t.Fatalf("%s accepted commit tagged as %s: %v",
 				completed[index].caseDefinition.operation, next.caseDefinition.operation, err)
@@ -3018,7 +2997,7 @@ func TestAllW1OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
 			badCommit := pipeline.commit
 			badCommit.facts = nil
 			if _, err := ApplyCommand(
-				pipeline.context, badCommit, pipeline.decision.Audit(), pipeline.decision.Effects(),
+				pipeline.context, badCommit, pipeline.decision.Audit(),
 			); !errors.Is(err, ErrInvalidCommandDecision) {
 				t.Fatalf("fact-shape mutation error=%v", err)
 			}
@@ -3035,7 +3014,7 @@ func TestAllW1OperationsCompleteTheRealApplicationPipeline(t *testing.T) {
 		crossOperationCommit.operation = next.caseDefinition.operation
 		if _, err := ApplyCommand(
 			completed[index].context, crossOperationCommit,
-			completed[index].decision.Audit(), completed[index].decision.Effects(),
+			completed[index].decision.Audit(),
 		); !errors.Is(err, ErrInvalidCommandDecision) {
 			t.Fatalf("%s accepted commit tagged as %s: %v",
 				completed[index].caseDefinition.operation, next.caseDefinition.operation, err)
@@ -3219,10 +3198,9 @@ func completeOperationPipeline(
 	if err != nil {
 		t.Fatal(err)
 	}
-	effects, _ := NewEffectSet()
-	decision, err := ApplyCommand(commandContext, commit, audit, effects)
+	decision, err := ApplyCommand(commandContext, commit, audit)
 	if err != nil {
-		t.Fatalf("apply: %v (resolution=%v operation=%v audit_outcome=%v audit_operation=%v audit_fingerprint=%v writes=%v facts=%v ceremonies=%v effects=%v)",
+		t.Fatalf("apply: %v (resolution=%v operation=%v audit_outcome=%v audit_operation=%v audit_fingerprint=%v writes=%v facts=%v ceremonies=%v)",
 			err,
 			commandContext.resolution.kind == ReceiptAdmitted,
 			commit.operation == commandContext.spec.commandOperation,
@@ -3232,7 +3210,6 @@ func completeOperationPipeline(
 			writesMatchPlan(commit.writes, commandContext.spec.guards.mutations),
 			factsMatchPlan(commit.facts, commandContext.spec.expectedFacts),
 			ceremonyTransitionsMatchPlan(commit.ceremonies, commandContext.spec.guards.ceremonies),
-			effectsReferToFacts(effects, commit.facts),
 		)
 	}
 	if err := ValidateCommandDecision(commandContext, decision); err != nil {

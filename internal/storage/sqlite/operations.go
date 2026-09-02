@@ -27,8 +27,6 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 )
 
-var ErrFilesystemQualification = errors.New("SQLite filesystem qualification failed")
-
 type eventCursorWire struct {
 	Workspace string `json:"workspace"`
 	Epoch     string `json:"epoch"`
@@ -736,34 +734,6 @@ type CheckpointReport struct {
 	Duration           time.Duration
 }
 
-type IntegrityReport struct {
-	Full     bool
-	Duration time.Duration
-}
-
-type PathQualification struct {
-	Path           string
-	Exists         bool
-	Directory      bool
-	OwnerUID       uint32
-	Permissions    os.FileMode
-	FilesystemType uint64
-	FilesystemName string
-	FreeBytes      uint64
-	LockVerified   bool
-}
-
-type FilesystemQualification struct {
-	DatabaseDirectory PathQualification
-	Database          PathQualification
-	WAL               PathQualification
-	SharedMemory      PathQualification
-	Artifacts         PathQualification
-	SameOwner         bool
-	Local             bool
-	QualifiedAt       time.Time
-}
-
 func (store *Store) Checkpoint(ctx context.Context, mode CheckpointMode) (CheckpointReport, error) {
 	if mode != CheckpointPassive && mode != CheckpointTruncate {
 		return CheckpointReport{}, fmt.Errorf("invalid SQLite checkpoint mode %q", mode)
@@ -810,128 +780,6 @@ func (store *Store) Checkpoint(ctx context.Context, mode CheckpointMode) (Checkp
 	return report, nil
 }
 
-func (store *Store) FullIntegrityCheck(ctx context.Context) (IntegrityReport, error) {
-	if _, bounded := ctx.Deadline(); !bounded {
-		return IntegrityReport{Full: true}, errors.New("full SQLite integrity check requires a bounded context")
-	}
-	if err := store.acquireWrite(ctx, false); err != nil {
-		return IntegrityReport{Full: true}, err
-	}
-	defer store.releaseWrite()
-
-	started := time.Now()
-	err := store.IntegrityCheck(ctx)
-	report := IntegrityReport{Full: true, Duration: time.Since(started)}
-	if err != nil {
-		return report, err
-	}
-	return report, nil
-}
-
-func QualifyFilesystem(databasePath, artifactDirectory string) (FilesystemQualification, error) {
-	if err := validateQualifiedPath(databasePath); err != nil {
-		return FilesystemQualification{}, err
-	}
-	if err := validateQualifiedPath(artifactDirectory); err != nil {
-		return FilesystemQualification{}, err
-	}
-
-	databaseDirectory, err := qualifyPath(filepath.Dir(databasePath), true, true)
-	if err != nil {
-		return FilesystemQualification{}, err
-	}
-	database, err := qualifyPath(databasePath, false, true)
-	if err != nil {
-		return FilesystemQualification{}, err
-	}
-	wal, err := qualifyPath(databasePath+"-wal", false, false)
-	if err != nil {
-		return FilesystemQualification{}, err
-	}
-	sharedMemory, err := qualifyPath(databasePath+"-shm", false, false)
-	if err != nil {
-		return FilesystemQualification{}, err
-	}
-	artifacts, err := qualifyPath(artifactDirectory, true, true)
-	if err != nil {
-		return FilesystemQualification{}, err
-	}
-
-	owner := uint32(os.Geteuid())
-	result := FilesystemQualification{
-		DatabaseDirectory: databaseDirectory, Database: database, WAL: wal,
-		SharedMemory: sharedMemory, Artifacts: artifacts,
-		SameOwner: true, Local: true, QualifiedAt: time.Now().UTC(),
-	}
-	for _, path := range []PathQualification{databaseDirectory, database, wal, sharedMemory, artifacts} {
-		if path.OwnerUID != owner {
-			result.SameOwner = false
-		}
-		if unsupportedFilesystem(path.FilesystemType, path.FilesystemName) {
-			result.Local = false
-		}
-	}
-	if !result.SameOwner {
-		return result, fmt.Errorf("%w: paths are not owned by effective uid %d", ErrFilesystemQualification, owner)
-	}
-	if !result.Local {
-		return result, fmt.Errorf("%w: network or userspace filesystem is unsupported", ErrFilesystemQualification)
-	}
-	return result, nil
-}
-
-func validateQualifiedPath(path string) error {
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return fmt.Errorf("%w: path must be absolute and clean: %q", ErrFilesystemQualification, path)
-	}
-	return nil
-}
-
-func qualifyPath(path string, directory, required bool) (PathQualification, error) {
-	result := PathQualification{Path: path, Directory: directory}
-	info, err := os.Lstat(path)
-	exists := err == nil
-	if errors.Is(err, os.ErrNotExist) && !required {
-		info, err = os.Lstat(filepath.Dir(path))
-	}
-	if err != nil {
-		return result, fmt.Errorf("%w: inspect %q: %v", ErrFilesystemQualification, path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return result, fmt.Errorf("%w: symlink is unsupported: %q", ErrFilesystemQualification, path)
-	}
-	if exists && directory != info.IsDir() {
-		return result, fmt.Errorf("%w: unexpected file type: %q", ErrFilesystemQualification, path)
-	}
-	if !exists && !info.IsDir() {
-		return result, fmt.Errorf("%w: sidecar parent is not a directory: %q", ErrFilesystemQualification, path)
-	}
-	if !info.IsDir() && !info.Mode().IsRegular() {
-		return result, fmt.Errorf("%w: path is not regular: %q", ErrFilesystemQualification, path)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return result, fmt.Errorf("%w: group or other permissions on %q are not allowed", ErrFilesystemQualification, path)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return result, fmt.Errorf("%w: ownership unavailable for %q", ErrFilesystemQualification, path)
-	}
-	result.Exists = exists
-	result.OwnerUID = stat.Uid
-	result.Permissions = info.Mode().Perm()
-	result.FreeBytes, result.FilesystemType, result.FilesystemName, err = filesystemStats(path)
-	if err != nil {
-		return result, fmt.Errorf("%w: filesystem stats for %q: %v", ErrFilesystemQualification, path, err)
-	}
-	if required && !directory {
-		if err := verifyAdvisoryLocks(path); err != nil {
-			return result, err
-		}
-		result.LockVerified = true
-	}
-	return result, nil
-}
-
 func filesystemStats(path string) (uint64, uint64, string, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
@@ -959,56 +807,6 @@ func filesystemName(stat syscall.Statfs_t) string {
 		name = append(name, value)
 	}
 	return strings.ToLower(string(name))
-}
-
-func verifyAdvisoryLocks(path string) error {
-	probe := func() (*sql.DB, error) {
-		db, err := sql.Open("sqlite", databaseURL(Config{Path: path, BusyTimeout: time.Millisecond}))
-		if err != nil {
-			return nil, err
-		}
-		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
-		return db, nil
-	}
-	first, err := probe()
-	if err != nil {
-		return fmt.Errorf("%w: open SQLite lock probe: %v", ErrFilesystemQualification, err)
-	}
-	defer func() { _ = first.Close() }()
-	second, err := probe()
-	if err != nil {
-		return fmt.Errorf("%w: open competing SQLite lock probe: %v", ErrFilesystemQualification, err)
-	}
-	defer func() { _ = second.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), defaultBusyTimeout)
-	defer cancel()
-	firstTx, err := first.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("%w: begin SQLite lock probe: %v", ErrFilesystemQualification, err)
-	}
-	defer func() { _ = firstTx.Rollback() }()
-	if competing, err := second.BeginTx(ctx, nil); err == nil {
-		_ = competing.Rollback()
-		return fmt.Errorf("%w: filesystem did not enforce competing SQLite write locks", ErrFilesystemQualification)
-	} else if ctx.Err() != nil {
-		return fmt.Errorf("%w: competing SQLite lock probe exceeded its bound: %v", ErrFilesystemQualification, ctx.Err())
-	}
-	return nil
-}
-
-func unsupportedFilesystem(filesystemType uint64, filesystemName string) bool {
-	switch filesystemName {
-	case "nfs", "smbfs", "webdav", "afpfs", "osxfuse", "macfuse":
-		return true
-	}
-	switch filesystemType {
-	case 0x6969, 0x517b, 0xff534d42, 0x65735546, 0x9fa0:
-		// NFS, SMB, CIFS, FUSE, and procfs are not supported authority storage.
-		return true
-	default:
-		return false
-	}
 }
 
 func (store *Store) OpenConversation(ctx context.Context, params application.OpenConversationParams) (application.Conversation, error) {
@@ -1481,11 +1279,28 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		// A lease this same actor already holds is not a conflict. Agents retry
+		// after a timeout or a lost response constantly, and without this an
+		// agent is refused by a reservation it owns -- on the commonest
+		// acquisition path there is, with no recovery but waiting out its own
+		// TTL. Holder identity is the actor rather than the session because a
+		// re-registration mints a new session for the same agent name and
+		// rebinds these very leases to it.
+		held := make(map[string][]application.LeaseSelector)
 		keys := make(map[string]struct{}, len(params.Selectors))
+		for _, prior := range existing {
+			if prior.holder == params.Holder.String() {
+				held[prior.lease] = append(held[prior.lease], prior.selector)
+			}
+		}
 		for _, requested := range params.Selectors {
 			keys[requested.Key()] = struct{}{}
 			for _, prior := range existing {
-				if !application.LeaseSelectorsOverlap(requested, prior.selector) {
+				// The holder's own selector key is deliberately left out of the
+				// fence set: bumping a counter this request does not name would
+				// supersede the holder's own still-valid fences on a lease this
+				// acquisition may not be replacing at all.
+				if prior.holder == params.Holder.String() || !application.LeaseSelectorsOverlap(requested, prior.selector) {
 					continue
 				}
 				keys[prior.selector.Key()] = struct{}{}
@@ -1496,6 +1311,9 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 							microsTime(prior.expires).Sub(now).Round(time.Millisecond)))
 				}
 			}
+		}
+		if err := supersedeHeldLeases(ctx, tx, params, held, now); err != nil {
+			return err
 		}
 		expires := now.Add(params.TTL)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO leases(lease_id, workspace_id, holder_actor_id, holder_session_id,
@@ -1552,6 +1370,69 @@ func (store *Store) AcquireLease(ctx context.Context, params application.Acquire
 			application.CoordinationEventLeaseAcquired, params.LeaseID.String(), now, payload)
 	})
 	return result, err
+}
+
+// supersedeHeldLeases retires the acquirer's own active leases whose every
+// selector the new request already covers. Skipping a self-conflict without
+// this leaks: the agent releases the lease it was just handed, forgets the one
+// it retried over, and that forgotten row keeps the same paths reserved against
+// every other agent for the rest of its TTL -- which is the whole failure the
+// retry fix is meant to remove. A lease covering anything outside the request
+// is left alone, because retiring it would silently drop paths its holder still
+// believes it has reserved.
+func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params application.AcquireLeaseParams,
+	held map[string][]application.LeaseSelector, now time.Time) error {
+	superseded := make([]string, 0, len(held))
+	for lease, selectors := range held {
+		covered := true
+		for _, selector := range selectors {
+			if !coveredBySelectors(params.Selectors, selector) {
+				covered = false
+				break
+			}
+		}
+		if covered {
+			superseded = append(superseded, lease)
+		}
+	}
+	// Sorted so the journal records the same order on every replay of the same
+	// acquisition; map iteration order would make the event stream depend on
+	// nothing an agent can observe.
+	sort.Strings(superseded)
+	for _, lease := range superseded {
+		leaseID, err := domain.ParseLeaseID(lease)
+		if err != nil {
+			return err
+		}
+		// Stamped strictly before the deadline, which is what separates an
+		// explicit release from the expiry reaper's terminal retirement.
+		if _, err := tx.ExecContext(ctx, `UPDATE leases SET status = 'released', released_at_us = ?
+			WHERE lease_id = ? AND status = 'active'`, timeMicros(now), lease); err != nil {
+			return fmt.Errorf("supersede SQLite lease: %w", err)
+		}
+		retired, err := loadLease(ctx, tx, leaseID)
+		if err != nil {
+			return err
+		}
+		payload, err := leaseCoordinationPayload(retired)
+		if err != nil {
+			return err
+		}
+		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
+			application.CoordinationEventLeaseReleased, lease, now, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func coveredBySelectors(outer []application.LeaseSelector, inner application.LeaseSelector) bool {
+	for _, selector := range outer {
+		if application.LeaseSelectorCovers(selector, inner) {
+			return true
+		}
+	}
+	return false
 }
 
 func (store *Store) RenewLease(ctx context.Context, params application.ChangeLeaseParams) (application.Lease, error) {
@@ -2184,11 +2065,215 @@ func (store *Store) AuthenticateLocalAgent(ctx context.Context, token string) (a
 	return result, err
 }
 
+// LocalAgentSnapshot answers the one question a resuming agent cannot answer
+// from its own memory: what is still bound to it. Registration rebinds the
+// agent's live leases to its new session, so without this an agent that
+// restarted or was compacted holds an exclusive reservation it does not know
+// about and cannot release, and every other agent waits out its TTL.
+//
+// The whole projection is read from one read-only snapshot against the store's
+// own clock, so the remaining lease time, the inbox counts and the roster all
+// describe the same instant.
+func (store *Store) LocalAgentSnapshot(ctx context.Context,
+	session application.LocalAgentSession) (application.LocalAgentSnapshot, error) {
+	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
+		return application.LocalAgentSnapshot{}, application.ErrInvalidCoordination
+	}
+	var snapshot application.LocalAgentSnapshot
+	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
+		reservations, err := localAgentReservations(ctx, tx, session, now)
+		if err != nil {
+			return err
+		}
+		snapshot.Reservations = reservations
+		inbox, err := localAgentInbox(ctx, tx, session)
+		if err != nil {
+			return err
+		}
+		snapshot.Inbox = inbox
+		conversations, err := localAgentConversations(ctx, tx, session)
+		if err != nil {
+			return err
+		}
+		snapshot.Conversations = conversations
+		peers, err := localAgentPeers(ctx, tx, session, now)
+		if err != nil {
+			return err
+		}
+		snapshot.Peers = peers
+		return nil
+	})
+	if err != nil {
+		return application.LocalAgentSnapshot{}, err
+	}
+	snapshot.ObservedAtUS = observed
+	return snapshot, nil
+}
+
+// The lease rows are read first and each one is then loaded whole, because the
+// fences a resuming agent needs in order to renew or release live in their own
+// table. Without them the agent can only wait the lease out.
+func localAgentReservations(ctx context.Context, tx *sql.Tx, session application.LocalAgentSession,
+	now time.Time) ([]application.LocalAgentReservation, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT lease_id FROM leases
+		WHERE holder_actor_id = ? AND workspace_id = ? AND status = 'active' AND expires_at_us > ?
+		ORDER BY expires_at_us, lease_id`, session.ActorID.String(), session.WorkspaceID.String(), timeMicros(now))
+	if err != nil {
+		return nil, fmt.Errorf("query SQLite held reservations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var identifiers []domain.LeaseID
+	for rows.Next() {
+		var leaseText string
+		if err := rows.Scan(&leaseText); err != nil {
+			return nil, fmt.Errorf("scan SQLite held reservation: %w", err)
+		}
+		leaseID, parseErr := domain.ParseLeaseID(leaseText)
+		if parseErr != nil {
+			return nil, application.ErrInvalidCoordination
+		}
+		identifiers = append(identifiers, leaseID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	reservations := make([]application.LocalAgentReservation, 0, len(identifiers))
+	for _, leaseID := range identifiers {
+		lease, loadErr := loadLease(ctx, tx, leaseID)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		reservations = append(reservations, application.LocalAgentReservation{LeaseID: lease.ID(), Mode: lease.Mode(),
+			Selectors: lease.Selectors(), Fences: lease.Fences(),
+			ExpiresInMS: lease.ExpiresAt().Sub(now).Milliseconds()})
+	}
+	return reservations, nil
+}
+
+// The counts aggregate d.message_id rather than the row so an agent with no
+// mail reports zero rather than one, matching the admin summaries.
+func localAgentInbox(ctx context.Context, tx *sql.Tx,
+	session application.LocalAgentSession) (application.LocalAgentInbox, error) {
+	var inbox application.LocalAgentInbox
+	if err := tx.QueryRowContext(ctx, `SELECT
+		count(d.message_id) FILTER (WHERE d.read_at_us IS NULL),
+		count(d.message_id) FILTER (WHERE d.acknowledgement_required = 1 AND d.acknowledged_at_us IS NULL)
+		FROM message_deliveries AS d WHERE d.recipient_actor_id = ?`,
+		session.ActorID.String()).Scan(&inbox.UnreadDeliveries, &inbox.UnackedDeliveries); err != nil {
+		return application.LocalAgentInbox{}, fmt.Errorf("query SQLite agent inbox counts: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT m.message_id, m.conversation_id, COALESCE(author.agent_name, ''),
+		m.subject, d.read_at_us IS NOT NULL, d.acknowledgement_required, d.acknowledged_at_us IS NOT NULL, m.sent_at_us
+		FROM message_deliveries AS d
+		JOIN messages AS m ON m.message_id = d.message_id
+		LEFT JOIN coordination_agents AS author ON author.actor_id = m.author_actor_id
+		WHERE d.recipient_actor_id = ?
+		  AND (d.read_at_us IS NULL OR (d.acknowledgement_required = 1 AND d.acknowledged_at_us IS NULL))
+		ORDER BY m.position DESC LIMIT ?`, session.ActorID.String(), application.MaxLocalAgentSnapshotItems)
+	if err != nil {
+		return application.LocalAgentInbox{}, fmt.Errorf("query SQLite agent inbox: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var item application.LocalAgentInboxItem
+		var messageText, conversationText string
+		if err := rows.Scan(&messageText, &conversationText, &item.AuthorAgentName, &item.Subject, &item.Read,
+			&item.AcknowledgementRequired, &item.Acknowledged, &item.SentAtUS); err != nil {
+			return application.LocalAgentInbox{}, fmt.Errorf("scan SQLite agent inbox item: %w", err)
+		}
+		message, messageErr := domain.ParseMessageID(messageText)
+		conversation, conversationErr := domain.ParseConversationID(conversationText)
+		if messageErr != nil || conversationErr != nil {
+			return application.LocalAgentInbox{}, application.ErrInvalidCoordination
+		}
+		item.MessageID, item.ConversationID = message, conversation
+		inbox.Recent = append(inbox.Recent, item)
+	}
+	return inbox, rows.Err()
+}
+
+// Participation, not the workspace, decides what belongs here: a conversation
+// this agent opened, wrote to, or was addressed in. A conversation it has never
+// touched is somebody else's work item and would only cost it context.
+func localAgentConversations(ctx context.Context, tx *sql.Tx,
+	session application.LocalAgentSession) ([]application.LocalAgentConversation, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT c.conversation_id, c.topic,
+		(SELECT count(*) FROM messages AS m WHERE m.conversation_id = c.conversation_id),
+		COALESCE((SELECT max(m.sent_at_us) FROM messages AS m WHERE m.conversation_id = c.conversation_id),
+			c.opened_at_us) AS last_message_at_us
+		FROM conversations AS c
+		WHERE c.workspace_id = ? AND c.status = 'open' AND (c.opened_by_actor_id = ?
+			OR EXISTS (SELECT 1 FROM messages AS m WHERE m.conversation_id = c.conversation_id
+				AND m.author_actor_id = ?)
+			OR EXISTS (SELECT 1 FROM message_deliveries AS d JOIN messages AS m ON m.message_id = d.message_id
+				WHERE m.conversation_id = c.conversation_id AND d.recipient_actor_id = ?))
+		ORDER BY last_message_at_us DESC, c.conversation_id LIMIT ?`,
+		session.WorkspaceID.String(), session.ActorID.String(), session.ActorID.String(), session.ActorID.String(),
+		application.MaxLocalAgentSnapshotItems)
+	if err != nil {
+		return nil, fmt.Errorf("query SQLite agent conversations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var conversations []application.LocalAgentConversation
+	for rows.Next() {
+		var conversation application.LocalAgentConversation
+		var conversationText string
+		if err := rows.Scan(&conversationText, &conversation.Topic, &conversation.Messages,
+			&conversation.LastMessageAtUS); err != nil {
+			return nil, fmt.Errorf("scan SQLite agent conversation: %w", err)
+		}
+		id, parseErr := domain.ParseConversationID(conversationText)
+		if parseErr != nil {
+			return nil, application.ErrInvalidCoordination
+		}
+		conversation.ConversationID = id
+		conversations = append(conversations, conversation)
+	}
+	return conversations, rows.Err()
+}
+
+// The liveness horizon is the shared one, and the clock is the store's, so this
+// roster and the admin roster cannot disagree about who is present.
+func localAgentPeers(ctx context.Context, tx *sql.Tx, session application.LocalAgentSession,
+	now time.Time) ([]application.ActiveAgent, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT agent.agent_name, agent.actor_id, session.session_id,
+		session.started_at_us, session.last_seen_at_us FROM coordination_agents AS agent
+		JOIN coordination_agent_sessions AS session USING(actor_id)
+		WHERE agent.project_key = ? AND agent.actor_id <> ? AND session.ended_at_us IS NULL
+		AND session.last_seen_at_us >= ? ORDER BY agent.agent_name`,
+		session.ProjectKey, session.ActorID.String(), timeMicros(now.Add(-application.LocalAgentActiveWindow)))
+	if err != nil {
+		return nil, fmt.Errorf("query SQLite agent peers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var peers []application.ActiveAgent
+	for rows.Next() {
+		var peer application.ActiveAgent
+		var actorText, sessionText string
+		var started, seen int64
+		if err := rows.Scan(&peer.Name, &actorText, &sessionText, &started, &seen); err != nil {
+			return nil, fmt.Errorf("scan SQLite agent peer: %w", err)
+		}
+		actor, actorErr := domain.ParseActorID(actorText)
+		peerSession, sessionErr := domain.ParseActorSessionID(sessionText)
+		if actorErr != nil || sessionErr != nil {
+			return nil, application.ErrInvalidCoordination
+		}
+		peer.ActorID, peer.SessionID = actor, peerSession
+		peer.StartedAt, peer.LastSeenAt = microsTime(started), microsTime(seen)
+		peers = append(peers, peer)
+	}
+	return peers, rows.Err()
+}
+
 func (store *Store) ListActiveLocalAgents(ctx context.Context, session application.LocalAgentSession) ([]application.ActiveAgent, error) {
 	if session.WorkspaceID.IsZero() || session.ProjectKey == "" {
 		return nil, application.ErrInvalidCoordination
 	}
-	cutoff := time.Now().UTC().Add(-5 * time.Minute)
+	cutoff := time.Now().UTC().Add(-application.LocalAgentActiveWindow)
 	rows, err := store.db.QueryContext(ctx, `SELECT agent.agent_name, agent.actor_id, session.session_id,
 		session.started_at_us, session.last_seen_at_us FROM coordination_agents AS agent
 		JOIN coordination_agent_sessions AS session USING(actor_id)

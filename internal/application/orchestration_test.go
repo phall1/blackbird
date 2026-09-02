@@ -320,15 +320,6 @@ func (policy *orchestrationDenialPolicy) DenialFollowUp(
 
 func ptrPolicy(value domain.PolicyRevision) *domain.PolicyRevision { return &value }
 
-type orchestrationEffects struct{ trap *orchestrationTrap }
-
-func (planner orchestrationEffects) PlanEffects(EffectPlanningInput) (EffectSet, error) {
-	if planner.trap != nil {
-		planner.trap.order = append(planner.trap.order, "effects")
-	}
-	return NewEffectSet()
-}
-
 type orchestrationPresentations struct {
 	trap    *orchestrationTrap
 	binding domain.PresentationCredentialBinding
@@ -697,7 +688,7 @@ func orchestrationFixture(t *testing.T, mode orchestrationUOWMode) (
 	service, err := NewOrchestrationService(OrchestrationDependencies{
 		UnitOfWork: unit, Authentication: orchestrationAuthentication{trap: trap}, Policy: orchestrationPolicy{trap: trap},
 		LockedAuthorization: authorizer, ReplayDisclosure: orchestrationReplay{ReplayDiscloseAppliedOnly},
-		DenialPolicy: denial, SignerLookup: signers, EffectPlanner: orchestrationEffects{trap},
+		DenialPolicy: denial, SignerLookup: signers,
 		BootstrapProofs:    orchestrationBootstrapVerifier{trap, fixture.input.Proof},
 		CeremonyProofs:     orchestrationCeremonyVerifier{trap: trap},
 		PairingRedemptions: orchestrationPairingVerifier{trap: trap},
@@ -1720,7 +1711,6 @@ func orchestrationMatrixService(
 		SignerLookup: &orchestrationSignerLookup{
 			trap: trap, signer: newTestCapsuleSigner(testCase.pipeline.spec.RecoveryCapsule().KeyID()),
 		},
-		EffectPlanner:   orchestrationEffects{trap},
 		BootstrapProofs: orchestrationBootstrapVerifier{trap: trap},
 		CeremonyProofs: orchestrationCeremonyVerifier{
 			trap: trap, membership: orchestrationProof(path.invited.Membership().AcceptanceChallenge()),
@@ -1798,7 +1788,7 @@ func TestAllOrdinaryOrchestrationHandlersAdversarialOutcomes(t *testing.T) {
 					contexts: []CommandContext{locked}, replayReceipt: receipt, replayAccess: ReplayDiscloseAppliedOnly}
 				execution, err := testCase.invoke(context.Background(), orchestrationMatrixService(t, path, testCase, unit, ReplayDiscloseAppliedOnly))
 				if err != nil || execution.Kind() != CommandReplayed || unit.writes != 0 || positionOf(trap.order, "authorization") >= 0 ||
-					positionOf(trap.order, "effects") >= 0 || positionOf(trap.order, "sign") >= 0 {
+					positionOf(trap.order, "sign") >= 0 {
 					t.Fatalf("execution=%s error=%v writes=%d order=%v", execution.Kind(), err, unit.writes, trap.order)
 				}
 			})
@@ -1820,8 +1810,7 @@ func TestAllOrdinaryOrchestrationHandlersAdversarialOutcomes(t *testing.T) {
 					wantSigns = 1
 				}
 				if err != nil || execution.Kind() != CommandReplayed || !full || !sameReceiptSnapshot(returned, receipt) ||
-					unit.writes != 0 || signers.signs != wantSigns || positionOf(trap.order, "authorization") >= 0 ||
-					positionOf(trap.order, "effects") >= 0 {
+					unit.writes != 0 || signers.signs != wantSigns || positionOf(trap.order, "authorization") >= 0 {
 					t.Fatalf("execution=%s error=%v full=%t writes=%d signs=%d order=%v",
 						execution.Kind(), err, full, unit.writes, signers.signs, trap.order)
 				}
@@ -2000,9 +1989,6 @@ func assertOrchestrationDecisionShape(
 	}
 	if len(audit.authorization.revocations) != expectRevocations {
 		t.Fatalf("audit revocation revisions=%d, want %d", len(audit.authorization.revocations), expectRevocations)
-	}
-	if len(decision.Effects().Intents()) != 0 {
-		t.Fatalf("effects=%v, want exact empty planned set", decision.Effects().Intents())
 	}
 	plan := decision.ResultPlan()
 	if plan.Operation() != spec.CommandOperation() || plan.CommandID() != spec.CommandID() ||

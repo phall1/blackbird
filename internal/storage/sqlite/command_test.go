@@ -96,7 +96,6 @@ func TestExecuteCommandPersistsBootstrapAtomicallyAndReplaysExactly(t *testing.T
 		"command_receipts":         1,
 		"domain_events":            3,
 		"audit_entries":            2,
-		"outbox_jobs":              1,
 	})
 	var capsuleRequired int
 	var capsule, capsuleDigest, capsulePublic []byte
@@ -108,16 +107,6 @@ func TestExecuteCommandPersistsBootstrapAtomicallyAndReplaysExactly(t *testing.T
 	if capsuleRequired != 1 || len(capsule) == 0 || len(capsuleDigest) != sha256.Size || len(capsulePublic) != ed25519.PublicKeySize {
 		t.Fatalf("invalid persisted capsule required=%d canonical=%d digest=%d public=%d",
 			capsuleRequired, len(capsule), len(capsuleDigest), len(capsulePublic))
-	}
-	var outboxCommand string
-	var outboxMetadataDigest []byte
-	if err := store.db.QueryRow(`SELECT command_id, metadata_digest FROM outbox_jobs`).Scan(
-		&outboxCommand, &outboxMetadataDigest,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if outboxCommand != spec.CommandID().String() || len(outboxMetadataDigest) != sha256.Size {
-		t.Fatalf("invalid outbox identity command=%q metadata_digest=%d", outboxCommand, len(outboxMetadataDigest))
 	}
 	var revocationRevision uint64
 	var credentialActivatedAt int64
@@ -1052,11 +1041,7 @@ func executeProductionStep(
 		if err != nil {
 			return application.CommandDecision{}, err
 		}
-		effects, err := application.NewEffectSet()
-		if err != nil {
-			return application.CommandDecision{}, err
-		}
-		decision, err := application.ApplyCommand(locked, commit, audit, effects)
+		decision, err := application.ApplyCommand(locked, commit, audit)
 		if err != nil {
 			return application.CommandDecision{}, fmt.Errorf("apply %s: %w", step.operation, err)
 		}
@@ -1533,18 +1518,7 @@ func newBootstrapCommand(
 		if err != nil {
 			return application.CommandDecision{}, err
 		}
-		effect, err := application.NewEffectIntent(
-			spec.ExpectedFacts()[0].EventID(), "sqlite_test_handler", major, "sqlite-test-destination", 0,
-			[]byte(`{"schema":"blackbird.sqlite-test-effect.v1"}`),
-		)
-		if err != nil {
-			return application.CommandDecision{}, err
-		}
-		effects, err := application.NewEffectSet(effect)
-		if err != nil {
-			return application.CommandDecision{}, err
-		}
-		return application.ApplyCommand(locked, commit, audit, effects)
+		return application.ApplyCommand(locked, commit, audit)
 	}
 	return spec, decide, preview
 }
@@ -1682,8 +1656,7 @@ func newRegisterPrincipalCommand(
 		if auditErr != nil {
 			return application.CommandDecision{}, auditErr
 		}
-		effects, _ := application.NewEffectSet()
-		return application.ApplyCommand(locked, commit, audit, effects)
+		return application.ApplyCommand(locked, commit, audit)
 	}
 	return spec, decide, preview
 }

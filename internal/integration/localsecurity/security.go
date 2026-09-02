@@ -11,9 +11,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -21,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -33,13 +29,10 @@ import (
 )
 
 const (
-	pairingExporterLabel    = "EXPORTER-Blackbird-Pair-v1"
-	sessionExporterLabel    = "EXPORTER-Blackbird-Session-v1"
 	transcriptDomain        = "blackbird-pairing-transcript/v1"
 	bindingSize             = 32
 	credentialService       = "com.phall1.blackbird.credentials.v1"
 	credentialIDMaxBytes    = 128
-	maxTransportAccessTTL   = 15 * time.Minute
 	maxPairingInvitationTTL = 5 * time.Minute
 	maxPairingAttempts      = 5
 	proofEvidenceVersion    = 1
@@ -49,10 +42,6 @@ const (
 
 var (
 	ErrInvalidKeyMaterial  = errors.New("invalid Ed25519 key material")
-	ErrInvalidCertificate  = errors.New("invalid local certificate")
-	ErrInvalidPin          = errors.New("invalid peer SPKI pin")
-	ErrPeerVerification    = errors.New("pinned TLS peer verification failed")
-	ErrExporter            = errors.New("TLS exporter unavailable")
 	ErrInvalidTranscript   = errors.New("invalid pairing transcript")
 	ErrInvalidProof        = errors.New("invalid pairing proof")
 	ErrInvalidCredential   = errors.New("invalid credential reference")
@@ -149,7 +138,6 @@ var (
 	_ application.ReplayDisclosureAuthorization  = (*ReplayAuthorization)(nil)
 	_ application.PresentationCredentialPreparer = (*GeneratedPresentationCredentialPreparer)(nil)
 	_ application.RecoveryCapsuleSignerLookup    = (*VaultRecoveryCapsuleSignerLookup)(nil)
-	_ application.EffectPlanner                  = BoundedEffectPlanner{}
 	_ application.DenialSecurityPolicy           = StrictDenialSecurityPolicy{}
 	_ application.BootstrapProofVerifier         = (*CryptographicProofVerifier)(nil)
 	_ application.CeremonyProofVerifier          = (*CryptographicProofVerifier)(nil)
@@ -166,7 +154,6 @@ type ProductionOrchestrationAdapters struct {
 	ReplayDisclosure    application.ReplayDisclosureAuthorization
 	Presentations       application.PresentationCredentialPreparer
 	SignerLookup        application.RecoveryCapsuleSignerLookup
-	EffectPlanner       application.EffectPlanner
 	DenialPolicy        application.DenialSecurityPolicy
 }
 
@@ -202,7 +189,7 @@ func NewProductionOrchestrationAdapters(
 		Authentication: authenticationPreparer, Policy: policyPreparer,
 		LockedAuthorization: authorizer, ReplayDisclosure: &ReplayAuthorization{authorization: authorizer},
 		Presentations: presentations,
-		SignerLookup:  signers, EffectPlanner: BoundedEffectPlanner{}, DenialPolicy: StrictDenialSecurityPolicy{},
+		SignerLookup:  signers, DenialPolicy: StrictDenialSecurityPolicy{},
 	}, nil
 }
 
@@ -874,41 +861,6 @@ func (signer *vaultRecoveryCapsuleSigner) String() string {
 
 func (signer *vaultRecoveryCapsuleSigner) GoString() string { return signer.String() }
 
-// BoundedEffectPlanner emits one deterministic projection intent per committed
-// identity fact. Application constructors enforce bounds, metadata size, and
-// logical uniqueness.
-type BoundedEffectPlanner struct{}
-
-func (BoundedEffectPlanner) PlanEffects(input application.EffectPlanningInput) (application.EffectSet, error) {
-	facts := input.Facts()
-	if input.CommandID().IsZero() || len(facts) == 0 || len(facts) > application.MaxCommandEffects {
-		return application.EffectSet{}, application.ErrInvalidApplicationContract
-	}
-	major, err := application.NewOperationMajor(1)
-	if err != nil {
-		return application.EffectSet{}, err
-	}
-	intents := make([]application.EffectIntent, len(facts))
-	for index, fact := range facts {
-		if fact.Fact() == nil || fact.EventID().IsZero() || fact.Fact().Origin().IsZero() {
-			return application.EffectSet{}, application.ErrInvalidApplicationContract
-		}
-		metadata := []byte(fmt.Sprintf(
-			`{"event_type":%q,"origin":%q}`,
-			fact.Fact().Type(), fact.Fact().Origin().Target().String(),
-		))
-		intent, intentErr := application.NewEffectIntent(
-			fact.EventID(), "identity_projection", major,
-			fact.Fact().Origin().Target().String(), uint16(index), metadata,
-		)
-		if intentErr != nil {
-			return application.EffectSet{}, intentErr
-		}
-		intents[index] = intent
-	}
-	return application.NewEffectSet(intents...)
-}
-
 // StrictDenialSecurityPolicy records only safe, cataloged denial classes. It
 // derives authority and admission data from the locked command context rather
 // than from caller-controlled error text.
@@ -1142,14 +1094,6 @@ func (credential *Ed25519Credential) Sign(_ io.Reader, message []byte, options c
 	return ed25519.Sign(privateKey, message), nil
 }
 
-func (credential *Ed25519Credential) NewCertificate(validity CertificateValidity) (tls.Certificate, SPKIPin, error) {
-	publicKey, err := credential.PublicKey()
-	if err != nil {
-		return tls.Certificate{}, SPKIPin{}, err
-	}
-	return newCertificate(publicKey, credential, validity)
-}
-
 // SignTranscript signs a pairing transcript without exporting vault key
 // material into the pairing layer.
 func (credential *Ed25519Credential) SignTranscript(transcript TranscriptHash) ([]byte, error) {
@@ -1290,278 +1234,6 @@ func validCredentialIdentifier(identifier string) bool {
 		return false
 	}
 	return true
-}
-
-// TransportAccessCredential is a short-lived opaque secret. It is useful only
-// with the mTLS connection whose exporter binding was supplied at issuance.
-type TransportAccessCredential struct {
-	mu        sync.RWMutex
-	material  [sha256.Size]byte
-	destroyed bool
-}
-
-func (credential *TransportAccessCredential) String() string {
-	return "[REDACTED transport access credential]"
-}
-
-func (credential *TransportAccessCredential) GoString() string { return credential.String() }
-
-// Bytes returns a disposable copy for transport encoding. Callers should clear
-// it immediately after writing it to the authenticated connection.
-func (credential *TransportAccessCredential) Bytes() ([]byte, error) {
-	if credential == nil {
-		return nil, ErrAccessDenied
-	}
-	credential.mu.RLock()
-	defer credential.mu.RUnlock()
-	if credential.destroyed {
-		return nil, ErrAccessDenied
-	}
-	return append([]byte(nil), credential.material[:]...), nil
-}
-
-func (credential *TransportAccessCredential) Destroy() {
-	if credential == nil {
-		return
-	}
-	credential.mu.Lock()
-	defer credential.mu.Unlock()
-	clear(credential.material[:])
-	credential.destroyed = true
-}
-
-// TransportAccessClaims are authenticated identity and authorization revisions
-// attached to one paired connection. Identifier fields are metadata, not
-// caller-overridable request values.
-type TransportAccessClaims struct {
-	PrincipalID       string
-	DeviceID          string
-	AuthorityEpoch    string
-	GrantsRevision    uint64
-	CredentialVersion uint64
-	RevocationVersion uint64
-}
-
-// TransportAccessCurrent is authoritative state checked on every acceptance.
-// Exact epoch equality is intentional; epochs have no ordering semantics.
-type TransportAccessCurrent struct {
-	AuthorityEpoch    string
-	GrantsRevision    uint64
-	CredentialVersion uint64
-	RevocationVersion uint64
-}
-
-// LocalAccessRequest contains evidence available at the local transport edge.
-// Origin-bearing browser requests are rejected even if they reach loopback.
-type LocalAccessRequest struct {
-	Credential    []byte
-	Binding       Binding
-	BrowserOrigin string
-}
-
-type transportAccessRecord struct {
-	claims            TransportAccessClaims
-	bindingDigest     [sha256.Size]byte
-	serverIncarnation [sha256.Size]byte
-	expiresAt         time.Time
-}
-
-// TransportAccessIssuer issues and verifies sender-constrained access for a
-// single daemon incarnation. Restart invalidates all issued credentials.
-type TransportAccessIssuer struct {
-	mu                sync.Mutex
-	random            io.Reader
-	now               func() time.Time
-	serverIncarnation [sha256.Size]byte
-	records           map[[sha256.Size]byte]transportAccessRecord
-	healthy           bool
-}
-
-func NewTransportAccessIssuer(random io.Reader, now func() time.Time) (*TransportAccessIssuer, error) {
-	if random == nil || now == nil {
-		return nil, ErrInvalidAccess
-	}
-	issuer := &TransportAccessIssuer{random: random, now: now, records: make(map[[sha256.Size]byte]transportAccessRecord)}
-	if err := issuer.rotateIncarnation(); err != nil {
-		return nil, err
-	}
-	issuer.healthy = true
-	return issuer, nil
-}
-
-func (issuer *TransportAccessIssuer) Issue(
-	claims TransportAccessClaims,
-	binding Binding,
-	ttl time.Duration,
-) (*TransportAccessCredential, error) {
-	if issuer == nil || !validTransportClaims(claims) || binding == (Binding{}) || ttl <= 0 || ttl > maxTransportAccessTTL {
-		return nil, ErrInvalidAccess
-	}
-	issuer.mu.Lock()
-	defer issuer.mu.Unlock()
-	if !issuer.healthy {
-		return nil, ErrAccessDenied
-	}
-	return issuer.issueLocked(claims, binding, ttl)
-}
-
-func (issuer *TransportAccessIssuer) issueLocked(
-	claims TransportAccessClaims,
-	binding Binding,
-	ttl time.Duration,
-) (*TransportAccessCredential, error) {
-	var material [sha256.Size]byte
-	var digest [sha256.Size]byte
-	generated := false
-	for range 4 {
-		if _, err := io.ReadFull(issuer.random, material[:]); err != nil {
-			clear(material[:])
-			return nil, fmt.Errorf("%w: access credential entropy unavailable", ErrInvalidAccess)
-		}
-		digest = sha256.Sum256(material[:])
-		if _, exists := issuer.records[digest]; !exists {
-			generated = true
-			break
-		}
-		clear(material[:])
-	}
-	if !generated {
-		return nil, fmt.Errorf("%w: access credential collision", ErrInvalidAccess)
-	}
-	record := transportAccessRecord{
-		claims: claims, bindingDigest: sha256.Sum256(binding[:]),
-		serverIncarnation: issuer.serverIncarnation, expiresAt: issuer.now().Add(ttl),
-	}
-	issuer.records[digest] = record
-	return &TransportAccessCredential{material: material}, nil
-}
-
-// Rotate replaces an accepted credential. The old credential remains valid if
-// generation of its replacement fails.
-func (issuer *TransportAccessIssuer) Rotate(
-	oldCredential []byte,
-	claims TransportAccessClaims,
-	binding Binding,
-	ttl time.Duration,
-) (*TransportAccessCredential, error) {
-	if issuer == nil || len(oldCredential) != sha256.Size || !validTransportClaims(claims) ||
-		binding == (Binding{}) || ttl <= 0 || ttl > maxTransportAccessTTL {
-		return nil, ErrInvalidAccess
-	}
-	oldDigest := sha256.Sum256(oldCredential)
-	bindingDigest := sha256.Sum256(binding[:])
-	issuer.mu.Lock()
-	defer issuer.mu.Unlock()
-	if !issuer.healthy {
-		return nil, ErrAccessDenied
-	}
-	oldRecord, ok := issuer.records[oldDigest]
-	if !ok || !issuer.now().Before(oldRecord.expiresAt) ||
-		subtle.ConstantTimeCompare(oldRecord.bindingDigest[:], bindingDigest[:]) != 1 ||
-		claims.PrincipalID != oldRecord.claims.PrincipalID || claims.DeviceID != oldRecord.claims.DeviceID ||
-		claims.AuthorityEpoch != oldRecord.claims.AuthorityEpoch ||
-		claims.GrantsRevision != oldRecord.claims.GrantsRevision ||
-		claims.RevocationVersion != oldRecord.claims.RevocationVersion ||
-		oldRecord.claims.CredentialVersion == ^uint64(0) ||
-		claims.CredentialVersion != oldRecord.claims.CredentialVersion+1 {
-		return nil, ErrAccessDenied
-	}
-	replacement, err := issuer.issueLocked(claims, binding, ttl)
-	if err != nil {
-		return nil, err
-	}
-	delete(issuer.records, oldDigest)
-	return replacement, nil
-}
-
-// VerifyLocalAccess denies browser-originated and unpaired callers before
-// returning server-established identity claims.
-func (issuer *TransportAccessIssuer) VerifyLocalAccess(
-	request LocalAccessRequest,
-	current TransportAccessCurrent,
-) (TransportAccessClaims, error) {
-	if issuer == nil || request.BrowserOrigin != "" || len(request.Credential) != sha256.Size ||
-		request.Binding == (Binding{}) || !validTransportCurrent(current) {
-		return TransportAccessClaims{}, ErrAccessDenied
-	}
-	credentialDigest := sha256.Sum256(request.Credential)
-	bindingDigest := sha256.Sum256(request.Binding[:])
-	issuer.mu.Lock()
-	defer issuer.mu.Unlock()
-	record, ok := issuer.records[credentialDigest]
-	if issuer.healthy && ok && subtle.ConstantTimeCompare(record.bindingDigest[:], bindingDigest[:]) == 1 &&
-		record.serverIncarnation == issuer.serverIncarnation && issuer.now().Before(record.expiresAt) &&
-		record.claims.AuthorityEpoch == current.AuthorityEpoch &&
-		record.claims.GrantsRevision == current.GrantsRevision &&
-		record.claims.CredentialVersion == current.CredentialVersion &&
-		record.claims.RevocationVersion == current.RevocationVersion {
-		return record.claims, nil
-	}
-	return TransportAccessClaims{}, ErrAccessDenied
-}
-
-func (issuer *TransportAccessIssuer) Revoke(credential []byte) error {
-	if issuer == nil || len(credential) != sha256.Size {
-		return ErrAccessDenied
-	}
-	digest := sha256.Sum256(credential)
-	issuer.mu.Lock()
-	defer issuer.mu.Unlock()
-	if !issuer.healthy {
-		return ErrAccessDenied
-	}
-	if _, ok := issuer.records[digest]; !ok {
-		return ErrAccessDenied
-	}
-	delete(issuer.records, digest)
-	return nil
-}
-
-// Restart rotates the opaque server incarnation and invalidates every live
-// assertion. Durable actor sessions are deliberately not represented here;
-// callers must issue fresh access and explicitly resume them elsewhere.
-func (issuer *TransportAccessIssuer) Restart() error {
-	if issuer == nil {
-		return ErrInvalidAccess
-	}
-	issuer.mu.Lock()
-	defer issuer.mu.Unlock()
-	issuer.healthy = false
-	if err := issuer.rotateIncarnationLocked(); err != nil {
-		return err
-	}
-	clear(issuer.records)
-	issuer.healthy = true
-	return nil
-}
-
-func (issuer *TransportAccessIssuer) rotateIncarnation() error {
-	issuer.mu.Lock()
-	defer issuer.mu.Unlock()
-	return issuer.rotateIncarnationLocked()
-}
-
-func (issuer *TransportAccessIssuer) rotateIncarnationLocked() error {
-	if _, err := io.ReadFull(issuer.random, issuer.serverIncarnation[:]); err != nil {
-		clear(issuer.serverIncarnation[:])
-		return fmt.Errorf("%w: server incarnation entropy unavailable", ErrInvalidAccess)
-	}
-	return nil
-}
-
-func validTransportClaims(claims TransportAccessClaims) bool {
-	return validAccessIdentifier(claims.PrincipalID) && validAccessIdentifier(claims.DeviceID) &&
-		validAccessIdentifier(claims.AuthorityEpoch) && claims.GrantsRevision > 0 &&
-		claims.CredentialVersion > 0 && claims.RevocationVersion > 0
-}
-
-func validTransportCurrent(current TransportAccessCurrent) bool {
-	return validAccessIdentifier(current.AuthorityEpoch) && current.GrantsRevision > 0 &&
-		current.CredentialVersion > 0 && current.RevocationVersion > 0
-}
-
-func validAccessIdentifier(identifier string) bool {
-	return identifier != "" && len(identifier) <= credentialIDMaxBytes && strings.TrimSpace(identifier) == identifier
 }
 
 // PairingInvitationID is a non-secret lookup identifier.
@@ -2368,169 +2040,12 @@ func decodeProofArray64(encoded string) ([ed25519.SignatureSize]byte, bool) {
 	return fixed, true
 }
 
-// SPKIPin is SHA-256 over the canonical DER SubjectPublicKeyInfo encoding.
-type SPKIPin [sha256.Size]byte
-
-// Binding is a fixed-size tls-exporter channel binding.
+// Binding is a fixed-size channel binding supplied by the transport that
+// carried the ceremony. This boundary consumes the value and never derives it.
 type Binding [bindingSize]byte
 
 // TranscriptHash is the SHA-256 digest of an already JCS-canonical transcript.
 type TranscriptHash [sha256.Size]byte
-
-// CertificateValidity fixes the identity certificate's validity window.
-type CertificateValidity struct {
-	NotBefore time.Time
-	NotAfter  time.Time
-}
-
-// NewCertificate creates a self-signed Ed25519 client/server certificate from
-// an Ed25519 seed or private key. The caller remains responsible for keeping
-// the supplied key material in a credential vault.
-func NewCertificate(keyMaterial []byte, validity CertificateValidity) (tls.Certificate, SPKIPin, error) {
-	privateKey, err := privateKeyFromMaterial(keyMaterial)
-	if err != nil {
-		return tls.Certificate{}, SPKIPin{}, err
-	}
-	publicKey := privateKey.Public().(ed25519.PublicKey)
-	return newCertificate(publicKey, privateKey, validity)
-}
-
-func newCertificate(
-	publicKey ed25519.PublicKey,
-	privateKey crypto.Signer,
-	validity CertificateValidity,
-) (tls.Certificate, SPKIPin, error) {
-	pin, err := PinPublicKey(publicKey)
-	if err != nil {
-		return tls.Certificate{}, SPKIPin{}, err
-	}
-	if validity.NotBefore.IsZero() || !validity.NotAfter.After(validity.NotBefore) {
-		return tls.Certificate{}, SPKIPin{}, ErrInvalidCertificate
-	}
-
-	serialBytes := append([]byte(nil), pin[:20]...)
-	serialBytes[0] &= 0x7f
-	serial := new(big.Int).SetBytes(serialBytes)
-	if serial.Sign() == 0 {
-		serial.SetInt64(1)
-	}
-	template := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "Blackbird local peer"},
-		NotBefore:    validity.NotBefore.UTC(),
-		NotAfter:     validity.NotAfter.UTC(),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageClientAuth,
-			x509.ExtKeyUsageServerAuth,
-		},
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
-	if err != nil {
-		return tls.Certificate{}, SPKIPin{}, fmt.Errorf("%w: create certificate", ErrInvalidCertificate)
-	}
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		return tls.Certificate{}, SPKIPin{}, fmt.Errorf("%w: parse certificate", ErrInvalidCertificate)
-	}
-	return tls.Certificate{
-		Certificate: [][]byte{der},
-		PrivateKey:  privateKey,
-		Leaf:        leaf,
-	}, pin, nil
-}
-
-// PinPublicKey returns the canonical SHA-256 SPKI pin for an Ed25519 key.
-func PinPublicKey(publicKey ed25519.PublicKey) (SPKIPin, error) {
-	if len(publicKey) != ed25519.PublicKeySize {
-		return SPKIPin{}, ErrInvalidKeyMaterial
-	}
-	spki, err := x509.MarshalPKIXPublicKey(publicKey)
-	if err != nil {
-		return SPKIPin{}, fmt.Errorf("%w: marshal SPKI", ErrInvalidKeyMaterial)
-	}
-	return sha256.Sum256(spki), nil
-}
-
-// PairingClientTLSConfig creates the first-contact TLS client. The daemon is
-// pinned from the invitation; the not-yet-trusted client key is authenticated
-// by the signed pairing transcript rather than a client certificate.
-// InsecureSkipVerify is intentional: ambient roots and DNS identity are
-// replaced by VerifyConnection's certificate, key-usage, and SPKI checks.
-func PairingClientTLSConfig(serverPins ...SPKIPin) (*tls.Config, error) {
-	if err := validatePins(serverPins); err != nil {
-		return nil, err
-	}
-	pins := append([]SPKIPin(nil), serverPins...)
-	return &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		MaxVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: true, // Verification is pin-based below; no ambient roots.
-		VerifyConnection: func(state tls.ConnectionState) error {
-			return verifyPinnedPeer(state, pins, x509.ExtKeyUsageServerAuth, time.Now())
-		},
-	}, nil
-}
-
-// PairingServerTLSConfig creates the daemon side of first-contact TLS. Client
-// authentication is completed by the exporter-bound transcript protocol.
-func PairingServerTLSConfig(certificate tls.Certificate) (*tls.Config, error) {
-	if err := validateLocalCertificate(certificate); err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{certificate},
-		MinVersion:   tls.VersionTLS13,
-		MaxVersion:   tls.VersionTLS13,
-		ClientAuth:   tls.NoClientCert,
-	}, nil
-}
-
-// PairedClientTLSConfig creates a TLS 1.3-only mTLS client with explicit server pins.
-func PairedClientTLSConfig(certificate tls.Certificate, serverPins ...SPKIPin) (*tls.Config, error) {
-	if err := validateLocalCertificate(certificate); err != nil {
-		return nil, err
-	}
-	config, err := PairingClientTLSConfig(serverPins...)
-	if err != nil {
-		return nil, err
-	}
-	config.Certificates = []tls.Certificate{certificate}
-	return config, nil
-}
-
-// PairedServerTLSConfig creates a TLS 1.3-only mTLS server with explicit client pins.
-// RequireAnyClientCert obtains a certificate without consulting ambient roots;
-// VerifyConnection performs the complete peer check.
-func PairedServerTLSConfig(certificate tls.Certificate, clientPins ...SPKIPin) (*tls.Config, error) {
-	if err := validateLocalCertificate(certificate); err != nil {
-		return nil, err
-	}
-	if err := validatePins(clientPins); err != nil {
-		return nil, err
-	}
-	pins := append([]SPKIPin(nil), clientPins...)
-	return &tls.Config{
-		Certificates: []tls.Certificate{certificate},
-		MinVersion:   tls.VersionTLS13,
-		MaxVersion:   tls.VersionTLS13,
-		ClientAuth:   tls.RequireAnyClientCert,
-		VerifyConnection: func(state tls.ConnectionState) error {
-			return verifyPinnedPeer(state, pins, x509.ExtKeyUsageClientAuth, time.Now())
-		},
-	}, nil
-}
-
-// PairingBinding derives the reviewed pairing channel-binding value.
-func PairingBinding(state tls.ConnectionState) (Binding, error) {
-	return exportBinding(state, pairingExporterLabel)
-}
-
-// SessionBinding derives the reviewed paired-session channel-binding value.
-func SessionBinding(state tls.ConnectionState) (Binding, error) {
-	return exportBinding(state, sessionExporterLabel)
-}
 
 // HashTranscript hashes an already validated RFC 8785 JCS encoding. This
 // boundary intentionally does not accept or normalize noncanonical JSON.
@@ -2567,7 +2082,7 @@ func VerifyTranscript(publicKey ed25519.PublicKey, transcript TranscriptHash, si
 	return nil
 }
 
-// PairingProof computes HMAC-SHA-256(secret, exporter || transcript_hash).
+// PairingProof computes HMAC-SHA-256(secret, binding || transcript_hash).
 func PairingProof(invitationSecret []byte, binding Binding, transcript TranscriptHash) ([sha256.Size]byte, error) {
 	if len(invitationSecret) != 32 || binding == (Binding{}) || transcript == (TranscriptHash{}) {
 		return [sha256.Size]byte{}, ErrInvalidProof
@@ -2587,120 +2102,6 @@ func VerifyPairingProof(invitationSecret []byte, binding Binding, transcript Tra
 		return ErrInvalidProof
 	}
 	return nil
-}
-
-func privateKeyFromMaterial(material []byte) (ed25519.PrivateKey, error) {
-	var privateKey ed25519.PrivateKey
-	switch len(material) {
-	case ed25519.SeedSize:
-		seed := append([]byte(nil), material...)
-		privateKey = ed25519.NewKeyFromSeed(seed)
-		clear(seed)
-	case ed25519.PrivateKeySize:
-		privateKey = append(ed25519.PrivateKey(nil), material...)
-		derived := ed25519.NewKeyFromSeed(privateKey[:ed25519.SeedSize])
-		if subtle.ConstantTimeCompare(privateKey, derived) != 1 {
-			clear(privateKey)
-			return nil, ErrInvalidKeyMaterial
-		}
-	default:
-		return nil, ErrInvalidKeyMaterial
-	}
-	return privateKey, nil
-}
-
-func validPrivateKey(privateKey ed25519.PrivateKey) bool {
-	if len(privateKey) != ed25519.PrivateKeySize {
-		return false
-	}
-	derived := ed25519.NewKeyFromSeed(privateKey[:ed25519.SeedSize])
-	return subtle.ConstantTimeCompare(privateKey, derived) == 1
-}
-
-func validateLocalCertificate(certificate tls.Certificate) error {
-	if len(certificate.Certificate) != 1 || certificate.PrivateKey == nil {
-		return ErrInvalidCertificate
-	}
-	leaf := certificate.Leaf
-	if leaf == nil {
-		var err error
-		leaf, err = x509.ParseCertificate(certificate.Certificate[0])
-		if err != nil {
-			return ErrInvalidCertificate
-		}
-	}
-	publicKey, ok := leaf.PublicKey.(ed25519.PublicKey)
-	signer, signerOK := certificate.PrivateKey.(crypto.Signer)
-	if !ok || !signerOK {
-		return ErrInvalidCertificate
-	}
-	signerPublicKey, publicOK := signer.Public().(ed25519.PublicKey)
-	if !publicOK || len(signerPublicKey) != ed25519.PublicKeySize || !signerPublicKey.Equal(publicKey) {
-		return ErrInvalidCertificate
-	}
-	if privateKey, privateOK := certificate.PrivateKey.(ed25519.PrivateKey); privateOK && !validPrivateKey(privateKey) {
-		return ErrInvalidCertificate
-	}
-	return nil
-}
-
-func validatePins(pins []SPKIPin) error {
-	if len(pins) == 0 {
-		return ErrInvalidPin
-	}
-	for _, pin := range pins {
-		if pin == (SPKIPin{}) {
-			return ErrInvalidPin
-		}
-	}
-	return nil
-}
-
-func verifyPinnedPeer(state tls.ConnectionState, pins []SPKIPin, usage x509.ExtKeyUsage, now time.Time) error {
-	// VerifyConnection runs before ConnectionState.HandshakeComplete is set.
-	if state.Version != tls.VersionTLS13 || len(state.PeerCertificates) != 1 {
-		return ErrPeerVerification
-	}
-	peer := state.PeerCertificates[0]
-	publicKey, ok := peer.PublicKey.(ed25519.PublicKey)
-	if !ok || now.Before(peer.NotBefore) || now.After(peer.NotAfter) || peer.IsCA ||
-		peer.KeyUsage&x509.KeyUsageDigitalSignature == 0 || !hasUsage(peer, usage) ||
-		peer.CheckSignature(peer.SignatureAlgorithm, peer.RawTBSCertificate, peer.Signature) != nil {
-		return ErrPeerVerification
-	}
-	pin, err := PinPublicKey(publicKey)
-	if err != nil {
-		return ErrPeerVerification
-	}
-	for _, expected := range pins {
-		if subtle.ConstantTimeCompare(pin[:], expected[:]) == 1 {
-			return nil
-		}
-	}
-	return ErrPeerVerification
-}
-
-func hasUsage(certificate *x509.Certificate, want x509.ExtKeyUsage) bool {
-	for _, usage := range certificate.ExtKeyUsage {
-		if usage == want {
-			return true
-		}
-	}
-	return false
-}
-
-func exportBinding(state tls.ConnectionState, label string) (Binding, error) {
-	if !state.HandshakeComplete || state.Version != tls.VersionTLS13 {
-		return Binding{}, ErrExporter
-	}
-	material, err := state.ExportKeyingMaterial(label, nil, bindingSize)
-	if err != nil || len(material) != bindingSize {
-		return Binding{}, ErrExporter
-	}
-	var binding Binding
-	copy(binding[:], material)
-	clear(material)
-	return binding, nil
 }
 
 func transcriptMessage(transcript TranscriptHash) []byte {

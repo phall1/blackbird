@@ -121,28 +121,21 @@ func (code ErrorCode) DefaultRetryable() bool {
 type ConflictKind string
 
 const (
-	ConflictAuthorityMismatch    ConflictKind = "AuthorityMismatch"
-	ConflictVersion              ConflictKind = "VersionConflict"
-	ConflictIdempotency          ConflictKind = "IdempotencyConflict"
-	ConflictState                ConflictKind = "StateConflict"
-	ConflictReference            ConflictKind = "ReferenceConflict"
-	ConflictProviderAuthority    ConflictKind = "ProviderAuthorityConflict"
-	ConflictSessionTerminal      ConflictKind = "SessionTerminalConflict"
-	ConflictParticipant          ConflictKind = "ParticipantConflict"
-	ConflictConversationClosed   ConflictKind = "ConversationClosedConflict"
-	ConflictDeliveryFact         ConflictKind = "DeliveryFactConflict"
-	ConflictDecisionTerminal     ConflictKind = "DecisionTerminalConflict"
-	ConflictDecisionResponse     ConflictKind = "DecisionResponseConflict"
-	ConflictAttentionGeneration  ConflictKind = "AttentionGenerationConflict"
-	ConflictAttentionResolved    ConflictKind = "AttentionResolvedConflict"
-	ConflictLease                ConflictKind = "LeaseConflict"
-	ConflictLeaseTerminal        ConflictKind = "LeaseTerminalConflict"
-	ConflictFence                ConflictKind = "FenceConflict"
-	ConflictLeaseScope           ConflictKind = "LeaseScopeConflict"
-	ConflictAcceptance           ConflictKind = "AcceptanceConflict"
-	ConflictProviderObservation  ConflictKind = "ProviderObservationConflict"
-	ConflictRuntimeObservation   ConflictKind = "RuntimeObservationConflict"
-	ConflictArtifactVerification ConflictKind = "ArtifactVerificationConflict"
+	ConflictAuthorityMismatch   ConflictKind = "AuthorityMismatch"
+	ConflictVersion             ConflictKind = "VersionConflict"
+	ConflictIdempotency         ConflictKind = "IdempotencyConflict"
+	ConflictState               ConflictKind = "StateConflict"
+	ConflictReference           ConflictKind = "ReferenceConflict"
+	ConflictProviderAuthority   ConflictKind = "ProviderAuthorityConflict"
+	ConflictSessionTerminal     ConflictKind = "SessionTerminalConflict"
+	ConflictParticipant         ConflictKind = "ParticipantConflict"
+	ConflictConversationClosed  ConflictKind = "ConversationClosedConflict"
+	ConflictDeliveryFact        ConflictKind = "DeliveryFactConflict"
+	ConflictLease               ConflictKind = "LeaseConflict"
+	ConflictLeaseTerminal       ConflictKind = "LeaseTerminalConflict"
+	ConflictFence               ConflictKind = "FenceConflict"
+	ConflictLeaseScope          ConflictKind = "LeaseScopeConflict"
+	ConflictProviderObservation ConflictKind = "ProviderObservationConflict"
 )
 
 func (kind ConflictKind) Valid() bool {
@@ -157,18 +150,11 @@ func (kind ConflictKind) Valid() bool {
 		ConflictParticipant,
 		ConflictConversationClosed,
 		ConflictDeliveryFact,
-		ConflictDecisionTerminal,
-		ConflictDecisionResponse,
-		ConflictAttentionGeneration,
-		ConflictAttentionResolved,
 		ConflictLease,
 		ConflictLeaseTerminal,
 		ConflictFence,
 		ConflictLeaseScope,
-		ConflictAcceptance,
-		ConflictProviderObservation,
-		ConflictRuntimeObservation,
-		ConflictArtifactVerification:
+		ConflictProviderObservation:
 		return true
 	default:
 		return false

@@ -243,7 +243,7 @@ func openRelaxedFsyncStore(b *testing.B, name string) *Store {
 	if err := migrated.Close(); err != nil {
 		b.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", withoutFullFsync(b, databaseURL(Config{Path: path, BusyTimeout: defaultBusyTimeout})))
+	db, err := sql.Open("sqlite", withoutFullFsync(b, databaseURL(Config{Path: path})))
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -37,12 +37,10 @@ const (
 	MaxCommandGuards    = 64
 	MaxCommandMutations = 64
 	MaxCommandFacts     = 64
-	MaxCommandEffects   = 64
 
 	MaxReceiptResultBytes    = 2 * 1024
 	MaxAuditMetadataBytes    = 8 * 1024
 	MaxAuditEntryBytes       = 32 * 1024
-	MaxEffectMetadataBytes   = 8 * 1024
 	MaxRecoveryCapsuleBytes  = 32 * 1024
 	Ed25519SignatureBytes    = 64
 	MaxQueryPageSize         = 256
@@ -63,7 +61,6 @@ var (
 	ErrInvalidSecurityContext     = errors.New("invalid security context")
 	ErrInvalidSecurityDecision    = errors.New("invalid security decision")
 	ErrInvalidSecurityExecution   = errors.New("invalid security execution")
-	ErrApplicationLimitExceeded   = errors.New("application contract limit exceeded")
 	ErrInvalidQuery               = errors.New("invalid application query")
 	ErrInvalidCoordination        = errors.New("invalid coordination contract")
 	ErrCoordinationUnsupported    = errors.New("coordination storage is unsupported")
@@ -3091,36 +3088,6 @@ func auditResources(expectations []domain.AggregateExpectation) []AuditResourceV
 	return resources
 }
 
-type EffectIntent struct {
-	causingEvent   domain.EventID
-	handler        string
-	contractMajor  OperationMajor
-	destinationKey string
-	ordinal        uint16
-	metadata       []byte
-	metadataDigest Digest
-}
-
-func NewEffectIntent(
-	causingEvent domain.EventID,
-	handler string,
-	contractMajor OperationMajor,
-	destinationKey string,
-	ordinal uint16,
-	metadata []byte,
-) (EffectIntent, error) {
-	if causingEvent.IsZero() || !validToken(handler, 128) || contractMajor.IsZero() ||
-		!validOpaqueText(destinationKey, 512) || len(metadata) == 0 ||
-		len(metadata) > MaxEffectMetadataBytes || !utf8.Valid(metadata) {
-		return EffectIntent{}, ErrInvalidApplicationContract
-	}
-	return EffectIntent{
-		causingEvent: causingEvent, handler: handler, contractMajor: contractMajor,
-		destinationKey: destinationKey, ordinal: ordinal, metadata: append([]byte(nil), metadata...),
-		metadataDigest: DigestBytes(metadata),
-	}, nil
-}
-
 func validToken(value string, maximum int) bool {
 	if value == "" || len(value) > maximum || value[0] < 'a' || value[0] > 'z' {
 		return false
@@ -3145,56 +3112,6 @@ func validOpaqueText(value string, maximum int) bool {
 	}
 	return true
 }
-
-func (intent EffectIntent) CausingEventID() domain.EventID { return intent.causingEvent }
-func (intent EffectIntent) Handler() string                { return intent.handler }
-func (intent EffectIntent) ContractMajor() OperationMajor  { return intent.contractMajor }
-func (intent EffectIntent) DestinationKey() string         { return intent.destinationKey }
-func (intent EffectIntent) Ordinal() uint16                { return intent.ordinal }
-func (intent EffectIntent) Metadata() []byte               { return append([]byte(nil), intent.metadata...) }
-func (intent EffectIntent) MetadataDigest() Digest         { return intent.metadataDigest }
-
-type EffectSet struct{ intents []EffectIntent }
-
-func NewEffectSet(intents ...EffectIntent) (EffectSet, error) {
-	if len(intents) > MaxCommandEffects {
-		return EffectSet{}, ErrApplicationLimitExceeded
-	}
-	cloned := append([]EffectIntent(nil), intents...)
-	sort.Slice(cloned, func(left, right int) bool {
-		if cloned[left].handler != cloned[right].handler {
-			return cloned[left].handler < cloned[right].handler
-		}
-		if cloned[left].contractMajor != cloned[right].contractMajor {
-			return cloned[left].contractMajor.Uint16() < cloned[right].contractMajor.Uint16()
-		}
-		if cloned[left].destinationKey != cloned[right].destinationKey {
-			return cloned[left].destinationKey < cloned[right].destinationKey
-		}
-		if cloned[left].ordinal != cloned[right].ordinal {
-			return cloned[left].ordinal < cloned[right].ordinal
-		}
-		return cloned[left].causingEvent.String() < cloned[right].causingEvent.String()
-	})
-	for index, intent := range cloned {
-		if intent.causingEvent.IsZero() || intent.handler == "" || intent.contractMajor.IsZero() ||
-			intent.destinationKey == "" || len(intent.metadata) == 0 {
-			return EffectSet{}, ErrInvalidApplicationContract
-		}
-		if index > 0 && sameLogicalEffect(cloned[index-1], intent) {
-			return EffectSet{}, ErrInvalidApplicationContract
-		}
-	}
-	return EffectSet{intents: cloned}, nil
-}
-
-func sameLogicalEffect(left, right EffectIntent) bool {
-	return left.handler == right.handler &&
-		left.contractMajor == right.contractMajor && left.destinationKey == right.destinationKey &&
-		left.ordinal == right.ordinal
-}
-
-func (set EffectSet) Intents() []EffectIntent { return append([]EffectIntent(nil), set.intents...) }
 
 type EventRange struct {
 	first domain.StreamPosition
@@ -4863,7 +4780,6 @@ type CommandDecision struct {
 	ceremonies     []CeremonyTransition
 	resultPlan     ReceiptResultPlan
 	audit          AuditIntent
-	effects        EffectSet
 	replay         ReceiptSnapshot
 	appliedOnly    AppliedOnlyReceipt
 	disclosure     ReplayDisclosure
@@ -4890,7 +4806,6 @@ func ApplyCommand(
 	commandContext CommandContext,
 	commit OperationCommit,
 	audit AuditIntent,
-	effects EffectSet,
 ) (CommandDecision, error) {
 	if commandContext.resolution.kind != ReceiptAdmitted ||
 		commit.operation != commandContext.spec.commandOperation ||
@@ -4898,8 +4813,7 @@ func ApplyCommand(
 		audit.fingerprint != commandContext.spec.requestFingerprint ||
 		!writesMatchPlan(commit.writes, commandContext.spec.guards.mutations) ||
 		!factsMatchPlan(commit.facts, commandContext.spec.expectedFacts) ||
-		!ceremonyTransitionsMatchPlan(commit.ceremonies, commandContext.spec.guards.ceremonies) ||
-		!effectsReferToFacts(effects, commit.facts) {
+		!ceremonyTransitionsMatchPlan(commit.ceremonies, commandContext.spec.guards.ceremonies) {
 		return CommandDecision{}, ErrInvalidCommandDecision
 	}
 	resultPlan, err := newReceiptResultPlan(commandContext, commit)
@@ -4915,7 +4829,6 @@ func ApplyCommand(
 		facts:      append([]FactIntent(nil), commit.facts...),
 		ceremonies: append([]CeremonyTransition(nil), commit.ceremonies...),
 		resultPlan: cloneReceiptResultPlan(resultPlan), audit: audit,
-		effects: cloneEffects(effects),
 	}, nil
 }
 
@@ -4980,27 +4893,6 @@ func factsMatchPlan(facts []FactIntent, expectations []FactExpectation) bool {
 		}
 	}
 	return true
-}
-
-func effectsReferToFacts(effects EffectSet, facts []FactIntent) bool {
-	events := make(map[domain.EventID]struct{}, len(facts))
-	for _, fact := range facts {
-		events[fact.eventID] = struct{}{}
-	}
-	for _, effect := range effects.intents {
-		if _, exists := events[effect.causingEvent]; !exists {
-			return false
-		}
-	}
-	return true
-}
-
-func cloneEffects(effects EffectSet) EffectSet {
-	cloned := append([]EffectIntent(nil), effects.intents...)
-	for index := range cloned {
-		cloned[index].metadata = append([]byte(nil), cloned[index].metadata...)
-	}
-	return EffectSet{intents: cloned}
 }
 
 func ReplayCommand(
@@ -5130,7 +5022,6 @@ func (decision CommandDecision) ResultPlan() ReceiptResultPlan {
 	return cloneReceiptResultPlan(decision.resultPlan)
 }
 func (decision CommandDecision) Audit() AuditIntent { return decision.audit }
-func (decision CommandDecision) Effects() EffectSet { return cloneEffects(decision.effects) }
 func (decision CommandDecision) Replay() (ReceiptSnapshot, ReplayDisclosure, bool) {
 	return decision.replay, decision.disclosure,
 		decision.kind == CommandDecisionReplay && decision.disclosure == ReplayDiscloseResult
@@ -5168,7 +5059,7 @@ func ValidateCommandDecision(locked CommandContext, decision CommandDecision) er
 			subject: decision.audit.subject, provenance: decision.audit.provenance,
 			invocation: decision.audit.invocation, timing: decision.audit.timing,
 		}
-		expected, err = ApplyCommand(locked, commit, seed, decision.effects)
+		expected, err = ApplyCommand(locked, commit, seed)
 	case CommandDecisionReplay:
 		expected, err = ReplayCommand(locked, decision.disclosure)
 	case CommandDecisionRollback:
@@ -6781,32 +6672,6 @@ type AuthorityTimeSource interface {
 	LockedAuthorityTime(context.Context, domain.AuthorityScope, domain.AuthorityEpoch) (time.Time, error)
 }
 
-type EffectPlanningInput struct {
-	commandID domain.CommandID
-	facts     []FactIntent
-}
-
-func NewEffectPlanningInput(
-	commandID domain.CommandID,
-	facts []FactIntent,
-) (EffectPlanningInput, error) {
-	if commandID.IsZero() || len(facts) == 0 || len(facts) > MaxCommandFacts {
-		return EffectPlanningInput{}, ErrInvalidApplicationContract
-	}
-	return EffectPlanningInput{commandID: commandID, facts: append([]FactIntent(nil), facts...)}, nil
-}
-
-func (input EffectPlanningInput) CommandID() domain.CommandID { return input.commandID }
-func (input EffectPlanningInput) Facts() []FactIntent {
-	return append([]FactIntent(nil), input.facts...)
-}
-
-// EffectPlanner is intentionally context-free: planning is pure, bounded, and
-// cannot perform provider I/O.
-type EffectPlanner interface {
-	PlanEffects(EffectPlanningInput) (EffectSet, error)
-}
-
 // CanonicalCodec owns typed RFC 8785 bytes. Implementations must validate the
 // schema both before and after canonical transformation.
 type CanonicalCodec[Value any] interface {
@@ -7221,6 +7086,19 @@ func LeaseSelectorsOverlap(left, right LeaseSelector) bool {
 		right.kind == LeaseSelectorSubtree && strings.HasPrefix(left.value, right.value+"/")
 }
 
+// LeaseSelectorCovers reports whether outer protects everything inner does.
+// Overlap is symmetric and only says two selectors touch; supersession needs
+// containment, because retiring a prior lease that the new one does not fully
+// cover silently drops paths its holder still believes it has reserved. An
+// exact selector covers only the identical exact selector: it does not protect
+// the subtree a same-path subtree selector does.
+func LeaseSelectorCovers(outer, inner LeaseSelector) bool {
+	if outer.kind == LeaseSelectorSubtree {
+		return outer.value == inner.value || strings.HasPrefix(inner.value, outer.value+"/")
+	}
+	return inner.kind == LeaseSelectorExact && outer.value == inner.value
+}
+
 type LeaseMode string
 
 const (
@@ -7386,6 +7264,7 @@ type LocalCoordinationStore interface {
 	GetVisibleMessage(context.Context, domain.WorkspaceID, domain.ActorID, domain.MessageID) (Message, error)
 	RegisterLocalAgent(context.Context, string, string, string) (LocalAgentSession, string, error)
 	AuthenticateLocalAgent(context.Context, string) (LocalAgentSession, error)
+	LocalAgentSnapshot(context.Context, LocalAgentSession) (LocalAgentSnapshot, error)
 	ListActiveLocalAgents(context.Context, LocalAgentSession) ([]ActiveAgent, error)
 	ResolveLocalAgentNames(context.Context, LocalAgentSession, []string) ([]domain.ActorID, error)
 }

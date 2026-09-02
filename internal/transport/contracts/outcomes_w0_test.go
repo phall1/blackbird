@@ -7,12 +7,12 @@ import (
 	"github.com/phall1/blackbird/internal/domain"
 )
 
-// These result decoders are what the CLI and the shipped plugin clients use to
-// read a daemon response, so they are the last place a wrong terminal state or
-// a mismatched ceremony purpose can be caught before a client acts on it. Each
-// one pins two bindings its neighbours do not share: the single resource state
-// the operation is allowed to report, and — where the command issues a ceremony
-// — the one purpose that ceremony may carry.
+// These result validators run on every W0 response the HTTP and MCP transports
+// emit, so they are the last place a wrong terminal state or a mismatched
+// ceremony purpose is caught before a client acts on it. Each one pins two
+// bindings its neighbours do not share: the single resource state the operation
+// is allowed to report, and — where the command issues a ceremony — the one
+// purpose that ceremony may carry.
 
 func w0ResultMetadata(t *testing.T, operation string) CommandResultMetadataDTO {
 	t.Helper()
@@ -139,106 +139,39 @@ func validSessionStartResult(t *testing.T) SessionStartResultDTO {
 	}
 }
 
-// TestW0ResultDecodersAdmitWellFormedResults proves each decoder round-trips
-// its own result and hands back the resource a caller acts on.
-func TestW0ResultDecodersAdmitWellFormedResults(t *testing.T) {
+// TestW0ResultsAdmitTheirOwnWellFormedResult proves every W0 result the daemon
+// can build passes the validator the HTTP and MCP transports run over it before
+// it reaches a client, so a rejection below is a real binding rather than a
+// fixture that was never valid.
+func TestW0ResultsAdmitTheirOwnWellFormedResult(t *testing.T) {
 	t.Parallel()
 
-	t.Run("device pairing begin", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeDevicePairingBeginResult(mustMarshal(t, validDevicePairingBeginResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeDevicePairingBeginResult() error = %v", err)
-		}
-		if decoded.Resource.DeviceState != string(domain.DevicePending) ||
-			decoded.Resource.Challenge.Purpose != string(domain.CeremonyPurposeDevicePairing) {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
+	results := map[string]func(*testing.T) interface{ Validate() error }{
+		"device pairing begin":        func(t *testing.T) interface{ Validate() error } { return validDevicePairingBeginResult(t) },
+		"device pair":                 func(t *testing.T) interface{ Validate() error } { return validDevicePairResult(t) },
+		"workspace member invite":     func(t *testing.T) interface{ Validate() error } { return validWorkspaceMemberInviteResult(t) },
+		"workspace membership accept": func(t *testing.T) interface{ Validate() error } { return validWorkspaceMembershipAcceptResult(t) },
+		"actor create":                func(t *testing.T) interface{ Validate() error } { return validActorCreateResult(t) },
+		"actor delegation propose":    func(t *testing.T) interface{ Validate() error } { return validActorDelegationProposeResult(t) },
+		"actor delegation activate":   func(t *testing.T) interface{ Validate() error } { return validActorDelegationActivateResult(t) },
+		"session start":               func(t *testing.T) interface{ Validate() error } { return validSessionStartResult(t) },
+	}
 
-	t.Run("device pair", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeDevicePairResult(mustMarshal(t, validDevicePairResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeDevicePairResult() error = %v", err)
-		}
-		if decoded.Resource.DeviceState != string(domain.DeviceTrusted) {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
-
-	t.Run("workspace member invite", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeWorkspaceMemberInviteResult(mustMarshal(t, validWorkspaceMemberInviteResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeWorkspaceMemberInviteResult() error = %v", err)
-		}
-		if decoded.Resource.MembershipState != string(domain.MembershipInvited) {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
-
-	t.Run("workspace membership accept", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeWorkspaceMembershipAcceptResult(mustMarshal(t, validWorkspaceMembershipAcceptResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeWorkspaceMembershipAcceptResult() error = %v", err)
-		}
-		if decoded.Resource.MembershipState != string(domain.MembershipActive) {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
-
-	t.Run("actor create", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeActorCreateResult(mustMarshal(t, validActorCreateResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeActorCreateResult() error = %v", err)
-		}
-		if decoded.Resource.ActorID.String() != idActor {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
-
-	t.Run("actor delegation propose", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeActorDelegationProposeResult(mustMarshal(t, validActorDelegationProposeResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeActorDelegationProposeResult() error = %v", err)
-		}
-		if decoded.Resource.DelegationState != string(domain.DelegationProposed) {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
-
-	t.Run("actor delegation activate", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeActorDelegationActivateResult(mustMarshal(t, validActorDelegationActivateResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeActorDelegationActivateResult() error = %v", err)
-		}
-		if decoded.Resource.SessionStartChallenge.Purpose != string(domain.CeremonyPurposeActorSessionStart) {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
-
-	t.Run("session start", func(t *testing.T) {
-		t.Parallel()
-		decoded, err := DecodeSessionStartResult(mustMarshal(t, validSessionStartResult(t)))
-		if err != nil {
-			t.Fatalf("DecodeSessionStartResult() error = %v", err)
-		}
-		if decoded.Resource.ActorSessionID.String() != idSession {
-			t.Fatalf("decoded = %#v", decoded.Resource)
-		}
-	})
+	for name, build := range results {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if err := build(t).Validate(); err != nil {
+				t.Fatalf("a well-formed result was rejected: %v", err)
+			}
+		})
+	}
 }
 
-// TestW0ResultDecodersPinTheirTerminalState is the binding that stops one
+// TestW0ResultsPinTheirTerminalState is the binding that stops one
 // command's success from being read as another's. Each case substitutes a
 // state that is legal for the aggregate but wrong for the operation that
 // reported it — the shape a confused or hostile daemon response would take.
-func TestW0ResultDecodersPinTheirTerminalState(t *testing.T) {
+func TestW0ResultsPinTheirTerminalState(t *testing.T) {
 	t.Parallel()
 
 	t.Run("pairing begin refuses an already trusted device", func(t *testing.T) {
@@ -284,11 +217,11 @@ func TestW0ResultDecodersPinTheirTerminalState(t *testing.T) {
 	})
 }
 
-// TestW0ResultDecodersPinTheirCeremonyPurpose swaps each issued ceremony for a
+// TestW0ResultsPinTheirCeremonyPurpose swaps each issued ceremony for a
 // purpose that is valid in the domain but belongs to a different command. A
 // client that acted on one of these would redeem a challenge against the wrong
 // ceremony entirely, so the purpose literal is the check that matters most.
-func TestW0ResultDecodersPinTheirCeremonyPurpose(t *testing.T) {
+func TestW0ResultsPinTheirCeremonyPurpose(t *testing.T) {
 	t.Parallel()
 
 	t.Run("pairing challenge may not carry a delegation purpose", func(t *testing.T) {
@@ -325,64 +258,4 @@ func TestW0ResultDecodersPinTheirCeremonyPurpose(t *testing.T) {
 		result.Resource.Challenge.Purpose = "arbitrary_purpose"
 		rejects(t, "unknown purpose", result.Validate(), "resource.challenge.purpose")
 	})
-}
-
-// TestW0ResultDecodersRequireAnExplicitIdempotentReplay covers the one contract
-// a Go zero value cannot express. `idempotent_replay` defaults to false when
-// absent, which is indistinguishable from a daemon that genuinely reported a
-// first execution — so the decoder demands the member be present rather than
-// inferred. Only the decoders enforce this; Validate alone does not.
-func TestW0ResultDecodersRequireAnExplicitIdempotentReplay(t *testing.T) {
-	t.Parallel()
-
-	decoders := map[string]struct {
-		decode func([]byte) error
-		valid  func(*testing.T) any
-	}{
-		"device pairing begin": {
-			decode: func(data []byte) error { _, err := DecodeDevicePairingBeginResult(data); return err },
-			valid:  func(t *testing.T) any { return validDevicePairingBeginResult(t) },
-		},
-		"device pair": {
-			decode: func(data []byte) error { _, err := DecodeDevicePairResult(data); return err },
-			valid:  func(t *testing.T) any { return validDevicePairResult(t) },
-		},
-		"workspace member invite": {
-			decode: func(data []byte) error { _, err := DecodeWorkspaceMemberInviteResult(data); return err },
-			valid:  func(t *testing.T) any { return validWorkspaceMemberInviteResult(t) },
-		},
-		"workspace membership accept": {
-			decode: func(data []byte) error { _, err := DecodeWorkspaceMembershipAcceptResult(data); return err },
-			valid:  func(t *testing.T) any { return validWorkspaceMembershipAcceptResult(t) },
-		},
-		"actor create": {
-			decode: func(data []byte) error { _, err := DecodeActorCreateResult(data); return err },
-			valid:  func(t *testing.T) any { return validActorCreateResult(t) },
-		},
-		"actor delegation propose": {
-			decode: func(data []byte) error { _, err := DecodeActorDelegationProposeResult(data); return err },
-			valid:  func(t *testing.T) any { return validActorDelegationProposeResult(t) },
-		},
-		"actor delegation activate": {
-			decode: func(data []byte) error { _, err := DecodeActorDelegationActivateResult(data); return err },
-			valid:  func(t *testing.T) any { return validActorDelegationActivateResult(t) },
-		},
-		"session start": {
-			decode: func(data []byte) error { _, err := DecodeSessionStartResult(data); return err },
-			valid:  func(t *testing.T) any { return validSessionStartResult(t) },
-		},
-	}
-
-	for name, decoder := range decoders {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			encoded := mustMarshal(t, decoder.valid(t))
-			if err := decoder.decode(encoded); err != nil {
-				t.Fatalf("a well-formed result was rejected: %v", err)
-			}
-			if err := decoder.decode(mustRemoveJSONField(t, encoded, `,"idempotent_replay":false`)); err == nil {
-				t.Fatal("decode() accepted a result with no idempotent_replay member")
-			}
-		})
-	}
 }

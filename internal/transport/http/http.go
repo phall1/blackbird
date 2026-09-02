@@ -563,33 +563,12 @@ func internalFailure(requestID string) contracts.ErrorDTO {
 	}
 }
 
+// statusFor reports the HTTP status a typed error code is served with. The
+// mapping itself lives in the contracts package, which also projects it into the
+// published OpenAPI document; keeping a second copy here let the served status
+// and the documented status drift apart without either side failing.
 func statusFor(code domain.ErrorCode) int {
-	switch code {
-	case domain.ErrorCodeInvalidArgument, domain.ErrorCodeCursorInvalid, domain.ErrorCodeCursorScopeMismatch:
-		return stdhttp.StatusBadRequest
-	case domain.ErrorCodeInvalidSchema:
-		return stdhttp.StatusUnprocessableEntity
-	case domain.ErrorCodeUnauthenticated, domain.ErrorCodeSessionExpired:
-		return stdhttp.StatusUnauthorized
-	case domain.ErrorCodeForbidden, domain.ErrorCodeCapabilityRequired:
-		return stdhttp.StatusForbidden
-	case domain.ErrorCodeNotFound:
-		return stdhttp.StatusNotFound
-	case domain.ErrorCodeStaleVersion, domain.ErrorCodeStateConflict, domain.ErrorCodeIdempotencyKeyReused,
-		domain.ErrorCodeCommandIDReused, domain.ErrorCodeCommandInProgress, domain.ErrorCodeLeaseConflict,
-		domain.ErrorCodeLeaseExpired, domain.ErrorCodeFenceRejected:
-		return stdhttp.StatusConflict
-	case domain.ErrorCodeCursorExpired:
-		return stdhttp.StatusGone
-	case domain.ErrorCodeRateLimited:
-		return stdhttp.StatusTooManyRequests
-	case domain.ErrorCodeBackpressure, domain.ErrorCodeDependencyUnavailable:
-		return stdhttp.StatusServiceUnavailable
-	case domain.ErrorCodeDeadlineExceeded:
-		return stdhttp.StatusGatewayTimeout
-	default:
-		return stdhttp.StatusInternalServerError
-	}
+	return contracts.HTTPStatusForErrorCode(code)
 }
 
 func newRequestID() string {
