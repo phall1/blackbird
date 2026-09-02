@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/phall1/blackbird/compare/claude-plugin-v0.1.1...claude-plugin-v0.1.2) (2026-09-02)
+
+
+### Bug Fixes
+
+* **claude-plugin:** patch the fast-uri and qs advisories ([bad8797](https://github.com/phall1/blackbird/commit/bad8797fe969f1a765977e4a626c5665ad7ac946))
+
 ## [0.1.1](https://github.com/phall1/blackbird/compare/claude-plugin-v0.1.0...claude-plugin-v0.1.1) (2026-09-02)
 
 

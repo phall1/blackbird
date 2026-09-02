@@ -1,7 +1,7 @@
 {
   "name": "blackbird",
   "displayName": "Blackbird",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Deliver durable Blackbird messages into active Claude Code sessions.",
   "author": {
     "name": "phall"
