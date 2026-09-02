@@ -2,22 +2,24 @@ package cli
 
 import (
 	"context"
+	"time"
 
 	"github.com/phall1/blackbird/internal/cli/render"
 )
 
-// GCCmd reports reclaimable space. It never prunes the coordination event
-// journal or the message tables: both carry no-update and no-delete triggers
-// that abort the statement, so a retention pruner would fail on its first row.
+// GCCmd reports reclaimable space and can prune the bounded coordination log.
 type GCCmd struct {
-	Checkpoint bool `help:"Truncate the write-ahead log. Requires a stopped daemon."`
-	Vacuum     bool `help:"Rewrite the database to reclaim free pages. Requires a stopped daemon."`
+	Checkpoint bool          `help:"Truncate the write-ahead log. Requires a stopped daemon."`
+	Vacuum     bool          `help:"Rewrite the database to reclaim free pages. Requires a stopped daemon."`
+	Prune      bool          `help:"Prune coordination events outside the age or row bounds. Requires a stopped daemon."`
+	OlderThan  time.Duration `default:"720h" help:"With --prune, delete events older than this age."`
+	MaxEvents  uint64        `default:"1000000" help:"With --prune, keep at most this many newest events."`
 }
 
 // Help is Kong's HelpProvider hook.
 func (cmd *GCCmd) Help() string {
-	return "Without a mutating flag, gc only reports. The coordination event journal is " +
-		"append-only and is never pruned."
+	return "Without a mutating flag, gc only reports. --prune keeps the coordination journal bounded " +
+		"by both age and row count while leaving immutable message bodies untouched."
 }
 
 type gcReport struct {
@@ -48,10 +50,13 @@ func (cmd *GCCmd) Run(ctx context.Context, console *Console) error {
 	report := gcReport{
 		Path: path, DiskFreeBytes: database.FreeBytes, WALBytes: database.WALBytes,
 		SizeBytes: database.SizeBytes, PageSize: database.PageSize, PageCount: database.PageCount,
-		JournalImmutable: true,
+		JournalImmutable: false,
 	}
 
-	if cmd.Checkpoint || cmd.Vacuum {
+	if cmd.Prune && (cmd.OlderThan <= 0 || cmd.MaxEvents == 0) {
+		return usageFault("--older-than and --max-events must be positive when pruning")
+	}
+	if cmd.Checkpoint || cmd.Vacuum || cmd.Prune {
 		reclaimed, err := cmd.reclaim(ctx, console, path)
 		if err != nil {
 			return err
@@ -79,8 +84,13 @@ func (cmd *GCCmd) reclaim(ctx context.Context, console *Console, path string) (R
 			unavailableFault(nil, "this binary cannot rewrite the database"),
 			"stop the daemon and run \"sqlite3 "+path+" 'PRAGMA wal_checkpoint(TRUNCATE); VACUUM;'\"")
 	}
-	reclaimed, err := console.Deps.Maintenance.Reclaim(ctx, path,
-		ReclaimPlan{Checkpoint: cmd.Checkpoint, Vacuum: cmd.Vacuum})
+	plan := ReclaimPlan{Checkpoint: cmd.Checkpoint, Vacuum: cmd.Vacuum}
+	if cmd.Prune {
+		plan.Prune = true
+		plan.PruneBefore = console.now().Add(-cmd.OlderThan)
+		plan.MaxEvents = cmd.MaxEvents
+	}
+	reclaimed, err := console.Deps.Maintenance.Reclaim(ctx, path, plan)
 	if err != nil {
 		return Reclaimed{}, fault(ExitError, err, "reclaim space")
 	}
@@ -97,6 +107,10 @@ func drawGC(doc *render.Document, report gcReport) {
 	}})
 	if report.Reclaimed != nil {
 		doc.Blank()
+		if report.Reclaimed.EventsPruned > 0 {
+			doc.Linef(render.RolePlain, "pruned %d coordination events; retained from position %d",
+				report.Reclaimed.EventsPruned, report.Reclaimed.RetainedFrom)
+		}
 		// A vacuum of an already compact database can add a page, so the delta is
 		// not always positive and "reclaimed -4 KiB" is not a thing to print.
 		if freed := report.Reclaimed.BeforeBytes - report.Reclaimed.AfterBytes; freed > 0 {
@@ -106,5 +120,5 @@ func drawGC(doc *render.Document, report gcReport) {
 		}
 	}
 	doc.Blank()
-	doc.Line(render.RoleMuted, "The coordination event journal is append-only and is never pruned.")
+	doc.Line(render.RoleMuted, "Message bodies remain immutable; use --prune to bound the coordination journal.")
 }

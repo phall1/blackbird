@@ -757,6 +757,26 @@ func TestGCReclaimsWhenDaemonIsDown(t *testing.T) {
 	}
 }
 
+func TestGCPrunePassesExplicitRetentionBounds(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.September, 2, 12, 0, 0, 0, time.UTC)
+	maintenance := &fakeMaintenance{}
+	deps := dependencies(t)
+	deps.Now = func() time.Time { return now }
+	deps.Store = &fakeStore{database: healthyDatabase()}
+	deps.Admin = &fakeAdmin{err: errors.New("connection refused")}
+	deps.Maintenance = maintenance
+
+	result := runCLI(t, deps, []string{"gc", "--prune", "--older-than=24h", "--max-events=42"})
+	if result.code != ExitOK {
+		t.Fatalf("code = %d; stderr=%q", result.code, result.stderr)
+	}
+	want := ReclaimPlan{Prune: true, PruneBefore: now.Add(-24 * time.Hour), MaxEvents: 42}
+	if maintenance.plan != want {
+		t.Fatalf("plan = %#v, want %#v", maintenance.plan, want)
+	}
+}
+
 func TestGCWithoutMaintenancePortExplainsItself(t *testing.T) {
 	t.Parallel()
 

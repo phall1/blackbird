@@ -289,7 +289,7 @@ func gcSection(database Database) *gcReport {
 	report := gcReport{
 		Path: database.Path, DiskFreeBytes: database.FreeBytes, WALBytes: database.WALBytes,
 		SizeBytes: database.SizeBytes, PageSize: database.PageSize, PageCount: database.PageCount,
-		JournalImmutable: true,
+		JournalImmutable: false,
 	}
 	return &report
 }

@@ -118,7 +118,7 @@ func (cmd *DoctorCmd) groups() []checkGroup {
 		{names: []string{"service.state", "service.definition", "updater"}, run: cmd.serviceChecks},
 		{names: []string{"daemon.liveness"}, run: cmd.daemonChecks},
 		{names: []string{"database.file", "database.permissions", "database.read", "database.schema",
-			"database.shutdown", "database.wal", "disk.free", "reservations.expired", "database.integrity"},
+			"database.shutdown", "database.wal", "database.journal", "disk.free", "reservations.expired", "database.integrity"},
 			run: cmd.databaseChecks},
 		{names: []string{"clients"}, run: cmd.clientChecks},
 	}
@@ -326,7 +326,8 @@ func (cmd *DoctorCmd) databaseChecks(ctx context.Context, console *Console, daem
 	schema := schemaCheck(database)
 
 	checks := []checkResult{file, permissionsCheck(database, path), read, schema,
-		cmd.shutdownCheck(ctx, console, daemon, database), walCheck(database), diskCheck(database), expiredLeaseCheck(database)}
+		cmd.shutdownCheck(ctx, console, daemon, database), walCheck(database), diskCheck(database),
+		journalRetentionCheck(database), expiredLeaseCheck(database)}
 	if cmd.Deep && database.Present {
 		integrity := checkResult{Name: "database.integrity", Status: checkPass,
 			Detail: "quick_check=" + orAbsent(database.QuickCheck) + " foreign_key_failures=" + itoa(database.ForeignKeyFailures)}
@@ -427,6 +428,10 @@ const (
 	// A backlog this size means the protocol is being ignored, which is worth
 	// one line of warning and no more.
 	expiredLeaseBacklog = 25
+
+	// The default retention cap is one million rows; reaching it means the
+	// offline sweep has not run recently enough to keep the journal bounded.
+	journalEventWarning = 1_000_000
 )
 
 func walCheck(database Database) checkResult {
@@ -503,6 +508,18 @@ func freeSpace(database Database) string {
 // is a warning about how agents are behaving, not about the daemon, so the
 // remedy is the command that names the holders rather than anything to run
 // against the database.
+func journalRetentionCheck(database Database) checkResult {
+	check := checkResult{Name: "database.journal", Status: checkPass,
+		Detail: "events=" + itoa(database.Events)}
+	if database.Events < journalEventWarning {
+		return check
+	}
+	check.Status = checkWarn
+	check.Detail += ": coordination event retention is overdue"
+	check.Remedy = "stop the daemon and run \"blackbird gc --prune\""
+	return check
+}
+
 func expiredLeaseCheck(database Database) checkResult {
 	check := checkResult{Name: "reservations.expired", Status: checkPass,
 		Detail: "expired=" + itoa(database.ExpiredActiveLeases) + " active=" + itoa(database.ActiveLeases)}

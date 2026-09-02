@@ -263,14 +263,19 @@ type StorePort interface {
 }
 
 type ReclaimPlan struct {
-	Checkpoint bool `json:"checkpoint"`
-	Vacuum     bool `json:"vacuum"`
+	Checkpoint  bool
+	Vacuum      bool
+	Prune       bool
+	PruneBefore time.Time
+	MaxEvents   uint64
 }
 
 type Reclaimed struct {
-	BeforeBytes int64 `json:"before_bytes"`
-	AfterBytes  int64 `json:"after_bytes"`
-	WALBytes    int64 `json:"wal_bytes"`
+	BeforeBytes  int64  `json:"before_bytes"`
+	AfterBytes   int64  `json:"after_bytes"`
+	WALBytes     int64  `json:"wal_bytes"`
+	EventsPruned int64  `json:"events_pruned"`
+	RetainedFrom uint64 `json:"retained_from"`
 }
 
 // MaintenancePort performs the two write operations gc is allowed to request.

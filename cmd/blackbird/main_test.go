@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -359,6 +360,55 @@ func TestGCReclaimsSpaceInTheShippedBinary(t *testing.T) {
 	}
 	if wal, err := os.Stat(path + "-wal"); err == nil && wal.Size() != 0 {
 		t.Fatalf("write-ahead log is %d bytes, want it truncated", wal.Size())
+	}
+}
+
+func TestGCPrunesJournalByAgeOrCountAndKeepsMessageImmutability(t *testing.T) {
+	t.Parallel()
+	path := blackbirdDatabase(t)
+	database, err := openForMaintenance(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for index := 0; index < 5; index++ {
+		occurred := now.Add(-time.Duration(index) * time.Hour)
+		if index == 0 {
+			occurred = now.Add(-31 * 24 * time.Hour)
+		}
+		if _, err := database.Exec(`INSERT INTO coordination_events(
+			workspace_id, actor_id, event_type, subject_id, occurred_at_us, payload, visibility)
+			VALUES (?, ?, 'lease.released', ?, ?, ?, 'workspace')`,
+			"00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002",
+			fmt.Sprintf("lease-%d", index), occurred.UnixMicro(), []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reclaimed, err := (maintenanceAdapter{}).Reclaim(context.Background(), path, cli.ReclaimPlan{
+		Prune: true, PruneBefore: now.Add(-30 * 24 * time.Hour), MaxEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed.EventsPruned != 3 || reclaimed.RetainedFrom != 4 {
+		t.Fatalf("reclaimed=%+v, want three pruned and retained_from=4", reclaimed)
+	}
+	database, err = openForMaintenance(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	var events int
+	if err := database.QueryRow(`SELECT count(*) FROM coordination_events`).Scan(&events); err != nil || events != 2 {
+		t.Fatalf("events=%d error=%v, want 2", events, err)
+	}
+	var immutableTrigger int
+	if err := database.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='messages_no_delete'`).Scan(
+		&immutableTrigger); err != nil || immutableTrigger != 1 {
+		t.Fatalf("message immutability trigger=%d error=%v", immutableTrigger, err)
 	}
 }
 

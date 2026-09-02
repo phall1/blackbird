@@ -263,14 +263,22 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if _, err := store.db.Exec(`UPDATE coordination_events SET event_type = 'message.read'`); err == nil {
 		t.Fatal("coordination event update was accepted")
 	}
-	if _, err := store.db.Exec(`DELETE FROM coordination_events`); err == nil {
-		t.Fatal("coordination event delete was accepted")
-	}
 	if _, err := store.db.Exec(`UPDATE coordination_event_recipients SET actor_id = ?`, other.String()); err == nil {
 		t.Fatal("coordination event recipient update was accepted")
 	}
-	if _, err := store.db.Exec(`DELETE FROM coordination_event_recipients`); err == nil {
-		t.Fatal("coordination event recipient delete was accepted")
+	if _, err := store.db.Exec(`DELETE FROM coordination_event_recipients`); err != nil {
+		t.Fatalf("coordination event recipient retention delete: %v", err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM coordination_events WHERE position <= ?`, second.Events()[0].Position()); err != nil {
+		t.Fatalf("coordination event retention delete: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE coordination_event_retention SET retained_from_position = ? WHERE singleton = 1`,
+		second.Events()[0].Position()+1); err != nil {
+		t.Fatal(err)
+	}
+	expired, _ := application.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
+	if _, err := store.SyncCoordinationEvents(context.Background(), expired); !errors.Is(err, domain.ErrCursorExpired) {
+		t.Fatalf("expired cursor error=%v, want CURSOR_EXPIRED", err)
 	}
 }
 

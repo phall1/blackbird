@@ -341,6 +341,14 @@ func (maintenanceAdapter) Reclaim(ctx context.Context, path string, plan cli.Rec
 	}
 	defer func() { _ = database.Close() }()
 
+	var eventsPruned int64
+	var retainedFrom uint64
+	if plan.Prune {
+		eventsPruned, retainedFrom, err = pruneCoordinationJournal(ctx, database, plan.PruneBefore, plan.MaxEvents)
+		if err != nil {
+			return cli.Reclaimed{}, fmt.Errorf("prune coordination journal: %w", err)
+		}
+	}
 	if plan.Checkpoint {
 		if err := checkpointWAL(ctx, database, path); err != nil {
 			return cli.Reclaimed{}, err
@@ -368,7 +376,59 @@ func (maintenanceAdapter) Reclaim(ctx context.Context, path string, plan cli.Rec
 	if err != nil {
 		return cli.Reclaimed{}, err
 	}
-	return cli.Reclaimed{BeforeBytes: before, AfterBytes: after, WALBytes: walAfter}, nil
+	return cli.Reclaimed{BeforeBytes: before, AfterBytes: after, WALBytes: walAfter,
+		EventsPruned: eventsPruned, RetainedFrom: retainedFrom}, nil
+}
+
+func pruneCoordinationJournal(ctx context.Context, database *sql.DB, before time.Time, maxEvents uint64) (int64, uint64, error) {
+	if before.IsZero() || maxEvents == 0 || maxEvents > 9_007_199_254_740_991 {
+		return 0, 0, errors.New("invalid coordination journal retention bounds")
+	}
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var ageThrough, countThrough uint64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM coordination_events
+		WHERE occurred_at_us < ?`, before.UTC().UnixMicro()).Scan(&ageThrough); err != nil {
+		return 0, 0, err
+	}
+	err = tx.QueryRowContext(ctx, `SELECT position FROM coordination_events ORDER BY position DESC LIMIT 1 OFFSET ?`,
+		maxEvents).Scan(&countThrough)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, err
+	}
+	deleteThrough := max(ageThrough, countThrough)
+	var pruned int64
+	if deleteThrough > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM coordination_event_recipients WHERE position <= ?`, deleteThrough); err != nil {
+			return 0, 0, err
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM coordination_events WHERE position <= ?`, deleteThrough)
+		if err != nil {
+			return 0, 0, err
+		}
+		pruned, err = result.RowsAffected()
+		if err != nil {
+			return 0, 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE coordination_event_retention SET
+			retained_from_position = MAX(retained_from_position, ?),
+			updated_at_us = CAST(unixepoch('subsec') * 1000000 AS INTEGER) WHERE singleton = 1`, deleteThrough+1); err != nil {
+			return 0, 0, err
+		}
+	}
+	var retainedFrom uint64
+	if err := tx.QueryRowContext(ctx, `SELECT retained_from_position FROM coordination_event_retention WHERE singleton = 1`).Scan(
+		&retainedFrom); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return pruned, retainedFrom, nil
 }
 
 // Backup and Restore complete cli.SnapshotPort. They hang off the maintenance

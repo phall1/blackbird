@@ -1096,6 +1096,16 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return application.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination consumer: %w", err)
 		}
+		if err == nil {
+			retainedFrom, _, boundsErr := coordinationJournalBounds(ctx, tx, query.WorkspaceID())
+			if boundsErr != nil {
+				return application.CoordinationEventsPage{}, boundsErr
+			}
+			if after < retainedFrom-1 {
+				return application.CoordinationEventsPage{}, coordinationError(domain.ErrorCodeCursorExpired,
+					"coordination consumer position has expired; restart from the retained journal boundary")
+			}
+		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT event.position, event.actor_id, event.event_type, event.subject_id,
 		event.occurred_at_us, event.payload FROM coordination_events AS event
@@ -1149,10 +1159,9 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		return application.CoordinationEventsPage{}, err
 	}
 	if !hasMore {
-		var head uint64
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM coordination_events WHERE workspace_id = ?`,
-			query.WorkspaceID().String()).Scan(&head); err != nil {
-			return application.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination event head: %w", err)
+		_, head, boundsErr := coordinationJournalBounds(ctx, tx, query.WorkspaceID())
+		if boundsErr != nil {
+			return application.CoordinationEventsPage{}, boundsErr
 		}
 		if head > nextPosition {
 			nextPosition = head
@@ -1230,14 +1239,32 @@ func decodeCoordinationCursor(ctx context.Context, query interface {
 	if wire.Workspace != workspace.String() || wire.Actor != actor.String() {
 		return 0, coordinationError(domain.ErrorCodeCursorScopeMismatch, "coordination event cursor belongs to another actor or workspace")
 	}
-	var head uint64
-	if err := query.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM coordination_events`).Scan(&head); err != nil {
+	retainedFrom, head, err := coordinationJournalBounds(ctx, query, workspace)
+	if err != nil {
 		return 0, err
+	}
+	if wire.Position < retainedFrom-1 {
+		return 0, coordinationError(domain.ErrorCodeCursorExpired,
+			"coordination event cursor has expired; restart from the retained journal boundary")
 	}
 	if wire.Position > head {
 		return 0, coordinationError(domain.ErrorCodeCursorInvalid, "coordination event cursor is ahead of the journal")
 	}
 	return wire.Position, nil
+}
+
+func coordinationJournalBounds(ctx context.Context, query interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, workspace domain.WorkspaceID) (uint64, uint64, error) {
+	var retainedFrom, head uint64
+	if err := query.QueryRowContext(ctx, `SELECT retention.retained_from_position,
+		MAX(COALESCE((SELECT max(position) FROM coordination_events WHERE workspace_id = ?), 0),
+			retention.retained_from_position - 1)
+		FROM coordination_event_retention AS retention WHERE retention.singleton = 1`, workspace.String()).Scan(
+		&retainedFrom, &head); err != nil {
+		return 0, 0, fmt.Errorf("read SQLite coordination journal bounds: %w", err)
+	}
+	return retainedFrom, head, nil
 }
 
 func coordinationCursorKey(ctx context.Context, query interface {

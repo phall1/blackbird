@@ -177,6 +177,24 @@ func TestDoctorReadsTheDatabaseFactsItIsHanded(t *testing.T) {
 			want: checkPass,
 		},
 		{
+			name:  "an overdue coordination journal warns",
+			check: "database.journal",
+			database: func(database Database) Database {
+				database.Events = journalEventWarning
+				return database
+			},
+			want: checkWarn, wantDetail: "retention is overdue", wantRemedy: "gc --prune",
+		},
+		{
+			name:  "a bounded coordination journal passes",
+			check: "database.journal",
+			database: func(database Database) Database {
+				database.Events = journalEventWarning - 1
+				return database
+			},
+			want: checkPass, wantDetail: "events=999999",
+		},
+		{
 			name:  "a backlog of unreleased reservations warns",
 			check: "reservations.expired",
 			database: func(database Database) Database {
