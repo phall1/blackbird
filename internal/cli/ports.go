@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/phall1/blackbird/internal/cli/render"
@@ -369,6 +370,7 @@ type Dependencies struct {
 	Maintenance  MaintenancePort
 	Product      ProductPort
 	Logs         LogPort
+	Input        io.Reader
 	Now          func() time.Time
 	Env          render.Env
 	Device       render.Device

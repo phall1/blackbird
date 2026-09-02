@@ -132,6 +132,16 @@ does to the model. Blackbird names that behavior with three verbs:
 These are host behaviors, not Blackbird mailbox facts. Adapter delivery in any
 mode never marks a message read or acknowledged.
 
+## Command-hook delivery (queue)
+
+`blackbird hook` is one fail-open Go adapter for the command-hook contracts that
+can add stdout to model context. It supports Claude Code, Cursor, and GitHub
+Copilot CLI with host-specific JSON emitted by the same binary. Hooks only run at
+host lifecycle boundaries, so this is queue delivery rather than externally
+triggerable push. Codex's outbound-only `notify` callback and Devin's hosted
+automations cannot consume this contract and are explicitly unsupported. See
+[command-hook delivery](docs/HOOK_ADAPTERS.md) for exact config and limits.
+
 ## OpenCode Delivery (notify)
 
 The `blackbird-opencode` package appends each durable `message.available` event

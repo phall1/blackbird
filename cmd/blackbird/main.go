@@ -110,6 +110,7 @@ func dependencies(
 		Maintenance:  maintenanceAdapter{},
 		Product:      manager,
 		Logs:         logsource.New(stateDir),
+		Input:        os.Stdin,
 		Now:          time.Now,
 		Env:          os.LookupEnv,
 		Device:       deviceOf(stdout),

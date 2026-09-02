@@ -42,6 +42,7 @@ type CLI struct {
 	Doctor DoctorCmd `cmd:"" group:"operate" help:"Diagnose the installation and print remedies."`
 	GC     GCCmd     `cmd:"" name:"gc" group:"operate" help:"Report reclaimable database space."`
 	Logs   LogsCmd   `cmd:"" group:"operate" help:"Show daemon logs."`
+	Hook   HookCmd   `cmd:"" group:"operate" help:"Deliver queued mail through a supported agent hook."`
 
 	SupportBundle SupportBundleCmd `cmd:"" name:"support-bundle" group:"operate" aliases:"support" help:"Collect a redacted diagnostic bundle to attach to a bug report."`
 
@@ -236,6 +237,7 @@ func grammarVars(deps Dependencies) map[string]string {
 	return map[string]string{
 		"db_default":              database,
 		"address_default":         defaults.HTTPAddress,
+		"hook_api_default":        defaultHookAPIURL,
 		"daemon_storage":          defaults.Storage,
 		"daemon_sqlite_path":      defaults.SQLitePath,
 		"daemon_state_dir":        defaults.StateDir,
