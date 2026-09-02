@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -38,6 +39,38 @@ func TestInvariantMismatchesNameEveryFailedCheck(t *testing.T) {
 		if !strings.Contains(joined, name+"=") {
 			t.Errorf("physical mismatches %q omit %s", joined, name)
 		}
+	}
+}
+
+func TestReadPoolSizeDefaultsToCPUAndAcceptsOverride(t *testing.T) {
+	t.Parallel()
+
+	if got := configuredReadPoolSize(Config{}); got != runtime.NumCPU() {
+		t.Fatalf("default read pool size=%d, want runtime.NumCPU()=%d", got, runtime.NumCPU())
+	}
+	const configured = 2
+	store, err := Open(context.Background(), Config{
+		Path: filepath.Join(t.TempDir(), "pool.db"), ReadPoolSize: configured,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if store.readPoolSize != configured {
+		t.Fatalf("store read pool size=%d, want %d", store.readPoolSize, configured)
+	}
+	stats := store.db.Stats()
+	if stats.MaxOpenConnections != configured {
+		t.Fatalf("database max open connections=%d, want %d", stats.MaxOpenConnections, configured)
+	}
+	// Open verifies every physical connection and keeps the configured number
+	// idle, so a larger pool cannot silently skip the per-connection pragmas.
+	if stats.OpenConnections != configured {
+		t.Fatalf("verified physical connections=%d, want %d", stats.OpenConnections, configured)
 	}
 }
 
@@ -388,6 +421,7 @@ func TestOpenRejectsIdentityChecksumAndConfigurationDrift(t *testing.T) {
 	}
 	for _, config := range []Config{
 		{}, {Path: "relative.db"}, {Path: filepath.Join(t.TempDir(), "database")},
+		{Path: filepath.Join(t.TempDir(), "blackbird.db"), ReadPoolSize: -1},
 	} {
 		if _, err := Open(context.Background(), config); !errors.Is(err, ErrInvalidConfiguration) {
 			t.Fatalf("config=%+v error=%v", config, err)

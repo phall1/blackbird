@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -35,7 +36,6 @@ const (
 	SQLiteSourceID            = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
 	defaultBusyTimeout        = 5 * time.Second
 	maximumBusyTimeout        = 30 * time.Second
-	maximumReadPoolSize       = 5
 	passiveCheckpointInterval = time.Minute
 	schemaChecksumHex         = "2d8ee10115bb382ce8068d6d92dbeb62deaf1cf7c9badd1bfba30a3518157806"
 	schemaV1ChecksumHex       = "370ba0de329fa9fdf77d027d2ebc85be6747a28bd79ad4ba892fe8884eb3622a"
@@ -98,6 +98,10 @@ var (
 
 type Config struct {
 	Path string
+	// ReadPoolSize bounds concurrent SQLite work. Zero derives the default from
+	// runtime.NumCPU so the daemon scales with the machine instead of carrying a
+	// fixed process-wide ceiling.
+	ReadPoolSize int
 }
 
 type Diagnostics struct {
@@ -124,6 +128,7 @@ type Diagnostics struct {
 type Store struct {
 	db               *sql.DB
 	path             string
+	readPoolSize     int
 	writes           writeArbiter
 	heartbeats       heartbeatLedger
 	securityLane     chan struct{}
@@ -188,12 +193,14 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: construct driver: %v", ErrInvalidConfiguration, err)
 	}
+	readPoolSize := configuredReadPoolSize(config)
 	db := sql.OpenDB(connector)
-	db.SetMaxOpenConns(maximumReadPoolSize)
-	db.SetMaxIdleConns(maximumReadPoolSize)
+	db.SetMaxOpenConns(readPoolSize)
+	db.SetMaxIdleConns(readPoolSize)
 	db.SetConnMaxLifetime(0)
 	store := &Store{
-		db: db, path: config.Path, securityLane: make(chan struct{}, 1), releasePath: releasePath,
+		db: db, path: config.Path, readPoolSize: readPoolSize,
+		securityLane: make(chan struct{}, 1), releasePath: releasePath,
 	}
 	store.writes.changed = make(chan struct{})
 	store.securityLane <- struct{}{}
@@ -331,7 +338,7 @@ func verifyIntegrity(ctx context.Context, query interface {
 }
 
 func validateConfig(config Config) error {
-	if config.Path == "" || !filepath.IsAbs(config.Path) {
+	if config.Path == "" || !filepath.IsAbs(config.Path) || config.ReadPoolSize < 0 {
 		return ErrInvalidConfiguration
 	}
 	clean := filepath.Clean(config.Path)
@@ -339,6 +346,13 @@ func validateConfig(config Config) error {
 		return ErrInvalidConfiguration
 	}
 	return nil
+}
+
+func configuredReadPoolSize(config Config) int {
+	if config.ReadPoolSize > 0 {
+		return config.ReadPoolSize
+	}
+	return runtime.NumCPU()
 }
 
 func databaseURL(config Config) string {
@@ -680,13 +694,13 @@ func (store *Store) inspect(ctx context.Context) (Diagnostics, error) {
 }
 
 func (store *Store) verifyPhysicalConnections(ctx context.Context, busyTimeout time.Duration) error {
-	connections := make([]*sql.Conn, 0, maximumReadPoolSize)
+	connections := make([]*sql.Conn, 0, store.readPoolSize)
 	defer func() {
 		for _, connection := range connections {
 			_ = connection.Close()
 		}
 	}()
-	for range maximumReadPoolSize {
+	for range store.readPoolSize {
 		connection, err := store.db.Conn(ctx)
 		if err != nil {
 			return fmt.Errorf("acquire SQLite connection for verification: %w", err)

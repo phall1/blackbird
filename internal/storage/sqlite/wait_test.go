@@ -249,7 +249,7 @@ func TestAwaitCoordinationReportsCancellationAsCancellation(t *testing.T) {
 
 // TestAwaitCoordinationHoldsNoConnectionWhileItWaits is the property that
 // decides whether this primitive is safe to expose at all. The daemon reads
-// through a pool of maximumReadPoolSize connections shared by every caller, so
+// through a bounded connection pool shared by every caller, so
 // a wait that kept its connection for the duration of the wait would let a
 // handful of parked agents take the whole pool and stall every unrelated read
 // on the machine -- turning a convenience into an outage. Polling is what buys
@@ -270,7 +270,7 @@ func TestAwaitCoordinationHoldsNoConnectionWhileItWaits(t *testing.T) {
 
 	// Deliberately more waiters than the pool has connections: if a wait held
 	// one, the pool would be exhausted before the last waiter even started.
-	waiters := 2 * maximumReadPoolSize
+	waiters := 2 * fixture.store.readPoolSize
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	parked := make(chan struct{}, waiters)
@@ -314,7 +314,7 @@ func TestAwaitCoordinationHoldsNoConnectionWhileItWaits(t *testing.T) {
 	}
 	if !idle {
 		t.Fatalf("the read pool was never idle with %d waiters parked (busiest InUse=%d of %d): "+
-			"a wait is holding its connection between polls", waiters, busiest, maximumReadPoolSize)
+			"a wait is holding its connection between polls", waiters, busiest, fixture.store.readPoolSize)
 	}
 
 	cancel()
