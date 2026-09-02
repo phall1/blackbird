@@ -42,11 +42,21 @@ type hookInput struct {
 	WorkspaceRoot  string   `json:"workspace_root"`
 	Workspace      string   `json:"workspace"`
 	WorkspaceRoots []string `json:"workspace_roots"`
+	// TranscriptPath is Claude Code's session transcript. It is the only place
+	// this host exposes per-call token usage, so it is the observation plane's
+	// entire data source here.
+	TranscriptPath string `json:"transcript_path"`
+	SessionID      string `json:"session_id"`
 }
 
 type hookState struct {
 	RegistrationToken string `json:"registration_token"`
 	Cursor            string `json:"cursor,omitempty"`
+	// TranscriptPath and TranscriptOffset are the observation plane's watermark
+	// into Claude Code's transcript. The path is stored beside the offset
+	// because an offset into a different file is meaningless.
+	TranscriptPath   string `json:"transcript_path,omitempty"`
+	TranscriptOffset int64  `json:"transcript_offset,omitempty"`
 }
 
 type hookRegisterResponse struct {
@@ -115,6 +125,17 @@ func (cmd *HookCmd) Run(ctx context.Context, console *Console) error {
 		return err
 	}
 	state.Cursor = page.NextCursor
+	// The observation plane runs last, on purpose. The host already has its
+	// output, so a daemon that is slow, down, or not collecting costs this hook
+	// a log line rather than a delayed turn.
+	telemetryCtx, cancelTelemetry := context.WithTimeout(ctx, hookTelemetryTimeout)
+	reported, telemetryErr := reportHookTelemetry(telemetryCtx, client, origin, state, input.TranscriptPath)
+	cancelTelemetry()
+	if telemetryErr != nil {
+		_, _ = fmt.Fprintf(console.Err, "blackbird hook: telemetry: %v\n", telemetryErr)
+	} else {
+		state = reported
+	}
 	if err := saveHookState(statePath, state); err != nil {
 		// Output already reached the host. Leave the old cursor in place so this
 		// delivery is retried rather than silently skipped.
