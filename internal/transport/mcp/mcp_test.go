@@ -272,14 +272,12 @@ func (observation *metricObservation) ObserveLeaseConflict() { observation.confl
 func TestMCPMiddlewareRecordsToolOutcomeAndLeaseContention(t *testing.T) {
 	t.Parallel()
 	observation := &metricObservation{}
-	failure, err := json.Marshal(coordinationFailureOutput{
-		RequestID: "req_metric", Code: string(domain.ErrorCodeLeaseConflict),
-	})
+	conflict, err := json.Marshal(claimOutput{OK: false, Options: []string{"wait"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	next := func(context.Context, string, sdkmcp.Request) (sdkmcp.Result, error) {
-		return &sdkmcp.CallToolResult{IsError: true, StructuredContent: json.RawMessage(failure)}, nil
+		return &sdkmcp.CallToolResult{StructuredContent: json.RawMessage(conflict)}, nil
 	}
 	request := &sdkmcp.CallToolRequest{Params: &sdkmcp.CallToolParamsRaw{Name: ToolClaim}}
 	if _, err := logToolFailures(slog.New(slog.DiscardHandler), observation)(next)(
@@ -440,6 +438,10 @@ func TestReservationsStatusAnswersWhoIsBlockingMe(t *testing.T) {
 		reservationsStatusInput{AgentToken: bob})
 	if len(all.Reservations) != 2 {
 		t.Fatalf("unfiltered status = %+v, want both leases including the caller's own", all.Reservations)
+	}
+	bounded := callCoord[statusOutput](t, client, ToolStatus, statusInput{AgentToken: bob, Limit: 1})
+	if len(bounded.Agents) != 1 || !bounded.Truncated {
+		t.Fatalf("bounded status = %+v, want one peer and truncated", bounded)
 	}
 	var generation uint64
 	for _, reservation := range all.Reservations {
@@ -656,17 +658,24 @@ func TestDescribeLeaseConflictUsesRequestedMode(t *testing.T) {
 			}
 		})
 	}
+	failedLookup := describeLeaseConflict(context.Background(), &leaseConflictQueryStore{err: errors.New("query failed")},
+		session, application.LeaseExclusive, []application.LeaseSelector{selector}, domain.ErrLeaseConflict)
+	var blocked *blockedError
+	if !errors.As(failedLookup, &blocked) || len(blocked.blockers) != 0 {
+		t.Fatalf("failed blocker lookup = %v, want a described conflict without blockers", failedLookup)
+	}
 }
 
 type leaseConflictQueryStore struct {
 	application.LocalCoordinationStore
 	query application.AdminReservationsQuery
+	err   error
 }
 
 func (store *leaseConflictQueryStore) LocalAgentReservations(_ context.Context, _ application.LocalAgentSession,
 	query application.AdminReservationsQuery) (application.AdminReservationsPage, error) {
 	store.query = query
-	return application.AdminReservationsPage{}, nil
+	return application.AdminReservationsPage{}, store.err
 }
 
 func newCoordinationSession(t *testing.T, name string) (*sdkmcp.ClientSession, string, string) {

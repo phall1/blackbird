@@ -99,12 +99,16 @@ func logToolFailures(logger *slog.Logger, metrics MetricsObserver) sdkmcp.Middle
 			if err != nil {
 				metricOutcome = "error"
 				logger.Error("mcp tool failed", slog.String("tool", call.Params.Name), slog.Any("error", err))
-			} else if outcome, isToolResult := result.(*sdkmcp.CallToolResult); isToolResult && outcome != nil && outcome.IsError {
-				metricOutcome = structuredFailureCode(outcome)
-				if metricOutcome == "" {
-					metricOutcome = "error"
-					logger.Error("mcp tool failed", slog.String("tool", call.Params.Name),
-						slog.String("error", toolFailureText(outcome)))
+			} else if outcome, isToolResult := result.(*sdkmcp.CallToolResult); isToolResult && outcome != nil {
+				if outcome.IsError {
+					metricOutcome = structuredFailureCode(outcome)
+					if metricOutcome == "" {
+						metricOutcome = "error"
+						logger.Error("mcp tool failed", slog.String("tool", call.Params.Name),
+							slog.String("error", toolFailureText(outcome)))
+					}
+				} else if call.Params.Name == ToolClaim && structuredClaimConflict(outcome) {
+					metricOutcome = string(domain.ErrorCodeLeaseConflict)
 				}
 			}
 			if metrics != nil {
@@ -122,6 +126,18 @@ func logToolFailures(logger *slog.Logger, metrics MetricsObserver) sdkmcp.Middle
 // its cause chain and returns the bounded outcome label used by metrics. An SDK
 // rejection before a handler runs carries no structured payload and falls back
 // to the generic error label and log record.
+func structuredClaimConflict(result *sdkmcp.CallToolResult) bool {
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		return false
+	}
+	var claim struct {
+		OK      bool     `json:"ok"`
+		Options []string `json:"options"`
+	}
+	return json.Unmarshal(encoded, &claim) == nil && !claim.OK && len(claim.Options) > 0
+}
+
 func structuredFailureCode(result *sdkmcp.CallToolResult) string {
 	encoded, isJSON := result.StructuredContent.(json.RawMessage)
 	if !isJSON {
@@ -615,7 +631,7 @@ func describeLeaseConflict(ctx context.Context, store application.LocalCoordinat
 		page, err := store.LocalAgentReservations(ctx, session, application.AdminReservationsQuery{
 			State: application.AdminReservationActive, Mode: queryMode, Path: selector.Path(), Limit: maxCoordinationBlockers})
 		if err != nil {
-			return cause
+			return &blockedError{cause: cause, blockers: blockers}
 		}
 		for _, reservation := range page.Reservations {
 			// The caller's own leases are never what blocked it: acquisition

@@ -240,6 +240,10 @@ func agentStatus(ctx context.Context, store application.LocalCoordinationStore, 
 	if err != nil {
 		return statusOutput{}, err
 	}
+	if input.Limit > 0 && len(agents) > int(input.Limit) {
+		agents = agents[:input.Limit]
+		page.Truncated = true
+	}
 	output := statusOutput{Agents: make([]activeAgentOutput, 0, len(agents)),
 		Reservations: reservationHolders(page.Reservations), Truncated: page.Truncated}
 	for _, agent := range agents {
