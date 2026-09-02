@@ -44,6 +44,8 @@ type CLI struct {
 	Logs   LogsCmd   `cmd:"" group:"operate" help:"Show daemon logs."`
 	Hook   HookCmd   `cmd:"" group:"operate" help:"Deliver queued mail through a supported agent hook."`
 
+	LeaseGuard LeaseGuardCmd `cmd:"" name:"lease-guard" group:"operate" help:"Check staged paths against other agents' exclusive reservations. Advisory: a local opt-in commit check, not file locking."`
+
 	SupportBundle SupportBundleCmd `cmd:"" name:"support-bundle" group:"operate" aliases:"support" help:"Collect a redacted diagnostic bundle to attach to a bug report."`
 
 	Overview     OverviewCmd     `cmd:"" group:"inspect" help:"Summarize projects, agents, mail, and reservations."`

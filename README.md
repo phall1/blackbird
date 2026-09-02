@@ -14,7 +14,9 @@ The released product includes:
 - a private, tamper-evident coordination event journal with authenticated
   catch-up cursors and a wake-only SSE stream;
 - shared and exclusive exact/subtree advisory path claims with expiry, renewal,
-  overlap detection, and internal claim generations;
+  overlap detection, and internal claim generations, plus an opt-in
+  `blackbird lease-guard` pre-commit check that surfaces another agent's claim
+  before you overwrite it;
 - one per-user launchd or systemd daemon, unattended Homebrew updates, and
   idempotent MCP client configuration; and
 - reproducible native releases for Apple Silicon macOS and amd64/arm64 Linux.
@@ -262,6 +264,13 @@ make test-race  # shuffled tests under the race detector
 make check      # the complete pre-push/CI quality gate
 make hooks      # install fast pre-commit and exhaustive pre-push hooks with prek
 ```
+
+`make hooks` also installs `blackbird lease-guard`, which checks a commit's
+staged paths against exclusive path claims held by other agents. It is a
+courtesy check, not a lock: claims are advisory, the guard is opt-in twice over
+(you install the hooks, and it only refuses when `BLACKBIRD_AGENT_NAME` names
+your registered agent), an unreachable daemon always passes, and `--no-verify`
+skips it. Set `BLACKBIRD_LEASE_GUARD=off|warn|block` to override the default.
 
 The live `bd` compatibility probe is intentionally excluded from hermetic test
 runs. Set `BLACKBIRD_RUN_EXTERNAL_TESTS=1` to exercise it against the installed

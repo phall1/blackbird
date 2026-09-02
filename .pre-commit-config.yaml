@@ -16,6 +16,19 @@ repos:
         entry: go vet ./...
         language: system
         pass_filenames: false
+      # Advisory, and opt-in twice over: it only runs for people who installed
+      # these hooks at all, and it only refuses a commit when BLACKBIRD_AGENT_NAME
+      # identifies you well enough to tell your own lease from a teammate's.
+      # Otherwise it warns. It is a courtesy check in the one place a shared
+      # checkout collides -- not file locking, and `--no-verify` walks past it.
+      # A daemon that is down, or a repo it has never seen, is never a reason to
+      # refuse a commit, so every failure here passes.
+      - id: blackbird-lease-guard
+        name: blackbird lease guard (advisory)
+        entry: go run ./cmd/blackbird lease-guard
+        language: system
+        require_serial: true
+
       - id: golangci-fast
         name: golangci-lint (fast)
         entry: golangci-lint run --fix --fast-only

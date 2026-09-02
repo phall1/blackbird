@@ -358,6 +358,21 @@ matters.
    acknowledge on another agent's behalf: read and acknowledgement facts belong
    to the recipient.
 
+**Claims are advisory, and the pre-commit guard does not change that.** A lease
+is an agreement between agents that choose to respect it; nothing in the daemon
+can stop a process from opening a file. `blackbird lease-guard` adds one local,
+opt-in place where a claim someone else already made becomes visible before you
+overwrite it — the staged set of a commit, which is where a shared checkout
+actually collides. It is installed with `make hooks`, it is not file locking,
+and `git commit --no-verify` walks past it.
+
+It fails open by design: an unreachable daemon, a missing admin credential, or a
+project the daemon has never seen all pass, because a hook that blocks commits
+when coordination is down is a hook people delete. It refuses only when it can
+name a live exclusive holder that is not you, which needs `BLACKBIRD_AGENT_NAME`
+to be your registered agent name — without it the guard warns instead, since it
+cannot tell your own lease from a teammate's.
+
 On a lease conflict, do not retry blindly and do not widen your selector.
 Another agent holds an overlapping lease — coordinate through a conversation, or
 narrow your scope to a disjoint path.
