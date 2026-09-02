@@ -214,6 +214,7 @@ type Daemon struct {
 	dependencies Dependencies
 	logger       *slog.Logger
 	logSeverity  *slog.LevelVar
+	ingress      *ingressDrain
 
 	runMu   sync.Mutex
 	running bool
@@ -225,6 +226,82 @@ type Daemon struct {
 	listeners    []net.Listener
 	workers      []Worker
 	store        Storage
+}
+
+// ingressDrain gives every request a process-owned cancellation signal and
+// keeps the storage close behind a handler barrier. net/http Shutdown stops new
+// connections but deliberately does not cancel active request contexts, so a
+// long-lived SSE or wait handler otherwise holds shutdown until its deadline
+// and can still touch storage after that deadline expires.
+type ingressDrain struct {
+	mu       sync.Mutex
+	stopping bool
+	next     uint64
+	cancels  map[uint64]context.CancelFunc
+	handlers sync.WaitGroup
+}
+
+func newIngressDrain() *ingressDrain {
+	return &ingressDrain{cancels: make(map[uint64]context.CancelFunc)}
+}
+
+func (drain *ingressDrain) wrap(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		ctx, cancel := context.WithCancel(request.Context())
+		drain.mu.Lock()
+		if drain.stopping {
+			drain.mu.Unlock()
+			cancel()
+			http.Error(writer, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		drain.next++
+		requestID := drain.next
+		drain.cancels[requestID] = cancel
+		drain.handlers.Add(1)
+		drain.mu.Unlock()
+		defer func() {
+			drain.mu.Lock()
+			delete(drain.cancels, requestID)
+			drain.mu.Unlock()
+			cancel()
+			drain.handlers.Done()
+		}()
+		handler.ServeHTTP(writer, request.WithContext(ctx))
+	})
+}
+
+func (drain *ingressDrain) begin() {
+	if drain == nil {
+		return
+	}
+	drain.mu.Lock()
+	drain.stopping = true
+	cancels := make([]context.CancelFunc, 0, len(drain.cancels))
+	for _, cancel := range drain.cancels {
+		cancels = append(cancels, cancel)
+	}
+	drain.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (drain *ingressDrain) wait(ctx context.Context) error {
+	if drain == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		drain.handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // New returns an identity-only daemon retained for build-info callers. Run
@@ -291,6 +368,7 @@ func NewDaemon(build BuildInfo, config Config, dependencies Dependencies) (*Daem
 			slog.Int("pid", os.Getpid()),
 		),
 		logSeverity: severity,
+		ingress:     newIngressDrain(),
 	}, nil
 }
 
@@ -421,8 +499,8 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	httpServer := daemon.dependencies.NewServer(daemon.config.HTTPAddress, bundle.HTTP)
-	mcpServer := daemon.dependencies.NewServer(daemon.config.MCPAddress, bundle.MCP)
+	httpServer := daemon.dependencies.NewServer(daemon.config.HTTPAddress, daemon.ingress.wrap(bundle.HTTP))
+	mcpServer := daemon.dependencies.NewServer(daemon.config.MCPAddress, daemon.ingress.wrap(bundle.MCP))
 	if isNil(httpServer) || isNil(mcpServer) {
 		daemon.logger.Error("server factory returned nil")
 		return errors.Join(errors.New("server factory returned nil"), daemon.Shutdown(context.Background()))
@@ -513,16 +591,22 @@ func (daemon *Daemon) Shutdown(ctx context.Context) error {
 		daemon.logger.Info("shutdown starting",
 			slog.Int("servers", len(servers)), slog.Int("workers", len(workers)))
 		var shutdownErr error
+		// Cancel request contexts before asking net/http to drain them. Without
+		// this, an SSE client can force the entire shutdown timeout because
+		// Server.Shutdown does not cancel active handlers.
+		daemon.ingress.begin()
 		for _, server := range servers {
 			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("shut down ingress", server.Shutdown(stopCtx)))
 		}
 		for _, listener := range listeners {
 			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("close listener", ignoreClosed(listener.Close())))
 		}
+		drainErr := daemon.ingress.wait(stopCtx)
+		shutdownErr = errors.Join(shutdownErr, daemon.logFailure("drain ingress handlers", drainErr))
 		for index := len(workers) - 1; index >= 0; index-- {
 			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("stop worker", workers[index].Stop(stopCtx)))
 		}
-		if store != nil {
+		if store != nil && drainErr == nil {
 			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("close storage", store.Close()))
 		}
 		daemon.shutdownErr = shutdownErr

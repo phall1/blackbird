@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -188,6 +189,110 @@ func TestLogLevelFallsBackToTheEnvironmentThenInfo(t *testing.T) {
 	}
 }
 
+func TestCancellationStopsActiveHandlerBeforeStorageClose(t *testing.T) {
+	t.Parallel()
+	ready := make(chan struct{})
+	handlerStarted := make(chan struct{})
+	handlerReturned := make(chan struct{})
+	var serverIndex atomic.Int32
+	storeClosed := make(chan struct{})
+	daemon := newTestDaemon(t, Dependencies{
+		OpenSQLite: func(context.Context, sqliteConfig) (Storage, error) {
+			return &testStore{close: func() {
+				select {
+				case <-handlerReturned:
+				default:
+					t.Error("storage closed while an ingress handler was still active")
+				}
+				close(storeClosed)
+			}}, nil
+		},
+		Compose: func(context.Context, Storage) (HandlerBundle, error) {
+			return HandlerBundle{HTTP: http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+				close(handlerStarted)
+				<-request.Context().Done()
+			}), MCP: http.HandlerFunc(noopHandler)}, nil
+		},
+		Listen: func(string, string) (net.Listener, error) { return &testListener{}, nil },
+		NewServer: func(_ string, handler http.Handler) IngressServer {
+			if serverIndex.Add(1) == 1 {
+				return newActiveHandlerServer(handler, handlerReturned)
+			}
+			return &testServer{}
+		},
+		Ready: func() { close(ready) },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- daemon.Run(ctx) }()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("daemon did not become ready")
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("active handler did not start")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("shutdown waited on the active handler instead of cancelling it")
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("shutdown took %v, want less than 500ms", elapsed)
+	}
+	select {
+	case <-storeClosed:
+	default:
+		t.Fatal("storage was not closed after handlers drained")
+	}
+}
+
+func TestShutdownDoesNotCloseStorageUnderAnUncooperativeHandler(t *testing.T) {
+	t.Parallel()
+	daemon := newTestDaemon(t, Dependencies{
+		Compose: func(context.Context, Storage) (HandlerBundle, error) {
+			return HandlerBundle{}, nil
+		},
+	})
+	daemon.config.ShutdownTimeout = 20 * time.Millisecond
+	var storageClosed atomic.Bool
+	daemon.store = &testStore{close: func() { storageClosed.Store(true) }}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	returned := make(chan struct{})
+	handler := daemon.ingress.wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(started)
+		<-release
+	}))
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/stuck", nil))
+		close(returned)
+	}()
+	<-started
+
+	if err := daemon.Shutdown(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown() error = %v, want deadline exceeded", err)
+	}
+	if storageClosed.Load() {
+		t.Fatal("storage closed while a handler remained active after the drain deadline")
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not return after release")
+	}
+}
+
 func TestCancellationDrainsIngressBeforeWorkersAndStorage(t *testing.T) {
 	t.Parallel()
 	var events eventLog
@@ -365,6 +470,36 @@ type testAddress string
 
 func (address testAddress) Network() string { return string(address) }
 func (address testAddress) String() string  { return string(address) }
+
+type activeHandlerServer struct {
+	handler  http.Handler
+	returned chan struct{}
+	stopped  chan struct{}
+	once     sync.Once
+}
+
+func newActiveHandlerServer(handler http.Handler, returned chan struct{}) *activeHandlerServer {
+	return &activeHandlerServer{handler: handler, returned: returned, stopped: make(chan struct{})}
+}
+
+func (server *activeHandlerServer) Serve(net.Listener) error {
+	go func() {
+		server.handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/stream", nil))
+		close(server.returned)
+	}()
+	<-server.stopped
+	return http.ErrServerClosed
+}
+
+func (server *activeHandlerServer) Shutdown(ctx context.Context) error {
+	server.once.Do(func() { close(server.stopped) })
+	select {
+	case <-server.returned:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 type testServer struct {
 	name     string
