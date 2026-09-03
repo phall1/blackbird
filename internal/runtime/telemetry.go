@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 )
 
 const (
@@ -32,8 +32,8 @@ const (
 // safe -- after ingress has drained, so nothing can still be offering, and
 // before storage closes, so the final flush has somewhere to write.
 type telemetryWorker struct {
-	sink      *application.TelemetrySink
-	store     application.TelemetryStore
+	sink      *telemetry.Sink
+	store     telemetry.Store
 	logger    *slog.Logger
 	retention time.Duration
 	interval  time.Duration
@@ -43,9 +43,9 @@ type telemetryWorker struct {
 	sweep  chan struct{}
 }
 
-func newTelemetryWorker(store application.TelemetryStore, logger *slog.Logger) *telemetryWorker {
+func newTelemetryWorker(store telemetry.Store, logger *slog.Logger) *telemetryWorker {
 	return &telemetryWorker{
-		sink:      application.NewTelemetrySink(store, application.TelemetrySinkConfig{Logger: logger}),
+		sink:      telemetry.NewSink(store, telemetry.SinkConfig{Logger: logger}),
 		store:     store,
 		logger:    logger,
 		retention: defaultTelemetryRetention,

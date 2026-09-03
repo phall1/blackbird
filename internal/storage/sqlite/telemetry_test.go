@@ -5,19 +5,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
 func telemetryEnvelope(t *testing.T, store *Store, project, agent string,
-	calls []domain.ModelCall, spans []domain.Span) application.TelemetryEnvelope {
+	calls []domain.ModelCall, spans []domain.Span) telemetry.Envelope {
 	t.Helper()
 	session, _, err := store.RegisterLocalAgent(context.Background(), project, agent, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return application.TelemetryEnvelope{
-		Attribution: application.TelemetryAttribution{
+	return telemetry.Envelope{
+		Attribution: telemetry.Attribution{
 			ProjectKey: session.ProjectKey,
 			ActorID:    session.ActorID,
 			SessionID:  session.ActorSessionID,
@@ -55,7 +55,7 @@ func TestAppendTelemetryIsIdempotentOnDedupeKey(t *testing.T) {
 	// The same observation arriving twice is the expected result of an emitter
 	// retrying or re-scanning a transcript, not a fault.
 	for range 3 {
-		if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{envelope}); err != nil {
+		if err := store.AppendTelemetry(ctx, []telemetry.Envelope{envelope}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -92,7 +92,7 @@ func TestAppendTelemetryScopesDedupeToTheActor(t *testing.T) {
 	second := telemetryEnvelope(t, store, "/workspace/scoped", "bob",
 		[]domain.ModelCall{sampleModelCall("shared")}, nil)
 
-	if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{first, second}); err != nil {
+	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{first, second}); err != nil {
 		t.Fatal(err)
 	}
 	var rows int
@@ -115,7 +115,7 @@ func TestAppendTelemetryKeepsUnreportedReasoningNull(t *testing.T) {
 	call.Usage.Reasoning = 0
 	call.Usage.ReasoningReported = false
 	envelope := telemetryEnvelope(t, store, "/workspace/reasoning", "alice", []domain.ModelCall{call}, nil)
-	if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{envelope}); err != nil {
+	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{envelope}); err != nil {
 		t.Fatal(err)
 	}
 	var reasoning *int64
@@ -138,7 +138,7 @@ func TestAppendTelemetryStoresSpans(t *testing.T) {
 		StartedAt: time.Now().UTC(), Duration: 92 * time.Second, DurationKnown: true,
 	}
 	envelope := telemetryEnvelope(t, store, "/workspace/spans", "alice", nil, []domain.Span{span})
-	if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{envelope}); err != nil {
+	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{envelope}); err != nil {
 		t.Fatal(err)
 	}
 	var name, outcome string
@@ -162,7 +162,7 @@ func TestSweepTelemetryUsesTheDaemonClockNotTheReportedStart(t *testing.T) {
 	call.StartedAt = time.Now().UTC().Add(365 * 24 * time.Hour)
 	envelope := telemetryEnvelope(t, store, "/workspace/sweep", "alice", []domain.ModelCall{call}, nil)
 	envelope.ReceivedAt = time.Now().UTC().Add(-90 * 24 * time.Hour)
-	if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{envelope}); err != nil {
+	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{envelope}); err != nil {
 		t.Fatal(err)
 	}
 

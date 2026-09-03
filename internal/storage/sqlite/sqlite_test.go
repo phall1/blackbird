@@ -239,7 +239,7 @@ func TestV7ActorEventsAndCursorsSurviveVisibilityMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	query, _ := coordination.NewCoordinationEventsQuery(workspace, actor, cursor, 10)
+	query, _ := coordination.NewEventsQuery(workspace, actor, cursor, 10)
 	page, err := store.SyncCoordinationEvents(context.Background(), query)
 	if err != nil || len(page.Events()) != 1 || page.Events()[0].SubjectID() != "legacy-message" {
 		t.Fatalf("migrated legacy page=%+v error=%v", page, err)

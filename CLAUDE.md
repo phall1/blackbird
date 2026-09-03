@@ -191,6 +191,19 @@ Layer is the first path segment under `internal/`; anything under `cmd/` is
 - **A new top-level directory under `internal/` must be declared** in the
   architecture test's allow-list, or every file in it fails. Add one only for a
   genuinely new architectural layer, never to silence a misplaced package.
+- **`application` is ordered internally, and the ordering is a second
+  allow-list.** The layer root holds no packages; each sub-package is a *plane*
+  with a rank, and a plane may import a strictly lower-ranked plane and itself,
+  never a higher one. Equal ranks are peers forbidden to import each other. This
+  is ADR-0001 made executable — coordination is the product, telemetry a
+  projection against it, so coordination must not learn that telemetry exists.
+  A new sub-package of `internal/application`, or a `.go` file at the layer
+  root, fails until it is ranked. Read the current planes and their order from
+  the test rather than from here:
+
+  ```sh
+  grep -A4 'applicationPlaneRank = map' internal/architecturetest/import_boundaries_test.go
+  ```
 - **The abandoned proof and legacy trees are forbidden** anywhere in the module
   graph, package sources, or `go.mod` replacements. The architecture test names
   them; read it if a path is rejected and you do not know why.

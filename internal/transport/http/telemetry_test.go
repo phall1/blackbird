@@ -9,16 +9,16 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 )
 
 type capturingTelemetrySink struct {
 	mu        sync.Mutex
-	envelopes []application.TelemetryEnvelope
+	envelopes []telemetry.Envelope
 	refuse    bool
 }
 
-func (sink *capturingTelemetrySink) Offer(envelope application.TelemetryEnvelope) bool {
+func (sink *capturingTelemetrySink) Offer(envelope telemetry.Envelope) bool {
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	if sink.refuse {
@@ -28,11 +28,11 @@ func (sink *capturingTelemetrySink) Offer(envelope application.TelemetryEnvelope
 	return true
 }
 
-func (sink *capturingTelemetrySink) last() (application.TelemetryEnvelope, bool) {
+func (sink *capturingTelemetrySink) last() (telemetry.Envelope, bool) {
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	if len(sink.envelopes) == 0 {
-		return application.TelemetryEnvelope{}, false
+		return telemetry.Envelope{}, false
 	}
 	return sink.envelopes[len(sink.envelopes)-1], true
 }
@@ -204,7 +204,7 @@ func TestTelemetryIngestBoundsOneSubmission(t *testing.T) {
 	handler, token := newTelemetryHandler(t, &capturingTelemetrySink{})
 	item := `{"dedupe_key":"k","harness":"pi","provider":"a","model":"m","operation":"chat",
 		"usage":{"output_tokens":1},"outcome":"ok","started_at":"2026-09-02T05:06:52Z","duration_ms":1}`
-	items := make([]string, application.MaxTelemetryEventsPerEnvelope+1)
+	items := make([]string, telemetry.MaxEventsPerEnvelope+1)
 	for index := range items {
 		items[index] = item
 	}

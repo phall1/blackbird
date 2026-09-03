@@ -291,7 +291,7 @@ func TestAdminInboxRequiresProjectKey(t *testing.T) {
 	store := newCoordinationStore(t)
 
 	if _, err := store.AdminInbox(context.Background(), coordination.AdminInboxQuery{}); !errors.Is(err,
-		coordination.ErrInvalidCoordination) {
+		coordination.ErrInvalid) {
 		t.Fatalf("missing project key error=%v", err)
 	}
 }
@@ -320,7 +320,7 @@ func TestForceReleaseAdminReservationClearsLeaseAndRecordsForcedFact(t *testing.
 	}
 
 	events, err := store.ListAdminEvents(ctx, coordination.AdminEventsQuery{
-		EventType: coordination.CoordinationEventLeaseReleased})
+		EventType: coordination.EventLeaseReleased})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestForceReleaseAdminReservationClearsLeaseAndRecordsForcedFact(t *testing.
 		t.Fatalf("repeated release instant=%v present=%v, want %v", repeatedAt, ok, releasedAt)
 	}
 	events, err = store.ListAdminEvents(ctx, coordination.AdminEventsQuery{
-		EventType: coordination.CoordinationEventLeaseReleased})
+		EventType: coordination.EventLeaseReleased})
 	if err != nil || len(events.Events) != 1 {
 		t.Fatalf("repeated release events=%d error=%v, want one", len(events.Events), err)
 	}
@@ -457,7 +457,7 @@ func TestListAdminReservationsRejectsInvalidStateAndNormalizesZero(t *testing.T)
 	acquireAdminLease(t, store, alice, "docs/live.md")
 
 	if _, err := store.ListAdminReservations(context.Background(),
-		coordination.AdminReservationsQuery{State: "bogus"}); !errors.Is(err, coordination.ErrInvalidCoordination) {
+		coordination.AdminReservationsQuery{State: "bogus"}); !errors.Is(err, coordination.ErrInvalid) {
 		t.Fatalf("invalid state error=%v", err)
 	}
 	page, err := store.ListAdminReservations(context.Background(), coordination.AdminReservationsQuery{})
@@ -480,7 +480,7 @@ func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Events) != 2 || page.Events[0].EventType != coordination.CoordinationEventLeaseAcquired {
+	if len(page.Events) != 2 || page.Events[0].EventType != coordination.EventLeaseAcquired {
 		t.Fatalf("events=%+v", page.Events)
 	}
 	for index := 1; index < len(page.Events); index++ {
@@ -489,7 +489,7 @@ func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 		}
 	}
 	available, err := store.ListAdminEvents(context.Background(), coordination.AdminEventsQuery{
-		EventType: coordination.CoordinationEventMessageAvailable})
+		EventType: coordination.EventMessageAvailable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +502,7 @@ func TestListAdminEventsReturnsNewestFirstWithoutRecipientFanout(t *testing.T) {
 		t.Fatalf("event=%+v", event)
 	}
 	if _, err := store.ListAdminEvents(context.Background(),
-		coordination.AdminEventsQuery{EventType: "bogus"}); !errors.Is(err, coordination.ErrInvalidCoordination) {
+		coordination.AdminEventsQuery{EventType: "bogus"}); !errors.Is(err, coordination.ErrInvalid) {
 		t.Fatalf("invalid event type error=%v", err)
 	}
 }
@@ -547,7 +547,7 @@ func TestListAdminConversationsSummarizesThread(t *testing.T) {
 func TestAdminQueriesRejectInvalidFilters(t *testing.T) {
 	t.Parallel()
 	store := newCoordinationStore(t)
-	oversized := string(make([]byte, coordination.MaxCoordinationKeyBytes+1))
+	oversized := string(make([]byte, coordination.MaxKeyBytes+1))
 	overLimit := uint16(coordination.MaxQueryPageSize + 1)
 
 	for _, testCase := range []struct {
@@ -591,7 +591,7 @@ func TestAdminQueriesRejectInvalidFilters(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			if err := testCase.call(); !errors.Is(err, coordination.ErrInvalidCoordination) {
+			if err := testCase.call(); !errors.Is(err, coordination.ErrInvalid) {
 				t.Fatalf("error=%v", err)
 			}
 		})
@@ -1084,7 +1084,7 @@ func TestListAdminReservationsRejectsUnknownModeAndInvalidPath(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			if _, err := store.ListAdminReservations(context.Background(), testCase.query); !errors.Is(err,
-				coordination.ErrInvalidCoordination) {
+				coordination.ErrInvalid) {
 				t.Fatalf("error=%v", err)
 			}
 		})

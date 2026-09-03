@@ -21,10 +21,10 @@ import (
 )
 
 const (
-	MaxCanonicalInteger            uint64 = domain.MaxCanonicalInteger
-	MaxQueryPageSize                      = 256
-	MaxQueryPayloadBytes                  = 256 * 1024
-	MaxCoordinationConsumerIDBytes        = 64
+	MaxCanonicalInteger  uint64 = domain.MaxCanonicalInteger
+	MaxQueryPageSize            = 256
+	MaxQueryPayloadBytes        = 256 * 1024
+	MaxConsumerIDBytes          = 64
 )
 
 type Digest [sha256.Size]byte
@@ -33,8 +33,8 @@ func DigestBytes(value []byte) Digest { return sha256.Sum256(value) }
 func (digest Digest) IsZero() bool    { return digest == Digest{} }
 
 var (
-	ErrInvalidCoordination     = errors.New("invalid coordination contract")
-	ErrCoordinationUnsupported = errors.New("coordination storage is unsupported")
+	ErrInvalid     = errors.New("invalid coordination contract")
+	ErrUnsupported = errors.New("coordination storage is unsupported")
 )
 
 func cloneOptional[T any](value *T) *T {
@@ -91,7 +91,7 @@ type Recipient struct {
 
 func NewRecipient(actor domain.ActorID, kind RecipientKind) (Recipient, error) {
 	if actor.IsZero() || kind != RecipientTo && kind != RecipientCc && kind != RecipientBcc {
-		return Recipient{}, ErrInvalidCoordination
+		return Recipient{}, ErrInvalid
 	}
 	return Recipient{actor: actor, kind: kind}, nil
 }
@@ -137,7 +137,7 @@ func NewConversation(params OpenConversationParams, openedAt time.Time) (Convers
 	if params.ConversationID.IsZero() || params.WorkspaceID.IsZero() || params.RunID.IsZero() ||
 		params.OpenedBy.IsZero() || params.OpenedBySession.IsZero() || !validOpaqueText(params.Topic, 512) ||
 		!ValidConversationSlug(params.Slug) || openedAt.IsZero() {
-		return Conversation{}, ErrInvalidCoordination
+		return Conversation{}, ErrInvalid
 	}
 	return Conversation{id: params.ConversationID, workspace: params.WorkspaceID, run: params.RunID,
 		openedBy: params.OpenedBy, topic: params.Topic, slug: params.Slug, openedAt: openedAt.UTC()}, nil
@@ -180,7 +180,7 @@ type Delivery struct {
 
 func NewDeliveryView(recipient Recipient, acknowledgementRequired bool, availableAt, readAt, acknowledgedAt *time.Time) (Delivery, error) {
 	if recipient.actor.IsZero() || recipient.kind != RecipientTo && recipient.kind != RecipientCc && recipient.kind != RecipientBcc {
-		return Delivery{}, ErrInvalidCoordination
+		return Delivery{}, ErrInvalid
 	}
 	return Delivery{recipient: recipient, acknowledgementRequired: acknowledgementRequired,
 		availableAt: cloneOptional(availableAt), readAt: cloneOptional(readAt), acknowledgedAt: cloneOptional(acknowledgedAt)}, nil
@@ -233,10 +233,10 @@ func NewMessageView(params MessageViewParams) (Message, error) {
 		len(params.Subject) == 0 || len(params.Subject) > MaxMessageSubjectBytes || !utf8.ValidString(params.Subject) ||
 		len(params.Body) == 0 || len(params.Body) > MaxMessageBodyBytes || !utf8.ValidString(params.Body) ||
 		params.SentAt.IsZero() || params.Position == 0 || len(params.Deliveries) == 0 || len(params.Deliveries) > MaxMessageRecipients {
-		return Message{}, ErrInvalidCoordination
+		return Message{}, ErrInvalid
 	}
 	if params.ReplyTo != nil && params.ReplyTo.IsZero() {
-		return Message{}, ErrInvalidCoordination
+		return Message{}, ErrInvalid
 	}
 	deliveries := append([]Delivery(nil), params.Deliveries...)
 	return Message{id: params.MessageID, conversation: params.ConversationID, workspace: params.WorkspaceID,
@@ -250,15 +250,15 @@ func ValidateSendMessage(params SendMessageParams) error {
 		!utf8.ValidString(params.Subject) || len(params.Body) == 0 || len(params.Body) > MaxMessageBodyBytes ||
 		!utf8.ValidString(params.Body) || len(params.Recipients) == 0 || len(params.Recipients) > MaxMessageRecipients ||
 		params.ReplyTo != nil && params.ReplyTo.IsZero() {
-		return ErrInvalidCoordination
+		return ErrInvalid
 	}
 	seen := make(map[domain.ActorID]struct{}, len(params.Recipients))
 	for _, recipient := range params.Recipients {
 		if recipient.actor.IsZero() || recipient.kind != RecipientTo && recipient.kind != RecipientCc && recipient.kind != RecipientBcc {
-			return ErrInvalidCoordination
+			return ErrInvalid
 		}
 		if _, duplicate := seen[recipient.actor]; duplicate {
-			return ErrInvalidCoordination
+			return ErrInvalid
 		}
 		seen[recipient.actor] = struct{}{}
 	}
@@ -277,206 +277,206 @@ func (message Message) SentAt() time.Time                     { return message.s
 func (message Message) Position() uint64                      { return message.position }
 func (message Message) Deliveries() []Delivery                { return append([]Delivery(nil), message.deliveries...) }
 
-type CoordinationPage struct {
+type MessagePage struct {
 	messages []Message
 	next     uint64
 	hasMore  bool
 }
 
-func NewCoordinationPage(messages []Message, next uint64, hasMore bool) (CoordinationPage, error) {
+func NewMessagePage(messages []Message, next uint64, hasMore bool) (MessagePage, error) {
 	if len(messages) > MaxQueryPageSize {
-		return CoordinationPage{}, ErrInvalidCoordination
+		return MessagePage{}, ErrInvalid
 	}
-	return CoordinationPage{messages: append([]Message(nil), messages...), next: next, hasMore: hasMore}, nil
+	return MessagePage{messages: append([]Message(nil), messages...), next: next, hasMore: hasMore}, nil
 }
-func (page CoordinationPage) Messages() []Message { return append([]Message(nil), page.messages...) }
-func (page CoordinationPage) NextCursor() uint64  { return page.next }
-func (page CoordinationPage) HasMore() bool       { return page.hasMore }
+func (page MessagePage) Messages() []Message { return append([]Message(nil), page.messages...) }
+func (page MessagePage) NextCursor() uint64  { return page.next }
+func (page MessagePage) HasMore() bool       { return page.hasMore }
 
-// CoordinationEventCursor is an opaque, authenticated continuation token.
+// EventCursor is an opaque, authenticated continuation token.
 // Callers may persist and return it but must not interpret its contents.
-type CoordinationEventCursor struct{ value string }
+type EventCursor struct{ value string }
 
-func NewCoordinationEventCursor(value string) (CoordinationEventCursor, error) {
+func NewEventCursor(value string) (EventCursor, error) {
 	if !validOpaqueText(value, 1024) {
-		return CoordinationEventCursor{}, ErrInvalidCoordination
+		return EventCursor{}, ErrInvalid
 	}
-	return CoordinationEventCursor{value: value}, nil
+	return EventCursor{value: value}, nil
 }
 
-func (cursor CoordinationEventCursor) String() string { return cursor.value }
-func (cursor CoordinationEventCursor) IsZero() bool   { return cursor.value == "" }
+func (cursor EventCursor) String() string { return cursor.value }
+func (cursor EventCursor) IsZero() bool   { return cursor.value == "" }
 
-type CoordinationEventType string
+type EventType string
 
 const (
-	CoordinationEventMessageAvailable    CoordinationEventType = "message.available"
-	CoordinationEventMessageRead         CoordinationEventType = "message.read"
-	CoordinationEventMessageAcknowledged CoordinationEventType = "message.acknowledged"
-	CoordinationEventLeaseAcquired       CoordinationEventType = "lease.acquired"
-	CoordinationEventLeaseRenewed        CoordinationEventType = "lease.renewed"
-	CoordinationEventLeaseReleased       CoordinationEventType = "lease.released"
+	EventMessageAvailable    EventType = "message.available"
+	EventMessageRead         EventType = "message.read"
+	EventMessageAcknowledged EventType = "message.acknowledged"
+	EventLeaseAcquired       EventType = "lease.acquired"
+	EventLeaseRenewed        EventType = "lease.renewed"
+	EventLeaseReleased       EventType = "lease.released"
 )
 
-func (kind CoordinationEventType) Valid() bool {
+func (kind EventType) Valid() bool {
 	switch kind {
-	case CoordinationEventMessageAvailable, CoordinationEventMessageRead,
-		CoordinationEventMessageAcknowledged, CoordinationEventLeaseAcquired,
-		CoordinationEventLeaseRenewed, CoordinationEventLeaseReleased:
+	case EventMessageAvailable, EventMessageRead,
+		EventMessageAcknowledged, EventLeaseAcquired,
+		EventLeaseRenewed, EventLeaseReleased:
 		return true
 	default:
 		return false
 	}
 }
 
-type CoordinationEvent struct {
+type Event struct {
 	position   uint64
 	workspace  domain.WorkspaceID
 	actor      domain.ActorID
-	eventType  CoordinationEventType
+	eventType  EventType
 	subjectID  string
 	occurredAt time.Time
 	payload    []byte
 }
 
-type CoordinationEventParams struct {
+type EventParams struct {
 	Position   uint64
 	Workspace  domain.WorkspaceID
 	Actor      domain.ActorID
-	EventType  CoordinationEventType
+	EventType  EventType
 	SubjectID  string
 	OccurredAt time.Time
 	Payload    []byte
 }
 
-func NewCoordinationEvent(params CoordinationEventParams) (CoordinationEvent, error) {
+func NewEvent(params EventParams) (Event, error) {
 	if params.Position == 0 || params.Position > MaxCanonicalInteger || params.Workspace.IsZero() ||
 		params.Actor.IsZero() || !params.EventType.Valid() || !validOpaqueText(params.SubjectID, 256) ||
 		params.OccurredAt.IsZero() || !validQueryJSONObject(params.Payload) {
-		return CoordinationEvent{}, ErrInvalidCoordination
+		return Event{}, ErrInvalid
 	}
-	return CoordinationEvent{position: params.Position, workspace: params.Workspace, actor: params.Actor,
+	return Event{position: params.Position, workspace: params.Workspace, actor: params.Actor,
 		eventType: params.EventType, subjectID: params.SubjectID, occurredAt: params.OccurredAt.UTC(),
 		payload: append([]byte(nil), params.Payload...)}, nil
 }
 
-func (event CoordinationEvent) Position() uint64                { return event.position }
-func (event CoordinationEvent) WorkspaceID() domain.WorkspaceID { return event.workspace }
+func (event Event) Position() uint64                { return event.position }
+func (event Event) WorkspaceID() domain.WorkspaceID { return event.workspace }
 
 // ActorID is the actor that caused a recipient- or workspace-visible fact.
 // Legacy actor-visible rows retain their original audience actor.
-func (event CoordinationEvent) ActorID() domain.ActorID          { return event.actor }
-func (event CoordinationEvent) EventType() CoordinationEventType { return event.eventType }
-func (event CoordinationEvent) SubjectID() string                { return event.subjectID }
-func (event CoordinationEvent) OccurredAt() time.Time            { return event.occurredAt }
-func (event CoordinationEvent) Payload() []byte                  { return append([]byte(nil), event.payload...) }
+func (event Event) ActorID() domain.ActorID { return event.actor }
+func (event Event) EventType() EventType    { return event.eventType }
+func (event Event) SubjectID() string       { return event.subjectID }
+func (event Event) OccurredAt() time.Time   { return event.occurredAt }
+func (event Event) Payload() []byte         { return append([]byte(nil), event.payload...) }
 
-type CoordinationConsumerID string
+type ConsumerID string
 
-func NewCoordinationConsumerID(value string) (CoordinationConsumerID, error) {
-	if value == "" || len(value) > MaxCoordinationConsumerIDBytes {
-		return "", ErrInvalidCoordination
+func NewConsumerID(value string) (ConsumerID, error) {
+	if value == "" || len(value) > MaxConsumerIDBytes {
+		return "", ErrInvalid
 	}
 	for _, character := range value {
 		if character > unicode.MaxASCII || !unicode.IsLetter(character) && !unicode.IsDigit(character) && !strings.ContainsRune("._-", character) {
-			return "", ErrInvalidCoordination
+			return "", ErrInvalid
 		}
 	}
-	return CoordinationConsumerID(value), nil
+	return ConsumerID(value), nil
 }
 
-func (id CoordinationConsumerID) String() string { return string(id) }
+func (id ConsumerID) String() string { return string(id) }
 
-// CoordinationEventsQuery uses either an explicit cursor or the committed
+// EventsQuery uses either an explicit cursor or the committed
 // position of one named consumer. The two modes are deliberately exclusive.
-type CoordinationEventsQuery struct {
+type EventsQuery struct {
 	workspace domain.WorkspaceID
 	actor     domain.ActorID
-	after     CoordinationEventCursor
-	consumer  CoordinationConsumerID
+	after     EventCursor
+	consumer  ConsumerID
 	limit     uint16
 }
 
-func NewCoordinationEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
-	after CoordinationEventCursor, limit uint16) (CoordinationEventsQuery, error) {
-	return newCoordinationEventsQuery(workspace, actor, after, "", limit)
+func NewEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
+	after EventCursor, limit uint16) (EventsQuery, error) {
+	return newEventsQuery(workspace, actor, after, "", limit)
 }
 
-func NewCoordinationConsumerEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
-	consumer CoordinationConsumerID, limit uint16) (CoordinationEventsQuery, error) {
-	return newCoordinationEventsQuery(workspace, actor, CoordinationEventCursor{}, consumer, limit)
+func NewConsumerEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID,
+	consumer ConsumerID, limit uint16) (EventsQuery, error) {
+	return newEventsQuery(workspace, actor, EventCursor{}, consumer, limit)
 }
 
-func newCoordinationEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID, after CoordinationEventCursor,
-	consumer CoordinationConsumerID, limit uint16) (CoordinationEventsQuery, error) {
+func newEventsQuery(workspace domain.WorkspaceID, actor domain.ActorID, after EventCursor,
+	consumer ConsumerID, limit uint16) (EventsQuery, error) {
 	if workspace.IsZero() || actor.IsZero() || limit == 0 || limit > MaxQueryPageSize ||
 		(!after.IsZero() && consumer != "") {
-		return CoordinationEventsQuery{}, ErrInvalidCoordination
+		return EventsQuery{}, ErrInvalid
 	}
-	return CoordinationEventsQuery{workspace: workspace, actor: actor, after: after, consumer: consumer, limit: limit}, nil
+	return EventsQuery{workspace: workspace, actor: actor, after: after, consumer: consumer, limit: limit}, nil
 }
 
-func (query CoordinationEventsQuery) WorkspaceID() domain.WorkspaceID      { return query.workspace }
-func (query CoordinationEventsQuery) ActorID() domain.ActorID              { return query.actor }
-func (query CoordinationEventsQuery) AfterCursor() CoordinationEventCursor { return query.after }
-func (query CoordinationEventsQuery) ConsumerID() CoordinationConsumerID   { return query.consumer }
-func (query CoordinationEventsQuery) Limit() uint16                        { return query.limit }
+func (query EventsQuery) WorkspaceID() domain.WorkspaceID { return query.workspace }
+func (query EventsQuery) ActorID() domain.ActorID         { return query.actor }
+func (query EventsQuery) AfterCursor() EventCursor        { return query.after }
+func (query EventsQuery) ConsumerID() ConsumerID          { return query.consumer }
+func (query EventsQuery) Limit() uint16                   { return query.limit }
 
-type CoordinationConsumerCommit struct {
+type ConsumerCommit struct {
 	workspace domain.WorkspaceID
 	actor     domain.ActorID
-	consumer  CoordinationConsumerID
-	cursor    CoordinationEventCursor
+	consumer  ConsumerID
+	cursor    EventCursor
 }
 
-func NewCoordinationConsumerCommit(workspace domain.WorkspaceID, actor domain.ActorID,
-	consumer CoordinationConsumerID, cursor CoordinationEventCursor) (CoordinationConsumerCommit, error) {
+func NewConsumerCommit(workspace domain.WorkspaceID, actor domain.ActorID,
+	consumer ConsumerID, cursor EventCursor) (ConsumerCommit, error) {
 	if workspace.IsZero() || actor.IsZero() || consumer == "" || cursor.IsZero() {
-		return CoordinationConsumerCommit{}, ErrInvalidCoordination
+		return ConsumerCommit{}, ErrInvalid
 	}
-	return CoordinationConsumerCommit{workspace: workspace, actor: actor, consumer: consumer, cursor: cursor}, nil
+	return ConsumerCommit{workspace: workspace, actor: actor, consumer: consumer, cursor: cursor}, nil
 }
 
-func (commit CoordinationConsumerCommit) WorkspaceID() domain.WorkspaceID    { return commit.workspace }
-func (commit CoordinationConsumerCommit) ActorID() domain.ActorID            { return commit.actor }
-func (commit CoordinationConsumerCommit) ConsumerID() CoordinationConsumerID { return commit.consumer }
-func (commit CoordinationConsumerCommit) Cursor() CoordinationEventCursor    { return commit.cursor }
+func (commit ConsumerCommit) WorkspaceID() domain.WorkspaceID { return commit.workspace }
+func (commit ConsumerCommit) ActorID() domain.ActorID         { return commit.actor }
+func (commit ConsumerCommit) ConsumerID() ConsumerID          { return commit.consumer }
+func (commit ConsumerCommit) Cursor() EventCursor             { return commit.cursor }
 
-type CoordinationEventsPage struct {
-	events       []CoordinationEvent
-	eventCursors []CoordinationEventCursor
-	next         CoordinationEventCursor
+type EventsPage struct {
+	events       []Event
+	eventCursors []EventCursor
+	next         EventCursor
 	hasMore      bool
 }
 
-func NewCoordinationEventsPage(events []CoordinationEvent, eventCursors []CoordinationEventCursor,
-	next CoordinationEventCursor, hasMore bool) (CoordinationEventsPage, error) {
+func NewEventsPage(events []Event, eventCursors []EventCursor,
+	next EventCursor, hasMore bool) (EventsPage, error) {
 	if next.IsZero() || len(events) > MaxQueryPageSize || len(events) != len(eventCursors) {
-		return CoordinationEventsPage{}, ErrInvalidCoordination
+		return EventsPage{}, ErrInvalid
 	}
-	cloned := append([]CoordinationEvent(nil), events...)
+	cloned := append([]Event(nil), events...)
 	for index := range cloned {
 		if cloned[index].position == 0 || eventCursors[index].IsZero() || index > 0 && cloned[index-1].position >= cloned[index].position {
-			return CoordinationEventsPage{}, ErrInvalidCoordination
+			return EventsPage{}, ErrInvalid
 		}
 		cloned[index].payload = append([]byte(nil), cloned[index].payload...)
 	}
-	return CoordinationEventsPage{events: cloned, eventCursors: append([]CoordinationEventCursor(nil), eventCursors...),
+	return EventsPage{events: cloned, eventCursors: append([]EventCursor(nil), eventCursors...),
 		next: next, hasMore: hasMore}, nil
 }
 
-func (page CoordinationEventsPage) Events() []CoordinationEvent {
-	result := append([]CoordinationEvent(nil), page.events...)
+func (page EventsPage) Events() []Event {
+	result := append([]Event(nil), page.events...)
 	for index := range result {
 		result[index].payload = append([]byte(nil), result[index].payload...)
 	}
 	return result
 }
-func (page CoordinationEventsPage) EventCursors() []CoordinationEventCursor {
-	return append([]CoordinationEventCursor(nil), page.eventCursors...)
+func (page EventsPage) EventCursors() []EventCursor {
+	return append([]EventCursor(nil), page.eventCursors...)
 }
-func (page CoordinationEventsPage) NextCursor() CoordinationEventCursor { return page.next }
-func (page CoordinationEventsPage) HasMore() bool                       { return page.hasMore }
+func (page EventsPage) NextCursor() EventCursor { return page.next }
+func (page EventsPage) HasMore() bool           { return page.hasMore }
 
 type InboxQuery struct {
 	WorkspaceID domain.WorkspaceID
@@ -525,15 +525,15 @@ type LeaseSelector struct {
 func NewLeaseSelector(kind LeaseSelectorKind, value string) (LeaseSelector, error) {
 	if kind != LeaseSelectorExact && kind != LeaseSelectorSubtree || value == "" || len(value) > MaxLeaseSelectorBytes ||
 		!utf8.ValidString(value) || strings.Contains(value, "\\") || path.IsAbs(value) || !norm.NFC.IsNormalString(value) {
-		return LeaseSelector{}, ErrInvalidCoordination
+		return LeaseSelector{}, ErrInvalid
 	}
 	for _, segment := range strings.Split(value, "/") {
 		if segment == "" || segment == "." || segment == ".." || strings.ContainsRune(segment, 0) {
-			return LeaseSelector{}, ErrInvalidCoordination
+			return LeaseSelector{}, ErrInvalid
 		}
 	}
 	if path.Clean(value) != value {
-		return LeaseSelector{}, ErrInvalidCoordination
+		return LeaseSelector{}, ErrInvalid
 	}
 	return LeaseSelector{kind: kind, value: value}, nil
 }
@@ -597,7 +597,7 @@ func NewLeaseView(params LeaseViewParams) (Lease, error) {
 		params.AuthorityEpoch.IsZero() || params.Mode != LeaseShared && params.Mode != LeaseExclusive ||
 		len(params.Selectors) == 0 || len(params.Selectors) > MaxLeaseSelectors || params.AcquiredAt.IsZero() ||
 		!params.ExpiresAt.After(params.AcquiredAt) {
-		return Lease{}, ErrInvalidCoordination
+		return Lease{}, ErrInvalid
 	}
 	return Lease{id: params.LeaseID, workspace: params.WorkspaceID, holder: params.Holder, holderSession: params.HolderSession,
 		epoch: params.AuthorityEpoch, mode: params.Mode, selectors: append([]LeaseSelector(nil), params.Selectors...),
@@ -608,27 +608,27 @@ func ValidateAcquireLease(params AcquireLeaseParams) error {
 	if params.LeaseID.IsZero() || params.WorkspaceID.IsZero() || params.Holder.IsZero() || params.HolderSession.IsZero() ||
 		params.AuthorityEpoch.IsZero() || params.Mode != LeaseShared && params.Mode != LeaseExclusive ||
 		params.TTL <= 0 || params.TTL > MaxLeaseTTL || len(params.Selectors) == 0 || len(params.Selectors) > MaxLeaseSelectors {
-		return ErrInvalidCoordination
+		return ErrInvalid
 	}
 	total := 0
 	seen := make(map[string]struct{}, len(params.Selectors))
 	for index, selector := range params.Selectors {
 		if selector.value == "" || selector.kind != LeaseSelectorExact && selector.kind != LeaseSelectorSubtree {
-			return ErrInvalidCoordination
+			return ErrInvalid
 		}
 		total += len(selector.Key())
 		if _, duplicate := seen[selector.Key()]; duplicate {
-			return ErrInvalidCoordination
+			return ErrInvalid
 		}
 		seen[selector.Key()] = struct{}{}
 		for prior := 0; prior < index; prior++ {
 			if LeaseSelectorsOverlap(params.Selectors[prior], selector) {
-				return ErrInvalidCoordination
+				return ErrInvalid
 			}
 		}
 	}
 	if total > MaxLeaseSelectorBytes {
-		return ErrInvalidCoordination
+		return ErrInvalid
 	}
 	return nil
 }
@@ -657,22 +657,22 @@ type ChangeLeaseParams struct {
 	TTL            time.Duration
 }
 
-type CoordinationStore interface {
+type Store interface {
 	OpenConversation(context.Context, OpenConversationParams) (Conversation, error)
 	SendMessage(context.Context, SendMessageParams) (Message, error)
-	Inbox(context.Context, InboxQuery) (CoordinationPage, error)
-	Thread(context.Context, ThreadQuery) (CoordinationPage, error)
+	Inbox(context.Context, InboxQuery) (MessagePage, error)
+	Thread(context.Context, ThreadQuery) (MessagePage, error)
 	RecordDeliveryFact(context.Context, RecordDeliveryFactParams) (Delivery, error)
 	AcquireLease(context.Context, AcquireLeaseParams) (Lease, error)
 	RenewLease(context.Context, ChangeLeaseParams) (Lease, error)
 	ReleaseLease(context.Context, ChangeLeaseParams) (Lease, error)
-	SyncCoordinationEvents(context.Context, CoordinationEventsQuery) (CoordinationEventsPage, error)
-	CommitCoordinationConsumer(context.Context, CoordinationConsumerCommit) error
+	SyncCoordinationEvents(context.Context, EventsQuery) (EventsPage, error)
+	CommitCoordinationConsumer(context.Context, ConsumerCommit) error
 }
 
 const (
-	MaxCoordinationKeyBytes  = 4096
-	MaxCoordinationNameBytes = 128
+	MaxKeyBytes  = 4096
+	MaxNameBytes = 128
 )
 
 // WorkReferenceObserver reads provider-owned work without making Blackbird an
@@ -737,10 +737,10 @@ type ActiveAgent struct {
 	LastSeenAt time.Time
 }
 
-// LocalCoordinationStore resolves ergonomic local names and bearer tokens to
+// LocalStore resolves ergonomic local names and bearer tokens to
 // the UUID-level durable coordination contracts above.
-type LocalCoordinationStore interface {
-	CoordinationStore
+type LocalStore interface {
+	Store
 	GetVisibleMessage(context.Context, domain.WorkspaceID, domain.ActorID, domain.MessageID) (Message, error)
 	RegisterLocalAgent(context.Context, string, string, string) (LocalAgentSession, string, error)
 	AuthenticateLocalAgent(context.Context, string) (LocalAgentSession, error)
@@ -760,7 +760,7 @@ type LocalCoordinationStore interface {
 	LocalAgentReservations(context.Context, LocalAgentSession, AdminReservationsQuery) (AdminReservationsPage, error)
 	// AwaitCoordination parks the caller until the path it wants is free, mail
 	// arrives for it, or the budget runs out, and says which. See
-	// CoordinationWaitRequest for why a bounded server-side wait is the only
+	// WaitRequest for why a bounded server-side wait is the only
 	// shape of this that a model on the far side of MCP can actually use.
-	AwaitCoordination(context.Context, LocalAgentSession, CoordinationWaitRequest) (CoordinationWaitResult, error)
+	AwaitCoordination(context.Context, LocalAgentSession, WaitRequest) (WaitResult, error)
 }

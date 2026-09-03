@@ -17,8 +17,8 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -60,8 +60,8 @@ type MetricsObserver interface {
 }
 
 type Dependencies struct {
-	Coordination   coordination.LocalCoordinationStore
-	Observations   application.TelemetryReader
+	Coordination   coordination.LocalStore
+	Observations   telemetry.Reader
 	WorkReferences coordination.WorkReferenceObserver
 	Logger         *slog.Logger
 	Metrics        MetricsObserver
@@ -441,7 +441,7 @@ type invalidCoordinationInputError struct{ message string }
 
 func (failure *invalidCoordinationInputError) Error() string { return failure.message }
 func (failure *invalidCoordinationInputError) Unwrap() error {
-	return coordination.ErrInvalidCoordination
+	return coordination.ErrInvalid
 }
 
 func invalidInput(message string) error { return &invalidCoordinationInputError{message: message} }
@@ -479,7 +479,7 @@ func coordinationFailure(requestID string, err error) coordinationFailureOutput 
 	case errors.As(err, &invalidInputError):
 		failure.Code, failure.Category = string(domain.ErrorCodeInvalidArgument), string(domain.ErrorCategoryValidation)
 		failure.Message, failure.Retryable = invalidInputError.message, false
-	case errors.Is(err, coordination.ErrInvalidCoordination):
+	case errors.Is(err, coordination.ErrInvalid):
 		failure.Code, failure.Category = string(domain.ErrorCodeInvalidArgument), string(domain.ErrorCategoryValidation)
 		failure.Message, failure.Retryable = "coordination request is invalid", false
 	}
@@ -509,14 +509,14 @@ func soonestExpiry(blockers []reservationHolderOutput) int64 {
 	return soonest
 }
 
-func sendLocalMessage(ctx context.Context, store coordination.LocalCoordinationStore, input sendMessageInput) (messageOutput, error) {
+func sendLocalMessage(ctx context.Context, store coordination.LocalStore, input sendMessageInput) (messageOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return messageOutput{}, err
 	}
 	conversation, err := domain.ParseConversationID(input.ConversationID)
 	if err != nil {
-		return messageOutput{}, coordination.ErrInvalidCoordination
+		return messageOutput{}, coordination.ErrInvalid
 	}
 	actors, err := store.ResolveLocalAgentNames(ctx, session, input.To)
 	if err != nil {
@@ -541,7 +541,7 @@ func sendLocalMessage(ctx context.Context, store coordination.LocalCoordinationS
 	if input.ReplyToMessageID != "" {
 		reply, parseErr := domain.ParseMessageID(input.ReplyToMessageID)
 		if parseErr != nil {
-			return messageOutput{}, coordination.ErrInvalidCoordination
+			return messageOutput{}, coordination.ErrInvalid
 		}
 		params.ReplyTo = &reply
 	}
@@ -605,7 +605,7 @@ func elapsedMS(observedAtUS, instantUS int64) int64 {
 	return (observedAtUS - instantUS) / 1000
 }
 
-func coordinationPageOutput(page coordination.CoordinationPage) messagePageOutput {
+func coordinationPageOutput(page coordination.MessagePage) messagePageOutput {
 	messages := page.Messages()
 	result := messagePageOutput{Messages: make([]messageOutput, 0, len(messages)), Next: page.NextCursor(), HasMore: page.HasMore()}
 	for _, message := range messages {
@@ -633,8 +633,8 @@ func localMessageOutput(message coordination.Message) messageOutput {
 
 func boundedWaitTimeout(seconds uint32) time.Duration {
 	requested := time.Duration(seconds) * time.Second
-	if requested <= 0 || requested > coordination.MaxCoordinationWait {
-		return coordination.MaxCoordinationWait
+	if requested <= 0 || requested > coordination.MaxWait {
+		return coordination.MaxWait
 	}
 	return requested
 }
@@ -643,7 +643,7 @@ func boundedWaitTimeout(seconds uint32) time.Duration {
 // evidence is best effort by design: the refusal is already the answer, and a
 // failed follow-up read must not turn a conflict the caller can act on into an
 // internal error it cannot.
-func describeLeaseConflict(ctx context.Context, store coordination.LocalCoordinationStore,
+func describeLeaseConflict(ctx context.Context, store coordination.LocalStore,
 	session coordination.LocalAgentSession, mode coordination.LeaseMode, selectors []coordination.LeaseSelector, cause error) error {
 	if !errors.Is(cause, domain.ErrLeaseConflict) {
 		return cause
@@ -746,13 +746,13 @@ func setTTLSchema(schema *jsonschema.Schema) {
 // back shorter than it asked for. The schema is documentation, not the guard;
 // boundedWaitTimeout is the guard.
 func setWaitTimeoutSchema(schema *jsonschema.Schema) {
-	ceiling := coordination.MaxCoordinationWait.Seconds()
+	ceiling := coordination.MaxWait.Seconds()
 	schema.Default = json.RawMessage(strconv.Itoa(int(ceiling)))
 	schema.Minimum = jsonschema.Ptr(float64(1))
 	schema.Maximum = jsonschema.Ptr(ceiling)
 }
 
-func changeLocalReservation(ctx context.Context, store coordination.LocalCoordinationStore,
+func changeLocalReservation(ctx context.Context, store coordination.LocalStore,
 	input reservationChangeInput) (reservationOutput, error) {
 	if input.Action == "release" && input.TTLSeconds != 0 {
 		return reservationOutput{}, invalidInput("ttl_seconds must be omitted when action is release")

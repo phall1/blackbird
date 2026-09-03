@@ -7,7 +7,7 @@ import (
 	stdhttp "net/http"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -115,14 +115,14 @@ func (handler *localHandler) telemetry(writer stdhttp.ResponseWriter, request *s
 			"request body does not match the telemetry schema")
 		return
 	}
-	if len(input.ModelCalls)+len(input.Spans) > application.MaxTelemetryEventsPerEnvelope {
+	if len(input.ModelCalls)+len(input.Spans) > telemetry.MaxEventsPerEnvelope {
 		writeLocalProblem(writer, stdhttp.StatusUnprocessableEntity, domain.ErrorCodeInvalidArgument,
-			"submit at most "+itoa(application.MaxTelemetryEventsPerEnvelope)+" observations per request")
+			"submit at most "+itoa(telemetry.MaxEventsPerEnvelope)+" observations per request")
 		return
 	}
 
-	envelope := application.TelemetryEnvelope{
-		Attribution: application.TelemetryAttribution{
+	envelope := telemetry.Envelope{
+		Attribution: telemetry.Attribution{
 			ProjectKey: session.ProjectKey,
 			ActorID:    session.ActorID,
 			SessionID:  session.ActorSessionID,

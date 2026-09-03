@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -42,11 +42,11 @@ const (
 // test can assert the drop path without running a drain goroutine, and so that
 // a daemon built without telemetry composes a nil here rather than a stub.
 type TelemetryOffer interface {
-	Offer(application.TelemetryEnvelope) bool
+	Offer(telemetry.Envelope) bool
 }
 
 type LocalDependencies struct {
-	Coordination coordination.LocalCoordinationStore
+	Coordination coordination.LocalStore
 	// Telemetry is optional. A nil sink makes the ingest route answer
 	// DEPENDENCY_UNAVAILABLE instead of disappearing, so an adapter learns that
 	// this daemon does not collect rather than that it does not exist.
@@ -61,7 +61,7 @@ type LocalDependencies struct {
 }
 
 type localHandler struct {
-	coordination  coordination.LocalCoordinationStore
+	coordination  coordination.LocalStore
 	telemetrySink TelemetryOffer
 	logger        *slog.Logger
 	pollInterval  time.Duration
@@ -95,11 +95,11 @@ type localRegisterResponse struct {
 }
 
 type localCoordinationEvent struct {
-	Type       coordination.CoordinationEventType `json:"type"`
-	Subject    string                             `json:"subject"`
-	Payload    json.RawMessage                    `json:"payload"`
-	OccurredAt string                             `json:"occurred_at"`
-	Cursor     string                             `json:"cursor"`
+	Type       coordination.EventType `json:"type"`
+	Subject    string                 `json:"subject"`
+	Payload    json.RawMessage        `json:"payload"`
+	OccurredAt string                 `json:"occurred_at"`
+	Cursor     string                 `json:"cursor"`
 }
 
 type localCoordinationConsumerAck struct {
@@ -400,18 +400,18 @@ func (handler *localHandler) ackEvents(writer stdhttp.ResponseWriter, request *s
 			"request body does not match the coordination consumer acknowledgement schema")
 		return
 	}
-	consumer, err := coordination.NewCoordinationConsumerID(input.ConsumerID)
+	consumer, err := coordination.NewConsumerID(input.ConsumerID)
 	if err != nil {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
 			"consumer_id must contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens")
 		return
 	}
-	cursor, err := coordination.NewCoordinationEventCursor(input.Cursor)
+	cursor, err := coordination.NewEventCursor(input.Cursor)
 	if err != nil {
 		handler.fail(writer, request, "coordination.events.ack", err)
 		return
 	}
-	commit, err := coordination.NewCoordinationConsumerCommit(session.WorkspaceID, session.ActorID, consumer, cursor)
+	commit, err := coordination.NewConsumerCommit(session.WorkspaceID, session.ActorID, consumer, cursor)
 	if err == nil {
 		err = handler.coordination.CommitCoordinationConsumer(request.Context(), commit)
 	}
@@ -538,27 +538,27 @@ func (handler *localHandler) authenticate(writer stdhttp.ResponseWriter, request
 }
 
 func (handler *localHandler) sync(request *stdhttp.Request, session coordination.LocalAgentSession,
-	after, consumerText string, limit uint16) (coordination.CoordinationEventsPage, error) {
-	var cursor coordination.CoordinationEventCursor
+	after, consumerText string, limit uint16) (coordination.EventsPage, error) {
+	var cursor coordination.EventCursor
 	var err error
 	if after != "" {
-		cursor, err = coordination.NewCoordinationEventCursor(after)
+		cursor, err = coordination.NewEventCursor(after)
 		if err != nil {
-			return coordination.CoordinationEventsPage{}, err
+			return coordination.EventsPage{}, err
 		}
 	}
-	var query coordination.CoordinationEventsQuery
+	var query coordination.EventsQuery
 	if consumerText != "" {
-		consumer, consumerErr := coordination.NewCoordinationConsumerID(consumerText)
+		consumer, consumerErr := coordination.NewConsumerID(consumerText)
 		if consumerErr != nil {
-			return coordination.CoordinationEventsPage{}, consumerErr
+			return coordination.EventsPage{}, consumerErr
 		}
-		query, err = coordination.NewCoordinationConsumerEventsQuery(session.WorkspaceID, session.ActorID, consumer, limit)
+		query, err = coordination.NewConsumerEventsQuery(session.WorkspaceID, session.ActorID, consumer, limit)
 	} else {
-		query, err = coordination.NewCoordinationEventsQuery(session.WorkspaceID, session.ActorID, cursor, limit)
+		query, err = coordination.NewEventsQuery(session.WorkspaceID, session.ActorID, cursor, limit)
 	}
 	if err != nil {
-		return coordination.CoordinationEventsPage{}, err
+		return coordination.EventsPage{}, err
 	}
 	return handler.coordination.SyncCoordinationEvents(request.Context(), query)
 }
@@ -577,7 +577,7 @@ func localEventQuery(writer stdhttp.ResponseWriter, values url.Values, allowLimi
 		return "", "", 0, false
 	}
 	if consumer != "" {
-		if _, err := coordination.NewCoordinationConsumerID(consumer); err != nil {
+		if _, err := coordination.NewConsumerID(consumer); err != nil {
 			writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument,
 				"consumer must contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens")
 			return "", "", 0, false
@@ -699,7 +699,7 @@ func writeLocalError(writer stdhttp.ResponseWriter, err error) {
 		writeLocalProblem(writer, statusFor(commandError.Code()), commandError.Code(), commandError.Error())
 		return
 	}
-	if errors.Is(err, coordination.ErrInvalidCoordination) {
+	if errors.Is(err, coordination.ErrInvalid) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "coordination request is invalid")
 		return
 	}

@@ -243,7 +243,7 @@ func TestLocalAdminRejectsInvalidQueryParameters(t *testing.T) {
 			strings.Repeat("x", coordination.MaxLeaseSelectorBytes+1), status: stdhttp.StatusBadRequest},
 		{name: "reservation path", target: PathLocalAdminReservations + "?path=internal%2Fapp.go", status: stdhttp.StatusOK},
 		{name: "oversized project key", target: PathLocalAdminAgents + "?project_key=" +
-			strings.Repeat("x", coordination.MaxCoordinationKeyBytes+1), status: stdhttp.StatusBadRequest},
+			strings.Repeat("x", coordination.MaxKeyBytes+1), status: stdhttp.StatusBadRequest},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -291,7 +291,7 @@ func TestLocalAdminPassesQueriesThroughUnchanged(t *testing.T) {
 		t.Fatalf("events status=%d", response.Code)
 	}
 	if store.eventsQuery != (coordination.AdminEventsQuery{AgentName: "bob",
-		EventType: coordination.CoordinationEventMessageAvailable}) {
+		EventType: coordination.EventMessageAvailable}) {
 		t.Fatalf("events query=%+v", store.eventsQuery)
 	}
 }
@@ -494,7 +494,7 @@ func TestLocalAdminEncodesPopulatedProjections(t *testing.T) {
 		var page localAdminEventsPage
 		decodeAdmin(t, handler, PathLocalAdminEvents, &page)
 		if len(page.Events) != 2 || page.Events[0].Position != 106 ||
-			page.Events[0].Type != string(coordination.CoordinationEventMessageAvailable) ||
+			page.Events[0].Type != string(coordination.EventMessageAvailable) ||
 			string(page.Events[0].Payload) != `{"message_id":"m"}` ||
 			page.Events[0].AgentName != "alice" || page.Events[0].OccurredAt != fixture.observedAt {
 			t.Fatalf("events=%+v", page)
@@ -540,7 +540,7 @@ func TestLocalAdminStoreErrorsBecomeProblemDocuments(t *testing.T) {
 		status int
 		code   domain.ErrorCode
 	}{
-		{name: "invalid coordination", target: PathLocalAdminOverview, err: coordination.ErrInvalidCoordination,
+		{name: "invalid coordination", target: PathLocalAdminOverview, err: coordination.ErrInvalid,
 			status: stdhttp.StatusBadRequest, code: domain.ErrorCodeInvalidArgument},
 		{name: "opaque failure", target: PathLocalAdminEvents, err: errAdminTestOpaque,
 			status: stdhttp.StatusInternalServerError, code: domain.ErrorCodeInternal},
@@ -693,10 +693,10 @@ func newAdminFixture(t *testing.T) adminFixture {
 				ExpiresInMS: -120000}}},
 		events: coordination.AdminEventsPage{ObservedAtUS: observedUS, Events: []coordination.AdminEvent{
 			{Position: 106, ProjectKey: "/repo", WorkspaceID: workspaceID, AgentName: "alice", ActorID: actorID,
-				EventType: coordination.CoordinationEventMessageAvailable, SubjectID: messageID.String(),
+				EventType: coordination.EventMessageAvailable, SubjectID: messageID.String(),
 				Payload: []byte(`{"message_id":"m"}`), OccurredAtUS: observedUS},
 			{Position: 105, ProjectKey: "/repo", WorkspaceID: workspaceID, ActorID: otherActorID,
-				EventType: coordination.CoordinationEventLeaseReleased, SubjectID: leaseID.String(),
+				EventType: coordination.EventLeaseReleased, SubjectID: leaseID.String(),
 				OccurredAtUS: createdUS},
 		}},
 	}

@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
-var _ application.TelemetryStore = (*Store)(nil)
+var _ telemetry.Store = (*Store)(nil)
 
 const (
 	insertModelCallSQL = `INSERT INTO telemetry_model_calls (
@@ -42,7 +42,7 @@ const (
 // Conflicts on (actor, dedupe key) are ignored rather than reported. A duplicate
 // is the expected result of an emitter retrying or re-scanning, not a fault, and
 // the whole point of the index is that the emitter need not know which it did.
-func (store *Store) AppendTelemetry(ctx context.Context, batch []application.TelemetryEnvelope) error {
+func (store *Store) AppendTelemetry(ctx context.Context, batch []telemetry.Envelope) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -67,7 +67,7 @@ func (store *Store) AppendTelemetry(ctx context.Context, batch []application.Tel
 }
 
 func appendEnvelope(ctx context.Context, modelCalls, spans *sql.Stmt,
-	envelope application.TelemetryEnvelope) error {
+	envelope telemetry.Envelope) error {
 	recordedAt := envelope.ReceivedAt
 	if recordedAt.IsZero() {
 		recordedAt = time.Now().UTC()
@@ -117,7 +117,7 @@ func appendEnvelope(ctx context.Context, modelCalls, spans *sql.Stmt,
 // its rows immortal.
 func (store *Store) SweepTelemetry(ctx context.Context, before time.Time) (int64, error) {
 	if before.IsZero() {
-		return 0, fmt.Errorf("%w: telemetry sweep needs a cutoff", coordination.ErrInvalidCoordination)
+		return 0, fmt.Errorf("%w: telemetry sweep needs a cutoff", coordination.ErrInvalid)
 	}
 	cutoff := before.UnixMicro()
 	var deleted int64
@@ -171,7 +171,7 @@ func nullableReasoning(usage domain.TokenUsage) any {
 	return int64(usage.Reasoning)
 }
 
-var _ application.TelemetryReader = (*Store)(nil)
+var _ telemetry.Reader = (*Store)(nil)
 
 // spendShape is the SQL a dimension resolves to. Every field is a literal from
 // the closed dimension set below, never caller text, so the assembled statement
@@ -184,7 +184,7 @@ type spendShape struct {
 	hasToken bool
 }
 
-func spendShapeFor(dimension application.SpendDimension) (spendShape, bool) {
+func spendShapeFor(dimension telemetry.SpendDimension) (spendShape, bool) {
 	// Model-call dimensions rank by tokens because the question is where the
 	// budget went; span dimensions rank by total duration because the question
 	// is where the time went. Each is the obviously right order for its table,
@@ -193,22 +193,22 @@ func spendShapeFor(dimension application.SpendDimension) (spendShape, bool) {
 		SUM(cache_write_tokens) + SUM(output_tokens) DESC`
 	const durationOrder = `COALESCE(SUM(duration_ms), 0) DESC`
 	switch dimension {
-	case application.SpendByModel:
+	case telemetry.SpendByModel:
 		return spendShape{table: "telemetry_model_calls calls", groupBy: "calls.model",
 			orderBy: tokenOrder, hasToken: true}, true
-	case application.SpendByHarness:
+	case telemetry.SpendByHarness:
 		return spendShape{table: "telemetry_model_calls calls", groupBy: "calls.harness",
 			orderBy: tokenOrder, hasToken: true}, true
-	case application.SpendByAgent:
+	case telemetry.SpendByAgent:
 		// LEFT JOIN, and the name coalesces to empty: an agent row can be gone
 		// while its spend remains, and dropping the spend would quietly change
 		// the totals rather than the labels.
 		return spendShape{table: "telemetry_model_calls calls",
 			join:    "LEFT JOIN coordination_agents agents ON agents.actor_id = calls.actor_id",
 			groupBy: "COALESCE(agents.agent_name, '')", orderBy: tokenOrder, hasToken: true}, true
-	case application.SpendBySpanKind:
+	case telemetry.SpendBySpanKind:
 		return spendShape{table: "telemetry_spans calls", groupBy: "calls.kind", orderBy: durationOrder}, true
-	case application.SpendBySpanName:
+	case telemetry.SpendBySpanName:
 		return spendShape{table: "telemetry_spans calls", groupBy: "calls.name", orderBy: durationOrder}, true
 	default:
 		return spendShape{}, false
@@ -239,17 +239,17 @@ const spendDurationColumns = `COUNT(duration_ms), COALESCE(SUM(duration_ms), 0),
 // caller does not get to name a scope: an agent reads its own workspace or
 // nothing, and MineOnly narrows further to the caller itself.
 func (store *Store) SpendReport(ctx context.Context, session coordination.LocalAgentSession,
-	query application.SpendQuery) (application.SpendReport, error) {
+	query telemetry.SpendQuery) (telemetry.SpendReport, error) {
 	if session.ProjectKey == "" || session.ActorID.String() == "" {
-		return application.SpendReport{}, coordination.ErrInvalidCoordination
+		return telemetry.SpendReport{}, coordination.ErrInvalid
 	}
 	if err := query.Validate(); err != nil {
-		return application.SpendReport{}, err
+		return telemetry.SpendReport{}, err
 	}
 	query = query.Normalized(time.Now().UTC())
 	shape, ok := spendShapeFor(query.Dimension)
 	if !ok {
-		return application.SpendReport{}, coordination.ErrInvalidCoordination
+		return telemetry.SpendReport{}, coordination.ErrInvalid
 	}
 
 	filter := "WHERE calls.project_key = ? AND calls.started_at_us >= ?"
@@ -259,15 +259,15 @@ func (store *Store) SpendReport(ctx context.Context, session coordination.LocalA
 		arguments = append(arguments, session.ActorID.String())
 	}
 
-	report := application.SpendReport{Dimension: query.Dimension, Since: query.Since}
+	report := telemetry.SpendReport{Dimension: query.Dimension, Since: query.Since}
 	totals, err := store.spendTotals(ctx, shape, filter, arguments)
 	if err != nil {
-		return application.SpendReport{}, err
+		return telemetry.SpendReport{}, err
 	}
 	report.Totals = totals
 	groups, truncated, err := store.spendGroups(ctx, shape, filter, arguments, query.Limit)
 	if err != nil {
-		return application.SpendReport{}, err
+		return telemetry.SpendReport{}, err
 	}
 	report.Groups = groups
 	report.Truncated = truncated
@@ -278,14 +278,14 @@ func (store *Store) SpendReport(ctx context.Context, session coordination.LocalA
 // truncated report still states honest totals instead of the sum of its visible
 // rows.
 func (store *Store) spendTotals(ctx context.Context, shape spendShape, filter string,
-	arguments []any) (application.SpendGroup, error) {
+	arguments []any) (telemetry.SpendGroup, error) {
 	statement := "SELECT COUNT(*), " + shape.tokenColumns() + ", " + spendDurationColumns +
 		" FROM " + shape.table + " " + shape.join + " " + filter
-	var totals application.SpendGroup
+	var totals telemetry.SpendGroup
 	if err := store.db.QueryRowContext(ctx, statement, arguments...).Scan(&totals.Observations,
 		&totals.UncachedInput, &totals.CacheRead, &totals.CacheWrite, &totals.Output, &totals.Reasoning,
 		&totals.MeasuredDurations, &totals.TotalDurationMS, &totals.MaxDurationMS); err != nil {
-		return application.SpendGroup{}, fmt.Errorf("aggregate telemetry totals: %w", err)
+		return telemetry.SpendGroup{}, fmt.Errorf("aggregate telemetry totals: %w", err)
 	}
 	return totals, nil
 }
@@ -293,7 +293,7 @@ func (store *Store) spendTotals(ctx context.Context, shape spendShape, filter st
 // spendGroups reads one more row than asked for, which is how truncation is
 // detected without a second counting query.
 func (store *Store) spendGroups(ctx context.Context, shape spendShape, filter string,
-	arguments []any, limit uint16) ([]application.SpendGroup, bool, error) {
+	arguments []any, limit uint16) ([]telemetry.SpendGroup, bool, error) {
 	statement := "SELECT " + shape.groupBy + " AS group_key, COUNT(*), " + shape.tokenColumns() + ", " +
 		spendDurationColumns + " FROM " + shape.table + " " + shape.join + " " + filter +
 		" GROUP BY group_key ORDER BY " + shape.orderBy + ", group_key ASC LIMIT ?"
@@ -302,14 +302,14 @@ func (store *Store) spendGroups(ctx context.Context, shape spendShape, filter st
 		return nil, false, fmt.Errorf("group telemetry spend: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	groups := make([]application.SpendGroup, 0, limit)
+	groups := make([]telemetry.SpendGroup, 0, limit)
 	truncated := false
 	for rows.Next() {
 		if len(groups) == int(limit) {
 			truncated = true
 			break
 		}
-		var group application.SpendGroup
+		var group telemetry.SpendGroup
 		if err := rows.Scan(&group.Key, &group.Observations, &group.UncachedInput, &group.CacheRead,
 			&group.CacheWrite, &group.Output, &group.Reasoning, &group.MeasuredDurations,
 			&group.TotalDurationMS, &group.MaxDurationMS); err != nil {

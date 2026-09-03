@@ -415,7 +415,7 @@ func (handler *adminHandler) events(writer stdhttp.ResponseWriter, request *stdh
 	if !ok {
 		return
 	}
-	eventType := coordination.CoordinationEventType(values.Get("type"))
+	eventType := coordination.EventType(values.Get("type"))
 	if eventType != "" && !eventType.Valid() {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "type is not a coordination event type")
 		return
@@ -495,7 +495,7 @@ func localAdminProjectKey(writer stdhttp.ResponseWriter, values url.Values, requ
 		}
 		return "", true
 	}
-	if len(key) > coordination.MaxCoordinationKeyBytes || !utf8.ValidString(key) {
+	if len(key) > coordination.MaxKeyBytes || !utf8.ValidString(key) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "project_key is invalid")
 		return "", false
 	}
@@ -504,7 +504,7 @@ func localAdminProjectKey(writer stdhttp.ResponseWriter, values url.Values, requ
 
 func localAdminAgentName(writer stdhttp.ResponseWriter, values url.Values) (string, bool) {
 	name := values.Get("agent")
-	if len(name) > coordination.MaxCoordinationNameBytes || !utf8.ValidString(name) {
+	if len(name) > coordination.MaxNameBytes || !utf8.ValidString(name) {
 		writeLocalProblem(writer, stdhttp.StatusBadRequest, domain.ErrorCodeInvalidArgument, "agent is invalid")
 		return "", false
 	}

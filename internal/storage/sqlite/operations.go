@@ -200,7 +200,7 @@ func conversationBySlug(ctx context.Context, tx *sql.Tx,
 	openedBy, e3 := domain.ParseActorID(openedByText)
 	openedBySession, e4 := domain.ParseActorSessionID(sessionText)
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-		return coordination.Conversation{}, false, coordination.ErrInvalidCoordination
+		return coordination.Conversation{}, false, coordination.ErrInvalid
 	}
 	stored, err := coordination.NewConversation(coordination.OpenConversationParams{ConversationID: conversationID,
 		WorkspaceID: params.WorkspaceID, RunID: run, OpenedBy: openedBy, OpenedBySession: openedBySession,
@@ -241,7 +241,7 @@ func (store *Store) SendMessage(ctx context.Context, params coordination.SendMes
 				return fmt.Errorf("read SQLite reply target: %w", replyErr)
 			}
 			if replyErr != nil || parentConversation != params.ConversationID.String() {
-				return coordination.ErrInvalidCoordination
+				return coordination.ErrInvalid
 			}
 		}
 		now, err := sqliteNow(ctx, tx)
@@ -266,7 +266,7 @@ func (store *Store) SendMessage(ctx context.Context, params coordination.SendMes
 			return fmt.Errorf("read SQLite message position: %w", err)
 		}
 		if position <= 0 {
-			return coordination.ErrInvalidCoordination
+			return coordination.ErrInvalid
 		}
 		deliveries := make([]coordination.Delivery, 0, len(params.Recipients))
 		recipients := make([]domain.ActorID, 0, len(params.Recipients))
@@ -286,7 +286,7 @@ func (store *Store) SendMessage(ctx context.Context, params coordination.SendMes
 			return payloadErr
 		}
 		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Author,
-			coordination.CoordinationEventMessageAvailable, params.MessageID.String(), now, payload,
+			coordination.EventMessageAvailable, params.MessageID.String(), now, payload,
 			coordinationVisibilityRecipients, recipients); err != nil {
 			return err
 		}
@@ -299,9 +299,9 @@ func (store *Store) SendMessage(ctx context.Context, params coordination.SendMes
 	return result, err
 }
 
-func (store *Store) Inbox(ctx context.Context, query coordination.InboxQuery) (coordination.CoordinationPage, error) {
+func (store *Store) Inbox(ctx context.Context, query coordination.InboxQuery) (coordination.MessagePage, error) {
 	if query.WorkspaceID.IsZero() || query.Recipient.IsZero() || query.Limit == 0 || query.Limit > coordination.MaxQueryPageSize {
-		return coordination.CoordinationPage{}, coordination.ErrInvalidCoordination
+		return coordination.MessagePage{}, coordination.ErrInvalid
 	}
 	return store.loadMessages(ctx, query.WorkspaceID, domain.ConversationID{}, query.Recipient, query.After, query.Limit, true, query.UnreadOnly)
 }
@@ -309,7 +309,7 @@ func (store *Store) Inbox(ctx context.Context, query coordination.InboxQuery) (c
 func (store *Store) GetVisibleMessage(ctx context.Context, workspace domain.WorkspaceID, viewer domain.ActorID,
 	messageID domain.MessageID) (coordination.Message, error) {
 	if workspace.IsZero() || viewer.IsZero() || messageID.IsZero() {
-		return coordination.Message{}, coordination.ErrInvalidCoordination
+		return coordination.Message{}, coordination.ErrInvalid
 	}
 	var conversationText, authorText, subject, body string
 	var reply sql.NullString
@@ -330,7 +330,7 @@ func (store *Store) GetVisibleMessage(ctx context.Context, workspace domain.Work
 	conversation, conversationErr := domain.ParseConversationID(conversationText)
 	author, authorErr := domain.ParseActorID(authorText)
 	if conversationErr != nil || authorErr != nil {
-		return coordination.Message{}, coordination.ErrInvalidCoordination
+		return coordination.Message{}, coordination.ErrInvalid
 	}
 	deliveries, err := loadVisibleDeliveries(ctx, store.db, messageID, author, viewer)
 	if err != nil {
@@ -348,22 +348,22 @@ func (store *Store) GetVisibleMessage(ctx context.Context, workspace domain.Work
 	return coordination.NewMessageView(params)
 }
 
-func (store *Store) Thread(ctx context.Context, query coordination.ThreadQuery) (coordination.CoordinationPage, error) {
+func (store *Store) Thread(ctx context.Context, query coordination.ThreadQuery) (coordination.MessagePage, error) {
 	if query.WorkspaceID.IsZero() || query.ConversationID.IsZero() || query.Viewer.IsZero() || query.Limit == 0 || query.Limit > coordination.MaxQueryPageSize {
-		return coordination.CoordinationPage{}, coordination.ErrInvalidCoordination
+		return coordination.MessagePage{}, coordination.ErrInvalid
 	}
 	return store.loadMessages(ctx, query.WorkspaceID, query.ConversationID, query.Viewer, query.After, query.Limit, false, false)
 }
 
 func (store *Store) loadMessages(ctx context.Context, workspace domain.WorkspaceID, conversation domain.ConversationID,
-	viewer domain.ActorID, after uint64, limit uint16, inbox, unreadOnly bool) (coordination.CoordinationPage, error) {
+	viewer domain.ActorID, after uint64, limit uint16, inbox, unreadOnly bool) (coordination.MessagePage, error) {
 	// The page, its deliveries and the journal head are read from one snapshot.
 	// The cursor advance below is only sound if no message can commit between
 	// reading the page and reading the head, which a read-only transaction
 	// guarantees; SQLite defers its BEGIN, so no writer waits on this.
 	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return coordination.CoordinationPage{}, fmt.Errorf("begin SQLite coordination message read: %w", err)
+		return coordination.MessagePage{}, fmt.Errorf("begin SQLite coordination message read: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	base := `SELECT DISTINCT message.message_id, message.conversation_id, message.author_actor_id, message.subject,
@@ -384,7 +384,7 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 	args = append(args, int(limit)+1)
 	rows, err := tx.QueryContext(ctx, base, args...)
 	if err != nil {
-		return coordination.CoordinationPage{}, fmt.Errorf("query SQLite coordination messages: %w", err)
+		return coordination.MessagePage{}, fmt.Errorf("query SQLite coordination messages: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	type row struct {
@@ -399,7 +399,7 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		var value row
 		if err := rows.Scan(&value.message, &value.conversation, &value.author, &value.subject, &value.body,
 			&value.reply, &value.sent, &value.position); err != nil {
-			return coordination.CoordinationPage{}, err
+			return coordination.MessagePage{}, err
 		}
 		if len(values) == int(limit) {
 			hasMore = true
@@ -408,12 +408,12 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		values = append(values, value)
 	}
 	if err := rows.Err(); err != nil {
-		return coordination.CoordinationPage{}, err
+		return coordination.MessagePage{}, err
 	}
 	// The delivery and head reads below share this transaction's single
 	// connection, so the page statement is finished with first.
 	if err := rows.Close(); err != nil {
-		return coordination.CoordinationPage{}, err
+		return coordination.MessagePage{}, err
 	}
 	result := make([]coordination.Message, 0, len(values))
 	for _, value := range values {
@@ -421,11 +421,11 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		conversationID, e2 := domain.ParseConversationID(value.conversation)
 		author, e3 := domain.ParseActorID(value.author)
 		if e1 != nil || e2 != nil || e3 != nil {
-			return coordination.CoordinationPage{}, coordination.ErrInvalidCoordination
+			return coordination.MessagePage{}, coordination.ErrInvalid
 		}
 		deliveries, err := loadVisibleDeliveries(ctx, tx, messageID, author, viewer)
 		if err != nil {
-			return coordination.CoordinationPage{}, err
+			return coordination.MessagePage{}, err
 		}
 		params := coordination.MessageViewParams{MessageID: messageID, ConversationID: conversationID, WorkspaceID: workspace,
 			Author: author, Subject: value.subject, Body: value.body, SentAt: microsTime(value.sent), Position: value.position,
@@ -433,13 +433,13 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		if value.reply.Valid {
 			id, parseErr := domain.ParseMessageID(value.reply.String)
 			if parseErr != nil {
-				return coordination.CoordinationPage{}, parseErr
+				return coordination.MessagePage{}, parseErr
 			}
 			params.ReplyTo = &id
 		}
 		message, err := coordination.NewMessageView(params)
 		if err != nil {
-			return coordination.CoordinationPage{}, err
+			return coordination.MessagePage{}, err
 		}
 		result = append(result, message)
 	}
@@ -460,13 +460,13 @@ func (store *Store) loadMessages(ctx context.Context, workspace domain.Workspace
 		// rescan every message the workspace has accumulated on every poll.
 		var head uint64
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM messages`).Scan(&head); err != nil {
-			return coordination.CoordinationPage{}, fmt.Errorf("read SQLite coordination message head: %w", err)
+			return coordination.MessagePage{}, fmt.Errorf("read SQLite coordination message head: %w", err)
 		}
 		if head > next {
 			next = head
 		}
 	}
-	return coordination.NewCoordinationPage(result, next, hasMore)
+	return coordination.NewMessagePage(result, next, hasMore)
 }
 
 func loadVisibleDeliveries(ctx context.Context, query coordinationQuery, message domain.MessageID,
@@ -515,13 +515,13 @@ func nullableTime(value sql.NullInt64) *time.Time {
 func (store *Store) RecordDeliveryFact(ctx context.Context, params coordination.RecordDeliveryFactParams) (coordination.Delivery, error) {
 	if params.WorkspaceID.IsZero() || params.MessageID.IsZero() || params.Recipient.IsZero() ||
 		params.Kind != coordination.DeliveryAvailable && params.Kind != coordination.DeliveryRead && params.Kind != coordination.DeliveryAcknowledged {
-		return coordination.Delivery{}, coordination.ErrInvalidCoordination
+		return coordination.Delivery{}, coordination.ErrInvalid
 	}
 	if params.Kind != coordination.DeliveryAvailable && (params.ActorSessionID == nil || params.ActorSessionID.IsZero()) {
-		return coordination.Delivery{}, coordination.ErrInvalidCoordination
+		return coordination.Delivery{}, coordination.ErrInvalid
 	}
 	if params.Kind == coordination.DeliveryAcknowledged && params.MessageDigest.IsZero() {
-		return coordination.Delivery{}, coordination.ErrInvalidCoordination
+		return coordination.Delivery{}, coordination.ErrInvalid
 	}
 	var result coordination.Delivery
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
@@ -725,7 +725,7 @@ func (store *Store) AcquireLease(ctx context.Context, params coordination.Acquir
 			return err
 		}
 		return appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
-			coordination.CoordinationEventLeaseAcquired, params.LeaseID.String(), now, payload,
+			coordination.EventLeaseAcquired, params.LeaseID.String(), now, payload,
 			coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
@@ -771,7 +771,7 @@ func supersedeHeldLeases(ctx context.Context, tx *sql.Tx, params coordination.Ac
 			return err
 		}
 		if err := appendCoordinationEvent(ctx, tx, params.WorkspaceID, params.Holder,
-			coordination.CoordinationEventLeaseReleased, lease, now, payload,
+			coordination.EventLeaseReleased, lease, now, payload,
 			coordinationVisibilityWorkspace, nil); err != nil {
 			return err
 		}
@@ -797,14 +797,14 @@ func sameSelectorSet(left, right []coordination.LeaseSelector) bool {
 
 func (store *Store) RenewLease(ctx context.Context, params coordination.ChangeLeaseParams) (coordination.Lease, error) {
 	if params.TTL <= 0 || params.TTL > coordination.MaxLeaseTTL {
-		return coordination.Lease{}, coordination.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalid
 	}
 	return store.changeLease(ctx, params, false)
 }
 
 func (store *Store) ReleaseLease(ctx context.Context, params coordination.ChangeLeaseParams) (coordination.Lease, error) {
 	if params.TTL != 0 {
-		return coordination.Lease{}, coordination.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalid
 	}
 	return store.changeLease(ctx, params, true)
 }
@@ -812,7 +812,7 @@ func (store *Store) ReleaseLease(ctx context.Context, params coordination.Change
 func (store *Store) changeLease(ctx context.Context, params coordination.ChangeLeaseParams, release bool) (coordination.Lease, error) {
 	if params.WorkspaceID.IsZero() || params.Holder.IsZero() || params.HolderSession.IsZero() ||
 		params.AuthorityEpoch.IsZero() || len(params.Selectors) == 0 || len(params.Selectors) > coordination.MaxLeaseSelectors {
-		return coordination.Lease{}, coordination.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalid
 	}
 	var result coordination.Lease
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
@@ -837,7 +837,7 @@ func (store *Store) changeLease(ctx context.Context, params coordination.ChangeL
 		} else {
 			expires := now.Add(params.TTL)
 			if expires.After(lease.AcquiredAt().Add(coordination.MaxLeaseLifetime)) {
-				return coordination.ErrInvalidCoordination
+				return coordination.ErrInvalid
 			}
 			_, err = tx.ExecContext(ctx, `UPDATE leases SET holder_session_id = ?, expires_at_us = ? WHERE lease_id = ? AND status = 'active'`,
 				params.HolderSession.String(), timeMicros(expires), lease.ID().String())
@@ -853,9 +853,9 @@ func (store *Store) changeLease(ctx context.Context, params coordination.ChangeL
 		if err != nil {
 			return err
 		}
-		eventType := coordination.CoordinationEventLeaseRenewed
+		eventType := coordination.EventLeaseRenewed
 		if release {
-			eventType = coordination.CoordinationEventLeaseReleased
+			eventType = coordination.EventLeaseReleased
 		}
 		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(), eventType,
 			result.ID().String(), now, payload, coordinationVisibilityWorkspace, nil)
@@ -937,7 +937,7 @@ func loadLease(ctx context.Context, query coordinationQuery, id domain.LeaseID) 
 	session, e3 := domain.ParseActorSessionID(sessionText)
 	epoch, e4 := domain.ParseAuthorityEpoch(epochText)
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-		return coordination.Lease{}, coordination.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalid
 	}
 	selectorRows, err := query.QueryContext(ctx, `SELECT selector_kind, selector_path FROM lease_selectors WHERE lease_id = ? ORDER BY selector_ordinal`, id.String())
 	if err != nil {
@@ -1026,7 +1026,7 @@ const (
 )
 
 func appendCoordinationEvent(ctx context.Context, tx *sql.Tx, workspace domain.WorkspaceID, actor domain.ActorID,
-	eventType coordination.CoordinationEventType, subjectID string, occurredAt time.Time, payload []byte,
+	eventType coordination.EventType, subjectID string, occurredAt time.Time, payload []byte,
 	visibility string, recipients []domain.ActorID) error {
 	insert, err := tx.ExecContext(ctx, `INSERT INTO coordination_events(workspace_id, actor_id, event_type,
 		subject_id, occurred_at_us, payload, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)`, workspace.String(), actor.String(),
@@ -1070,39 +1070,39 @@ func leaseCoordinationFields(lease coordination.Lease) map[string]any {
 }
 
 func (store *Store) SyncCoordinationEvents(ctx context.Context,
-	query coordination.CoordinationEventsQuery) (coordination.CoordinationEventsPage, error) {
+	query coordination.EventsQuery) (coordination.EventsPage, error) {
 	if query.WorkspaceID().IsZero() || query.ActorID().IsZero() || query.Limit() == 0 ||
 		query.Limit() > coordination.MaxQueryPageSize {
-		return coordination.CoordinationEventsPage{}, coordination.ErrInvalidCoordination
+		return coordination.EventsPage{}, coordination.ErrInvalid
 	}
 	if err := ctx.Err(); err != nil {
-		return coordination.CoordinationEventsPage{}, err
+		return coordination.EventsPage{}, err
 	}
 	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return coordination.CoordinationEventsPage{}, fmt.Errorf("begin SQLite coordination event sync: %w", err)
+		return coordination.EventsPage{}, fmt.Errorf("begin SQLite coordination event sync: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	after := uint64(0)
 	if !query.AfterCursor().IsZero() {
 		after, err = decodeCoordinationCursor(ctx, tx, query.AfterCursor(), query.WorkspaceID(), query.ActorID())
 		if err != nil {
-			return coordination.CoordinationEventsPage{}, err
+			return coordination.EventsPage{}, err
 		}
 	} else if query.ConsumerID() != "" {
 		err = tx.QueryRowContext(ctx, `SELECT position FROM coordination_event_consumers
 			WHERE workspace_id = ? AND actor_id = ? AND consumer_id = ?`, query.WorkspaceID().String(),
 			query.ActorID().String(), query.ConsumerID().String()).Scan(&after)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return coordination.CoordinationEventsPage{}, fmt.Errorf("read SQLite coordination consumer: %w", err)
+			return coordination.EventsPage{}, fmt.Errorf("read SQLite coordination consumer: %w", err)
 		}
 		if err == nil {
 			retainedFrom, _, boundsErr := coordinationJournalBounds(ctx, tx, query.WorkspaceID())
 			if boundsErr != nil {
-				return coordination.CoordinationEventsPage{}, boundsErr
+				return coordination.EventsPage{}, boundsErr
 			}
 			if after < retainedFrom-1 {
-				return coordination.CoordinationEventsPage{}, coordinationError(domain.ErrorCodeCursorExpired,
+				return coordination.EventsPage{}, coordinationError(domain.ErrorCodeCursorExpired,
 					"coordination consumer position has expired; restart from the retained journal boundary")
 			}
 		}
@@ -1118,11 +1118,11 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		ORDER BY event.position LIMIT ?`, query.WorkspaceID().String(), after, query.ActorID().String(),
 		query.ActorID().String(), int(query.Limit())+1)
 	if err != nil {
-		return coordination.CoordinationEventsPage{}, fmt.Errorf("query SQLite coordination events: %w", err)
+		return coordination.EventsPage{}, fmt.Errorf("query SQLite coordination events: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	events := make([]coordination.CoordinationEvent, 0, query.Limit())
-	eventCursors := make([]coordination.CoordinationEventCursor, 0, query.Limit())
+	events := make([]coordination.Event, 0, query.Limit())
+	eventCursors := make([]coordination.EventCursor, 0, query.Limit())
 	hasMore := false
 	nextPosition := after
 	for rows.Next() {
@@ -1131,7 +1131,7 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		var occurredAt int64
 		var payload []byte
 		if err := rows.Scan(&position, &actorText, &eventType, &subjectID, &occurredAt, &payload); err != nil {
-			return coordination.CoordinationEventsPage{}, err
+			return coordination.EventsPage{}, err
 		}
 		if len(events) == int(query.Limit()) {
 			hasMore = true
@@ -1139,29 +1139,29 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 		}
 		actor, actorErr := domain.ParseActorID(actorText)
 		if actorErr != nil {
-			return coordination.CoordinationEventsPage{}, actorErr
+			return coordination.EventsPage{}, actorErr
 		}
-		event, eventErr := coordination.NewCoordinationEvent(coordination.CoordinationEventParams{Position: position,
-			Workspace: query.WorkspaceID(), Actor: actor, EventType: coordination.CoordinationEventType(eventType),
+		event, eventErr := coordination.NewEvent(coordination.EventParams{Position: position,
+			Workspace: query.WorkspaceID(), Actor: actor, EventType: coordination.EventType(eventType),
 			SubjectID: subjectID, OccurredAt: microsTime(occurredAt), Payload: payload})
 		if eventErr != nil {
-			return coordination.CoordinationEventsPage{}, eventErr
+			return coordination.EventsPage{}, eventErr
 		}
 		cursor, cursorErr := encodeCoordinationCursor(ctx, tx, query.WorkspaceID(), query.ActorID(), position)
 		if cursorErr != nil {
-			return coordination.CoordinationEventsPage{}, cursorErr
+			return coordination.EventsPage{}, cursorErr
 		}
 		events = append(events, event)
 		eventCursors = append(eventCursors, cursor)
 		nextPosition = position
 	}
 	if err := rows.Err(); err != nil {
-		return coordination.CoordinationEventsPage{}, err
+		return coordination.EventsPage{}, err
 	}
 	if !hasMore {
 		_, head, boundsErr := coordinationJournalBounds(ctx, tx, query.WorkspaceID())
 		if boundsErr != nil {
-			return coordination.CoordinationEventsPage{}, boundsErr
+			return coordination.EventsPage{}, boundsErr
 		}
 		if head > nextPosition {
 			nextPosition = head
@@ -1169,17 +1169,17 @@ func (store *Store) SyncCoordinationEvents(ctx context.Context,
 	}
 	next, err := encodeCoordinationCursor(ctx, tx, query.WorkspaceID(), query.ActorID(), nextPosition)
 	if err != nil {
-		return coordination.CoordinationEventsPage{}, err
+		return coordination.EventsPage{}, err
 	}
-	return coordination.NewCoordinationEventsPage(events, eventCursors, next, hasMore)
+	return coordination.NewEventsPage(events, eventCursors, next, hasMore)
 }
 
 // CommitCoordinationConsumer advances one authenticated adapter monotonically.
 // Replaying the same or an older acknowledgement is idempotent and can never
 // move delivery backwards.
-func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit coordination.CoordinationConsumerCommit) error {
+func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit coordination.ConsumerCommit) error {
 	if commit.WorkspaceID().IsZero() || commit.ActorID().IsZero() || commit.ConsumerID() == "" || commit.Cursor().IsZero() {
-		return coordination.ErrInvalidCoordination
+		return coordination.ErrInvalid
 	}
 	return store.withImmediate(ctx, func(tx *sql.Tx) error {
 		position, err := decodeCoordinationCursor(ctx, tx, commit.Cursor(), commit.WorkspaceID(), commit.ActorID())
@@ -1205,23 +1205,23 @@ func (store *Store) CommitCoordinationConsumer(ctx context.Context, commit coord
 
 func encodeCoordinationCursor(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, workspace domain.WorkspaceID, actor domain.ActorID, position uint64) (coordination.CoordinationEventCursor, error) {
+}, workspace domain.WorkspaceID, actor domain.ActorID, position uint64) (coordination.EventCursor, error) {
 	key, err := coordinationCursorKey(ctx, query)
 	if err != nil {
-		return coordination.CoordinationEventCursor{}, err
+		return coordination.EventCursor{}, err
 	}
 	wire := coordinationCursorWire{Workspace: workspace.String(), Actor: actor.String(), Position: position}
 	wire.MAC = coordinationCursorMAC(key, wire)
 	encoded, err := json.Marshal(wire)
 	if err != nil {
-		return coordination.CoordinationEventCursor{}, err
+		return coordination.EventCursor{}, err
 	}
-	return coordination.NewCoordinationEventCursor("bbcc1_" + base64.RawURLEncoding.EncodeToString(encoded))
+	return coordination.NewEventCursor("bbcc1_" + base64.RawURLEncoding.EncodeToString(encoded))
 }
 
 func decodeCoordinationCursor(ctx context.Context, query interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, cursor coordination.CoordinationEventCursor, workspace domain.WorkspaceID, actor domain.ActorID) (uint64, error) {
+}, cursor coordination.EventCursor, workspace domain.WorkspaceID, actor domain.ActorID) (uint64, error) {
 	const prefix = "bbcc1_"
 	encoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(cursor.String(), prefix))
 	var wire coordinationCursorWire
@@ -1275,7 +1275,7 @@ func coordinationCursorKey(ctx context.Context, query interface {
 		return nil, fmt.Errorf("read SQLite coordination cursor key: %w", err)
 	}
 	if len(key) != sha256.Size {
-		return nil, coordination.ErrInvalidCoordination
+		return nil, coordination.ErrInvalid
 	}
 	return key, nil
 }
@@ -1315,9 +1315,9 @@ func requireCurrentLeaseEpoch(ctx context.Context, query interface {
 }
 
 func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentName, registrationToken string) (coordination.LocalAgentSession, string, error) {
-	if !validLocalCoordinationText(projectKey, coordination.MaxCoordinationKeyBytes) ||
-		!validLocalCoordinationText(agentName, coordination.MaxCoordinationNameBytes) {
-		return coordination.LocalAgentSession{}, "", coordination.ErrInvalidCoordination
+	if !validLocalCoordinationText(projectKey, coordination.MaxKeyBytes) ||
+		!validLocalCoordinationText(agentName, coordination.MaxNameBytes) {
+		return coordination.LocalAgentSession{}, "", coordination.ErrInvalid
 	}
 	actorID, err := domain.NewActorID()
 	if err != nil {
@@ -1561,7 +1561,7 @@ func (store *Store) releaseHeartbeat(sessionText string) {
 func (store *Store) LocalAgentSnapshot(ctx context.Context,
 	session coordination.LocalAgentSession) (coordination.LocalAgentSnapshot, error) {
 	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
-		return coordination.LocalAgentSnapshot{}, coordination.ErrInvalidCoordination
+		return coordination.LocalAgentSnapshot{}, coordination.ErrInvalid
 	}
 	var snapshot coordination.LocalAgentSnapshot
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
@@ -1613,7 +1613,7 @@ func localAgentReservations(ctx context.Context, tx *sql.Tx, session coordinatio
 		}
 		leaseID, parseErr := domain.ParseLeaseID(leaseText)
 		if parseErr != nil {
-			return nil, coordination.ErrInvalidCoordination
+			return nil, coordination.ErrInvalid
 		}
 		identifiers = append(identifiers, leaseID)
 	}
@@ -1674,7 +1674,7 @@ func localAgentInbox(ctx context.Context, tx *sql.Tx,
 		message, messageErr := domain.ParseMessageID(messageText)
 		conversation, conversationErr := domain.ParseConversationID(conversationText)
 		if messageErr != nil || conversationErr != nil {
-			return coordination.LocalAgentInbox{}, coordination.ErrInvalidCoordination
+			return coordination.LocalAgentInbox{}, coordination.ErrInvalid
 		}
 		item.MessageID, item.ConversationID = message, conversation
 		inbox.Recent = append(inbox.Recent, item)
@@ -1714,7 +1714,7 @@ func localAgentConversations(ctx context.Context, tx *sql.Tx,
 		}
 		id, parseErr := domain.ParseConversationID(conversationText)
 		if parseErr != nil {
-			return nil, coordination.ErrInvalidCoordination
+			return nil, coordination.ErrInvalid
 		}
 		conversation.ConversationID = id
 		conversations = append(conversations, conversation)
@@ -1747,7 +1747,7 @@ func localAgentPeers(ctx context.Context, tx *sql.Tx, session coordination.Local
 		actor, actorErr := domain.ParseActorID(actorText)
 		peerSession, sessionErr := domain.ParseActorSessionID(sessionText)
 		if actorErr != nil || sessionErr != nil {
-			return nil, coordination.ErrInvalidCoordination
+			return nil, coordination.ErrInvalid
 		}
 		peer.ActorID, peer.SessionID = actor, peerSession
 		peer.StartedAt, peer.LastSeenAt = microsTime(started), microsTime(seen)
@@ -1758,7 +1758,7 @@ func localAgentPeers(ctx context.Context, tx *sql.Tx, session coordination.Local
 
 func (store *Store) ListActiveLocalAgents(ctx context.Context, session coordination.LocalAgentSession) ([]coordination.ActiveAgent, error) {
 	if session.WorkspaceID.IsZero() || session.ProjectKey == "" {
-		return nil, coordination.ErrInvalidCoordination
+		return nil, coordination.ErrInvalid
 	}
 	cutoff := time.Now().UTC().Add(-coordination.LocalAgentActiveWindow)
 	rows, err := store.db.QueryContext(ctx, `SELECT agent.agent_name, agent.actor_id, session.session_id,
@@ -1794,16 +1794,16 @@ func (store *Store) ListActiveLocalAgents(ctx context.Context, session coordinat
 
 func (store *Store) ResolveLocalAgentNames(ctx context.Context, session coordination.LocalAgentSession, names []string) ([]domain.ActorID, error) {
 	if session.ProjectKey == "" || len(names) == 0 || len(names) > coordination.MaxMessageRecipients {
-		return nil, coordination.ErrInvalidCoordination
+		return nil, coordination.ErrInvalid
 	}
 	result := make([]domain.ActorID, 0, len(names))
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		if !validLocalCoordinationText(name, coordination.MaxCoordinationNameBytes) {
-			return nil, coordination.ErrInvalidCoordination
+		if !validLocalCoordinationText(name, coordination.MaxNameBytes) {
+			return nil, coordination.ErrInvalid
 		}
 		if _, duplicate := seen[name]; duplicate {
-			return nil, coordination.ErrInvalidCoordination
+			return nil, coordination.ErrInvalid
 		}
 		seen[name] = struct{}{}
 		var actorText string
@@ -1842,7 +1842,7 @@ func localAgentSession(projectKey, agentName, workspaceText, runText, actorText,
 	session, e4 := domain.ParseActorSessionID(sessionText)
 	epoch, e5 := domain.ParseAuthorityEpoch(epochText)
 	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil {
-		return coordination.LocalAgentSession{}, coordination.ErrInvalidCoordination
+		return coordination.LocalAgentSession{}, coordination.ErrInvalid
 	}
 	return coordination.LocalAgentSession{ProjectKey: projectKey, AgentName: agentName, WorkspaceID: workspace, RunID: run,
 		ActorID: actor, ActorSessionID: session, AuthorityEpoch: epoch, StartedAt: microsTime(started),

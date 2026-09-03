@@ -54,13 +54,13 @@ func TestAwaitCoordinationReturnsWhenTheLeaseIsReleased(t *testing.T) {
 	}()
 
 	started := time.Now()
-	result, err := fixture.store.AwaitCoordination(ctx, fixture.waiter, coordination.CoordinationWaitRequest{
+	result, err := fixture.store.AwaitCoordination(ctx, fixture.waiter, coordination.WaitRequest{
 		Path: "internal/storage/sqlite/sqlite.go", Timeout: 10 * time.Second})
 	<-released
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Reason != coordination.CoordinationWaitPathFree {
+	if result.Reason != coordination.WaitPathFree {
 		t.Fatalf("reason=%q blockers=%+v, want the path reported free", result.Reason, result.Blockers)
 	}
 	if len(result.Blockers) != 0 {
@@ -86,12 +86,12 @@ func TestAwaitCoordinationReportsTheDeadlineWithItsBlockers(t *testing.T) {
 	acquireTestLease(t, fixture.store, fixture.holder, coordination.LeaseExclusive,
 		coordination.LeaseSelectorExact, "internal/storage/sqlite/sqlite.go")
 
-	result, err := fixture.store.AwaitCoordination(ctx, fixture.waiter, coordination.CoordinationWaitRequest{
+	result, err := fixture.store.AwaitCoordination(ctx, fixture.waiter, coordination.WaitRequest{
 		Path: "internal/storage/sqlite/sqlite.go", Timeout: 300 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Reason != coordination.CoordinationWaitDeadline {
+	if result.Reason != coordination.WaitDeadline {
 		t.Fatalf("reason=%q, want the deadline", result.Reason)
 	}
 	if len(result.Blockers) != 1 || result.Blockers[0].HolderAgentName != "holder" ||
@@ -116,17 +116,17 @@ func TestAwaitCoordinationReadsConflictTheWayAcquisitionDoes(t *testing.T) {
 		heldMode   coordination.LeaseMode
 		heldBy     func(waitFixture) coordination.LocalAgentSession
 		wantedMode coordination.LeaseMode
-		wantReason coordination.CoordinationWaitReason
+		wantReason coordination.WaitReason
 	}{
 		{name: "the caller's own lease is not a blocker", heldMode: coordination.LeaseExclusive,
 			heldBy:     func(f waitFixture) coordination.LocalAgentSession { return f.waiter },
-			wantReason: coordination.CoordinationWaitPathFree},
+			wantReason: coordination.WaitPathFree},
 		{name: "a shared reader waits out nobody but a writer", heldMode: coordination.LeaseShared,
 			heldBy:     func(f waitFixture) coordination.LocalAgentSession { return f.holder },
-			wantedMode: coordination.LeaseShared, wantReason: coordination.CoordinationWaitPathFree},
+			wantedMode: coordination.LeaseShared, wantReason: coordination.WaitPathFree},
 		{name: "a shared holder still blocks an exclusive taker", heldMode: coordination.LeaseShared,
 			heldBy:     func(f waitFixture) coordination.LocalAgentSession { return f.holder },
-			wantedMode: coordination.LeaseExclusive, wantReason: coordination.CoordinationWaitDeadline},
+			wantedMode: coordination.LeaseExclusive, wantReason: coordination.WaitDeadline},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -134,7 +134,7 @@ func TestAwaitCoordinationReadsConflictTheWayAcquisitionDoes(t *testing.T) {
 			acquireTestLease(t, fixture.store, testCase.heldBy(fixture), testCase.heldMode,
 				coordination.LeaseSelectorExact, "internal/storage/sqlite/sqlite.go")
 			result, err := fixture.store.AwaitCoordination(ctx, fixture.waiter,
-				coordination.CoordinationWaitRequest{Path: "internal/storage/sqlite/sqlite.go",
+				coordination.WaitRequest{Path: "internal/storage/sqlite/sqlite.go",
 					Mode: testCase.wantedMode, Timeout: 300 * time.Millisecond})
 			if err != nil {
 				t.Fatal(err)
@@ -158,11 +158,11 @@ func TestAwaitCoordinationWakesOnNewMail(t *testing.T) {
 	// Mail that predates the wait must not end it, or an agent with a backlog
 	// can never wait for anything again.
 	stale, err := fixture.store.AwaitCoordination(ctx, fixture.waiter,
-		coordination.CoordinationWaitRequest{AwaitMail: true, Timeout: 300 * time.Millisecond})
+		coordination.WaitRequest{AwaitMail: true, Timeout: 300 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stale.Reason != coordination.CoordinationWaitDeadline || stale.PendingDeliveries != 1 {
+	if stale.Reason != coordination.WaitDeadline || stale.PendingDeliveries != 1 {
 		t.Fatalf("result=%+v, want the deadline with the backlog reported", stale)
 	}
 
@@ -173,12 +173,12 @@ func TestAwaitCoordinationWakesOnNewMail(t *testing.T) {
 		seedSnapshotMail(t, fixture.store, fixture.holder, fixture.waiter)
 	}()
 	result, err := fixture.store.AwaitCoordination(ctx, fixture.waiter,
-		coordination.CoordinationWaitRequest{AwaitMail: true, Timeout: 10 * time.Second})
+		coordination.WaitRequest{AwaitMail: true, Timeout: 10 * time.Second})
 	<-sent
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Reason != coordination.CoordinationWaitMailArrived || result.PendingDeliveries != 2 {
+	if result.Reason != coordination.WaitMailArrived || result.PendingDeliveries != 2 {
 		t.Fatalf("result=%+v, want a mail wakeup carrying the pending count", result)
 	}
 }
@@ -192,12 +192,12 @@ func TestBoundedWaitBudgetIsCappedServerSide(t *testing.T) {
 		requested time.Duration
 		want      time.Duration
 	}{
-		{0, coordination.MaxCoordinationWait},
-		{-time.Second, coordination.MaxCoordinationWait},
-		{coordination.MaxCoordinationWait + time.Second, coordination.MaxCoordinationWait},
-		{time.Hour, coordination.MaxCoordinationWait},
+		{0, coordination.MaxWait},
+		{-time.Second, coordination.MaxWait},
+		{coordination.MaxWait + time.Second, coordination.MaxWait},
+		{time.Hour, coordination.MaxWait},
 		{5 * time.Second, 5 * time.Second},
-		{coordination.MaxCoordinationWait, coordination.MaxCoordinationWait},
+		{coordination.MaxWait, coordination.MaxWait},
 	} {
 		if got := boundedWaitBudget(testCase.requested); got != testCase.want {
 			t.Fatalf("budget for %v = %v, want %v", testCase.requested, got, testCase.want)
@@ -212,16 +212,16 @@ func TestAwaitCoordinationRejectsRequestsItCannotServe(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string
 		session coordination.LocalAgentSession
-		request coordination.CoordinationWaitRequest
+		request coordination.WaitRequest
 	}{
-		{"no session", coordination.LocalAgentSession{}, coordination.CoordinationWaitRequest{AwaitMail: true}},
+		{"no session", coordination.LocalAgentSession{}, coordination.WaitRequest{AwaitMail: true}},
 		// A request naming neither condition can only ever sleep out its budget.
-		{"no condition", fixture.waiter, coordination.CoordinationWaitRequest{}},
-		{"unusable path", fixture.waiter, coordination.CoordinationWaitRequest{Path: " leading-space"}},
-		{"unknown mode", fixture.waiter, coordination.CoordinationWaitRequest{Path: "a/b.go", Mode: "sideways"}},
+		{"no condition", fixture.waiter, coordination.WaitRequest{}},
+		{"unusable path", fixture.waiter, coordination.WaitRequest{Path: " leading-space"}},
+		{"unknown mode", fixture.waiter, coordination.WaitRequest{Path: "a/b.go", Mode: "sideways"}},
 	} {
 		_, err := fixture.store.AwaitCoordination(ctx, testCase.session, testCase.request)
-		if !errors.Is(err, coordination.ErrInvalidCoordination) {
+		if !errors.Is(err, coordination.ErrInvalid) {
 			t.Fatalf("%s error=%v, want an invalid coordination rejection", testCase.name, err)
 		}
 	}
@@ -240,7 +240,7 @@ func TestAwaitCoordinationReportsCancellationAsCancellation(t *testing.T) {
 		cancel()
 	}()
 	defer cancel()
-	_, err := fixture.store.AwaitCoordination(ctx, fixture.waiter, coordination.CoordinationWaitRequest{
+	_, err := fixture.store.AwaitCoordination(ctx, fixture.waiter, coordination.WaitRequest{
 		Path: "internal/storage/sqlite/sqlite.go", Timeout: 10 * time.Second})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want a cancellation", err)
@@ -279,8 +279,8 @@ func TestAwaitCoordinationHoldsNoConnectionWhileItWaits(t *testing.T) {
 		go func() {
 			parked <- struct{}{}
 			_, err := fixture.store.AwaitCoordination(ctx, fixture.waiter,
-				coordination.CoordinationWaitRequest{Path: "internal/storage/sqlite/sqlite.go",
-					Timeout: coordination.MaxCoordinationWait})
+				coordination.WaitRequest{Path: "internal/storage/sqlite/sqlite.go",
+					Timeout: coordination.MaxWait})
 			done <- err
 		}()
 	}
@@ -289,7 +289,7 @@ func TestAwaitCoordinationHoldsNoConnectionWhileItWaits(t *testing.T) {
 	}
 	// Let every waiter get past its first poll and into the sleep that
 	// dominates its life.
-	time.Sleep(2 * coordination.CoordinationWaitPoll)
+	time.Sleep(2 * coordination.WaitPoll)
 
 	// An unrelated reader must not be queued behind the parked waiters.
 	readStarted := time.Now()

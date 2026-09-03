@@ -26,7 +26,7 @@ not by care:
   daemon.
 
 Read the counters with `blackbird status`; they are in
-`application.TelemetrySinkStats`.
+`telemetry.SinkStats`.
 
 ## The token classes are disjoint
 

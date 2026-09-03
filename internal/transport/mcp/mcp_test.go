@@ -473,7 +473,7 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 
 	blocked := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 1})
-	if blocked.Reason != string(coordination.CoordinationWaitDeadline) || len(blocked.Blockers) != 1 ||
+	if blocked.Reason != string(coordination.WaitDeadline) || len(blocked.Blockers) != 1 ||
 		blocked.Blockers[0].HolderAgentName != "alice" {
 		t.Fatalf("wait on a held path = %+v", blocked)
 	}
@@ -483,7 +483,7 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 		"agent_token": alice, "selectors": held.Selectors})
 	freed := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, Path: "src/main.go", TimeoutSeconds: 30})
-	if freed.Reason != string(coordination.CoordinationWaitPathFree) || len(freed.Blockers) != 0 {
+	if freed.Reason != string(coordination.WaitPathFree) || len(freed.Blockers) != 0 {
 		t.Fatalf("wait on a freed path = %+v", freed)
 	}
 	// A shared reader waits only for exclusive writers, and never for itself.
@@ -492,14 +492,14 @@ func TestWaitReportsWhichConditionEndedIt(t *testing.T) {
 		Selectors: []reservationSelectorInput{{Kind: "exact", Path: "src/main.go"}}})
 	shared := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: alice, Path: "src/main.go", Mode: "shared", TimeoutSeconds: 30})
-	if shared.Reason != string(coordination.CoordinationWaitPathFree) {
+	if shared.Reason != string(coordination.WaitPathFree) {
 		t.Fatalf("shared wait behind a shared reader = %+v", shared)
 	}
 	// await_mail alone is a valid wait: reaching the deadline rather than an
 	// argument failure is what proves the flag arrived at the store.
 	mail := callCoord[coordinationWaitOutput](t, client, ToolWait, coordinationWaitInput{
 		AgentToken: bob, AwaitMail: true, TimeoutSeconds: 1})
-	if mail.Reason != string(coordination.CoordinationWaitDeadline) || mail.WaitedMS <= 0 {
+	if mail.Reason != string(coordination.WaitDeadline) || mail.WaitedMS <= 0 {
 		t.Fatalf("mail wait = %+v", mail)
 	}
 	neither := callCoordFailure(t, client, ToolWait, coordinationWaitInput{AgentToken: bob, TimeoutSeconds: 1})
@@ -521,11 +521,11 @@ func TestBoundedWaitTimeoutClampsWhateverTheCallerAsksFor(t *testing.T) {
 		seconds  uint32
 		expected time.Duration
 	}{
-		{name: "unset asks for the ceiling", seconds: 0, expected: coordination.MaxCoordinationWait},
+		{name: "unset asks for the ceiling", seconds: 0, expected: coordination.MaxWait},
 		{name: "within the ceiling is honoured", seconds: 5, expected: 5 * time.Second},
-		{name: "at the ceiling is honoured", seconds: uint32(coordination.MaxCoordinationWait / time.Second),
-			expected: coordination.MaxCoordinationWait},
-		{name: "beyond the ceiling is clamped", seconds: 86400, expected: coordination.MaxCoordinationWait},
+		{name: "at the ceiling is honoured", seconds: uint32(coordination.MaxWait / time.Second),
+			expected: coordination.MaxWait},
+		{name: "beyond the ceiling is clamped", seconds: 86400, expected: coordination.MaxWait},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -667,7 +667,7 @@ func TestDescribeLeaseConflictUsesRequestedMode(t *testing.T) {
 }
 
 type leaseConflictQueryStore struct {
-	coordination.LocalCoordinationStore
+	coordination.LocalStore
 	query coordination.AdminReservationsQuery
 	err   error
 }
@@ -949,7 +949,7 @@ func assertCoordinationToolSchemas(t *testing.T, session *sdkmcp.ClientSession) 
 	if err := json.Unmarshal(waitSchema, &waitDecoded); err != nil {
 		t.Fatalf("decode wait schema: %v", err)
 	}
-	ceiling := coordination.MaxCoordinationWait.Seconds()
+	ceiling := coordination.MaxWait.Seconds()
 	if maximum := waitDecoded.Properties.TimeoutSeconds.Maximum; maximum == nil || *maximum != ceiling {
 		t.Errorf("wait timeout maximum = %v, want the daemon ceiling %v", maximum, ceiling)
 	}
@@ -1044,7 +1044,7 @@ func (testWorkReferenceObserver) ObserveWorkReference(
 	}, nil
 }
 
-func newTestServer(t *testing.T, store coordination.LocalCoordinationStore) *Server {
+func newTestServer(t *testing.T, store coordination.LocalStore) *Server {
 	t.Helper()
 	server, err := NewServer(Dependencies{Coordination: store, WorkReferences: testWorkReferenceObserver{}})
 	if err != nil {

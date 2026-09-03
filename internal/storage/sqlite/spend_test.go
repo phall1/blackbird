@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -31,24 +31,24 @@ func spendSession(t *testing.T, store *Store, project, agent string) coordinatio
 func appendFor(t *testing.T, store *Store, session coordination.LocalAgentSession,
 	calls []domain.ModelCall, spans []domain.Span) {
 	t.Helper()
-	envelope := application.TelemetryEnvelope{
-		Attribution: application.TelemetryAttribution{
+	envelope := telemetry.Envelope{
+		Attribution: telemetry.Attribution{
 			ProjectKey: session.ProjectKey, ActorID: session.ActorID, SessionID: session.ActorSessionID,
 		},
 		ModelCalls: calls, Spans: spans, ReceivedAt: time.Now().UTC(),
 	}
-	if err := store.AppendTelemetry(context.Background(), []application.TelemetryEnvelope{envelope}); err != nil {
+	if err := store.AppendTelemetry(context.Background(), []telemetry.Envelope{envelope}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func groupByKey(report application.SpendReport, key string) (application.SpendGroup, bool) {
+func groupByKey(report telemetry.SpendReport, key string) (telemetry.SpendGroup, bool) {
 	for _, group := range report.Groups {
 		if group.Key == key {
 			return group, true
 		}
 	}
-	return application.SpendGroup{}, false
+	return telemetry.SpendGroup{}, false
 }
 
 func TestSpendReportGroupsByModelAndRanksBySpend(t *testing.T) {
@@ -66,7 +66,7 @@ func TestSpendReportGroupsByModelAndRanksBySpend(t *testing.T) {
 			domain.TokenUsage{UncachedInput: 1, CacheRead: 2, CacheWrite: 0, Output: 3}, now, time.Second, true),
 	}, nil)
 
-	report, err := store.SpendReport(ctx, session, application.SpendQuery{Dimension: application.SpendByModel})
+	report, err := store.SpendReport(ctx, session, telemetry.SpendQuery{Dimension: telemetry.SpendByModel})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestSpendReportCountsOnlyMeasuredDurations(t *testing.T) {
 			now, 4*time.Second, true),
 	}, nil)
 
-	report, err := store.SpendReport(ctx, session, application.SpendQuery{Dimension: application.SpendByModel})
+	report, err := store.SpendReport(ctx, session, telemetry.SpendQuery{Dimension: telemetry.SpendByModel})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestSpendReportIsScopedToTheCallersProject(t *testing.T) {
 		spendCall("theirs", "m", domain.HarnessPi, domain.TokenUsage{Output: 900}, now, 0, false),
 	}, nil)
 
-	report, err := store.SpendReport(ctx, mine, application.SpendQuery{Dimension: application.SpendByModel})
+	report, err := store.SpendReport(ctx, mine, telemetry.SpendQuery{Dimension: telemetry.SpendByModel})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestSpendReportMineOnlyNarrowsToTheCaller(t *testing.T) {
 		spendCall("b", "m", domain.HarnessPi, domain.TokenUsage{Output: 90}, now, 0, false),
 	}, nil)
 
-	whole, err := store.SpendReport(ctx, alice, application.SpendQuery{Dimension: application.SpendByModel})
+	whole, err := store.SpendReport(ctx, alice, telemetry.SpendQuery{Dimension: telemetry.SpendByModel})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestSpendReportMineOnlyNarrowsToTheCaller(t *testing.T) {
 		t.Fatalf("project output=%d, want both agents", whole.Totals.Output)
 	}
 	own, err := store.SpendReport(ctx, alice,
-		application.SpendQuery{Dimension: application.SpendByModel, MineOnly: true})
+		telemetry.SpendQuery{Dimension: telemetry.SpendByModel, MineOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestSpendReportGroupsByAgentName(t *testing.T) {
 		spendCall("b", "m", domain.HarnessPi, domain.TokenUsage{Output: 90}, now, 0, false),
 	}, nil)
 
-	report, err := store.SpendReport(ctx, alice, application.SpendQuery{Dimension: application.SpendByAgent})
+	report, err := store.SpendReport(ctx, alice, telemetry.SpendQuery{Dimension: telemetry.SpendByAgent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestSpendReportGroupsSpansByTotalDuration(t *testing.T) {
 		span("s3", "go build", 3*time.Second),
 	})
 
-	report, err := store.SpendReport(ctx, session, application.SpendQuery{Dimension: application.SpendBySpanName})
+	report, err := store.SpendReport(ctx, session, telemetry.SpendQuery{Dimension: telemetry.SpendBySpanName})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,15 +254,15 @@ func TestSpendReportWindowExcludesOlderWork(t *testing.T) {
 		spendCall("old", "m", domain.HarnessPi, domain.TokenUsage{Output: 500}, now.Add(-72*time.Hour), 0, false),
 	}, nil)
 
-	report, err := store.SpendReport(ctx, session, application.SpendQuery{Dimension: application.SpendByModel})
+	report, err := store.SpendReport(ctx, session, telemetry.SpendQuery{Dimension: telemetry.SpendByModel})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if report.Totals.Output != 5 {
 		t.Fatalf("default window output=%d, want only the last day", report.Totals.Output)
 	}
-	wide, err := store.SpendReport(ctx, session, application.SpendQuery{
-		Dimension: application.SpendByModel, Since: now.Add(-96 * time.Hour),
+	wide, err := store.SpendReport(ctx, session, telemetry.SpendQuery{
+		Dimension: telemetry.SpendByModel, Since: now.Add(-96 * time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +289,7 @@ func TestSpendReportReportsTruncationWithHonestTotals(t *testing.T) {
 	appendFor(t, store, session, calls, nil)
 
 	report, err := store.SpendReport(ctx, session,
-		application.SpendQuery{Dimension: application.SpendByModel, Limit: 2})
+		telemetry.SpendQuery{Dimension: telemetry.SpendByModel, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestSpendReportRejectsAnUnknownDimension(t *testing.T) {
 	store := newCoordinationStore(t)
 	session := spendSession(t, store, "/workspace/bad", "alice")
 	if _, err := store.SpendReport(context.Background(), session,
-		application.SpendQuery{Dimension: "vibes"}); err == nil {
+		telemetry.SpendQuery{Dimension: "vibes"}); err == nil {
 		t.Fatal("an unknown dimension must be rejected rather than silently defaulted")
 	}
 }
@@ -316,7 +316,7 @@ func TestSpendReportIsEmptyRatherThanFailingWithNoData(t *testing.T) {
 	store := newCoordinationStore(t)
 	session := spendSession(t, store, "/workspace/empty", "alice")
 	report, err := store.SpendReport(context.Background(), session,
-		application.SpendQuery{Dimension: application.SpendByHarness})
+		telemetry.SpendQuery{Dimension: telemetry.SpendByHarness})
 	if err != nil {
 		t.Fatal(err)
 	}

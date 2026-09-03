@@ -157,8 +157,8 @@ type heartbeatLedger struct {
 	flushed map[string]time.Time
 }
 
-var _ coordination.CoordinationStore = (*Store)(nil)
-var _ coordination.LocalCoordinationStore = (*Store)(nil)
+var _ coordination.Store = (*Store)(nil)
+var _ coordination.LocalStore = (*Store)(nil)
 
 type writeArbiter struct {
 	sync.Mutex

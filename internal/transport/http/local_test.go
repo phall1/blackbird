@@ -106,7 +106,7 @@ func TestLocalHTTPRegistrationSSEWakeAndCatchUp(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != stdhttp.StatusOK || len(page.Events) != 1 || page.Events[0].Type != coordination.CoordinationEventMessageAvailable ||
+	if response.StatusCode != stdhttp.StatusOK || len(page.Events) != 1 || page.Events[0].Type != coordination.EventMessageAvailable ||
 		page.Events[0].Subject != messageID.String() || page.NextCursor != wakeup.Cursor || page.Events[0].Cursor != page.NextCursor {
 		t.Fatalf("catch-up response=%d page=%+v wakeup=%+v", response.StatusCode, page, wakeup)
 	}
@@ -334,7 +334,7 @@ type localHTTPAgent struct {
 	session  coordination.LocalAgentSession
 }
 
-func registerLocalHTTPAgentSession(t *testing.T, store coordination.LocalCoordinationStore, handler stdhttp.Handler,
+func registerLocalHTTPAgentSession(t *testing.T, store coordination.LocalStore, handler stdhttp.Handler,
 	project, agent string) localHTTPAgent {
 	t.Helper()
 	body, _ := json.Marshal(localRegisterRequest{ProjectKey: project, AgentName: agent})

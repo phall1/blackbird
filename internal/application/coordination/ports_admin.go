@@ -60,7 +60,7 @@ func AdminPageLimit(limit uint16) (uint16, error) {
 	case limit == 0:
 		return AdminDefaultPageSize, nil
 	case limit > MaxQueryPageSize:
-		return 0, ErrInvalidCoordination
+		return 0, ErrInvalid
 	default:
 		return limit, nil
 	}
@@ -326,7 +326,7 @@ type AdminConversationsPage struct {
 type AdminEventsQuery struct {
 	ProjectKey string
 	AgentName  string
-	EventType  CoordinationEventType
+	EventType  EventType
 	Limit      uint16
 }
 
@@ -339,7 +339,7 @@ type AdminEvent struct {
 	WorkspaceID  domain.WorkspaceID
 	AgentName    string
 	ActorID      domain.ActorID
-	EventType    CoordinationEventType
+	EventType    EventType
 	SubjectID    string
 	Payload      []byte
 	OccurredAtUS int64

@@ -324,11 +324,11 @@ func BenchmarkAwaitCoordination(b *testing.B) {
 
 	for _, variant := range []struct {
 		name    string
-		request coordination.CoordinationWaitRequest
+		request coordination.WaitRequest
 	}{
-		{"blocked-path", coordination.CoordinationWaitRequest{Path: "internal/storage/sqlite/sqlite.go"}},
-		{"free-path", coordination.CoordinationWaitRequest{Path: "internal/transport/mcp/mcp.go"}},
-		{"mail", coordination.CoordinationWaitRequest{AwaitMail: true}},
+		{"blocked-path", coordination.WaitRequest{Path: "internal/storage/sqlite/sqlite.go"}},
+		{"free-path", coordination.WaitRequest{Path: "internal/transport/mcp/mcp.go"}},
+		{"mail", coordination.WaitRequest{AwaitMail: true}},
 	} {
 		b.Run(variant.name, func(b *testing.B) {
 			b.ReportAllocs()

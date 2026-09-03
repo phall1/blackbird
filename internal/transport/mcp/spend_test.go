@@ -9,7 +9,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
@@ -87,8 +87,8 @@ func TestSpendToolReportsTokensAndDefaultsToModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{{
-		Attribution: application.TelemetryAttribution{
+	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{{
+		Attribution: telemetry.Attribution{
 			ProjectKey: session.ProjectKey, ActorID: session.ActorID, SessionID: session.ActorSessionID,
 		},
 		ModelCalls: []domain.ModelCall{{
@@ -111,7 +111,7 @@ func TestSpendToolReportsTokensAndDefaultsToModel(t *testing.T) {
 	defer closeMCP()
 
 	report := callSpend(t, client, map[string]any{"agent_token": token})
-	if report.Dimension != string(application.SpendByModel) {
+	if report.Dimension != string(telemetry.SpendByModel) {
 		t.Fatalf("dimension=%q, want the model default", report.Dimension)
 	}
 	if len(report.Groups) != 1 || report.Groups[0].Key != "claude-opus-5" {

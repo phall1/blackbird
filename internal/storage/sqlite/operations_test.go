@@ -195,13 +195,13 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 			t.Fatal(err)
 		}
 	}
-	query, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, coordination.CoordinationEventCursor{}, 1)
+	query, _ := coordination.NewEventsQuery(workspace, recipient, coordination.EventCursor{}, 1)
 	first, err := store.SyncCoordinationEvents(context.Background(), query)
 	if err != nil || len(first.Events()) != 1 || !first.HasMore() || first.NextCursor().IsZero() ||
-		first.Events()[0].EventType() != coordination.CoordinationEventMessageAvailable || first.Events()[0].ActorID() != author {
+		first.Events()[0].EventType() != coordination.EventMessageAvailable || first.Events()[0].ActorID() != author {
 		t.Fatalf("first coordination page=%+v error=%v", first, err)
 	}
-	continued, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
+	continued, _ := coordination.NewEventsQuery(workspace, recipient, first.NextCursor(), 1)
 	second, err := store.SyncCoordinationEvents(context.Background(), continued)
 	if err != nil || len(second.Events()) != 1 || second.HasMore() || second.Events()[0].Position() <= first.Events()[0].Position() {
 		t.Fatalf("second coordination page=%+v error=%v", second, err)
@@ -209,13 +209,13 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if len(first.EventCursors()) != 1 || first.EventCursors()[0].IsZero() || len(second.EventCursors()) != 1 {
 		t.Fatalf("event cursors first=%+v second=%+v", first.EventCursors(), second.EventCursors())
 	}
-	consumer, _ := coordination.NewCoordinationConsumerID("pi-extension")
-	consumerQuery, _ := coordination.NewCoordinationConsumerEventsQuery(workspace, recipient, consumer, 1)
+	consumer, _ := coordination.NewConsumerID("pi-extension")
+	consumerQuery, _ := coordination.NewConsumerEventsQuery(workspace, recipient, consumer, 1)
 	consumerFirst, err := store.SyncCoordinationEvents(context.Background(), consumerQuery)
 	if err != nil || len(consumerFirst.Events()) != 1 || consumerFirst.Events()[0].Position() != first.Events()[0].Position() {
 		t.Fatalf("initial consumer page=%+v error=%v", consumerFirst, err)
 	}
-	commit, _ := coordination.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
+	commit, _ := coordination.NewConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
@@ -223,12 +223,12 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if err != nil || len(consumerSecond.Events()) != 1 || consumerSecond.Events()[0].Position() != second.Events()[0].Position() {
 		t.Fatalf("advanced consumer page=%+v error=%v", consumerSecond, err)
 	}
-	commit, _ = coordination.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerSecond.EventCursors()[0])
+	commit, _ = coordination.NewConsumerCommit(workspace, recipient, consumer, consumerSecond.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), commit); err != nil {
 		t.Fatal(err)
 	}
 	// A delayed duplicate acknowledgement cannot move the consumer backwards.
-	stale, _ := coordination.NewCoordinationConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
+	stale, _ := coordination.NewConsumerCommit(workspace, recipient, consumer, consumerFirst.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), stale); err != nil {
 		t.Fatal(err)
 	}
@@ -236,27 +236,27 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 	if err != nil || len(drained.Events()) != 0 {
 		t.Fatalf("drained consumer page=%+v error=%v", drained, err)
 	}
-	independent, _ := coordination.NewCoordinationConsumerID("opencode")
-	independentQuery, _ := coordination.NewCoordinationConsumerEventsQuery(workspace, recipient, independent, 1)
+	independent, _ := coordination.NewConsumerID("opencode")
+	independentQuery, _ := coordination.NewConsumerEventsQuery(workspace, recipient, independent, 1)
 	independentPage, err := store.SyncCoordinationEvents(context.Background(), independentQuery)
 	if err != nil || len(independentPage.Events()) != 1 || independentPage.Events()[0].Position() != first.Events()[0].Position() {
 		t.Fatalf("independent consumer page=%+v error=%v", independentPage, err)
 	}
-	wrongScope, _ := coordination.NewCoordinationConsumerCommit(workspace, other, consumer, first.EventCursors()[0])
+	wrongScope, _ := coordination.NewConsumerCommit(workspace, other, consumer, first.EventCursors()[0])
 	if err := store.CommitCoordinationConsumer(context.Background(), wrongScope); err == nil {
 		t.Fatal("actor-scoped acknowledgement was accepted for another actor")
 	}
-	otherQuery, _ := coordination.NewCoordinationEventsQuery(workspace, other, coordination.CoordinationEventCursor{}, 10)
+	otherQuery, _ := coordination.NewEventsQuery(workspace, other, coordination.EventCursor{}, 10)
 	private, err := store.SyncCoordinationEvents(context.Background(), otherQuery)
 	if err != nil || len(private.Events()) != 0 {
 		t.Fatalf("other actor events=%d error=%v", len(private.Events()), err)
 	}
-	scopeMismatch, _ := coordination.NewCoordinationEventsQuery(workspace, other, first.NextCursor(), 1)
+	scopeMismatch, _ := coordination.NewEventsQuery(workspace, other, first.NextCursor(), 1)
 	if _, err := store.SyncCoordinationEvents(context.Background(), scopeMismatch); err == nil {
 		t.Fatal("actor-scoped cursor was accepted for another actor")
 	}
-	tampered, _ := coordination.NewCoordinationEventCursor(first.NextCursor().String() + "x")
-	tamperedQuery, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, tampered, 1)
+	tampered, _ := coordination.NewEventCursor(first.NextCursor().String() + "x")
+	tamperedQuery, _ := coordination.NewEventsQuery(workspace, recipient, tampered, 1)
 	if _, err := store.SyncCoordinationEvents(context.Background(), tamperedQuery); err == nil {
 		t.Fatal("tampered coordination cursor was accepted")
 	}
@@ -276,7 +276,7 @@ func TestCoordinationEventJournalIsPrivateBoundedAuthenticatedAndImmutable(t *te
 		second.Events()[0].Position()+1); err != nil {
 		t.Fatal(err)
 	}
-	expired, _ := coordination.NewCoordinationEventsQuery(workspace, recipient, first.NextCursor(), 1)
+	expired, _ := coordination.NewEventsQuery(workspace, recipient, first.NextCursor(), 1)
 	if _, err := store.SyncCoordinationEvents(context.Background(), expired); !errors.Is(err, domain.ErrCursorExpired) {
 		t.Fatalf("expired cursor error=%v, want CURSOR_EXPIRED", err)
 	}
@@ -318,7 +318,7 @@ func TestCoordinationJournalStoresOneMessageFactForAllRecipients(t *testing.T) {
 		t.Fatalf("message facts=%d recipients=%d, want one fact for two recipients", events, recipients)
 	}
 	for _, actor := range []domain.ActorID{toActor, bccActor} {
-		query, _ := coordination.NewCoordinationEventsQuery(workspace, actor, coordination.CoordinationEventCursor{}, 10)
+		query, _ := coordination.NewEventsQuery(workspace, actor, coordination.EventCursor{}, 10)
 		page, syncErr := store.SyncCoordinationEvents(context.Background(), query)
 		if syncErr != nil || len(page.Events()) != 1 || page.Events()[0].ActorID() != author {
 			t.Fatalf("recipient %s page=%+v error=%v", actor, page, syncErr)
@@ -328,7 +328,7 @@ func TestCoordinationJournalStoresOneMessageFactForAllRecipients(t *testing.T) {
 			t.Fatalf("recipient list leaked through message event payload: %s", page.Events()[0].Payload())
 		}
 	}
-	outsiderQuery, _ := coordination.NewCoordinationEventsQuery(workspace, outsider, coordination.CoordinationEventCursor{}, 10)
+	outsiderQuery, _ := coordination.NewEventsQuery(workspace, outsider, coordination.EventCursor{}, 10)
 	outsiderPage, err := store.SyncCoordinationEvents(context.Background(), outsiderQuery)
 	if err != nil || len(outsiderPage.Events()) != 0 {
 		t.Fatalf("outsider page=%+v error=%v", outsiderPage, err)
@@ -372,9 +372,9 @@ func TestCoordinationLeaseReleaseIsWorkspaceVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	query, _ := coordination.NewCoordinationEventsQuery(workspace, observer, coordination.CoordinationEventCursor{}, 10)
+	query, _ := coordination.NewEventsQuery(workspace, observer, coordination.EventCursor{}, 10)
 	acquired, err := store.SyncCoordinationEvents(context.Background(), query)
-	if err != nil || len(acquired.Events()) != 1 || acquired.Events()[0].EventType() != coordination.CoordinationEventLeaseAcquired ||
+	if err != nil || len(acquired.Events()) != 1 || acquired.Events()[0].EventType() != coordination.EventLeaseAcquired ||
 		acquired.Events()[0].ActorID() != holder {
 		t.Fatalf("observer acquired page=%+v error=%v", acquired, err)
 	}
@@ -382,9 +382,9 @@ func TestCoordinationLeaseReleaseIsWorkspaceVisible(t *testing.T) {
 		Holder: holder, HolderSession: session, AuthorityEpoch: epoch, Selectors: lease.Selectors()}); err != nil {
 		t.Fatal(err)
 	}
-	continued, _ := coordination.NewCoordinationEventsQuery(workspace, observer, acquired.NextCursor(), 10)
+	continued, _ := coordination.NewEventsQuery(workspace, observer, acquired.NextCursor(), 10)
 	released, err := store.SyncCoordinationEvents(context.Background(), continued)
-	if err != nil || len(released.Events()) != 1 || released.Events()[0].EventType() != coordination.CoordinationEventLeaseReleased ||
+	if err != nil || len(released.Events()) != 1 || released.Events()[0].EventType() != coordination.EventLeaseReleased ||
 		released.Events()[0].ActorID() != holder {
 		t.Fatalf("observer release page=%+v error=%v", released, err)
 	}

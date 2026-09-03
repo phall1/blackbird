@@ -97,7 +97,7 @@ func (store *Store) ListAdminProjects(ctx context.Context) (coordination.AdminPr
 			workspace, workspaceErr := domain.ParseWorkspaceID(workspaceText)
 			run, runErr := domain.ParseRunID(runText)
 			if workspaceErr != nil || runErr != nil {
-				return coordination.ErrInvalidCoordination
+				return coordination.ErrInvalid
 			}
 			project.WorkspaceID, project.RunID = workspace, run
 			projects = append(projects, project)
@@ -178,13 +178,13 @@ func adminAgentRows(ctx context.Context, tx *sql.Tx, query coordination.AdminAge
 		}
 		actor, actorErr := domain.ParseActorID(actorText)
 		if actorErr != nil {
-			return nil, false, coordination.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalid
 		}
 		agent.ActorID = actor
 		if sessionText != "" {
 			session, sessionErr := domain.ParseActorSessionID(sessionText)
 			if sessionErr != nil {
-				return nil, false, coordination.ErrInvalidCoordination
+				return nil, false, coordination.ErrInvalid
 			}
 			agent.SessionID = session
 			agent.Active = agent.LastSeenAtUS >= cutoff
@@ -201,7 +201,7 @@ func (store *Store) AdminInbox(ctx context.Context,
 		return coordination.AdminInboxPage{}, err
 	}
 	if query.ProjectKey == "" {
-		return coordination.AdminInboxPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminInboxPage{}, coordination.ErrInvalid
 	}
 	page := coordination.AdminInboxPage{ProjectKey: query.ProjectKey}
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, _ time.Time) error {
@@ -253,7 +253,7 @@ func adminInboxSummaries(ctx context.Context, tx *sql.Tx,
 		}
 		actor, actorErr := domain.ParseActorID(actorText)
 		if actorErr != nil {
-			return nil, coordination.ErrInvalidCoordination
+			return nil, coordination.ErrInvalid
 		}
 		summary.ActorID = actor
 		summaries = append(summaries, summary)
@@ -308,7 +308,7 @@ func adminInboxPending(ctx context.Context, tx *sql.Tx, query coordination.Admin
 		recipient, recipientErr := domain.ParseActorID(recipientText)
 		author, authorErr := domain.ParseActorID(authorText)
 		if messageErr != nil || conversationErr != nil || recipientErr != nil || authorErr != nil {
-			return nil, false, coordination.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalid
 		}
 		item.MessageID, item.ConversationID = message, conversation
 		item.RecipientActorID, item.AuthorActorID = recipient, author
@@ -385,7 +385,7 @@ func adminConversationRows(ctx context.Context, tx *sql.Tx, query coordination.A
 		workspace, workspaceErr := domain.ParseWorkspaceID(workspaceText)
 		openedBy, openedByErr := domain.ParseActorID(openedByText)
 		if idErr != nil || workspaceErr != nil || openedByErr != nil {
-			return nil, false, coordination.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalid
 		}
 		conversation.ConversationID, conversation.WorkspaceID = id, workspace
 		conversation.OpenedByActorID = openedBy
@@ -471,10 +471,10 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 	}
 	state := query.State.Normalized()
 	if !state.Valid() || !coordination.ValidAdminReservationMode(query.Mode) {
-		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalid
 	}
 	if query.Path != "" && !validLocalCoordinationText(query.Path, coordination.MaxLeaseSelectorBytes) {
-		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalid
 	}
 	return store.reservationsPage(ctx, query, state, limit, reservationScope{})
 }
@@ -486,7 +486,7 @@ func (store *Store) ListAdminReservations(ctx context.Context,
 func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 	leaseID domain.LeaseID) (coordination.Lease, error) {
 	if leaseID.IsZero() {
-		return coordination.Lease{}, coordination.ErrInvalidCoordination
+		return coordination.Lease{}, coordination.ErrInvalid
 	}
 	var result coordination.Lease
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
@@ -511,7 +511,7 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 			if err != nil {
 				return fmt.Errorf("count force released SQLite leases: %w", err)
 			}
-			return coordination.ErrInvalidCoordination
+			return coordination.ErrInvalid
 		}
 		result, err = loadLease(ctx, tx, leaseID)
 		if err != nil {
@@ -524,7 +524,7 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 			return err
 		}
 		return appendCoordinationEvent(ctx, tx, result.WorkspaceID(), result.Holder(),
-			coordination.CoordinationEventLeaseReleased, result.ID().String(), now, payload,
+			coordination.EventLeaseReleased, result.ID().String(), now, payload,
 			coordinationVisibilityWorkspace, nil)
 	})
 	return result, err
@@ -543,7 +543,7 @@ func (store *Store) ForceReleaseAdminReservation(ctx context.Context,
 func (store *Store) LocalAgentReservations(ctx context.Context, session coordination.LocalAgentSession,
 	query coordination.AdminReservationsQuery) (coordination.AdminReservationsPage, error) {
 	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
-		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalid
 	}
 	query.ProjectKey = session.ProjectKey
 	limit, err := adminFilters(query.ProjectKey, query.AgentName, query.Limit)
@@ -552,10 +552,10 @@ func (store *Store) LocalAgentReservations(ctx context.Context, session coordina
 	}
 	state := query.State.Normalized()
 	if !state.Valid() || !coordination.ValidAdminReservationMode(query.Mode) {
-		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalid
 	}
 	if query.Path != "" && !validLocalCoordinationText(query.Path, coordination.MaxLeaseSelectorBytes) {
-		return coordination.AdminReservationsPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminReservationsPage{}, coordination.ErrInvalid
 	}
 	return store.reservationsPage(ctx, query, state, limit,
 		reservationScope{workspaceID: session.WorkspaceID.String()})
@@ -701,7 +701,7 @@ func adminReservationRows(ctx context.Context, tx *sql.Tx, query coordination.Ad
 		holder, holderErr := domain.ParseActorID(holderText)
 		session, sessionErr := domain.ParseActorSessionID(sessionText)
 		if leaseErr != nil || workspaceErr != nil || holderErr != nil || sessionErr != nil {
-			return nil, false, coordination.ErrInvalidCoordination
+			return nil, false, coordination.ErrInvalid
 		}
 		reservation.LeaseID, reservation.WorkspaceID = lease, workspace
 		reservation.HolderActorID, reservation.HolderSessionID = holder, session
@@ -772,7 +772,7 @@ func (store *Store) ListAdminEvents(ctx context.Context,
 		return coordination.AdminEventsPage{}, err
 	}
 	if query.EventType != "" && !query.EventType.Valid() {
-		return coordination.AdminEventsPage{}, coordination.ErrInvalidCoordination
+		return coordination.AdminEventsPage{}, coordination.ErrInvalid
 	}
 	var events []coordination.AdminEvent
 	truncated := false
@@ -803,10 +803,10 @@ func (store *Store) ListAdminEvents(ctx context.Context,
 			workspace, workspaceErr := domain.ParseWorkspaceID(workspaceText)
 			actor, actorErr := domain.ParseActorID(actorText)
 			if workspaceErr != nil || actorErr != nil {
-				return coordination.ErrInvalidCoordination
+				return coordination.ErrInvalid
 			}
 			event.WorkspaceID, event.ActorID = workspace, actor
-			event.EventType = coordination.CoordinationEventType(typeText)
+			event.EventType = coordination.EventType(typeText)
 			events = append(events, event)
 		}
 		return rows.Err()
@@ -837,11 +837,11 @@ func (store *Store) adminSnapshot(ctx context.Context, snapshot func(*sql.Tx, ti
 }
 
 func adminFilters(projectKey, agentName string, limit uint16) (uint16, error) {
-	if projectKey != "" && !validLocalCoordinationText(projectKey, coordination.MaxCoordinationKeyBytes) {
-		return 0, coordination.ErrInvalidCoordination
+	if projectKey != "" && !validLocalCoordinationText(projectKey, coordination.MaxKeyBytes) {
+		return 0, coordination.ErrInvalid
 	}
-	if agentName != "" && !validLocalCoordinationText(agentName, coordination.MaxCoordinationNameBytes) {
-		return 0, coordination.ErrInvalidCoordination
+	if agentName != "" && !validLocalCoordinationText(agentName, coordination.MaxNameBytes) {
+		return 0, coordination.ErrInvalid
 	}
 	return coordination.AdminPageLimit(limit)
 }

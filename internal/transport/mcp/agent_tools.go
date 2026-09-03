@@ -10,8 +10,8 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
@@ -87,8 +87,8 @@ type claimOutput struct {
 	Options   []string                   `json:"options,omitempty"`
 }
 
-func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalCoordinationStore,
-	observations application.TelemetryReader, workReferences coordination.WorkReferenceObserver, logger *slog.Logger) {
+func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalStore,
+	observations telemetry.Reader, workReferences coordination.WorkReferenceObserver, logger *slog.Logger) {
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolJoin,
 		Description: "Read blackbird://coordination/protocol, then start or resume one durable repository agent and recover its compact snapshot: claims, inbox, conversations, and peers."},
 		func(ctx context.Context, input registerAgentInput) (agentSessionOutput, error) {
@@ -161,8 +161,8 @@ func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalCoo
 
 	statusSchema := coordinationInputSchema[statusInput](func(properties map[string]*jsonschema.Schema) {
 		setPageLimitSchema(properties["limit"])
-		properties["dimension"].Enum = []any{string(application.SpendByModel), string(application.SpendByAgent),
-			string(application.SpendByHarness), string(application.SpendBySpanKind), string(application.SpendBySpanName)}
+		properties["dimension"].Enum = []any{string(telemetry.SpendByModel), string(telemetry.SpendByAgent),
+			string(telemetry.SpendByHarness), string(telemetry.SpendBySpanKind), string(telemetry.SpendBySpanName)}
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolStatus,
 		Description: "Inspect peers and active claims; optionally observe one work item in this repository's issue tracker, or a telemetry rollup, without adding more tools. " +
@@ -213,7 +213,7 @@ func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalCoo
 			if err != nil {
 				return coordinationWaitOutput{}, err
 			}
-			result, err := store.AwaitCoordination(ctx, session, coordination.CoordinationWaitRequest{
+			result, err := store.AwaitCoordination(ctx, session, coordination.WaitRequest{
 				Path: input.Path, Mode: coordination.LeaseMode(input.Mode), AwaitMail: input.AwaitMail,
 				Timeout: boundedWaitTimeout(input.TimeoutSeconds)})
 			if err != nil {
@@ -229,7 +229,7 @@ func claimResult(lease coordination.Lease) claimOutput {
 	return claimOutput{OK: true, LeaseID: value.LeaseID, Mode: value.Mode, Selectors: value.Selectors, ExpiresAt: value.ExpiresAt}
 }
 
-func agentStatus(ctx context.Context, store coordination.LocalCoordinationStore, observations application.TelemetryReader,
+func agentStatus(ctx context.Context, store coordination.LocalStore, observations telemetry.Reader,
 	workReferences coordination.WorkReferenceObserver, input statusInput) (statusOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
@@ -276,9 +276,9 @@ func agentStatus(ctx context.Context, store coordination.LocalCoordinationStore,
 		if isNil(observations) {
 			return statusOutput{}, invalidInput("spend requires a configured observation reader")
 		}
-		query := application.SpendQuery{Dimension: application.SpendDimension(input.Dimension), MineOnly: input.MineOnly, Limit: input.Limit}
+		query := telemetry.SpendQuery{Dimension: telemetry.SpendDimension(input.Dimension), MineOnly: input.MineOnly, Limit: input.Limit}
 		if query.Dimension == "" {
-			query.Dimension = application.SpendByModel
+			query.Dimension = telemetry.SpendByModel
 		}
 		if input.SinceHours > 0 {
 			query.Since = time.Now().UTC().Add(-time.Duration(input.SinceHours) * time.Hour)
@@ -293,7 +293,7 @@ func agentStatus(ctx context.Context, store coordination.LocalCoordinationStore,
 	return output, nil
 }
 
-func say(ctx context.Context, store coordination.LocalCoordinationStore, input sayInput) (sayOutput, error) {
+func say(ctx context.Context, store coordination.LocalStore, input sayInput) (sayOutput, error) {
 	conversationID := input.ConversationID
 	output := sayOutput{}
 	if conversationID == "" {
@@ -330,7 +330,7 @@ func say(ctx context.Context, store coordination.LocalCoordinationStore, input s
 	return output, nil
 }
 
-func readMessages(ctx context.Context, store coordination.LocalCoordinationStore, input readInput) (messagePageOutput, error) {
+func readMessages(ctx context.Context, store coordination.LocalStore, input readInput) (messagePageOutput, error) {
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {
 		return messagePageOutput{}, err
@@ -355,7 +355,7 @@ func readMessages(ctx context.Context, store coordination.LocalCoordinationStore
 	return coordinationPageOutput(page), nil
 }
 
-func recordDeliveryFact(ctx context.Context, store coordination.LocalCoordinationStore, input messageFactInput) (deliveryFactOutput, error) {
+func recordDeliveryFact(ctx context.Context, store coordination.LocalStore, input messageFactInput) (deliveryFactOutput, error) {
 	kind := coordination.DeliveryFactKind(input.Kind)
 	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
 	if err != nil {

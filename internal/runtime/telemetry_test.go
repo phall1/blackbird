@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
@@ -24,14 +24,14 @@ func openTelemetryStore(t *testing.T) *sqlite.Store {
 	return store
 }
 
-func telemetryObservation(t *testing.T, store *sqlite.Store) application.TelemetryEnvelope {
+func telemetryObservation(t *testing.T, store *sqlite.Store) telemetry.Envelope {
 	t.Helper()
 	session, _, err := store.RegisterLocalAgent(context.Background(), "/workspace/observed", "alice", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return application.TelemetryEnvelope{
-		Attribution: application.TelemetryAttribution{
+	return telemetry.Envelope{
+		Attribution: telemetry.Attribution{
 			ProjectKey: session.ProjectKey, ActorID: session.ActorID, SessionID: session.ActorSessionID,
 		},
 		ModelCalls: []domain.ModelCall{{
@@ -111,7 +111,7 @@ func TestTelemetrySweepDeletesExpiredObservations(t *testing.T) {
 	worker := newTelemetryWorker(store, slog.New(slog.DiscardHandler))
 	envelope := telemetryObservation(t, store)
 	envelope.ReceivedAt = time.Now().UTC().Add(-90 * 24 * time.Hour)
-	if err := store.AppendTelemetry(ctx, []application.TelemetryEnvelope{envelope}); err != nil {
+	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{envelope}); err != nil {
 		t.Fatal(err)
 	}
 	worker.sweepOnce(ctx)

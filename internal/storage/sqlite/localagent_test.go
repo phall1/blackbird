@@ -237,11 +237,11 @@ func TestLocalAgentReservationsCannotReadAnotherWorkspace(t *testing.T) {
 		t.Fatalf("cross-workspace read returned %+v", page.Reservations)
 	}
 	if _, err := store.LocalAgentReservations(ctx, coordination.LocalAgentSession{},
-		coordination.AdminReservationsQuery{}); !errors.Is(err, coordination.ErrInvalidCoordination) {
+		coordination.AdminReservationsQuery{}); !errors.Is(err, coordination.ErrInvalid) {
 		t.Fatalf("unsessioned read error=%v, want an invalid coordination rejection", err)
 	}
 	if _, err := store.LocalAgentReservations(ctx, carol,
-		coordination.AdminReservationsQuery{State: "sideways"}); !errors.Is(err, coordination.ErrInvalidCoordination) {
+		coordination.AdminReservationsQuery{State: "sideways"}); !errors.Is(err, coordination.ErrInvalid) {
 		t.Fatalf("invalid state error=%v, want an invalid coordination rejection", err)
 	}
 }
@@ -332,7 +332,7 @@ func TestOpenConversationRejectsAnUnusableSlug(t *testing.T) {
 		_, err := store.OpenConversation(ctx, coordination.OpenConversationParams{ConversationID: conversationID,
 			WorkspaceID: alice.WorkspaceID, RunID: alice.RunID, OpenedBy: alice.ActorID,
 			OpenedBySession: alice.ActorSessionID, Topic: "topic", Slug: slug})
-		if !errors.Is(err, coordination.ErrInvalidCoordination) {
+		if !errors.Is(err, coordination.ErrInvalid) {
 			t.Fatalf("slug %q error=%v, want an invalid coordination rejection", slug, err)
 		}
 	}

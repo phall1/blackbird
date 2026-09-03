@@ -1,4 +1,4 @@
-package application_test
+package telemetry_test
 
 import (
 	"context"
@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 )
 
 type recordingTelemetryStore struct {
 	mu        sync.Mutex
-	batches   [][]application.TelemetryEnvelope
+	batches   [][]telemetry.Envelope
 	appended  atomic.Int64
 	failWith  error
 	panicWith string
@@ -22,7 +22,7 @@ type recordingTelemetryStore struct {
 }
 
 func (store *recordingTelemetryStore) AppendTelemetry(_ context.Context,
-	batch []application.TelemetryEnvelope) error {
+	batch []telemetry.Envelope) error {
 	if store.panicWith != "" {
 		panic(store.panicWith)
 	}
@@ -46,8 +46,8 @@ func (store *recordingTelemetryStore) batchCount() int {
 	return len(store.batches)
 }
 
-func sampleEnvelope() application.TelemetryEnvelope {
-	return application.TelemetryEnvelope{
+func sampleEnvelope() telemetry.Envelope {
+	return telemetry.Envelope{
 		ModelCalls: []domain.ModelCall{{
 			DedupeKey: "k", Harness: domain.HarnessPi, Provider: "anthropic", Model: "m",
 			Operation: domain.ModelOperationChat, Outcome: domain.ObservedOutcomeOK,
@@ -61,8 +61,8 @@ func sampleEnvelope() application.TelemetryEnvelope {
 // whose drain is not running must still answer immediately, forever.
 func TestOfferNeverBlocksWhenTheQueueIsFull(t *testing.T) {
 	t.Parallel()
-	sink := application.NewTelemetrySink(&recordingTelemetryStore{},
-		application.TelemetrySinkConfig{QueueDepth: 2})
+	sink := telemetry.NewSink(&recordingTelemetryStore{},
+		telemetry.SinkConfig{QueueDepth: 2})
 
 	done := make(chan struct{})
 	var accepted, dropped int
@@ -98,7 +98,7 @@ func TestOfferNeverBlocksWhenTheQueueIsFull(t *testing.T) {
 func TestWriteFailuresNeverReachTheCaller(t *testing.T) {
 	t.Parallel()
 	store := &recordingTelemetryStore{failWith: errors.New("disk is gone")}
-	sink := application.NewTelemetrySink(store, application.TelemetrySinkConfig{Coalesce: time.Millisecond})
+	sink := telemetry.NewSink(store, telemetry.SinkConfig{Coalesce: time.Millisecond})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sink.Run(ctx)
@@ -125,7 +125,7 @@ func TestWriteFailuresNeverReachTheCaller(t *testing.T) {
 func TestDrainBatchesRatherThanWritingPerEnvelope(t *testing.T) {
 	t.Parallel()
 	store := &recordingTelemetryStore{release: make(chan struct{})}
-	sink := application.NewTelemetrySink(store, application.TelemetrySinkConfig{
+	sink := telemetry.NewSink(store, telemetry.SinkConfig{
 		QueueDepth: 64, BatchSize: 32, Coalesce: 50 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,7 +151,7 @@ func TestDrainBatchesRatherThanWritingPerEnvelope(t *testing.T) {
 func TestCloseFlushesWhatWasAlreadyQueued(t *testing.T) {
 	t.Parallel()
 	store := &recordingTelemetryStore{}
-	sink := application.NewTelemetrySink(store, application.TelemetrySinkConfig{
+	sink := telemetry.NewSink(store, telemetry.SinkConfig{
 		QueueDepth: 16, Coalesce: time.Hour,
 	})
 	for range 8 {
@@ -170,7 +170,7 @@ func TestCloseFlushesWhatWasAlreadyQueued(t *testing.T) {
 
 func TestOfferAfterCloseIsRefusedAndCounted(t *testing.T) {
 	t.Parallel()
-	sink := application.NewTelemetrySink(&recordingTelemetryStore{}, application.TelemetrySinkConfig{})
+	sink := telemetry.NewSink(&recordingTelemetryStore{}, telemetry.SinkConfig{})
 	go sink.Run(context.Background())
 	if err := sink.Close(); err != nil {
 		t.Fatal(err)
@@ -186,8 +186,8 @@ func TestOfferAfterCloseIsRefusedAndCounted(t *testing.T) {
 // A defect in the observation plane must stop observation, not the daemon.
 func TestDrainRecoversFromAPanickingStore(t *testing.T) {
 	t.Parallel()
-	sink := application.NewTelemetrySink(&recordingTelemetryStore{panicWith: "storage exploded"},
-		application.TelemetrySinkConfig{Coalesce: time.Millisecond})
+	sink := telemetry.NewSink(&recordingTelemetryStore{panicWith: "storage exploded"},
+		telemetry.SinkConfig{Coalesce: time.Millisecond})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopped := make(chan struct{})
@@ -209,10 +209,10 @@ func TestDrainRecoversFromAPanickingStore(t *testing.T) {
 // An empty submission is a no-op rather than a queue slot.
 func TestOfferIgnoresEmptyEnvelopes(t *testing.T) {
 	t.Parallel()
-	sink := application.NewTelemetrySink(&recordingTelemetryStore{},
-		application.TelemetrySinkConfig{QueueDepth: 1})
+	sink := telemetry.NewSink(&recordingTelemetryStore{},
+		telemetry.SinkConfig{QueueDepth: 1})
 	for range 100 {
-		if !sink.Offer(application.TelemetryEnvelope{}) {
+		if !sink.Offer(telemetry.Envelope{}) {
 			t.Fatal("an empty envelope must never consume a queue slot")
 		}
 	}
@@ -227,31 +227,31 @@ func TestSpendQueryNormalizationClampsWindowAndLimit(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 
-	defaulted := application.SpendQuery{Dimension: application.SpendByModel}.Normalized(now)
-	if defaulted.Limit != application.DefaultSpendGroups {
+	defaulted := telemetry.SpendQuery{Dimension: telemetry.SpendByModel}.Normalized(now)
+	if defaulted.Limit != telemetry.DefaultSpendGroups {
 		t.Fatalf("limit=%d, want the default", defaulted.Limit)
 	}
-	if !defaulted.Since.Equal(now.Add(-application.DefaultSpendWindow)) {
+	if !defaulted.Since.Equal(now.Add(-telemetry.DefaultSpendWindow)) {
 		t.Fatalf("since=%s, want the default window", defaulted.Since)
 	}
 
 	// A caller asking for the whole history is clamped rather than refused: the
 	// answer it gets is still useful, which a rejection would not be.
-	wide := application.SpendQuery{
-		Dimension: application.SpendByModel,
+	wide := telemetry.SpendQuery{
+		Dimension: telemetry.SpendByModel,
 		Since:     now.Add(-365 * 24 * time.Hour),
 		Limit:     5000,
 	}.Normalized(now)
-	if !wide.Since.Equal(now.Add(-application.MaxSpendWindow)) {
+	if !wide.Since.Equal(now.Add(-telemetry.MaxSpendWindow)) {
 		t.Fatalf("since=%s, want the window clamped to the maximum", wide.Since)
 	}
-	if wide.Limit != application.DefaultSpendGroups {
+	if wide.Limit != telemetry.DefaultSpendGroups {
 		t.Fatalf("limit=%d, want an over-large limit brought back to the default", wide.Limit)
 	}
 
 	// A reasonable explicit request survives untouched.
-	kept := application.SpendQuery{
-		Dimension: application.SpendBySpanName, Since: now.Add(-2 * time.Hour), Limit: 25,
+	kept := telemetry.SpendQuery{
+		Dimension: telemetry.SpendBySpanName, Since: now.Add(-2 * time.Hour), Limit: 25,
 	}.Normalized(now)
 	if !kept.Since.Equal(now.Add(-2*time.Hour)) || kept.Limit != 25 {
 		t.Fatalf("query=%+v, want an in-bounds request preserved", kept)
@@ -260,28 +260,28 @@ func TestSpendQueryNormalizationClampsWindowAndLimit(t *testing.T) {
 
 func TestSpendDimensionSeparatesTokenAndSpanTables(t *testing.T) {
 	t.Parallel()
-	for _, dimension := range []application.SpendDimension{
-		application.SpendByModel, application.SpendByAgent, application.SpendByHarness,
+	for _, dimension := range []telemetry.SpendDimension{
+		telemetry.SpendByModel, telemetry.SpendByAgent, telemetry.SpendByHarness,
 	} {
 		if !dimension.Valid() || dimension.Spans() {
 			t.Fatalf("%q must be a valid model-call dimension", dimension)
 		}
 	}
-	for _, dimension := range []application.SpendDimension{
-		application.SpendBySpanKind, application.SpendBySpanName,
+	for _, dimension := range []telemetry.SpendDimension{
+		telemetry.SpendBySpanKind, telemetry.SpendBySpanName,
 	} {
 		if !dimension.Valid() || !dimension.Spans() {
 			t.Fatalf("%q must be a valid span dimension", dimension)
 		}
 	}
-	if application.SpendDimension("vibes").Valid() {
+	if telemetry.SpendDimension("vibes").Valid() {
 		t.Fatal("the dimension set is closed because each value is a column expression")
 	}
 }
 
 func TestSpendGroupBilledInputExcludesOutput(t *testing.T) {
 	t.Parallel()
-	group := application.SpendGroup{UncachedInput: 2, CacheRead: 26354, CacheWrite: 23947, Output: 1469}
+	group := telemetry.SpendGroup{UncachedInput: 2, CacheRead: 26354, CacheWrite: 23947, Output: 1469}
 	if group.BilledInput() != 50303 {
 		t.Fatalf("BilledInput=%d, want the three input classes and not output", group.BilledInput())
 	}

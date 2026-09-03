@@ -1,7 +1,7 @@
-// Package application holds the observation plane: the bounded telemetry
+// Package telemetry holds the observation plane: the bounded telemetry
 // ingest sink and the spend rollup contracts. The coordination contracts it
-// attributes observations against live in the coordination sub-package.
-package application
+// attributes observations against live in the sibling coordination package.
+package telemetry
 
 import (
 	"context"
@@ -32,46 +32,46 @@ import (
 //   - Every bound is explicit and finite, so a buggy adapter degrades its own
 //     observability and nothing else.
 
-// ErrTelemetryUnavailable reports that the sink is closed. It exists so a
+// ErrUnavailable reports that the sink is closed. It exists so a
 // caller can distinguish "not recorded" from "recorded", and never so a caller
 // can retry: the correct response to a closed sink is to carry on.
-var ErrTelemetryUnavailable = errors.New("telemetry sink is closed")
+var ErrUnavailable = errors.New("telemetry sink is closed")
 
 const (
-	// MaxTelemetryEventsPerEnvelope bounds one submission. An adapter with more
+	// MaxEventsPerEnvelope bounds one submission. An adapter with more
 	// than this splits, which keeps a single request from monopolizing a batch.
-	MaxTelemetryEventsPerEnvelope = 128
-	// DefaultTelemetryQueueDepth is measured in envelopes, not events, because
+	MaxEventsPerEnvelope = 128
+	// DefaultQueueDepth is measured in envelopes, not events, because
 	// an envelope is what one HTTP request produces and therefore what the
 	// transport's body limit already bounds.
-	DefaultTelemetryQueueDepth = 256
-	// DefaultTelemetryBatchSize bounds one write transaction. Larger batches
+	DefaultQueueDepth = 256
+	// DefaultBatchSize bounds one write transaction. Larger batches
 	// amortize the fsync better but hold the write arbiter longer, and holding
 	// it longer is the thing this plane is forbidden from doing.
-	DefaultTelemetryBatchSize = 32
-	// DefaultTelemetryCoalesce is how long the drain waits for a batch to fill
+	DefaultBatchSize = 32
+	// DefaultCoalesce is how long the drain waits for a batch to fill
 	// before writing what it has. It trades observation freshness -- which
 	// nothing is waiting on -- for fewer durable commits.
-	DefaultTelemetryCoalesce = 250 * time.Millisecond
-	// DefaultTelemetryFlushBudget bounds the shutdown drain. A clean stop
+	DefaultCoalesce = 250 * time.Millisecond
+	// DefaultFlushBudget bounds the shutdown drain. A clean stop
 	// should not lose the last few observations, and must not delay the
 	// daemon's exit to save them.
-	DefaultTelemetryFlushBudget = 2 * time.Second
+	DefaultFlushBudget = 2 * time.Second
 )
 
-// TelemetryAttribution is taken from the caller's authenticated session, never
+// Attribution is taken from the caller's authenticated session, never
 // from a request body. An adapter therefore cannot attribute its spend to
 // another agent, which is the only security property this plane needs.
-type TelemetryAttribution struct {
+type Attribution struct {
 	ProjectKey string
 	ActorID    domain.ActorID
 	SessionID  domain.ActorSessionID
 }
 
-// TelemetryEnvelope is one adapter submission: the observations from one agent
+// Envelope is one adapter submission: the observations from one agent
 // in one request.
-type TelemetryEnvelope struct {
-	Attribution TelemetryAttribution
+type Envelope struct {
+	Attribution Attribution
 	ModelCalls  []domain.ModelCall
 	Spans       []domain.Span
 	// ReceivedAt is the daemon's clock, and it is what retention is measured
@@ -80,22 +80,22 @@ type TelemetryEnvelope struct {
 	ReceivedAt time.Time
 }
 
-func (envelope TelemetryEnvelope) Len() int {
+func (envelope Envelope) Len() int {
 	return len(envelope.ModelCalls) + len(envelope.Spans)
 }
 
-// TelemetryStore is the durable half. Implementations must write telemetry in
+// Store is the durable half. Implementations must write telemetry in
 // its own transaction, must be idempotent on (actor, dedupe key), and must not
 // participate in any coordination transaction.
-type TelemetryStore interface {
-	AppendTelemetry(context.Context, []TelemetryEnvelope) error
+type Store interface {
+	AppendTelemetry(context.Context, []Envelope) error
 	SweepTelemetry(context.Context, time.Time) (int64, error)
 }
 
-// TelemetrySinkStats is the plane's self-report. Drops are counted rather than
+// SinkStats is the plane's self-report. Drops are counted rather than
 // hidden: a plane that silently loses data is worse than no plane, because it
 // invites conclusions from a sample nobody knows is partial.
-type TelemetrySinkStats struct {
+type SinkStats struct {
 	Accepted      uint64
 	DroppedFull   uint64
 	DroppedClosed uint64
@@ -104,7 +104,7 @@ type TelemetrySinkStats struct {
 	Batches       uint64
 }
 
-type TelemetrySinkConfig struct {
+type SinkConfig struct {
 	QueueDepth  int
 	BatchSize   int
 	Coalesce    time.Duration
@@ -112,18 +112,18 @@ type TelemetrySinkConfig struct {
 	Logger      *slog.Logger
 }
 
-func (config TelemetrySinkConfig) withDefaults() TelemetrySinkConfig {
+func (config SinkConfig) withDefaults() SinkConfig {
 	if config.QueueDepth <= 0 {
-		config.QueueDepth = DefaultTelemetryQueueDepth
+		config.QueueDepth = DefaultQueueDepth
 	}
 	if config.BatchSize <= 0 {
-		config.BatchSize = DefaultTelemetryBatchSize
+		config.BatchSize = DefaultBatchSize
 	}
 	if config.Coalesce <= 0 {
-		config.Coalesce = DefaultTelemetryCoalesce
+		config.Coalesce = DefaultCoalesce
 	}
 	if config.FlushBudget <= 0 {
-		config.FlushBudget = DefaultTelemetryFlushBudget
+		config.FlushBudget = DefaultFlushBudget
 	}
 	if config.Logger == nil {
 		config.Logger = slog.New(slog.DiscardHandler)
@@ -131,11 +131,11 @@ func (config TelemetrySinkConfig) withDefaults() TelemetrySinkConfig {
 	return config
 }
 
-// TelemetrySink is the bounded, non-blocking buffer between ingest and storage.
-type TelemetrySink struct {
-	store  TelemetryStore
-	config TelemetrySinkConfig
-	queue  chan TelemetryEnvelope
+// Sink is the bounded, non-blocking buffer between ingest and storage.
+type Sink struct {
+	store  Store
+	config SinkConfig
+	queue  chan Envelope
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -149,12 +149,12 @@ type TelemetrySink struct {
 	batches       atomic.Uint64
 }
 
-func NewTelemetrySink(store TelemetryStore, config TelemetrySinkConfig) *TelemetrySink {
+func NewSink(store Store, config SinkConfig) *Sink {
 	config = config.withDefaults()
-	return &TelemetrySink{
+	return &Sink{
 		store:  store,
 		config: config,
-		queue:  make(chan TelemetryEnvelope, config.QueueDepth),
+		queue:  make(chan Envelope, config.QueueDepth),
 		closed: make(chan struct{}),
 		done:   make(chan struct{}),
 	}
@@ -164,7 +164,7 @@ func NewTelemetrySink(store TelemetryStore, config TelemetrySinkConfig) *Telemet
 // whether the observations were queued; a false result means they were dropped,
 // which is a normal outcome under load and never an error the caller should
 // act on.
-func (sink *TelemetrySink) Offer(envelope TelemetryEnvelope) bool {
+func (sink *Sink) Offer(envelope Envelope) bool {
 	if envelope.Len() == 0 {
 		return true
 	}
@@ -187,7 +187,7 @@ func (sink *TelemetrySink) Offer(envelope TelemetryEnvelope) bool {
 // Run drains the queue until ctx is cancelled or Close is called, then makes one
 // bounded attempt to flush what is left. It owns the only write path, so it is
 // started exactly once.
-func (sink *TelemetrySink) Run(ctx context.Context) {
+func (sink *Sink) Run(ctx context.Context) {
 	defer close(sink.done)
 	defer sink.recoverDrain()
 	for {
@@ -206,8 +206,8 @@ func (sink *TelemetrySink) Run(ctx context.Context) {
 
 // collect greedily fills a batch from whatever is already queued, waiting no
 // longer than the coalesce window for more.
-func (sink *TelemetrySink) collect(ctx context.Context, first TelemetryEnvelope) []TelemetryEnvelope {
-	batch := make([]TelemetryEnvelope, 0, sink.config.BatchSize)
+func (sink *Sink) collect(ctx context.Context, first Envelope) []Envelope {
+	batch := make([]Envelope, 0, sink.config.BatchSize)
 	batch = append(batch, first)
 	timer := time.NewTimer(sink.config.Coalesce)
 	defer timer.Stop()
@@ -229,7 +229,7 @@ func (sink *TelemetrySink) collect(ctx context.Context, first TelemetryEnvelope)
 // write is where a failure stops. Nothing above this line learns that a write
 // went wrong, because nothing above this line is entitled to change behaviour
 // when it does.
-func (sink *TelemetrySink) write(ctx context.Context, batch []TelemetryEnvelope) {
+func (sink *Sink) write(ctx context.Context, batch []Envelope) {
 	if len(batch) == 0 {
 		return
 	}
@@ -249,11 +249,11 @@ func (sink *TelemetrySink) write(ctx context.Context, batch []TelemetryEnvelope)
 
 // flushRemaining makes one bounded attempt at whatever is still queued, on a
 // fresh context because the one that just ended is why we are here.
-func (sink *TelemetrySink) flushRemaining() {
+func (sink *Sink) flushRemaining() {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), sink.config.FlushBudget)
 	defer cancel()
 	for {
-		batch := make([]TelemetryEnvelope, 0, sink.config.BatchSize)
+		batch := make([]Envelope, 0, sink.config.BatchSize)
 		for len(batch) < sink.config.BatchSize {
 			select {
 			case envelope := <-sink.queue:
@@ -275,7 +275,7 @@ func (sink *TelemetrySink) flushRemaining() {
 
 // recoverDrain keeps a defect in this plane from taking the daemon down with
 // it. A panicking drain stops observing; it does not stop coordinating.
-func (sink *TelemetrySink) recoverDrain() {
+func (sink *Sink) recoverDrain() {
 	if recovered := recover(); recovered != nil {
 		sink.config.Logger.Error("telemetry drain panicked and stopped", "panic", recovered)
 	}
@@ -283,14 +283,14 @@ func (sink *TelemetrySink) recoverDrain() {
 
 // Close stops accepting, waits for the drain's bounded flush, and is safe to
 // call more than once.
-func (sink *TelemetrySink) Close() error {
+func (sink *Sink) Close() error {
 	sink.closeOnce.Do(func() { close(sink.closed) })
 	<-sink.done
 	return nil
 }
 
-func (sink *TelemetrySink) Stats() TelemetrySinkStats {
-	return TelemetrySinkStats{
+func (sink *Sink) Stats() SinkStats {
+	return SinkStats{
 		Accepted:      sink.accepted.Load(),
 		DroppedFull:   sink.droppedFull.Load(),
 		DroppedClosed: sink.droppedClosed.Load(),
@@ -391,7 +391,7 @@ func (query SpendQuery) Normalized(now time.Time) SpendQuery {
 
 func (query SpendQuery) Validate() error {
 	if !query.Dimension.Valid() {
-		return fmt.Errorf("%w: unknown spend dimension %q", coordination.ErrInvalidCoordination, query.Dimension)
+		return fmt.Errorf("%w: unknown spend dimension %q", coordination.ErrInvalid, query.Dimension)
 	}
 	return nil
 }
@@ -435,10 +435,10 @@ type SpendReport struct {
 	Truncated bool
 }
 
-// TelemetryReader is the read port. It is separate from TelemetryStore because
+// Reader is the read port. It is separate from Store because
 // the write path is a fail-open sink with its own failure rules and the read
 // path is an ordinary query -- and because a daemon may compose one without the
 // other, in which case the agent-facing tool is simply not registered.
-type TelemetryReader interface {
+type Reader interface {
 	SpendReport(context.Context, coordination.LocalAgentSession, SpendQuery) (SpendReport, error)
 }

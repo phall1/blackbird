@@ -13,8 +13,8 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/phall1/blackbird/internal/application"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/integration/beads"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 	mcptransport "github.com/phall1/blackbird/internal/transport/mcp"
@@ -25,7 +25,7 @@ const mcpSessionTimeout = 30 * time.Minute
 
 type productionStore interface {
 	Storage
-	coordination.LocalCoordinationStore
+	coordination.LocalStore
 	coordination.LocalAdminStore
 }
 
@@ -72,8 +72,8 @@ func composeProductionBundle(
 	if !ok {
 		return HandlerBundle{}, errors.New("production storage does not implement local coordination ports")
 	}
-	telemetry := metrics.New()
-	observations, _ := storage.(application.TelemetryStore)
+	metricsRegistry := metrics.New()
+	observations, _ := storage.(telemetry.Store)
 	var telemetryIngest *telemetryWorker
 	if observations != nil {
 		telemetryIngest = newTelemetryWorker(observations, logger)
@@ -90,7 +90,7 @@ func composeProductionBundle(
 	}
 	started := time.Now().UTC()
 	adminHTTPHandler, err := httptransport.NewAdminHandler(httptransport.AdminDependencies{
-		Admin: store, Token: httptransport.NewAdminTokenDigest(token), Metrics: telemetry,
+		Admin: store, Token: httptransport.NewAdminTokenDigest(token), Metrics: metricsRegistry,
 		Identity: httptransport.LocalIdentity{
 			Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt,
 			PID: os.Getpid(), StartedAt: started,
@@ -116,7 +116,7 @@ func composeProductionBundle(
 	httpMux.Handle(httptransport.PathLocalAdmin, adminHTTPHandler)
 	httpMux.Handle("/api/v1/local/", localHTTPHandler)
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
-		Logger: logger, Metrics: telemetry, Coordination: store,
+		Logger: logger, Metrics: metricsRegistry, Coordination: store,
 		Observations: observationReader(store), WorkReferences: newBeadsWorkReferenceObserver(),
 	})
 	if err != nil {
@@ -127,7 +127,7 @@ func composeProductionBundle(
 		slog.String("health_path", httptransport.PathHealth),
 		slog.String("readiness_path", httptransport.PathReady))
 	return HandlerBundle{
-		HTTP:    telemetry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
+		HTTP:    metricsRegistry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
 		Workers: telemetryWorkers(handshake, telemetryIngest),
 		MCP:     mcpServer.HTTPHandler(&sdkmcp.StreamableHTTPOptions{SessionTimeout: mcpSessionTimeout}),
 	}, nil
@@ -144,8 +144,8 @@ func (worker *adminHandshakeWorker) SetBoundHTTPAddress(address string) {
 // observationReader returns a nil interface rather than a typed nil when the
 // store cannot answer rollups, so the MCP transport's nil check decides whether
 // the agent-facing tool exists at all.
-func observationReader(store Storage) application.TelemetryReader {
-	reader, ok := store.(application.TelemetryReader)
+func observationReader(store Storage) telemetry.Reader {
+	reader, ok := store.(telemetry.Reader)
 	if !ok {
 		return nil
 	}
@@ -159,11 +159,11 @@ func telemetryOffer(worker *telemetryWorker) httptransport.TelemetryOffer {
 	return worker.sink
 }
 
-func telemetryWorkers(handshake Worker, telemetry *telemetryWorker) []Worker {
-	if telemetry == nil {
+func telemetryWorkers(handshake Worker, worker *telemetryWorker) []Worker {
+	if worker == nil {
 		return []Worker{handshake}
 	}
-	return []Worker{handshake, telemetry}
+	return []Worker{handshake, worker}
 }
 
 // workObservationBudget bounds one whole observation, and workObservationStep

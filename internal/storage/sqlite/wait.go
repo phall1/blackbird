@@ -37,10 +37,10 @@ const coordinationWaitBlockers = 8
 // waiter parked for the full minute holds none of the five daemon-wide read
 // connections between polls and never touches the write arbiter at all.
 func (store *Store) AwaitCoordination(ctx context.Context, session coordination.LocalAgentSession,
-	request coordination.CoordinationWaitRequest) (coordination.CoordinationWaitResult, error) {
+	request coordination.WaitRequest) (coordination.WaitResult, error) {
 	mode, err := validateCoordinationWait(session, request)
 	if err != nil {
-		return coordination.CoordinationWaitResult{}, err
+		return coordination.WaitResult{}, err
 	}
 	budget := boundedWaitBudget(request.Timeout)
 	started := time.Now()
@@ -54,29 +54,29 @@ func (store *Store) AwaitCoordination(ctx context.Context, session coordination.
 	for {
 		state, stateErr := store.coordinationWaitState(ctx, session, request, mode)
 		if stateErr != nil {
-			return coordination.CoordinationWaitResult{}, stateErr
+			return coordination.WaitResult{}, stateErr
 		}
 		if mailFloor < 0 {
 			mailFloor = state.mailHead
 		}
-		result := coordination.CoordinationWaitResult{Blockers: state.blockers,
+		result := coordination.WaitResult{Blockers: state.blockers,
 			PendingDeliveries: state.unread, ObservedAtUS: state.observedAtUS,
 			WaitedMS: time.Since(started).Milliseconds()}
 		switch {
 		case request.AwaitMail && state.mailHead > mailFloor:
-			result.Reason = coordination.CoordinationWaitMailArrived
+			result.Reason = coordination.WaitMailArrived
 			return result, nil
 		case request.Path != "" && len(state.blockers) == 0:
-			result.Reason = coordination.CoordinationWaitPathFree
+			result.Reason = coordination.WaitPathFree
 			return result, nil
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			result.Reason = coordination.CoordinationWaitDeadline
+			result.Reason = coordination.WaitDeadline
 			return result, nil
 		}
-		if err := sleepBounded(ctx, min(remaining, coordination.CoordinationWaitPoll)); err != nil {
-			return coordination.CoordinationWaitResult{}, err
+		if err := sleepBounded(ctx, min(remaining, coordination.WaitPoll)); err != nil {
+			return coordination.WaitResult{}, err
 		}
 	}
 }
@@ -87,8 +87,8 @@ func (store *Store) AwaitCoordination(ctx context.Context, session coordination.
 // outlives a client's own request timeout is indistinguishable from a hung
 // daemon. Zero, and anything nonsensical, asks for the ceiling.
 func boundedWaitBudget(requested time.Duration) time.Duration {
-	if requested <= 0 || requested > coordination.MaxCoordinationWait {
-		return coordination.MaxCoordinationWait
+	if requested <= 0 || requested > coordination.MaxWait {
+		return coordination.MaxWait
 	}
 	return requested
 }
@@ -108,17 +108,17 @@ func sleepBounded(ctx context.Context, interval time.Duration) error {
 }
 
 func validateCoordinationWait(session coordination.LocalAgentSession,
-	request coordination.CoordinationWaitRequest) (coordination.LeaseMode, error) {
+	request coordination.WaitRequest) (coordination.LeaseMode, error) {
 	if session.ProjectKey == "" || session.WorkspaceID.IsZero() || session.ActorID.IsZero() {
-		return "", coordination.ErrInvalidCoordination
+		return "", coordination.ErrInvalid
 	}
 	// A request that names neither condition can only ever return the deadline,
 	// which is an expensive way to sleep and never what the caller meant.
 	if request.Path == "" && !request.AwaitMail {
-		return "", coordination.ErrInvalidCoordination
+		return "", coordination.ErrInvalid
 	}
 	if request.Path != "" && !validLocalCoordinationText(request.Path, coordination.MaxLeaseSelectorBytes) {
-		return "", coordination.ErrInvalidCoordination
+		return "", coordination.ErrInvalid
 	}
 	// Exclusive is the default because it is the strictest reading: it treats
 	// every overlapping lease as a blocker, so an unstated intent can never
@@ -130,7 +130,7 @@ func validateCoordinationWait(session coordination.LocalAgentSession,
 	case coordination.LeaseShared:
 		return coordination.LeaseShared, nil
 	default:
-		return "", coordination.ErrInvalidCoordination
+		return "", coordination.ErrInvalid
 	}
 }
 
@@ -145,7 +145,7 @@ type coordinationWaitState struct {
 }
 
 func (store *Store) coordinationWaitState(ctx context.Context, session coordination.LocalAgentSession,
-	request coordination.CoordinationWaitRequest, mode coordination.LeaseMode) (coordinationWaitState, error) {
+	request coordination.WaitRequest, mode coordination.LeaseMode) (coordinationWaitState, error) {
 	var state coordinationWaitState
 	observed, err := store.adminSnapshot(ctx, func(tx *sql.Tx, now time.Time) error {
 		if request.Path != "" {

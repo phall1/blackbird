@@ -48,7 +48,7 @@ func TestNewConversationCarriesTheSlugItWasOpenedUnder(t *testing.T) {
 	// An unusable slug fails the same construction every other unusable field
 	// does, so a store can never persist an alternate key it could not look up.
 	params.Slug = "  not a key  "
-	if _, err := NewConversation(params, openedAt); err != ErrInvalidCoordination {
+	if _, err := NewConversation(params, openedAt); err != ErrInvalid {
 		t.Fatalf("error=%v, want an invalid coordination rejection", err)
 	}
 
@@ -66,8 +66,8 @@ func TestNewConversationCarriesTheSlugItWasOpenedUnder(t *testing.T) {
 // stale to a roster that has not actually lost it.
 func TestCoordinationWaitCeilingBoundsTheHeartbeatLag(t *testing.T) {
 	t.Parallel()
-	if MaxCoordinationWait <= CoordinationWaitPoll {
-		t.Fatalf("wait ceiling %v does not admit a single poll of %v", MaxCoordinationWait, CoordinationWaitPoll)
+	if MaxWait <= WaitPoll {
+		t.Fatalf("wait ceiling %v does not admit a single poll of %v", MaxWait, WaitPoll)
 	}
 	if LocalAgentHeartbeatInterval >= LocalAgentActiveWindow {
 		t.Fatalf("heartbeat interval %v would let a live session fall outside the %v liveness window",
@@ -76,22 +76,22 @@ func TestCoordinationWaitCeilingBoundsTheHeartbeatLag(t *testing.T) {
 	// A wait parks an agent for up to the ceiling without authenticating again,
 	// so a heartbeat interval shorter than the ceiling would be pointless and
 	// one shorter than the window is what keeps that agent on the roster.
-	if LocalAgentActiveWindow-LocalAgentHeartbeatInterval <= MaxCoordinationWait {
+	if LocalAgentActiveWindow-LocalAgentHeartbeatInterval <= MaxWait {
 		t.Fatalf("a %v wait plus a %v heartbeat lag exhausts the %v liveness window",
-			MaxCoordinationWait, LocalAgentHeartbeatInterval, LocalAgentActiveWindow)
+			MaxWait, LocalAgentHeartbeatInterval, LocalAgentActiveWindow)
 	}
 }
 
 func TestCoordinationConsumerIDIsBoundedAndRetypeable(t *testing.T) {
 	t.Parallel()
-	for _, value := range []string{"pi-extension", "opencode.v1", "Claude_Code", strings.Repeat("a", MaxCoordinationConsumerIDBytes)} {
-		id, err := NewCoordinationConsumerID(value)
+	for _, value := range []string{"pi-extension", "opencode.v1", "Claude_Code", strings.Repeat("a", MaxConsumerIDBytes)} {
+		id, err := NewConsumerID(value)
 		if err != nil || id.String() != value {
 			t.Fatalf("consumer %q id=%q error=%v", value, id, err)
 		}
 	}
-	for _, value := range []string{"", "has space", "slash/name", "snowman-☃", strings.Repeat("a", MaxCoordinationConsumerIDBytes+1)} {
-		if _, err := NewCoordinationConsumerID(value); err == nil {
+	for _, value := range []string{"", "has space", "slash/name", "snowman-☃", strings.Repeat("a", MaxConsumerIDBytes+1)} {
+		if _, err := NewConsumerID(value); err == nil {
 			t.Fatalf("consumer %q was accepted", value)
 		}
 	}

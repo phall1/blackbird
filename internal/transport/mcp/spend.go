@@ -3,7 +3,7 @@ package mcp
 import (
 	"time"
 
-	"github.com/phall1/blackbird/internal/application"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 )
 
 // ToolSpendReport is the observation plane's only agent-facing surface.
@@ -46,7 +46,7 @@ type spendReportOutput struct {
 	Truncated bool               `json:"truncated" jsonschema:"More groups existed than limit allowed. The groups returned are the largest ones."`
 }
 
-func spendReportPayload(report application.SpendReport) spendReportOutput {
+func spendReportPayload(report telemetry.SpendReport) spendReportOutput {
 	groups := make([]spendGroupOutput, 0, len(report.Groups))
 	for _, group := range report.Groups {
 		groups = append(groups, spendGroupPayload(group))
@@ -60,7 +60,7 @@ func spendReportPayload(report application.SpendReport) spendReportOutput {
 	}
 }
 
-func spendGroupPayload(group application.SpendGroup) spendGroupOutput {
+func spendGroupPayload(group telemetry.SpendGroup) spendGroupOutput {
 	return spendGroupOutput{
 		Key: group.Key, Observations: group.Observations,
 		BilledInput: group.BilledInput(), UncachedInput: group.UncachedInput,
