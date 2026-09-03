@@ -104,6 +104,7 @@ func composeProductionBundle(
 	started := time.Now().UTC()
 	adminHTTPHandler, err := httptransport.NewAdminHandler(httptransport.AdminDependencies{
 		Admin: store, Token: httptransport.NewAdminTokenDigest(token), Metrics: metricsRegistry,
+		Cost: costAdminReader(store),
 		Identity: httptransport.LocalIdentity{
 			Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt,
 			PID: os.Getpid(), StartedAt: started,
@@ -159,6 +160,18 @@ func (worker *adminHandshakeWorker) SetBoundHTTPAddress(address string) {
 // the agent-facing tool exists at all.
 func observationReader(store Storage) telemetry.Reader {
 	reader, ok := store.(telemetry.Reader)
+	if !ok {
+		return nil
+	}
+	return reader
+}
+
+// costAdminReader is the operator half of the same optional capability, and
+// returns a nil interface for the same reason: the admin route reads a nil
+// dependency as "this daemon cannot answer cost" and says so, which is a
+// different answer from a report full of zeros.
+func costAdminReader(store Storage) telemetry.CostAdminReader {
+	reader, ok := store.(telemetry.CostAdminReader)
 	if !ok {
 		return nil
 	}

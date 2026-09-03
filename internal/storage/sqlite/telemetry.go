@@ -286,20 +286,24 @@ func (store *Store) SpendReport(ctx context.Context, session coordination.LocalA
 	if err := query.Validate(); err != nil {
 		return telemetry.SpendReport{}, err
 	}
-	query = query.Normalized(time.Now().UTC())
+	now := time.Now().UTC()
+	query = query.Normalized(now)
 	shape, ok := spendShapeFor(query.Dimension)
 	if !ok {
 		return telemetry.SpendReport{}, coordination.ErrInvalid
 	}
 
-	filter := "WHERE calls.project_key = ? AND calls.started_at_us >= ?"
-	arguments := []any{session.ProjectKey, query.Since.UnixMicro()}
+	// Closed at both ends. started_at_us is the adapter's clock, not this
+	// daemon's, and it is unclamped at ingest -- so an upper bound is what stops
+	// a future-dated call being counted in every window until that date passes.
+	filter := "WHERE calls.project_key = ? AND calls.started_at_us >= ? AND calls.started_at_us <= ?"
+	arguments := []any{session.ProjectKey, query.Since.UnixMicro(), timeMicros(now)}
 	if query.MineOnly {
 		filter += " AND calls.actor_id = ?"
 		arguments = append(arguments, session.ActorID.String())
 	}
 
-	report := telemetry.SpendReport{Dimension: query.Dimension, Since: query.Since}
+	report := telemetry.SpendReport{Dimension: query.Dimension, Since: query.Since, Until: now}
 	totals, err := store.spendTotals(ctx, shape, filter, arguments)
 	if err != nil {
 		return telemetry.SpendReport{}, err

@@ -390,9 +390,21 @@ func pruneCoordinationJournal(ctx context.Context, database *sql.DB, before time
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// The age boundary is the last position BELOW the oldest event still inside
+	// the retention window -- not the highest position among events outside it.
+	//
+	// Those two agree only while position tracks occurrence order, and it no
+	// longer does: contention facts are written by a paced background drain, so
+	// a refusal commits a coalesce window after it happened and lands behind
+	// acquisitions that happened after it. Taking max(position) over the old
+	// events would then sweep away the retained events sitting below that mark,
+	// deleting facts inside the window a caller asked to keep. Reading the
+	// minimum from the KEPT side instead cannot do that, whatever the skew,
+	// because the boundary is defined by the first row that must survive.
 	var ageThrough, countThrough uint64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(position), 0) FROM coordination_events
-		WHERE occurred_at_us < ?`, before.UTC().UnixMicro()).Scan(&ageThrough); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(min(position) - 1, (SELECT COALESCE(max(position), 0)
+		FROM coordination_events)) FROM coordination_events WHERE occurred_at_us >= ?`,
+		before.UTC().UnixMicro()).Scan(&ageThrough); err != nil {
 		return 0, 0, err
 	}
 	err = tx.QueryRowContext(ctx, `SELECT position FROM coordination_events ORDER BY position DESC LIMIT 1 OFFSET ?`,

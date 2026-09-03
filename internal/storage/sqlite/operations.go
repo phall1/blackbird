@@ -588,6 +588,11 @@ func (store *Store) AcquireLease(ctx context.Context, params coordination.Acquir
 		return coordination.Lease{}, err
 	}
 	var result coordination.Lease
+	// The refusal is captured inside the transaction and recorded after it, so
+	// nothing about writing the fact happens under the daemon-wide write lock.
+	// The closure runs exactly once per call, so a captured refusal is one
+	// refusal and produces one fact.
+	var refusal *coordination.ClaimRefusal
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
 		now, err := sqliteNow(ctx, tx)
 		if err != nil {
@@ -664,6 +669,8 @@ func (store *Store) AcquireLease(ctx context.Context, params coordination.Acquir
 				}
 				keys[prior.selector.Key()] = struct{}{}
 				if params.Mode == coordination.LeaseExclusive || coordination.LeaseMode(prior.mode) == coordination.LeaseExclusive {
+					refusal = claimRefusal(params, prior.lease, prior.holder, prior.mode,
+						requested, prior.selector, prior.expires, now)
 					return coordinationConflict(domain.ErrorCodeLeaseConflict, domain.ConflictLease,
 						fmt.Sprintf("an active overlapping %s lease exists: lease %s held by actor %s over %s %s, free in %s",
 							prior.mode, prior.lease, prior.holder, prior.selector.Kind(), evidenceText(prior.selector.Path()),
@@ -728,7 +735,38 @@ func (store *Store) AcquireLease(ctx context.Context, params coordination.Acquir
 			coordination.EventLeaseAcquired, params.LeaseID.String(), now, payload,
 			coordinationVisibilityWorkspace, nil)
 	})
+	if refusal != nil {
+		store.contention.RecordClaimRefusal(*refusal)
+	}
 	return result, err
+}
+
+// claimRefusal keeps the conflict's evidence instead of discarding it. Every
+// field here is already in scope where the overlap is decided -- the earlier
+// work that made a conflict legible to its caller put it there -- so the only
+// thing this function adds is a durable copy. A reader of the fact needs no
+// second lookup to say who was refused, what they asked for, who held it, which
+// two selectors met, and how long the holder was still entitled to hold.
+func claimRefusal(params coordination.AcquireLeaseParams, holderLease, holderActor, holderMode string,
+	requested, held coordination.LeaseSelector, holderExpires int64, now time.Time) *coordination.ClaimRefusal {
+	lease, err := domain.ParseLeaseID(holderLease)
+	if err != nil {
+		return nil
+	}
+	actor, err := domain.ParseActorID(holderActor)
+	if err != nil {
+		return nil
+	}
+	return &coordination.ClaimRefusal{
+		WorkspaceID: params.WorkspaceID, RefusedActor: params.Holder, RefusedSession: params.HolderSession,
+		ProposedLeaseID: params.LeaseID, RequestedMode: params.Mode,
+		RequestedSelectors: append([]coordination.LeaseSelector(nil), params.Selectors...),
+		RequestedTTL:       params.TTL,
+		RequestedSelector:  requested, HolderSelector: held,
+		Holder: coordination.ContentionHolder{LeaseID: lease, Actor: actor,
+			Mode: coordination.LeaseMode(holderMode), ExpiresAt: microsTime(holderExpires)},
+		RefusedAt: now,
+	}
 }
 
 // supersedeHeldLeases retires the acquirer's own active leases whose every
@@ -1021,6 +1059,7 @@ func instantEvidence(value time.Time) string {
 }
 
 const (
+	coordinationVisibilityActor      = "actor"
 	coordinationVisibilityRecipients = "recipients"
 	coordinationVisibilityWorkspace  = "workspace"
 )

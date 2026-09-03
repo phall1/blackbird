@@ -316,13 +316,21 @@ const (
 	EventLeaseAcquired       EventType = "lease.acquired"
 	EventLeaseRenewed        EventType = "lease.renewed"
 	EventLeaseReleased       EventType = "lease.released"
+	// EventLeaseRefused and EventWaitCompleted are the journal's only
+	// non-successes. Everything above them records something that worked, which
+	// is why the cost of being blocked was never computable from this stream.
+	// See contention.go for what each payload carries and why they share this
+	// table rather than one of their own.
+	EventLeaseRefused  EventType = "lease.refused"
+	EventWaitCompleted EventType = "wait.completed"
 )
 
 func (kind EventType) Valid() bool {
 	switch kind {
 	case EventMessageAvailable, EventMessageRead,
 		EventMessageAcknowledged, EventLeaseAcquired,
-		EventLeaseRenewed, EventLeaseReleased:
+		EventLeaseRenewed, EventLeaseReleased,
+		EventLeaseRefused, EventWaitCompleted:
 		return true
 	default:
 		return false

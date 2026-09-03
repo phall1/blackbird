@@ -31,6 +31,7 @@ const (
 	pathConversations = "/api/v1/local/admin/conversations"
 	pathReservations  = "/api/v1/local/admin/reservations"
 	pathEvents        = "/api/v1/local/admin/events"
+	pathCost          = "/api/v1/local/admin/cost"
 
 	defaultTimeout  = 5 * time.Second
 	maximumResponse = 8 << 20
@@ -206,6 +207,21 @@ func (client *Client) Events(ctx context.Context, query cli.EventQuery) (cli.Eve
 		events = append(events, event)
 	}
 	return cli.EventsPage{Events: events, Truncated: page.Truncated}, nil
+}
+
+// Cost reads the operator cost report for one project. The project key is sent
+// as given: the daemon owns the decision about what an unknown project means,
+// and answering "not found" there rather than an empty report here is what
+// keeps a typo from reading as a quiet project.
+func (client *Client) Cost(ctx context.Context, query cli.CostQuery) (cli.CostReport, error) {
+	values := url.Values{}
+	setNonEmpty(values, "project_key", query.ProjectKey)
+	if query.SinceHours > 0 {
+		values.Set("since_hours", strconv.Itoa(query.SinceHours))
+	}
+	setLimit(values, query.Limit)
+	var report cli.CostReport
+	return report, client.get(ctx, pathCost, values, &report)
 }
 
 func (client *Client) get(ctx context.Context, path string, values url.Values, payload any) error {

@@ -718,3 +718,73 @@ func TestBackupAndRestoreRoundTripInTheShippedBinary(t *testing.T) {
 		t.Fatalf("the restored database is not itself backupable: %v", err)
 	}
 }
+
+// TestGCKeepsEventsInsideTheWindowWhenPositionsAreOutOfOrder covers the skew
+// the contention journal introduced.
+//
+// Position is COMMIT order, not occurrence order: contention facts are written
+// by a paced background drain, so a refusal commits a coalesce window after it
+// happened and lands behind acquisitions that happened later. Taking the age
+// boundary as max(position) over the events OUTSIDE the window then sweeps away
+// every retained event sitting below that mark -- deleting facts the caller
+// asked to keep, silently, because the pruner reports only a count. Reading the
+// boundary from the KEPT side instead cannot do that whatever the skew.
+func TestGCKeepsEventsInsideTheWindowWhenPositionsAreOutOfOrder(t *testing.T) {
+	t.Parallel()
+	path := blackbirdDatabase(t)
+	database, err := openForMaintenance(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	before := now.Add(-30 * 24 * time.Hour)
+	// Written in this order, occurring in a different one. Position 2 is a
+	// fresh event; position 3 is an old one that reached the journal late,
+	// which is exactly what a paced drain produces.
+	occurrences := []time.Time{
+		now.Add(-31 * 24 * time.Hour), // 1: outside the window
+		now.Add(-time.Hour),           // 2: INSIDE, and below the late arrival
+		now.Add(-32 * 24 * time.Hour), // 3: outside, committed late
+		now.Add(-time.Minute),         // 4: inside
+	}
+	for index, occurred := range occurrences {
+		if _, err := database.Exec(`INSERT INTO coordination_events(
+			workspace_id, actor_id, event_type, subject_id, occurred_at_us, payload, visibility)
+			VALUES (?, ?, 'lease.refused', ?, ?, ?, 'workspace')`,
+			"00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002",
+			fmt.Sprintf("lease-%d", index), occurred.UnixMicro(), []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// MaxEvents is high enough that only the age rule can delete anything, so
+	// this measures the age boundary alone.
+	reclaimed, err := (maintenanceAdapter{}).Reclaim(context.Background(), path, cli.ReclaimPlan{
+		Prune: true, PruneBefore: before, MaxEvents: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only position 1 may go. Position 3 is older than the boundary but sits
+	// above a retained event, so it survives -- keeping a stale fact is a cost
+	// the next sweep collects, where deleting a fresh one is unrecoverable.
+	if reclaimed.EventsPruned != 1 {
+		t.Fatalf("pruned %d events, want only the one below the first retained position", reclaimed.EventsPruned)
+	}
+	database, err = openForMaintenance(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	var survived int
+	if err := database.QueryRow(`SELECT count(*) FROM coordination_events
+		WHERE occurred_at_us >= ?`, before.UnixMicro()).Scan(&survived); err != nil {
+		t.Fatal(err)
+	}
+	if survived != 2 {
+		t.Fatalf("%d events inside the retention window survived, want both: the pruner deleted "+
+			"a fact the caller asked to keep", survived)
+	}
+}

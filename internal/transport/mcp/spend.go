@@ -39,8 +39,13 @@ type spendGroupOutput struct {
 }
 
 type spendReportOutput struct {
-	Dimension string             `json:"dimension"`
-	Since     string             `json:"since"`
+	Dimension string `json:"dimension"`
+	Since     string `json:"since"`
+	// Until closes the window. It is stated because it is ENFORCED: a call
+	// stamped after it is excluded rather than counted, which matters because
+	// started_at comes from the harness that recorded the call and this daemon
+	// does not own that clock.
+	Until     string             `json:"until"`
 	Groups    []spendGroupOutput `json:"groups"`
 	Totals    spendGroupOutput   `json:"totals" jsonschema:"Totals over the whole window, not merely the groups returned, so they stay honest when truncated is true."`
 	Truncated bool               `json:"truncated" jsonschema:"More groups existed than limit allowed. The groups returned are the largest ones."`
@@ -54,6 +59,7 @@ func spendReportPayload(report telemetry.SpendReport) spendReportOutput {
 	return spendReportOutput{
 		Dimension: string(report.Dimension),
 		Since:     report.Since.Format(time.RFC3339),
+		Until:     report.Until.Format(time.RFC3339),
 		Groups:    groups,
 		Totals:    spendGroupPayload(report.Totals),
 		Truncated: report.Truncated,

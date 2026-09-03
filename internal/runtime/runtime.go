@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
 )
 
@@ -233,25 +234,34 @@ type Daemon struct {
 // connections but deliberately does not cancel active request contexts, so a
 // long-lived SSE or wait handler otherwise holds shutdown until its deadline
 // and can still touch storage after that deadline expires.
+//
+// The cancellation carries a CAUSE, and that is not cosmetic. Cancelling an
+// in-flight request looks identical, from inside a handler, to the client
+// hanging up -- so without a cause a shutdown makes every parked waiter look
+// like an agent that gave up, and the observation plane writes that down as an
+// abandonment. The updater restarts this daemon on a schedule, so the fiction
+// would recur forever and be indistinguishable from a real coordination
+// problem. coordination.ErrDaemonStopping is how a store tells our own stop
+// from the caller's.
 type ingressDrain struct {
 	mu       sync.Mutex
 	stopping bool
 	next     uint64
-	cancels  map[uint64]context.CancelFunc
+	cancels  map[uint64]context.CancelCauseFunc
 	handlers sync.WaitGroup
 }
 
 func newIngressDrain() *ingressDrain {
-	return &ingressDrain{cancels: make(map[uint64]context.CancelFunc)}
+	return &ingressDrain{cancels: make(map[uint64]context.CancelCauseFunc)}
 }
 
 func (drain *ingressDrain) wrap(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		ctx, cancel := context.WithCancel(request.Context())
+		ctx, cancel := context.WithCancelCause(request.Context())
 		drain.mu.Lock()
 		if drain.stopping {
 			drain.mu.Unlock()
-			cancel()
+			cancel(coordination.ErrDaemonStopping)
 			http.Error(writer, "server is shutting down", http.StatusServiceUnavailable)
 			return
 		}
@@ -264,7 +274,9 @@ func (drain *ingressDrain) wrap(handler http.Handler) http.Handler {
 			drain.mu.Lock()
 			delete(drain.cancels, requestID)
 			drain.mu.Unlock()
-			cancel()
+			// A nil cause is the ordinary end of a request. The first cancel
+			// wins, so this can never overwrite a shutdown cause already set.
+			cancel(nil)
 			drain.handlers.Done()
 		}()
 		handler.ServeHTTP(writer, request.WithContext(ctx))
@@ -277,13 +289,13 @@ func (drain *ingressDrain) begin() {
 	}
 	drain.mu.Lock()
 	drain.stopping = true
-	cancels := make([]context.CancelFunc, 0, len(drain.cancels))
+	cancels := make([]context.CancelCauseFunc, 0, len(drain.cancels))
 	for _, cancel := range drain.cancels {
 		cancels = append(cancels, cancel)
 	}
 	drain.mu.Unlock()
 	for _, cancel := range cancels {
-		cancel()
+		cancel(coordination.ErrDaemonStopping)
 	}
 }
 
@@ -606,13 +618,64 @@ func (daemon *Daemon) Shutdown(ctx context.Context) error {
 		for index := len(workers) - 1; index >= 0; index-- {
 			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("stop worker", workers[index].Stop(stopCtx)))
 		}
-		if store != nil && drainErr == nil {
-			shutdownErr = errors.Join(shutdownErr, daemon.logFailure("close storage", store.Close()))
+		if store != nil {
+			// Storage is closed only once every handler is gone; closing under a
+			// live handler is what the drain barrier exists to prevent.
+			if drainErr == nil {
+				shutdownErr = errors.Join(shutdownErr, daemon.logFailure("close storage", store.Close()))
+			}
+			// Reported whether or not the close ran, and after it when it did.
+			// Closing is what performs the contention journal's final flush, so
+			// a drain that timed out leaves facts unwritten -- which is exactly
+			// the case a reader must be told about, and exactly the case the
+			// old guard stayed silent for. A dropped or unwritten contention
+			// fact is invisible everywhere else: the journal has no error
+			// return by construction, so this line is the only place a loss is
+			// ever stated.
+			daemon.logContention(store, drainErr == nil)
 		}
 		daemon.shutdownErr = shutdownErr
 		daemon.logger.Info("shutdown complete", slog.Bool("clean", shutdownErr == nil))
 	})
 	return daemon.shutdownErr
+}
+
+// logContention states what the contention journal recorded and what it lost.
+// It is an optional capability of a store rather than part of the Storage
+// contract: a backend that records no contention is a valid backend, and one
+// that does must not be able to fail a shutdown by reporting on itself.
+func (daemon *Daemon) logContention(store Storage, flushed bool) {
+	reporter, ok := store.(coordination.ContentionReporter)
+	if !ok {
+		return
+	}
+	stats := reporter.ContentionStats()
+	// Silent ONLY when the journal both handled nothing and lost nothing.
+	//
+	// The guard used to name three counters and miss the rest, which inverted
+	// the whole point of this line: a fact offered after the journal closed
+	// counts as DroppedClosed and nothing else, so a daemon that lost facts at
+	// shutdown -- the likeliest moment to lose one -- printed nothing at all
+	// and the loss was invisible everywhere. Lost() is every kind of loss by
+	// construction, so a counter added later cannot fall outside it.
+	if stats.Offered == 0 && stats.Lost() == 0 {
+		return
+	}
+	// flushed says whether the journal got its final write. When it is false
+	// the counts below are a snapshot taken before the last batch, so offered
+	// minus written is an upper bound on what was lost rather than the loss
+	// itself -- and saying which is the difference between an honest report and
+	// a misleading one.
+	daemon.logger.Info("contention journal stopped",
+		slog.Bool("flushed", flushed),
+		slog.Uint64("offered", stats.Offered), slog.Uint64("written", stats.Written),
+		slog.Uint64("dropped_queue_full", stats.DroppedFull),
+		slog.Uint64("dropped_closed", stats.DroppedClosed),
+		slog.Uint64("dropped_invalid", stats.DroppedInvalid),
+		slog.Uint64("dropped_unwritten", stats.DroppedWrite),
+		slog.Uint64("lost", stats.Lost()),
+		slog.Uint64("write_failures", stats.WriteFailures),
+		slog.Uint64("batches", stats.Batches))
 }
 
 func (daemon *Daemon) logFailure(message string, err error) error {

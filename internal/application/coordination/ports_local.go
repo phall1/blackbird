@@ -1,6 +1,7 @@
 package coordination
 
 import (
+	"errors"
 	"time"
 
 	"github.com/phall1/blackbird/internal/domain"
@@ -95,7 +96,37 @@ const (
 	// out. It is an ordinary outcome, not an error: the caller should decide
 	// again rather than be handed a failure it cannot act on.
 	WaitDeadline WaitReason = "deadline"
+	// WaitAbandoned means the caller went away mid-wait -- its request context
+	// was cancelled -- so neither condition was ever reached and neither was
+	// the budget. It is RECORDED and never RETURNED: AwaitCoordination answers
+	// a cancelled wait with the cancellation, so no caller can receive this
+	// value. It exists because "the agent gave up" is a fact we know, and the
+	// two honest alternatives are worse -- calling it a deadline would invent
+	// a budget that never ran out, and calling it unknown would discard
+	// something the daemon observed directly.
+	WaitAbandoned WaitReason = "abandoned"
+	// WaitDaemonStopping means this daemon cut the wait short while shutting
+	// down. It is RECORDED and never RETURNED, and it exists because the
+	// alternative is a lie that repeats on a schedule: shutdown cancels every
+	// in-flight request context before draining, so without this every restart
+	// -- and the updater restarts this daemon on a timer -- would manufacture a
+	// crop of "the agent gave up" facts about agents that did nothing of the
+	// kind. A wait ended this way says nothing about the agent or the path; it
+	// is an artefact of the daemon's own lifecycle and must never be counted as
+	// an abandonment or a deadline.
+	WaitDaemonStopping WaitReason = "daemon_stopping"
 )
+
+// ErrDaemonStopping is the cancellation cause the composition root attaches to
+// every in-flight request context when it begins shutting down.
+//
+// It exists so a store can tell its own shutdown apart from a client that
+// walked away. Both arrive at a handler as an identical cancelled context, and
+// the observation plane has to distinguish them: one is a fact about an agent,
+// the other is a fact about this process. Cancelling with a cause is the only
+// channel that survives the context boundary, so the sentinel is declared in
+// the plane both the runtime and the store already depend on.
+var ErrDaemonStopping = errors.New("daemon is shutting down")
 
 const (
 	// MaxWait is the ceiling the store imposes on every wait,

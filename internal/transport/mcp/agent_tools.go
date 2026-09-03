@@ -60,7 +60,8 @@ type statusInput struct {
 	Spend      bool   `json:"spend,omitempty" jsonschema:"Include a telemetry rollup when the observation reader is available."`
 	Dimension  string `json:"dimension,omitempty" jsonschema:"Spend grouping: model, agent, harness, span_kind, or span_name."`
 	SinceHours uint32 `json:"since_hours,omitempty" jsonschema:"Spend lookback window in hours; zero uses the service default."`
-	MineOnly   bool   `json:"mine_only,omitempty" jsonschema:"Restrict spend to the authenticated agent."`
+	MineOnly   bool   `json:"mine_only,omitempty" jsonschema:"Restrict spend and contention to the authenticated agent. It never narrows abandonment: a lease someone ELSE walked away from is the thing you cannot see from your own side and most need told about."`
+	Cost       bool   `json:"cost,omitempty" jsonschema:"Include what contention and abandonment cost: which paths are refusing claims, and which expired-unreleased leases are still refusing people. Read it when a claim was refused or a wait hit its deadline; it names the selector to narrow and the holder to talk to. Contention facts are written by a paced background drain so a refusal from the last moment may not be counted yet; the totals are eventually complete, never authoritative for right now."`
 }
 
 type statusOutput struct {
@@ -69,6 +70,7 @@ type statusOutput struct {
 	Truncated     bool                        `json:"truncated"`
 	WorkReference *coordination.WorkReference `json:"work_reference,omitempty" jsonschema:"One point-in-time observation of a tracker work item. Blackbird is not authoritative for these fields and does not retain them; observed_at and provenance say when it was read and by what."`
 	SpendReport   *spendReportOutput          `json:"spend_report,omitempty"`
+	CostReport    *costReportOutput           `json:"cost_report,omitempty" jsonschema:"What contention and abandonment cost over the window. A section missing from it is listed in unobserved and means nothing was recorded, which is not the same claim as zero."`
 }
 
 type releaseInput struct {
@@ -165,7 +167,8 @@ func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalSto
 			string(telemetry.SpendByHarness), string(telemetry.SpendBySpanKind), string(telemetry.SpendBySpanName)}
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolStatus,
-		Description: "Inspect peers and active claims; optionally observe one work item in this repository's issue tracker, or a telemetry rollup, without adding more tools. " +
+		Description: "Inspect peers and active claims; optionally observe one work item in this repository's issue tracker, a telemetry rollup, or what contention cost, without adding more tools. " +
+			"Set cost after a refused claim or a wait that hit its deadline: it names the holder selector that is refusing people and the expired-unreleased leases still blocking the repository, which is what turns a retry into a fix. " +
 			"A work_reference in the result is an observation, never Blackbird state: it is what the tracker said at observed_at, nothing is stored, and the tracker stays the only authority over work fields, so read it again rather than trusting an earlier copy. " +
 			"Where no tracker is installed the call fails with DEPENDENCY_UNAVAILABLE and a dependency.kind naming why; that is a property of the machine, and peers, claims and spend are unaffected.",
 		InputSchema: statusSchema},
@@ -289,6 +292,21 @@ func agentStatus(ctx context.Context, store coordination.LocalStore, observation
 		}
 		payload := spendReportPayload(report)
 		output.SpendReport = &payload
+	}
+	if input.Cost {
+		if isNil(observations) {
+			return statusOutput{}, invalidInput("cost requires a configured observation reader")
+		}
+		query := telemetry.CostQuery{MineOnly: input.MineOnly, Limit: input.Limit}
+		if input.SinceHours > 0 {
+			query.Since = time.Now().UTC().Add(-time.Duration(input.SinceHours) * time.Hour)
+		}
+		report, reportErr := observations.CostReport(ctx, session, query)
+		if reportErr != nil {
+			return statusOutput{}, reportErr
+		}
+		payload := costReportPayload(report)
+		output.CostReport = &payload
 	}
 	return output, nil
 }

@@ -62,6 +62,7 @@ const (
 	benchmarkLeaseAuthorityIndex = 14
 	benchmarkStaleLeaseBase      = 2_000_000
 	benchmarkAcquiredLeaseBase   = 3_000_000
+	benchmarkRefusedLeaseBase    = 4_000_000
 )
 
 const benchmarkMessageBody = "durable benchmark body"
@@ -339,6 +340,90 @@ func BenchmarkAwaitCoordination(b *testing.B) {
 				if _, err := store.coordinationWaitState(ctx, waiter, variant.request,
 					coordination.LeaseExclusive); err != nil {
 					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkRefusedClaim measures the path this change touched: an acquisition
+// that loses to an overlapping lease. A denial is decided while the
+// daemon-wide write lock is held, and authentication was taken off the durable
+// path to lift the daemon from roughly 195 to 15,300 calls per second -- so the
+// question this benchmark exists to answer is whether recording a fact per
+// denial hands that back.
+//
+// The unrecorded arm is the control: the identical refusal with no journal
+// attached, which is what the store did before contention was recorded. The two
+// arms must stay within noise of each other, because the recording is a slice
+// clone and a non-blocking channel send outside the transaction -- not a commit.
+// A future change that writes a denial durably where it is decided shows up
+// here as the recorded arm collapsing toward BenchmarkCommitLatency.
+//
+// Under a benchmark's arrival rate the bounded queue fills and the journal
+// drops, counted, rather than slowing the refusal down. That is the designed
+// behaviour and it is exactly why the cost stays flat.
+func BenchmarkRefusedClaim(b *testing.B) {
+	ctx := context.Background()
+	store := openBenchmarkStore(b, "refused.db")
+	holder, _, err := store.RegisterLocalAgent(ctx, "/workspace/refused", "holder", "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	refused, _, err := store.RegisterLocalAgent(ctx, "/workspace/refused", "refused", "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	holderSelector, err := coordination.NewLeaseSelector(coordination.LeaseSelectorSubtree, "internal/storage")
+	if err != nil {
+		b.Fatal(err)
+	}
+	leaseID, err := domain.NewLeaseID()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := store.AcquireLease(ctx, coordination.AcquireLeaseParams{LeaseID: leaseID,
+		WorkspaceID: holder.WorkspaceID, Holder: holder.ActorID, HolderSession: holder.ActorSessionID,
+		AuthorityEpoch: holder.AuthorityEpoch, Mode: coordination.LeaseExclusive,
+		Selectors: []coordination.LeaseSelector{holderSelector}, TTL: time.Hour}); err != nil {
+		b.Fatal(err)
+	}
+	wanted, err := coordination.NewLeaseSelector(coordination.LeaseSelectorExact, "internal/storage/sqlite/sqlite.go")
+	if err != nil {
+		b.Fatal(err)
+	}
+	foldSeedIntoDatabase(b, store)
+
+	journal := store.contention
+	// Restored unconditionally so Close still stops the drain it started.
+	b.Cleanup(func() { store.contention = journal })
+	for _, variant := range []struct {
+		name    string
+		journal *contentionJournal
+	}{
+		{"recorded", journal},
+		{"unrecorded", nil},
+	} {
+		store.contention = variant.journal
+		// The proposed lease counter lives out here to stay unique across the
+		// sub-benchmark body's reruns at growing b.N.
+		attempt := 0
+		b.Run(variant.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				attempt++
+				proposed, parseErr := domain.ParseLeaseID(coordinationUUID(benchmarkRefusedLeaseBase + attempt))
+				if parseErr != nil {
+					b.Fatal(parseErr)
+				}
+				_, err := store.AcquireLease(ctx, coordination.AcquireLeaseParams{LeaseID: proposed,
+					WorkspaceID: refused.WorkspaceID, Holder: refused.ActorID,
+					HolderSession: refused.ActorSessionID, AuthorityEpoch: refused.AuthorityEpoch,
+					Mode: coordination.LeaseExclusive, Selectors: []coordination.LeaseSelector{wanted},
+					TTL: time.Hour})
+				if err == nil {
+					b.Fatal("the benchmark acquired the lease it is meant to be refused")
 				}
 			}
 		})

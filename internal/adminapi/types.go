@@ -186,3 +186,111 @@ type EventsPage struct {
 	Truncated  bool    `json:"truncated"`
 	ObservedAt string  `json:"observed_at"`
 }
+
+// CostReport is the operator's answer to "what did coordination cost". It is a
+// projection of the daemon's report, not a second computation of it: every
+// figure here is carried across as the daemon measured it.
+//
+// The wire form keeps the discipline the report itself keeps. An unobserved
+// section is ABSENT and named in Unobserved rather than rendered as zeros,
+// because "nothing was contended" and "nothing was recorded" call for opposite
+// responses. Recording is present only when the daemon lost contention facts,
+// and while it is present every contention count is a floor.
+type CostReport struct {
+	ProjectKey  string           `json:"project_key"`
+	Since       string           `json:"since"`
+	Until       string           `json:"until"`
+	Unobserved  []string         `json:"unobserved,omitempty"`
+	Recording   *CostRecording   `json:"recording_incomplete,omitempty"`
+	Contention  *CostContention  `json:"contention,omitempty"`
+	Abandonment *CostAbandonment `json:"abandonment,omitempty"`
+	Cache       *CostCache       `json:"cache,omitempty"`
+}
+
+type CostRecording struct {
+	Dropped uint64 `json:"facts_dropped"`
+	Written uint64 `json:"facts_written"`
+}
+
+type CostContention struct {
+	Refusals            uint64             `json:"refusals"`
+	PathWaits           uint64             `json:"path_waits"`
+	MailWaits           uint64             `json:"mail_waits"`
+	WaitsEndedFree      uint64             `json:"waits_ended_free"`
+	WaitsEndedMail      uint64             `json:"waits_ended_mail"`
+	WaitsEndedDeadline  uint64             `json:"waits_ended_deadline"`
+	WaitsEndedAbandoned uint64             `json:"waits_ended_abandoned"`
+	WaitsEndedStopped   uint64             `json:"waits_ended_stopped"`
+	WaitsEndedUnknown   uint64             `json:"waits_ended_unknown"`
+	ParkedMS            uint64             `json:"parked_ms"`
+	LongestParkMS       uint64             `json:"longest_park_ms"`
+	Agents              []CostBlockedAgent `json:"agents,omitempty"`
+	Paths               []CostPath         `json:"contended_paths,omitempty"`
+	Truncated           bool               `json:"truncated"`
+}
+
+// CostBlockedAgent puts one agent's contention beside one agent's spend. The
+// two halves are CO-OCCURRING TOTALS over the same window and the same actor
+// id; nothing here claims the tokens were spent because of the contention.
+type CostBlockedAgent struct {
+	AgentName          string `json:"agent_name,omitempty"`
+	ActorID            string `json:"actor_id"`
+	Refusals           uint64 `json:"refusals"`
+	PathWaits          uint64 `json:"path_waits"`
+	WaitsEndedDeadline uint64 `json:"waits_ended_deadline"`
+	ParkedMS           uint64 `json:"parked_ms"`
+	ModelCalls         uint64 `json:"model_calls"`
+	BilledInput        uint64 `json:"billed_input_tokens"`
+	Output             uint64 `json:"output_tokens"`
+}
+
+type CostPath struct {
+	Path          string `json:"path"`
+	Kind          string `json:"kind"`
+	Refusals      uint64 `json:"refusals"`
+	BlockedAgents uint64 `json:"blocked_agents"`
+}
+
+type CostAbandonment struct {
+	Abandoned       uint64      `json:"abandoned"`
+	Released        uint64      `json:"released"`
+	AbandonedHeldMS uint64      `json:"abandoned_held_ms"`
+	ReleasedHeldMS  uint64      `json:"released_held_ms"`
+	RefusalsDuring  uint64      `json:"refusals_caused"`
+	Leases          []CostLease `json:"leases,omitempty"`
+	Truncated       bool        `json:"truncated"`
+}
+
+type CostLease struct {
+	LeaseID       string `json:"lease_id"`
+	HolderAgent   string `json:"holder_agent_name,omitempty"`
+	Mode          string `json:"mode"`
+	HeldMS        uint64 `json:"held_ms"`
+	Refusals      uint64 `json:"refusals"`
+	BlockedAgents uint64 `json:"blocked_agents"`
+	ContendedPath string `json:"contended_path,omitempty"`
+}
+
+type CostCache struct {
+	Models    []CostModel `json:"models"`
+	Truncated bool        `json:"truncated"`
+}
+
+// CostModel keeps the three input classes apart on the wire for the same reason
+// the schema keeps them in separate columns: they are billed at materially
+// different rates, and a caller cannot recover the split from a sum.
+//
+// CacheReadShare and CacheReuse are omitted when their denominator is zero,
+// which is why they are pointers. A model that wrote no cache has NO reuse
+// ratio; rendering that as 0.0 would say caching is failing when the truth is
+// it was never used.
+type CostModel struct {
+	Model          string   `json:"model"`
+	Calls          uint64   `json:"calls"`
+	UncachedInput  uint64   `json:"uncached_input_tokens"`
+	CacheRead      uint64   `json:"cache_read_tokens"`
+	CacheWrite     uint64   `json:"cache_write_tokens"`
+	Output         uint64   `json:"output_tokens"`
+	CacheReadShare *float64 `json:"cache_read_share,omitempty"`
+	CacheReuse     *float64 `json:"cache_reuse,omitempty"`
+}

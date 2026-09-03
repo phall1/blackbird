@@ -30,14 +30,14 @@ import (
 const (
 	backwardClockToleranceMicros int64 = 1_000_000
 	ApplicationID                      = 0x42424d4c
-	SchemaVersion                      = 11
+	SchemaVersion                      = 12
 	DriverVersion                      = "v1.56.0"
 	SQLiteVersion                      = "3.53.3"
 	SQLiteSourceID                     = "2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
 	defaultBusyTimeout                 = 5 * time.Second
 	maximumBusyTimeout                 = 30 * time.Second
 	passiveCheckpointInterval          = time.Minute
-	schemaChecksumHex                  = "d89ec1800e9d66778fe313a8da9cd200b5fc5094fbe4fa074bc9e77a22cadc17"
+	schemaChecksumHex                  = "943a0e18b9e7450f4977fbd6422348d5206bf27d5d9096db620eb7884bb1c704"
 	schemaV1ChecksumHex                = "370ba0de329fa9fdf77d027d2ebc85be6747a28bd79ad4ba892fe8884eb3622a"
 	schemaV2ChecksumHex                = "2e0c68a7f203a9c245aed614b5586c4136bd2d1a6764fc8ca3f69e89522ba975"
 	schemaV3ChecksumHex                = "608aa68c86abf1092ec5900ec2b03aecce9b4d3a5284ab7b7f072be0b3d1df6e"
@@ -48,6 +48,7 @@ const (
 	schemaV8ChecksumHex                = "0afe663304ca09eb07951ae44424cde5768e29ecf4c87675b02e5e4cc2dd41d9"
 	schemaV9ChecksumHex                = "a20234bf2bb40c37696a07108f94040c7411a2bb69ce57eaf5ad87c1757546f2"
 	schemaV10ChecksumHex               = "a272fa446ab9c692f6b3978f18147a5881c7ada62d181475d9d5f8aba8cd3025"
+	schemaV11ChecksumHex               = "d89ec1800e9d66778fe313a8da9cd200b5fc5094fbe4fa074bc9e77a22cadc17"
 )
 
 // migrationRung is one step of the upgrade ladder: the embedded migration that
@@ -79,7 +80,8 @@ var migrationLadder = [SchemaVersion]migrationRung{
 	{migrationID: "0008_coordination_event_visibility.sql", schemaChecksum: schemaV8ChecksumHex},
 	{migrationID: "0009_coordination_event_consumers.sql", schemaChecksum: schemaV9ChecksumHex},
 	{migrationID: "0010_coordination_event_retention.sql", schemaChecksum: schemaV10ChecksumHex},
-	{migrationID: "0011_telemetry_codex_harness.sql", schemaChecksum: schemaChecksumHex},
+	{migrationID: "0011_telemetry_codex_harness.sql", schemaChecksum: schemaV11ChecksumHex},
+	{migrationID: "0012_coordination_contention_events.sql", schemaChecksum: schemaChecksumHex},
 }
 
 var migrationIDs = ladderMigrationIDs()
@@ -144,9 +146,13 @@ type Store struct {
 	diagnostics      Diagnostics
 	checkpointCancel context.CancelFunc
 	checkpointDone   chan struct{}
-	closeOnce        sync.Once
-	closeErr         error
-	releasePath      func()
+	// contention buffers the journal's two non-success facts. It is a field
+	// rather than a constructor argument because both producers live in this
+	// package; see contention.go for why the write cannot be synchronous.
+	contention  *contentionJournal
+	closeOnce   sync.Once
+	closeErr    error
+	releasePath func()
 }
 
 // heartbeatLedger remembers when each open session's liveness was last written
@@ -242,6 +248,7 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	diagnostics.UncleanCheckRan = uncleanCheckRan
 	store.diagnostics = diagnostics
 	store.startPassiveCheckpoints()
+	store.startContentionJournal()
 	opened = true
 	return store, nil
 }
@@ -936,6 +943,11 @@ func (store *Store) Close() error {
 	store.closeOnce.Do(func() {
 		store.checkpointCancel()
 		<-store.checkpointDone
+		// The contention journal stops before the database does, so its final
+		// bounded flush still has somewhere to write. Its facts are
+		// bookkeeping, so a flush that fails is counted and dropped rather
+		// than reported here.
+		store.contention.stop()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultBusyTimeout)
 		defer cancel()
 		if err := store.withImmediate(ctx, func(tx *sql.Tx) error {

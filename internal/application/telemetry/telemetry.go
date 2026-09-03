@@ -478,9 +478,18 @@ func (group SpendGroup) BilledInput() uint64 {
 // groups returned, so a truncated report still reports honest totals.
 type SpendReport struct {
 	Dimension SpendDimension
-	Since     time.Time
-	Groups    []SpendGroup
-	Totals    SpendGroup
+	// Since and Until bound the window at BOTH ends, and both are enforced by
+	// the query rather than merely published. started_at_us comes from the
+	// adapter that recorded the call, and nothing clamps it at ingest -- the
+	// column's only constraint is that it is positive -- so a harness with a
+	// skewed clock writes calls dated in the future. With a half-open window
+	// those calls are reported inside every window from now until that date
+	// arrives, which shows up as a "last hour" report full of tokens for an
+	// hour in which nothing ran.
+	Since  time.Time
+	Until  time.Time
+	Groups []SpendGroup
+	Totals SpendGroup
 	// Truncated says the window held more groups than Limit. Without it a
 	// caller cannot tell a complete report from the top of a long tail.
 	Truncated bool
@@ -492,4 +501,11 @@ type SpendReport struct {
 // other, in which case the agent-facing tool is simply not registered.
 type Reader interface {
 	SpendReport(context.Context, coordination.LocalAgentSession, SpendQuery) (SpendReport, error)
+	// CostReport joins this plane's spend to the coordination facts underneath
+	// it. It sits on the same interface as SpendReport because the same store
+	// answers both from the same file in the same transaction-free read lane,
+	// and because a daemon that can answer one can always answer the other:
+	// splitting them would let a composition offer spend without cost, which is
+	// exactly the successes-only report this join exists to replace.
+	CostReport(context.Context, coordination.LocalAgentSession, CostQuery) (CostReport, error)
 }

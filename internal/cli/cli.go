@@ -55,6 +55,7 @@ type CLI struct {
 	Threads      ThreadsCmd      `cmd:"" group:"inspect" aliases:"thread" help:"Inspect conversations."`
 	Reservations ReservationsCmd `cmd:"" group:"inspect" aliases:"reservation,leases,lease" help:"Inspect file reservations."`
 	Events       EventsCmd       `cmd:"" group:"inspect" aliases:"event,journal" help:"Read the coordination event journal."`
+	Cost         CostCmd         `cmd:"" group:"inspect" help:"Report what contention and abandoned leases cost, beside the tokens spent alongside them."`
 
 	Install   InstallCmd   `cmd:"" group:"manage" help:"Install the per-user service, updater, and MCP client entries."`
 	Update    UpdateCmd    `cmd:"" group:"manage" help:"Upgrade Blackbird through Homebrew and converge the service."`

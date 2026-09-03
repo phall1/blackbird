@@ -623,10 +623,23 @@ func (store *Store) reservationsPage(ctx context.Context, query coordination.Adm
 // refuses one after it, while the reaper stamps at or after the deadline by
 // construction. The three predicates below are therefore disjoint and total
 // over every lease row, and each is stable across a reap.
+// The three predicates are the ONE definition of a lease's bucket in this
+// codebase. They are bare boolean expressions over the alias `l` so that every
+// caller composes them rather than restating them: the reservation listing
+// appends them to a WHERE clause, and the cost report's abandonment section
+// puts the same two inside CASE arms to count and to sum. A second definition
+// of "abandoned" written for the second caller is exactly the drift this
+// spelling exists to prevent, so a query that needs one takes it from here.
 const (
-	adminReservationActive   = ` AND l.status = 'active' AND l.expires_at_us > ?`
-	adminReservationExpired  = ` AND ((l.status = 'active' AND l.expires_at_us <= ?) OR (l.status = 'released' AND l.released_at_us >= l.expires_at_us))`
-	adminReservationReleased = ` AND l.status = 'released' AND l.released_at_us < l.expires_at_us`
+	leaseActivePredicate   = `l.status = 'active' AND l.expires_at_us > ?`
+	leaseExpiredPredicate  = `((l.status = 'active' AND l.expires_at_us <= ?) OR (l.status = 'released' AND l.released_at_us >= l.expires_at_us))`
+	leaseReleasedPredicate = `l.status = 'released' AND l.released_at_us < l.expires_at_us`
+)
+
+const (
+	adminReservationActive   = ` AND ` + leaseActivePredicate
+	adminReservationExpired  = ` AND ` + leaseExpiredPredicate
+	adminReservationReleased = ` AND ` + leaseReleasedPredicate
 )
 
 const adminSelectorCoversPath = ` AND EXISTS (SELECT 1 FROM lease_selectors AS sel

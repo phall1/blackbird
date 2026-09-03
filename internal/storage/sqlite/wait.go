@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -45,6 +46,22 @@ func (store *Store) AwaitCoordination(ctx context.Context, session coordination.
 	budget := boundedWaitBudget(request.Timeout)
 	started := time.Now()
 	deadline := started.Add(budget)
+	// Every exit from the loop below records one fact, because the value of a
+	// wait record is the reason it ended and a path that returned without one
+	// would leave that reason unknowable. The observation is filled in as the
+	// wait proceeds and written by the deferred call, so no exit can forget it
+	// -- including the two that return an error rather than a result.
+	observation := coordination.WaitObservation{WorkspaceID: session.WorkspaceID, Waiter: session.ActorID,
+		WaiterSession: session.ActorSessionID, Path: request.Path, Mode: mode,
+		AwaitMail: request.AwaitMail, Budget: budget, StartedAt: started.UTC()}
+	defer func() {
+		// Waited comes from the monotonic reading `started` still carries;
+		// EndedAt is the wall-clock instant. Deriving the duration from the two
+		// stored instants instead would measure the wall clock, which can step.
+		observation.Waited = time.Since(started)
+		observation.EndedAt = time.Now().UTC()
+		store.contention.RecordWait(observation)
+	}()
 	// mailFloor is the caller's mail head at the first poll, so the wait ends
 	// on mail that arrives during it rather than on mail that was already
 	// sitting there. Deliveries only ever gain rows, so a monotonic head is a
@@ -54,6 +71,7 @@ func (store *Store) AwaitCoordination(ctx context.Context, session coordination.
 	for {
 		state, stateErr := store.coordinationWaitState(ctx, session, request, mode)
 		if stateErr != nil {
+			observation.Reason = interruptedWaitReason(ctx)
 			return coordination.WaitResult{}, stateErr
 		}
 		if mailFloor < 0 {
@@ -62,23 +80,77 @@ func (store *Store) AwaitCoordination(ctx context.Context, session coordination.
 		result := coordination.WaitResult{Blockers: state.blockers,
 			PendingDeliveries: state.unread, ObservedAtUS: state.observedAtUS,
 			WaitedMS: time.Since(started).Milliseconds()}
+		observation.PendingDeliveries = state.unread
+		observation.BlockedBy = contentionHolders(state.blockers)
 		switch {
 		case request.AwaitMail && state.mailHead > mailFloor:
 			result.Reason = coordination.WaitMailArrived
+			observation.Reason = result.Reason
 			return result, nil
 		case request.Path != "" && len(state.blockers) == 0:
 			result.Reason = coordination.WaitPathFree
+			observation.Reason = result.Reason
 			return result, nil
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			result.Reason = coordination.WaitDeadline
+			observation.Reason = result.Reason
 			return result, nil
 		}
 		if err := sleepBounded(ctx, min(remaining, coordination.WaitPoll)); err != nil {
+			observation.Reason = interruptedWaitReason(ctx)
 			return coordination.WaitResult{}, err
 		}
 	}
+}
+
+// interruptedWaitReason separates the three ways a wait can end without
+// reaching any of its conditions, and refuses to guess between them.
+//
+// The cancellation CAUSE is what distinguishes them, and reading it is not
+// optional. This daemon's shutdown cancels every in-flight request context
+// before draining, so a cancelled context is not evidence that the caller went
+// anywhere: without the cause, every restart -- and the updater restarts this
+// daemon on a schedule -- would write a crop of abandonment facts about agents
+// that were waiting perfectly patiently. The composition root cancels with
+// coordination.ErrDaemonStopping precisely so this function can tell the two
+// apart.
+//
+// So: our own shutdown is recorded as such, any other cancellation is the
+// caller walking away, and anything else is a durable read that failed mid-poll
+// -- the condition at that instant was never evaluated, so the reason is left
+// absent and stored as null. Filling any of them in with "deadline" would
+// invent a budget that never ran out and would count an agent that is still
+// working as one that gave up.
+func interruptedWaitReason(ctx context.Context) coordination.WaitReason {
+	if ctx.Err() == nil {
+		return ""
+	}
+	if errors.Is(context.Cause(ctx), coordination.ErrDaemonStopping) {
+		return coordination.WaitDaemonStopping
+	}
+	return coordination.WaitAbandoned
+}
+
+// contentionHolders reduces the wait's blockers to what the recorded fact
+// needs. The admin view carries selectors and claim generations for a caller
+// deciding what to do next; the fact needs only who was in the way and until
+// when, and a journal row is not the place to duplicate a projection.
+func contentionHolders(blockers []coordination.AdminReservation) []coordination.ContentionHolder {
+	if len(blockers) == 0 {
+		return nil
+	}
+	if len(blockers) > coordination.MaxContentionHolders {
+		blockers = blockers[:coordination.MaxContentionHolders]
+	}
+	holders := make([]coordination.ContentionHolder, 0, len(blockers))
+	for _, blocker := range blockers {
+		holders = append(holders, coordination.ContentionHolder{LeaseID: blocker.LeaseID,
+			Actor: blocker.HolderActorID, Mode: blocker.Mode,
+			ExpiresAt: coordination.TimeFromMicros(blocker.ExpiresAtUS)})
+	}
+	return holders
 }
 
 // boundedWaitBudget clamps what the caller asked for rather than trusting it.

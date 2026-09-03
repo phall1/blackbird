@@ -16,6 +16,7 @@ import (
 
 	"github.com/phall1/blackbird/internal/adminapi"
 	"github.com/phall1/blackbird/internal/application/coordination"
+	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/transport/metrics"
 )
@@ -61,6 +62,11 @@ type AdminDependencies struct {
 	Token    AdminTokenDigest
 	Identity LocalIdentity
 	Metrics  *metrics.Registry
+	// Cost is optional. A daemon whose storage cannot answer cost still serves
+	// every other admin projection; the route it cannot answer reports the
+	// missing capability rather than an empty report, because an empty report
+	// would be a claim about the project rather than about this daemon.
+	Cost telemetry.CostAdminReader
 }
 
 type adminHandler struct {
@@ -68,6 +74,7 @@ type adminHandler struct {
 	token    AdminTokenDigest
 	identity LocalIdentity
 	metrics  *metrics.Registry
+	costs    telemetry.CostAdminReader
 	now      func() time.Time
 }
 
@@ -101,7 +108,8 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 		return nil, errors.New("local admin HTTP transport requires an admin token digest")
 	}
 	handler := &adminHandler{admin: dependencies.Admin, token: dependencies.Token,
-		identity: dependencies.Identity, metrics: dependencies.Metrics, now: time.Now}
+		identity: dependencies.Identity, metrics: dependencies.Metrics,
+		costs: dependencies.Cost, now: time.Now}
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("GET "+PathLocalAdminIdentity, handler.describe)
 	mux.HandleFunc("GET "+PathLocalAdminOverview, handler.overview)
@@ -112,6 +120,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("GET "+PathLocalAdminReservations, handler.reservations)
 	mux.HandleFunc("POST "+PathLocalAdminReservations+"/{lease_id}/release", handler.forceReleaseReservation)
 	mux.HandleFunc("GET "+PathLocalAdminEvents, handler.events)
+	mux.HandleFunc("GET "+PathLocalAdminCost, handler.cost)
 	return localSafety(mux), nil
 }
 

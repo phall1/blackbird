@@ -169,6 +169,31 @@ type EventQuery struct {
 	Limit      int
 }
 
+// CostQuery selects the operator's cost report. ProjectKey is REQUIRED and has
+// no "every project" reading: contention only exists between agents that could
+// have collided, so a total summed across projects adds numbers that were never
+// comparable.
+type CostQuery struct {
+	ProjectKey string
+	SinceHours int
+	Limit      int
+}
+
+// CostReport is the daemon's cost report as the CLI receives it. It is the
+// adminapi type rather than a copy, so the renderer cannot drift from the wire
+// contract, and a section the daemon did not observe arrives as a nil pointer
+// rather than as a struct of zeros.
+type CostReport = adminapi.CostReport
+
+// The sections arrive as pointers so the renderer can tell an unobserved
+// section from an observed one full of zeros. That distinction is the whole
+// discipline of this report and it must survive the type aliasing.
+type (
+	CostContention  = adminapi.CostContention
+	CostAbandonment = adminapi.CostAbandonment
+	CostCache       = adminapi.CostCache
+)
+
 // Truncated reports that the daemon had more matching rows than the page limit
 // allowed. It is carried on every page so no command can show a partial list as
 // if it were the whole one.
@@ -216,6 +241,11 @@ type AdminPort interface {
 	Reservations(ctx context.Context, query ReservationQuery) (ReservationsPage, error)
 	ForceReleaseReservation(ctx context.Context, leaseID string) (ReservationRelease, error)
 	Events(ctx context.Context, query EventQuery) (EventsPage, error)
+	// Cost answers what coordination cost one project over one window. It is
+	// the only admin read whose backing capability is optional: a daemon whose
+	// storage cannot join spend to coordination answers ExitUnavailable here
+	// and serves every other projection normally.
+	Cost(ctx context.Context, query CostQuery) (CostReport, error)
 }
 
 // Database is what a read-only inspection of the database file reports. It is

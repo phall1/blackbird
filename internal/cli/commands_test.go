@@ -71,6 +71,9 @@ type fakeAdmin struct {
 	conversationQuery ConversationQuery
 	reservationQuery  ReservationQuery
 	eventQuery        EventQuery
+
+	cost      CostReport
+	costQuery CostQuery
 }
 
 func (admin *fakeAdmin) Health(context.Context) (Health, error) {
@@ -156,6 +159,14 @@ func (admin *fakeAdmin) Events(_ context.Context, query EventQuery) (EventsPage,
 	return EventsPage{Events: admin.events, Truncated: admin.truncated}, nil
 }
 
+func (admin *fakeAdmin) Cost(_ context.Context, query CostQuery) (CostReport, error) {
+	admin.costQuery = query
+	if admin.err != nil {
+		return CostReport{}, admin.err
+	}
+	return admin.cost, nil
+}
+
 type panickingAdmin struct{}
 
 func (panickingAdmin) Health(context.Context) (Health, error)     { panic("boom") }
@@ -174,6 +185,8 @@ func (panickingAdmin) Conversations(context.Context, ConversationQuery) (Convers
 func (panickingAdmin) Reservations(context.Context, ReservationQuery) (ReservationsPage, error) {
 	panic("boom")
 }
+func (panickingAdmin) Cost(context.Context, CostQuery) (CostReport, error) { panic("boom") }
+
 func (panickingAdmin) ForceReleaseReservation(context.Context, string) (ReservationRelease, error) {
 	panic("boom")
 }
