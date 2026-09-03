@@ -143,11 +143,42 @@ is not optional hygiene:
 - OpenCode reference-counts one supervisor across activations, so the same
   event can reach two hook instances.
 - The Claude Code transcript reader re-scans from an imprecise watermark, and a
-  live transcript carries the same assistant usage twice a millisecond apart.
+  live transcript carries the same assistant usage many times over.
+- Codex restates a finished call verbatim, and a forked thread replays its
+  parent's whole history.
 - Any adapter may retry a request whose response was lost.
 
 With nothing stable to key on, synthesize a unique value. It simply never
 dedupes, which is correct rather than special.
+
+**A duplicate is not always a copy, and this is where the plane has already been
+burned once.** Claude Code writes one transcript record per content block of a
+single API message. All of them carry the message id, so all of them collide on
+the dedupe key — but they are successive snapshots of a response still being
+written. Input, cache-read and cache-write are identical across them; output
+grows, and only the terminal record carries the finished count and the
+`output_tokens_details` thinking breakdown. A measured message ran
+`3, 3, 3, 3, 3, 836`.
+
+So a conflict is absorbed **monotonically**: a conflicting row replaces the
+stored one when, and only when, it reports strictly more output. Under the
+first-writer-wins rule this replaced, 16.4% of every output token on a live
+workstation was discarded permanently — no re-scan could repair it — while the
+observation *count* stayed correct, so nothing looked missing. The loss
+concentrated in subagent transcripts, so "what did my subagent fleet cost" was
+the query that returned near zero.
+
+Two consequences for an adapter author:
+
+- **Report each record faithfully; do not pick a winner.** Deciding which of two
+  records bearing one key is the truer one belongs to the collector's in-pass
+  high-water mark and to the store's upsert, not to a mapping.
+- **An emitter that genuinely retries an identical call is unaffected**, since
+  it reports no more output than is stored. Monotone absorption keeps
+  first-writer-wins semantics for every case that actually is a copy.
+
+Spans have no monotone measure of completeness, so a span conflict is still
+ignored outright.
 
 ## Why this is not an MCP tool
 
@@ -170,13 +201,64 @@ hook records only messages with `time.completed` — `message.updated` fires
 repeatedly while a response streams, and recording an in-flight message would
 store a zero-duration call and then store it again.
 
+**Codex** (`internal/integration/ledger/codex`) has no plugin surface at all, so
+the daemon-side reader of its rollout tree under `CODEX_HOME` is not one
+mechanism among two — it is the only way Codex spend is ever observed. It is
+also the harness whose convention is inverted: `input_tokens` **includes**
+cache, so uncached input is `input_tokens` minus `cached_input_tokens` minus
+`cache_write_input_tokens`. Mapping the name straight across would count the
+cached prompt twice on every row while OpenCode stayed correct, and nothing
+about the result would look wrong. Two duplicate paths matter as much as the
+subtraction: the harness restates a finished call with a new timestamp while
+its own running total stands still, and a forked thread replays its parent's
+whole history under the parent's session id. Both are collapsed by keying on
+the session plus that running total, which is why the dedupe key is not a
+timestamp, an ordinal, or a file position. Read the package comment for the
+measurements behind each of those.
+
 **Claude Code** is the asymmetric one. Its MCP surface shows a server only its
 own tool frames, so there is no usage there at all; the counts live in the
-session transcript. `blackbird hook claude` reads the transcript named by the
-hook payload from a byte watermark, **after** it has answered the host, so a
-slow or absent daemon cannot delay a turn. A transcript records what a call
-cost and never how long it took, so `duration_ms` is omitted rather than
-faked — this is the one adapter that reports no latency.
+session transcript. `internal/integration/ledger/claudecode` reads that
+transcript tree from the daemon, under `CLAUDE_CONFIG_DIR` where it is set and
+`~/.claude/projects` otherwise. A transcript records what a call cost and never
+how long it took, so `duration_ms` is omitted rather than faked — this is the
+one adapter that reports no latency. Every assistant record carries its own
+`cwd`, so the project key is read rather than decoded out of the directory name,
+which is a lossy encoding that would misattribute any path containing a dash.
+
+`blackbird hook claude` pushes the same counts from inside a session hook, from
+a byte watermark, **after** it has answered the host so a slow or absent daemon
+cannot delay a turn. **It is superseded by the collector and kept only for
+compatibility**: a daemon that collects `claude-code` drops what this pushes, at
+`Sink.Offer`, so the two can never both be counted. Do not extend it; extend the
+adapter.
+
+## Ownership: collect or push, never both
+
+Two mechanisms can observe one turn, and dedupe does **not** settle it — a
+pushed call is attributed to the registered agent that posted it and a collected
+one to the collector's synthetic identity, so two actors carrying the same
+message id are two rows. Ownership is therefore partitioned per harness at
+`Sink.Offer`, which is the single entry to the plane's only writer:
+
+| | admitted | dropped |
+|---|---|---|
+| a harness this daemon **collects** | collected model calls, and pushed **spans** | pushed model calls |
+| every other harness | pushed observations | — |
+
+Spans are untouched by the partition, because a collector reads a token ledger
+and supersedes token counts rather than timing.
+
+**A harness is claimed only when its ledger tree is actually present on this
+machine.** Superseding a push is a claim the daemon has to be able to back. The
+daemon is a per-user service and does not inherit the login shell, so a
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` exported in a profile is absent from its
+environment and the root it resolves points at nothing. Claiming the harness
+anyway dropped every push while collecting nothing — and both halves are silent,
+since an absent ledger is a *passing* probe state by design and the plane counts
+write failures rather than returning them. The cost of the rule is a bounded,
+visible overlap if a tree first appears after the daemon started; the cost of
+its absence was permanent, total, and invisible.
 
 ## Reading it back
 
@@ -195,7 +277,7 @@ so a daemon that collects nothing advertises nothing.
 |---|---|---|---|
 | `model` (default) | model calls | tokens | where the budget goes |
 | `agent` | model calls | tokens | who is spending it |
-| `harness` | model calls | tokens | Claude Code vs OpenCode vs Pi |
+| `harness` | model calls | tokens | Claude Code vs Codex vs OpenCode vs Pi |
 | `span_kind` | spans | total duration | which kind of work takes the clock |
 | `span_name` | spans | total duration | which specific activity is slow |
 

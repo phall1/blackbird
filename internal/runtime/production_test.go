@@ -40,13 +40,18 @@ func TestProductionCompositionRoutesHealthAndAdminAheadOfTheCatchAll(t *testing.
 		t.Fatalf("composeProduction() error = %v", err)
 	}
 	// The admin handshake, then the observation plane. Order is load-bearing:
-	// runtime stops workers in reverse, so telemetry's drain finishes first,
-	// while the database it flushes into is still open.
-	if len(bundle.Workers) != 2 {
-		t.Fatalf("workers = %d, want the handshake and the telemetry drain", len(bundle.Workers))
+	// runtime stops workers in reverse, so the ledger collectors stop before the
+	// drain they offer into, and the drain finishes while the database it
+	// flushes into is still open.
+	if len(bundle.Workers) != 3 {
+		t.Fatalf("workers = %d, want the handshake, the telemetry drain, and the ledger collectors",
+			len(bundle.Workers))
 	}
 	if _, ok := bundle.Workers[1].(*telemetryWorker); !ok {
-		t.Fatalf("last worker = %T, want the telemetry drain stopped first", bundle.Workers[1])
+		t.Fatalf("workers[1] = %T, want the telemetry drain", bundle.Workers[1])
+	}
+	if _, ok := bundle.Workers[2].(*ledgerCollectorWorker); !ok {
+		t.Fatalf("last worker = %T, want the ledger collectors stopped first", bundle.Workers[2])
 	}
 	server := httptest.NewServer(bundle.HTTP)
 	t.Cleanup(server.Close)

@@ -15,7 +15,9 @@ import (
 
 	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/application/telemetry"
+	"github.com/phall1/blackbird/internal/domain"
 	"github.com/phall1/blackbird/internal/integration/beads"
+	"github.com/phall1/blackbird/internal/integration/ledger"
 	httptransport "github.com/phall1/blackbird/internal/transport/http"
 	mcptransport "github.com/phall1/blackbird/internal/transport/mcp"
 	"github.com/phall1/blackbird/internal/transport/metrics"
@@ -74,9 +76,20 @@ func composeProductionBundle(
 	}
 	metricsRegistry := metrics.New()
 	observations, _ := storage.(telemetry.Store)
+	// The ledger collectors are resolved BEFORE the sink is built, because the
+	// sink has to know which harnesses this daemon reads for itself in order to
+	// drop the pushed copies of them. That ordering is the anti-double-counting
+	// mechanism; see internal/application/telemetry/collection.go.
+	collectorSpecs := productionLedgerCollectors()
 	var telemetryIngest *telemetryWorker
+	var ledgerCollectors *ledgerCollectorWorker
 	if observations != nil {
-		telemetryIngest = newTelemetryWorker(observations, logger)
+		telemetryIngest = newTelemetryWorker(observations, logger, collectedSpecHarnesses(collectorSpecs))
+		collectors, err := newLedgerCollectorWorker(collectorSpecs, telemetryIngest.sink, config.StateDir, logger)
+		if err != nil {
+			return HandlerBundle{}, fmt.Errorf("compose ledger collectors: %w", err)
+		}
+		ledgerCollectors = collectors
 	}
 	localHTTPHandler, err := httptransport.NewLocalHandler(httptransport.LocalDependencies{
 		Coordination: store, Logger: logger, Telemetry: telemetryOffer(telemetryIngest),
@@ -128,7 +141,7 @@ func composeProductionBundle(
 		slog.String("readiness_path", httptransport.PathReady))
 	return HandlerBundle{
 		HTTP:    metricsRegistry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
-		Workers: telemetryWorkers(handshake, telemetryIngest),
+		Workers: telemetryWorkers(handshake, telemetryIngest, ledgerCollectors),
 		MCP:     mcpServer.HTTPHandler(&sdkmcp.StreamableHTTPOptions{SessionTimeout: mcpSessionTimeout}),
 	}, nil
 }
@@ -159,11 +172,56 @@ func telemetryOffer(worker *telemetryWorker) httptransport.TelemetryOffer {
 	return worker.sink
 }
 
-func telemetryWorkers(handshake Worker, worker *telemetryWorker) []Worker {
-	if worker == nil {
-		return []Worker{handshake}
+// telemetryWorkers orders the observation plane behind the handshake. Runtime
+// stops workers in reverse, and the order here is the stop order read
+// backwards: the ledger collectors stop first so nothing is still offering,
+// then the drain flushes into a database that is still open.
+func telemetryWorkers(handshake Worker, drain *telemetryWorker, collectors *ledgerCollectorWorker) []Worker {
+	workers := []Worker{handshake}
+	if drain != nil {
+		workers = append(workers, drain)
 	}
-	return []Worker{handshake, worker}
+	if collectors != nil {
+		workers = append(workers, collectors)
+	}
+	return workers
+}
+
+// collectedSpecHarnesses names the harnesses the composed collectors own,
+// before those collectors exist. It reads the specs rather than the collectors
+// because the sink needs the answer first.
+//
+// A harness is claimed only when its ledger tree is ACTUALLY PRESENT on this
+// machine, and that condition is the whole point of the function.
+//
+// Superseding a push is a claim -- "do not store this, I have it from the
+// ledger" -- and a daemon that cannot see the ledger cannot back it. The roots
+// are resolved from the daemon's own environment, and the daemon is a per-user
+// service: it does not inherit the login shell, so a CLAUDE_CONFIG_DIR or
+// CODEX_HOME the user exported in their profile is simply absent here and the
+// resolved root points at a directory that does not exist. Claiming the harness
+// anyway would drop every pushed observation while collecting none, and both
+// halves are silent -- absence is a PASSING probe state by design, and the plane
+// counts write failures rather than returning them. Spend would read zero
+// forever with nothing anywhere reporting a fault. This is the same shape as
+// the updater's LookPathIn lesson: detection must read the environment the work
+// will actually run in, and a detector that cannot must not be trusted to
+// disable the fallback.
+//
+// The trade this makes is deliberate. A harness whose tree appears AFTER the
+// daemon started stays unclaimed until the next restart, so a push adapter and
+// the collector could both observe the window in between. That is a bounded,
+// one-time overlap on a machine in transition, visible in the numbers; the
+// alternative it replaces is permanent, total, and invisible.
+func collectedSpecHarnesses(specs []ledgerCollectorSpec) telemetry.CollectedHarnesses {
+	harnesses := make([]domain.Harness, 0, len(specs))
+	for _, spec := range specs {
+		if present, _ := ledger.RootPresent(spec.root); !present {
+			continue
+		}
+		harnesses = append(harnesses, spec.adapter.Harness())
+	}
+	return telemetry.NewCollectedHarnesses(harnesses...)
 }
 
 // workObservationBudget bounds one whole observation, and workObservationStep

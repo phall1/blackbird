@@ -20,7 +20,18 @@ const (
 		output_tokens, reasoning_tokens, outcome, error_kind, started_at_us, duration_ms,
 		recorded_at_us, phux_terminal, raw_usage
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT (actor_id, dedupe_key) DO NOTHING`
+	ON CONFLICT (actor_id, dedupe_key) DO UPDATE SET
+		uncached_input_tokens = excluded.uncached_input_tokens,
+		cache_read_tokens = excluded.cache_read_tokens,
+		cache_write_tokens = excluded.cache_write_tokens,
+		output_tokens = excluded.output_tokens,
+		reasoning_tokens = excluded.reasoning_tokens,
+		outcome = excluded.outcome,
+		error_kind = excluded.error_kind,
+		duration_ms = excluded.duration_ms,
+		recorded_at_us = excluded.recorded_at_us,
+		raw_usage = excluded.raw_usage
+	WHERE excluded.output_tokens > telemetry_model_calls.output_tokens`
 
 	insertSpanSQL = `INSERT INTO telemetry_spans (
 		span_id, dedupe_key, project_key, actor_id, session_id, harness, harness_session,
@@ -39,9 +50,38 @@ const (
 // means a coordination write waits behind at most one bounded telemetry commit,
 // no matter how hard an adapter is reporting.
 //
-// Conflicts on (actor, dedupe key) are ignored rather than reported. A duplicate
-// is the expected result of an emitter retrying or re-scanning, not a fault, and
-// the whole point of the index is that the emitter need not know which it did.
+// Conflicts on (actor, dedupe key) are absorbed rather than reported. A
+// duplicate is the expected result of an emitter retrying or re-scanning, not a
+// fault, and the whole point of the index is that the emitter need not know
+// which it did.
+//
+// A model-call conflict is absorbed MONOTONICALLY, not ignored, and the
+// difference is a correctness one rather than a refinement.
+//
+// A ledger does not always write a call once. Claude Code writes one transcript
+// record per content block of a single API message, and those records are
+// successive snapshots of a response still being written rather than copies:
+// the early ones carry a placeholder output count and no thinking breakdown,
+// and only the terminal one carries the whole of it. All of them share the
+// message id, so all of them share the dedupe key. Under DO NOTHING the first
+// snapshot won permanently and no re-scan could ever repair it -- measured over
+// 138 live transcripts, that discarded 16.4% of all output tokens and 440 calls'
+// reasoning counts, while the observation COUNT stayed correct so nothing
+// looked missing.
+//
+// So a conflicting row replaces the stored one when, and only when, it reports
+// strictly more output. That is the right discriminator because output is the
+// only class that differs between the records of one message and it only ever
+// grows; a stop-reason flag would not do, since barely half the terminal records
+// carry one. The in-pass high-water mark in internal/integration/ledger is the
+// other half of this and is not sufficient alone: the per-pass record bound can
+// split one message's records across two passes, and separate passes share no
+// in-memory state. An emitter that genuinely retries an identical call reports
+// no more output than is stored, so this keeps DO NOTHING's semantics exactly.
+//
+// Spans have no monotone measure of completeness, so their conflict stays
+// DO NOTHING. Inventing one for them would be a guess, and the one thing this
+// clause must not be is a guess.
 func (store *Store) AppendTelemetry(ctx context.Context, batch []telemetry.Envelope) error {
 	if len(batch) == 0 {
 		return nil

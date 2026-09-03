@@ -81,6 +81,85 @@ func TestAppendTelemetryIsIdempotentOnDedupeKey(t *testing.T) {
 	}
 }
 
+// A conflicting row that reports MORE output replaces the stored one, and one
+// that reports the same or less does not. This is the store half of the fix for
+// the observation plane's worst measured defect.
+//
+// Claude Code writes one transcript record per content block of a single API
+// message, and those records are not copies: they are successive snapshots of a
+// response still being written, sharing the message id and therefore the dedupe
+// key, with only the terminal one carrying the finished output count and the
+// thinking breakdown. Under DO NOTHING the first snapshot won permanently and
+// no re-scan could repair it -- 16.4% of every output token on a live
+// workstation, and 440 calls' reasoning counts turned into NULLs the schema
+// reads as "this harness does not report them".
+//
+// The collector's in-pass high-water mark is not sufficient alone, which is why
+// this exists as well: the per-pass record bound can split one message's
+// records across two passes, and separate passes share no in-memory state.
+func TestAppendTelemetryKeepsTheLargerOutputForOneDedupeKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCoordinationStore(t)
+	session, _, err := store.RegisterLocalAgent(ctx, "/workspace/monotone", "alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attribution := telemetry.Attribution{
+		ProjectKey: session.ProjectKey, ActorID: session.ActorID, SessionID: session.ActorSessionID,
+	}
+	submit := func(output, reasoning uint64) {
+		t.Helper()
+		call := sampleModelCall("msg_split")
+		call.Usage.Output = output
+		call.Usage.Reasoning = reasoning
+		call.Usage.ReasoningReported = reasoning > 0
+		if err := store.AppendTelemetry(ctx, []telemetry.Envelope{{
+			Attribution: attribution, ModelCalls: []domain.ModelCall{call},
+			ReceivedAt: time.Now().UTC(),
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func() (int64, *int64, int64) {
+		t.Helper()
+		var output, rows int64
+		var reasoning *int64
+		if err := store.db.QueryRowContext(ctx, `SELECT output_tokens, reasoning_tokens,
+			(SELECT count(*) FROM telemetry_model_calls) FROM telemetry_model_calls`).
+			Scan(&output, &reasoning, &rows); err != nil {
+			t.Fatal(err)
+		}
+		return output, reasoning, rows
+	}
+
+	// The partial snapshot arrives first, exactly as it does in a transcript.
+	submit(3, 0)
+	if output, reasoning, rows := read(); output != 3 || reasoning != nil || rows != 1 {
+		t.Fatalf("after the first snapshot: output=%d reasoning=%v rows=%d", output, reasoning, rows)
+	}
+	// The terminal record supersedes it, and brings the thinking count with it.
+	submit(836, 35)
+	output, reasoning, rows := read()
+	if rows != 1 {
+		t.Fatalf("rows=%d, want the restatement to update rather than duplicate", rows)
+	}
+	if output != 836 {
+		t.Fatalf("output=%d, want the finished count to replace the placeholder", output)
+	}
+	if reasoning == nil || *reasoning != 35 {
+		t.Fatalf("reasoning=%v, want the terminal record's thinking count, not a NULL", reasoning)
+	}
+	// Monotone, not last-writer-wins. A re-scan replays the early snapshots, and
+	// letting one of those overwrite the finished row would make the value
+	// oscillate with whichever pass ran most recently.
+	submit(3, 0)
+	if output, reasoning, rows := read(); output != 836 || reasoning == nil || *reasoning != 35 || rows != 1 {
+		t.Fatalf("a replayed snapshot regressed the row: output=%d reasoning=%v rows=%d",
+			output, reasoning, rows)
+	}
+}
+
 // Two agents can legitimately observe the same upstream identifier, so the
 // dedupe index is scoped to the actor rather than global.
 func TestAppendTelemetryScopesDedupeToTheActor(t *testing.T) {

@@ -52,6 +52,7 @@ type Harness string
 
 const (
 	HarnessClaudeCode Harness = "claude-code"
+	HarnessCodex      Harness = "codex"
 	HarnessOpenCode   Harness = "opencode"
 	HarnessPi         Harness = "pi"
 	HarnessUnknown    Harness = "unknown"
@@ -59,7 +60,7 @@ const (
 
 func (harness Harness) Valid() bool {
 	switch harness {
-	case HarnessClaudeCode, HarnessOpenCode, HarnessPi, HarnessUnknown:
+	case HarnessClaudeCode, HarnessCodex, HarnessOpenCode, HarnessPi, HarnessUnknown:
 		return true
 	default:
 		return false

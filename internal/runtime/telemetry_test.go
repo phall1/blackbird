@@ -51,7 +51,7 @@ func TestTelemetryWorkerDrainsToStorage(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	store := openTelemetryStore(t)
-	worker := newTelemetryWorker(store, slog.New(slog.DiscardHandler))
+	worker := newTelemetryWorker(store, slog.New(slog.DiscardHandler), nil)
 	if err := worker.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestTelemetryWorkerDrainsToStorage(t *testing.T) {
 func TestTelemetryWorkerStopIsIdempotent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	worker := newTelemetryWorker(openTelemetryStore(t), slog.New(slog.DiscardHandler))
+	worker := newTelemetryWorker(openTelemetryStore(t), slog.New(slog.DiscardHandler), nil)
 	if err := worker.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestTelemetryWorkerStopIsIdempotent(t *testing.T) {
 func TestTelemetryWorkerRefusesASecondStart(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	worker := newTelemetryWorker(openTelemetryStore(t), slog.New(slog.DiscardHandler))
+	worker := newTelemetryWorker(openTelemetryStore(t), slog.New(slog.DiscardHandler), nil)
 	if err := worker.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestTelemetryWorkerRefusesASecondStart(t *testing.T) {
 // partway, and it must not deadlock on channels that were never made.
 func TestTelemetryWorkerStopBeforeStartIsANoOp(t *testing.T) {
 	t.Parallel()
-	worker := newTelemetryWorker(openTelemetryStore(t), slog.New(slog.DiscardHandler))
+	worker := newTelemetryWorker(openTelemetryStore(t), slog.New(slog.DiscardHandler), nil)
 	if err := worker.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestTelemetrySweepDeletesExpiredObservations(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	store := openTelemetryStore(t)
-	worker := newTelemetryWorker(store, slog.New(slog.DiscardHandler))
+	worker := newTelemetryWorker(store, slog.New(slog.DiscardHandler), nil)
 	envelope := telemetryObservation(t, store)
 	envelope.ReceivedAt = time.Now().UTC().Add(-90 * 24 * time.Hour)
 	if err := store.AppendTelemetry(ctx, []telemetry.Envelope{envelope}); err != nil {

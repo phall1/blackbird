@@ -74,6 +74,11 @@ type Envelope struct {
 	Attribution Attribution
 	ModelCalls  []domain.ModelCall
 	Spans       []domain.Span
+	// Source says which mechanism produced these observations. The zero value
+	// is SourcePushed, so a transport that predates collection constructs a
+	// pushed envelope without knowing the field exists. Offer reads it to
+	// enforce the ownership partition described in collection.go.
+	Source ObservationSource
 	// ReceivedAt is the daemon's clock, and it is what retention is measured
 	// from. An adapter's clock decides when a call started; it does not get to
 	// decide how long this daemon keeps the row.
@@ -102,6 +107,12 @@ type SinkStats struct {
 	Written       uint64
 	WriteFailures uint64
 	Batches       uint64
+	// DroppedSuperseded counts pushed model calls refused because this daemon
+	// collects that harness itself. It is not a fault and not a loss: the same
+	// calls arrive on the collected path from the harness's own ledger. It is
+	// reported because a plane that silently discards data invites the same
+	// wrong conclusion as one that silently loses it.
+	DroppedSuperseded uint64
 }
 
 type SinkConfig struct {
@@ -110,6 +121,11 @@ type SinkConfig struct {
 	Coalesce    time.Duration
 	FlushBudget time.Duration
 	Logger      *slog.Logger
+	// Collected names the harnesses this daemon reads for itself. Model calls
+	// pushed for one of them are dropped here rather than stored, which is the
+	// whole of the anti-double-counting mechanism: Offer is the only entry to
+	// the only writer, so there is no path around this check.
+	Collected CollectedHarnesses
 }
 
 func (config SinkConfig) withDefaults() SinkConfig {
@@ -141,12 +157,13 @@ type Sink struct {
 	closed    chan struct{}
 	done      chan struct{}
 
-	accepted      atomic.Uint64
-	droppedFull   atomic.Uint64
-	droppedClosed atomic.Uint64
-	written       atomic.Uint64
-	writeFailures atomic.Uint64
-	batches       atomic.Uint64
+	accepted          atomic.Uint64
+	droppedFull       atomic.Uint64
+	droppedClosed     atomic.Uint64
+	written           atomic.Uint64
+	writeFailures     atomic.Uint64
+	batches           atomic.Uint64
+	droppedSuperseded atomic.Uint64
 }
 
 func NewSink(store Store, config SinkConfig) *Sink {
@@ -165,6 +182,7 @@ func NewSink(store Store, config SinkConfig) *Sink {
 // which is a normal outcome under load and never an error the caller should
 // act on.
 func (sink *Sink) Offer(envelope Envelope) bool {
+	envelope = sink.admit(envelope)
 	if envelope.Len() == 0 {
 		return true
 	}
@@ -182,6 +200,38 @@ func (sink *Sink) Offer(envelope Envelope) bool {
 		sink.droppedFull.Add(1)
 		return false
 	}
+}
+
+// admit applies the ownership partition. A pushed envelope loses the model
+// calls whose harness this daemon collects; everything else passes through
+// untouched, including that envelope's spans, because a collector reads a token
+// ledger and supersedes token counts rather than timing.
+//
+// It filters rather than rejects the whole envelope on purpose. One request may
+// carry more than one harness, and refusing the request would cost the
+// observations that nothing else is going to report.
+func (sink *Sink) admit(envelope Envelope) Envelope {
+	if envelope.Source == SourceCollected || len(sink.config.Collected) == 0 {
+		return envelope
+	}
+	superseded := 0
+	for _, call := range envelope.ModelCalls {
+		if sink.config.Collected.Collects(call.Harness) {
+			superseded++
+		}
+	}
+	if superseded == 0 {
+		return envelope
+	}
+	sink.droppedSuperseded.Add(uint64(superseded))
+	kept := make([]domain.ModelCall, 0, len(envelope.ModelCalls)-superseded)
+	for _, call := range envelope.ModelCalls {
+		if !sink.config.Collected.Collects(call.Harness) {
+			kept = append(kept, call)
+		}
+	}
+	envelope.ModelCalls = kept
+	return envelope
 }
 
 // Run drains the queue until ctx is cancelled or Close is called, then makes one
@@ -291,12 +341,13 @@ func (sink *Sink) Close() error {
 
 func (sink *Sink) Stats() SinkStats {
 	return SinkStats{
-		Accepted:      sink.accepted.Load(),
-		DroppedFull:   sink.droppedFull.Load(),
-		DroppedClosed: sink.droppedClosed.Load(),
-		Written:       sink.written.Load(),
-		WriteFailures: sink.writeFailures.Load(),
-		Batches:       sink.batches.Load(),
+		Accepted:          sink.accepted.Load(),
+		DroppedFull:       sink.droppedFull.Load(),
+		DroppedClosed:     sink.droppedClosed.Load(),
+		Written:           sink.written.Load(),
+		WriteFailures:     sink.writeFailures.Load(),
+		Batches:           sink.batches.Load(),
+		DroppedSuperseded: sink.droppedSuperseded.Load(),
 	}
 }
 

@@ -43,9 +43,13 @@ type telemetryWorker struct {
 	sweep  chan struct{}
 }
 
-func newTelemetryWorker(store telemetry.Store, logger *slog.Logger) *telemetryWorker {
+// newTelemetryWorker builds the plane's writer. collected names the harnesses
+// this daemon reads for itself; the sink drops pushed model calls for them, so
+// this parameter is where the ownership partition is actually installed.
+func newTelemetryWorker(store telemetry.Store, logger *slog.Logger,
+	collected telemetry.CollectedHarnesses) *telemetryWorker {
 	return &telemetryWorker{
-		sink:      telemetry.NewSink(store, telemetry.SinkConfig{Logger: logger}),
+		sink:      telemetry.NewSink(store, telemetry.SinkConfig{Logger: logger, Collected: collected}),
 		store:     store,
 		logger:    logger,
 		retention: defaultTelemetryRetention,
@@ -96,6 +100,7 @@ func (worker *telemetryWorker) Stop(ctx context.Context) error {
 		slog.Uint64("accepted", stats.Accepted), slog.Uint64("written", stats.Written),
 		slog.Uint64("dropped_queue_full", stats.DroppedFull),
 		slog.Uint64("dropped_closed", stats.DroppedClosed),
+		slog.Uint64("dropped_superseded", stats.DroppedSuperseded),
 		slog.Uint64("write_failures", stats.WriteFailures))
 	return nil
 }

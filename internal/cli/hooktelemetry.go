@@ -25,6 +25,14 @@ import (
 // Ordering is the point: telemetry runs after writeHookOutput, so a slow or
 // absent daemon cannot delay the mail this hook exists to deliver. Every error
 // path here is a log line and a return.
+//
+// SUPERSEDED BY THE DAEMON-SIDE COLLECTOR, and kept anyway.
+// internal/integration/ledger/claudecode reads the same transcripts from the
+// daemon, which sees the sessions this hook was not installed for and the ones
+// that ran while the daemon was down. A daemon that collects claude-code drops
+// what this pushes -- at Sink.Offer, so the two can never both be counted --
+// and this path remains only so a new CLI keeps working against a daemon too
+// old to collect. Do not extend it; extend the adapter.
 const (
 	// hookTelemetryPath is the daemon's ingest route.
 	hookTelemetryPath = "api/v1/local/telemetry"
