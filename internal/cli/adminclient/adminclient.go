@@ -32,6 +32,7 @@ const (
 	pathReservations  = "/api/v1/local/admin/reservations"
 	pathEvents        = "/api/v1/local/admin/events"
 	pathCost          = "/api/v1/local/admin/cost"
+	pathOutbox        = "/api/v1/local/admin/outbox"
 
 	defaultTimeout  = 5 * time.Second
 	maximumResponse = 8 << 20
@@ -48,6 +49,7 @@ var ErrStaleHandshake = errors.New("daemon handshake record is stale")
 type handshake struct {
 	Schema      string `json:"schema"`
 	HTTPAddress string `json:"http_address"`
+	PeerAddress string `json:"peer_address,omitempty"`
 	Token       string `json:"token"`
 	PID         int    `json:"pid"`
 	StartedAt   string `json:"started_at"`
@@ -224,6 +226,14 @@ func (client *Client) Cost(ctx context.Context, query cli.CostQuery) (cli.CostRe
 	return report, client.get(ctx, pathCost, values, &report)
 }
 
+func (client *Client) Outbox(ctx context.Context, query cli.OutboxQuery) (cli.OutboxPage, error) {
+	values := url.Values{}
+	setNonEmpty(values, "project_key", query.ProjectKey)
+	setLimit(values, query.Limit)
+	var page cli.OutboxPage
+	return page, client.get(ctx, pathOutbox, values, &page)
+}
+
 func (client *Client) get(ctx context.Context, path string, values url.Values, payload any) error {
 	address, token, err := client.discover()
 	if err != nil {
@@ -301,19 +311,9 @@ func (client *Client) request(
 // --address still needs the record for its token, so a missing record is only
 // fatal for the authenticated endpoints.
 func (client *Client) discover() (string, string, error) {
-	if client.HandshakePath == "" {
-		return client.Address, "", ErrNoHandshake
-	}
-	content, err := os.ReadFile(client.HandshakePath)
+	record, err := client.record()
 	if err != nil {
-		return client.Address, "", client.missingRecord()
-	}
-	var record handshake
-	if err := json.Unmarshal(content, &record); err != nil {
-		return client.Address, "", fmt.Errorf("%w: %s", ErrStaleHandshake, client.HandshakePath)
-	}
-	if record.Schema != handshakeSchema {
-		return client.Address, "", fmt.Errorf("%w: unknown schema %q", ErrStaleHandshake, record.Schema)
+		return client.Address, "", err
 	}
 	address := client.Address
 	if address == "" {
@@ -323,6 +323,39 @@ func (client *Client) discover() (string, string, error) {
 		return "", "", ErrNoHandshake
 	}
 	return address, record.Token, nil
+}
+
+// record reads and validates the discovery record. It is separate from discover
+// because peering is a fact about the daemon rather than a way to reach it: the
+// record answers it without any address or credential being involved.
+func (client *Client) record() (handshake, error) {
+	if client.HandshakePath == "" {
+		return handshake{}, ErrNoHandshake
+	}
+	content, err := os.ReadFile(client.HandshakePath)
+	if err != nil {
+		return handshake{}, client.missingRecord()
+	}
+	var record handshake
+	if err := json.Unmarshal(content, &record); err != nil {
+		return handshake{}, fmt.Errorf("%w: %s", ErrStaleHandshake, client.HandshakePath)
+	}
+	if record.Schema != handshakeSchema {
+		return handshake{}, fmt.Errorf("%w: unknown schema %q", ErrStaleHandshake, record.Schema)
+	}
+	return record, nil
+}
+
+// Peering reports what the running daemon published about tailnet
+// reachability. A record with no peer address is a daemon with peering off:
+// the field is written on every start, so its absence is a statement rather
+// than a gap.
+func (client *Client) Peering() (cli.Peering, error) {
+	record, err := client.record()
+	if err != nil {
+		return cli.Peering{}, err
+	}
+	return cli.Peering{Enabled: record.PeerAddress != "", Address: record.PeerAddress}, nil
 }
 
 // missingRecord says why an explicit address did not rescue the request. The

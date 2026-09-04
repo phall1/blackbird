@@ -114,6 +114,55 @@ parks until the path frees or mail arrives. It returns `path_free`,
 `mail_arrived`, or `deadline`, so a caller that ran out of budget still learns
 what happened.
 
+## Tailnet peering
+
+Blackbird is loopback-only by default and stays that way through every upgrade.
+Peering is opt-in, per machine, and needs two things said explicitly:
+
+```sh
+blackbird install --peer --peer-allow phalls-mac-mini --peer-allow nFJpq2jD1311CNTRL
+blackbird status          # reports "peering on <tailnet address>" or "peering off"
+blackbird install --no-peer
+```
+
+`--peer` alone is a startup error: naming no peer would open a listener that
+admits nobody. The preference is recorded rather than written only into the
+service definition, because `blackbird update` regenerates that definition — a
+flag that lived only there would be erased by the next unattended upgrade.
+
+What peering does and does not do:
+
+- **Identity is verified, never inferred.** Every non-loopback request is
+  resolved through `tailscale whois`. Being inside `100.64.0.0/10` is not a
+  credential, and no answer is cached: an operator who removes a node or
+  changes an ACL has closed the door immediately.
+- **The listener binds a tailnet address this machine owns**, and refuses any
+  other address — `0.0.0.0` included — at startup.
+- **Four routes cross, and nothing else**: `/healthz`, `/readyz`, the peer probe
+  at `/api/v1/local/peer`, the operator's cost projection at
+  `/api/v1/local/peer/cost`, and one write, `POST /api/v1/local/peer/mail`.
+  Every other route — reservations, registration, telemetry, the event feed,
+  and the whole admin surface — is loopback-only, and a route nobody classified
+  is loopback-only by default.
+- **Claims never cross a host boundary.** A lease protects a path on one
+  machine's disk, so a remote holder could only ever be wrong. Lease mutation
+  lives on the MCP listener, which refuses every non-loopback caller regardless
+  of the address it is bound to.
+- **This machine is not its own peer.** A local process that dials the peer
+  address instead of loopback is refused even when the allow-list names this
+  host, which the natural symmetric fleet configuration does.
+- **A browser is refused.** Nothing on the peer surface is for one, and a
+  browser on an allowed peer would otherwise be a confused deputy holding that
+  machine's credential.
+
+Cross-host mail addresses a recipient as `agent@host`, where the host is a
+tailnet machine name. The sending host ships a bare agent name and the
+receiving host resolves it, qualifies the author with the machine it verified,
+and mints every identifier itself — so a sender cannot name a host it is not.
+`blackbird outbox` shows what is still owed to the wire and why, and
+`blackbird cost --peer HOST` unions spend across a fleet while never summing
+contention.
+
 ## Delivery modes
 
 "Push" says only that an adapter moved a message; it does not say what the host

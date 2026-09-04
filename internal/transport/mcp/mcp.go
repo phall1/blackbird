@@ -63,8 +63,14 @@ type Dependencies struct {
 	Coordination   coordination.LocalStore
 	Observations   telemetry.Reader
 	WorkReferences coordination.WorkReferenceObserver
-	Logger         *slog.Logger
-	Metrics        MetricsObserver
+	// PeerMailStore and PeerMailDispatch are the cross-host half of
+	// blackbird_say and are composed together or not at all. Both nil is a
+	// daemon without peering, which serves every local send unchanged and
+	// refuses a name@host recipient by name rather than dropping it.
+	PeerMailStore    coordination.PeerMailSendPort
+	PeerMailDispatch coordination.PeerMailDispatch
+	Logger           *slog.Logger
+	Metrics          MetricsObserver
 }
 
 type Server struct{ *sdkmcp.Server }
@@ -83,8 +89,9 @@ func NewServer(dependencies Dependencies) (*Server, error) {
 	}
 	sdk.AddReceivingMiddleware(logToolFailures(logger, dependencies.Metrics))
 	registerCoordinationProtocol(sdk)
-	registerAgentNativeTools(sdk, dependencies.Coordination, dependencies.Observations,
-		dependencies.WorkReferences, logger)
+	registerAgentNativeTools(sdk, dependencies.Coordination,
+		peerMailPorts{Store: dependencies.PeerMailStore, Dispatch: dependencies.PeerMailDispatch},
+		dependencies.Observations, dependencies.WorkReferences, logger)
 	return server, nil
 }
 

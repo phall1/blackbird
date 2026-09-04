@@ -29,10 +29,29 @@ type DaemonOptions struct {
 	MCPAddress      string        `json:"mcp_address"`
 	LogLevel        string        `json:"log_level"`
 	ShutdownTimeout time.Duration `json:"shutdown_timeout"`
+	PeerEnabled     bool          `json:"peer_enabled,omitempty"`
+	PeerAddress     string        `json:"peer_address,omitempty"`
+	PeerAllowed     []string      `json:"peer_allowed,omitempty"`
 }
 
 type DaemonPort interface {
 	Run(ctx context.Context, options DaemonOptions) error
+}
+
+// Peering is what a running daemon's discovery record says about tailnet
+// reachability. Address is empty exactly when Enabled is false, because the
+// record has one field and its absence is the whole answer.
+type Peering struct {
+	Enabled bool   `json:"enabled"`
+	Address string `json:"address,omitempty"`
+}
+
+// PeeringPort is the optional capability of an AdminPort that can report
+// peering. It is an assertion rather than a method on AdminPort so that a
+// binary assembled without it degrades to saying nothing about peering, which
+// is honest, rather than to reporting it as off, which would be a claim.
+type PeeringPort interface {
+	Peering() (Peering, error)
 }
 
 // Health is the answer to an unauthenticated /healthz plus /readyz probe pair.
@@ -185,6 +204,17 @@ type CostQuery struct {
 // rather than as a struct of zeros.
 type CostReport = adminapi.CostReport
 
+// OutboxQuery scopes the operator's view of cross-host mail still owed to the
+// wire. The project is required: the credential is the loopback admin token,
+// which is not scoped to a workspace, so the scope is stated rather than
+// inferred.
+type OutboxQuery struct {
+	ProjectKey string
+	Limit      int
+}
+
+type OutboxPage = adminapi.OutboxPage
+
 // The sections arrive as pointers so the renderer can tell an unobserved
 // section from an observed one full of zeros. That distinction is the whole
 // discipline of this report and it must survive the type aliasing.
@@ -246,6 +276,11 @@ type AdminPort interface {
 	// storage cannot join spend to coordination answers ExitUnavailable here
 	// and serves every other projection normally.
 	Cost(ctx context.Context, query CostQuery) (CostReport, error)
+	// Outbox reports cross-host mail this daemon is still holding. Its backing
+	// capability is optional in the same way: a daemon composed without
+	// cross-host mail answers ExitUnavailable, which the command renders as
+	// "this daemon holds no outbox" rather than as an empty queue.
+	Outbox(ctx context.Context, query OutboxQuery) (OutboxPage, error)
 }
 
 // Database is what a read-only inspection of the database file reports. It is
@@ -325,6 +360,14 @@ type ProductPort interface {
 	Uninstall(ctx context.Context) (install.Result, error)
 	ServiceArgv() []string
 	StateDir() string
+	// Peering reads and SetPeering records the operator's tailnet peering
+	// preference. It is a preference rather than a flag on the daemon
+	// invocation because `blackbird update` regenerates the service definition
+	// from ServiceArgv: a --peer that lived only in the unit file would be
+	// erased by the next unattended Homebrew upgrade, hours after anything the
+	// operator did.
+	Peering() (install.Peering, error)
+	SetPeering(preference install.Peering) error
 }
 
 type LogRequest struct {
@@ -355,9 +398,14 @@ type Dependencies struct {
 	Maintenance  MaintenancePort
 	Product      ProductPort
 	Logs         LogPort
-	Input        io.Reader
-	Now          func() time.Time
-	Env          render.Env
-	Device       render.Device
-	WidthProbe   func() (int, bool)
+	// Peers reads a peer daemon's cost report for the fleet view. It is
+	// optional and defaults to the built-in client, because a fleet query needs
+	// no adapter this binary does not already contain: it carries no credential
+	// and speaks one route.
+	Peers      PeerCostPort
+	Input      io.Reader
+	Now        func() time.Time
+	Env        render.Env
+	Device     render.Device
+	WidthProbe func() (int, bool)
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -74,6 +75,9 @@ type fakeAdmin struct {
 
 	cost      CostReport
 	costQuery CostQuery
+
+	outbox      OutboxPage
+	outboxQuery OutboxQuery
 }
 
 func (admin *fakeAdmin) Health(context.Context) (Health, error) {
@@ -167,6 +171,14 @@ func (admin *fakeAdmin) Cost(_ context.Context, query CostQuery) (CostReport, er
 	return admin.cost, nil
 }
 
+func (admin *fakeAdmin) Outbox(_ context.Context, query OutboxQuery) (OutboxPage, error) {
+	admin.outboxQuery = query
+	if admin.err != nil {
+		return OutboxPage{}, admin.err
+	}
+	return admin.outbox, nil
+}
+
 type panickingAdmin struct{}
 
 func (panickingAdmin) Health(context.Context) (Health, error)     { panic("boom") }
@@ -186,6 +198,8 @@ func (panickingAdmin) Reservations(context.Context, ReservationQuery) (Reservati
 	panic("boom")
 }
 func (panickingAdmin) Cost(context.Context, CostQuery) (CostReport, error) { panic("boom") }
+
+func (panickingAdmin) Outbox(context.Context, OutboxQuery) (OutboxPage, error) { panic("boom") }
 
 func (panickingAdmin) ForceReleaseReservation(context.Context, string) (ReservationRelease, error) {
 	panic("boom")
@@ -214,6 +228,9 @@ type fakeProduct struct {
 	statusErr      error
 	err            error
 	updaterSkipped string
+	peering        install.Peering
+	peeringErr     error
+	peeringSet     bool
 }
 
 func (product *fakeProduct) Install(context.Context) (install.Result, error) {
@@ -262,6 +279,19 @@ func (product *fakeProduct) ServiceArgv() []string {
 }
 
 func (product *fakeProduct) StateDir() string { return "/state/blackbird" }
+
+func (product *fakeProduct) Peering() (install.Peering, error) {
+	return product.peering, product.peeringErr
+}
+
+func (product *fakeProduct) SetPeering(preference install.Peering) error {
+	if product.peeringErr != nil {
+		return product.peeringErr
+	}
+	product.peering = preference
+	product.peeringSet = true
+	return nil
+}
 
 type fakeLogs struct {
 	lines   []LogLine
@@ -313,15 +343,38 @@ func TestDaemonCommandPassesOptionsThrough(t *testing.T) {
 		StateDir: "/state", HTTPAddress: "127.0.0.1:1", MCPAddress: "127.0.0.1:2",
 		ShutdownTimeout: 5 * time.Second}
 
-	result := runCLI(t, deps, []string{"daemon", "--http-address=127.0.0.1:9100", "--log-level=debug"})
+	result := runCLI(t, deps, []string{"daemon", "--http-address=127.0.0.1:9100", "--log-level=debug",
+		"--peer", "--peer-address=100.64.0.7:9100", "--peer-allow=phalls-mac-mini", "--peer-allow=nFJpq2jD1311CNTRL"})
 	if result.code != ExitOK {
 		t.Fatalf("code = %d, want %d; stderr=%q", result.code, ExitOK, result.stderr)
 	}
 	want := DaemonOptions{Storage: "sqlite", SQLitePath: "/data/blackbird.db", StateDir: "/state",
 		HTTPAddress: "127.0.0.1:9100", MCPAddress: "127.0.0.1:2", LogLevel: "debug",
-		ShutdownTimeout: 5 * time.Second}
-	if daemon.options != want {
+		ShutdownTimeout: 5 * time.Second, PeerEnabled: true, PeerAddress: "100.64.0.7:9100",
+		PeerAllowed: []string{"phalls-mac-mini", "nFJpq2jD1311CNTRL"}}
+	if !reflect.DeepEqual(daemon.options, want) {
 		t.Fatalf("options = %#v, want %#v", daemon.options, want)
+	}
+}
+
+// TestDaemonCommandLeavesPeeringOffWithoutTheFlag is the default nobody may
+// change by accident: an invocation that says nothing about peering must
+// produce options that say nothing about peering.
+func TestDaemonCommandLeavesPeeringOffWithoutTheFlag(t *testing.T) {
+	t.Parallel()
+
+	daemon := &recordingDaemon{}
+	deps := dependencies(t)
+	deps.Daemon = daemon
+	deps.Defaults = DaemonOptions{Storage: "sqlite", SQLitePath: "/data/blackbird.db",
+		StateDir: "/state", HTTPAddress: "127.0.0.1:1", MCPAddress: "127.0.0.1:2"}
+
+	result := runCLI(t, deps, []string{"daemon"})
+	if result.code != ExitOK {
+		t.Fatalf("code = %d, want %d; stderr=%q", result.code, ExitOK, result.stderr)
+	}
+	if daemon.options.PeerEnabled || daemon.options.PeerAddress != "" || len(daemon.options.PeerAllowed) != 0 {
+		t.Fatalf("peering = %#v, want every field unset", daemon.options)
 	}
 }
 

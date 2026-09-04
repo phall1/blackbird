@@ -216,6 +216,9 @@ func (adapter daemonAdapter) Run(ctx context.Context, options cli.DaemonOptions)
 	config.HTTPAddress = options.HTTPAddress
 	config.MCPAddress = options.MCPAddress
 	config.ShutdownTimeout = options.ShutdownTimeout
+	config.Peering = blackbirdruntime.PeeringConfig{
+		Enabled: options.PeerEnabled, Address: options.PeerAddress, Allowed: options.PeerAllowed,
+	}
 	if options.LogLevel != "" {
 		config.LogLevel = options.LogLevel
 	}

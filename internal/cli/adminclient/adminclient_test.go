@@ -527,3 +527,57 @@ func TestRejectionsCarryTheStatusAndTheDaemonsMessage(t *testing.T) {
 		t.Fatalf("error = %q", rejected.Error())
 	}
 }
+
+// TestPeeringReadsTheDiscoveryRecord asserts the one fact status needs and no
+// endpoint can answer: whether the daemon that published this record is
+// reachable from the tailnet. It comes from the record rather than a request,
+// so it stays answerable when the daemon is not answering at all.
+func TestPeeringReadsTheDiscoveryRecord(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "admin.json")
+	record := handshake{Schema: handshakeSchema, HTTPAddress: "127.0.0.1:8080",
+		PeerAddress: "100.78.103.8:8080", Token: "bba_x", PID: 4242, Version: "0.4.0"}
+	content, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	peering, err := New(path, "").Peering()
+	if err != nil {
+		t.Fatalf("Peering() error = %v", err)
+	}
+	if !peering.Enabled || peering.Address != "100.78.103.8:8080" {
+		t.Fatalf("Peering() = %+v", peering)
+	}
+}
+
+// TestPeeringReportsOffForARecordWithoutAPeerAddress is the default. The field
+// is written on every start, so its absence is a statement rather than a gap.
+func TestPeeringReportsOffForARecordWithoutAPeerAddress(t *testing.T) {
+	t.Parallel()
+
+	peering, err := New(writeHandshake(t, "127.0.0.1:8080", "bba_x"), "").Peering()
+	if err != nil {
+		t.Fatalf("Peering() error = %v", err)
+	}
+	if peering.Enabled || peering.Address != "" {
+		t.Fatalf("Peering() = %+v, want off", peering)
+	}
+}
+
+// TestPeeringRefusesToGuessWithoutARecord keeps status silent about peering
+// rather than reporting it as off, which would be a claim about a daemon this
+// client could not read.
+func TestPeeringRefusesToGuessWithoutARecord(t *testing.T) {
+	t.Parallel()
+
+	if _, err := New(filepath.Join(t.TempDir(), "absent.json"), "").Peering(); !errors.Is(err, ErrNoHandshake) {
+		t.Fatalf("Peering() error = %v, want %v", err, ErrNoHandshake)
+	}
+	if _, err := New("", "").Peering(); !errors.Is(err, ErrNoHandshake) {
+		t.Fatalf("Peering() error = %v, want %v", err, ErrNoHandshake)
+	}
+}

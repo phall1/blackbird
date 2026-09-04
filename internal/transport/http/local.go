@@ -300,11 +300,20 @@ func localMessageOutput(message coordination.Message) localMessage {
 	return result
 }
 
+// localSafety is the per-handler half of the reachability partition, and it
+// stays fail-closed on its own: a handler composed without the peer guard
+// refuses every non-loopback caller exactly as it always did.
+//
+// The one way past it is a request the guard already admitted, which means the
+// route was named in peerReachableRoutes AND the caller's tailnet identity
+// verified to a peer an operator listed. Nothing here inspects the source
+// address to make that decision -- the admission is a fact carried on the
+// request, not an inference from its address.
 func localSafety(next stdhttp.Handler) stdhttp.Handler {
 	return stdhttp.HandlerFunc(func(writer stdhttp.ResponseWriter, request *stdhttp.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
-		if !loopbackRequest(request) {
+		if _, admitted := Peer(request); !admitted && !loopbackRequest(request) {
 			writeLocalProblem(writer, stdhttp.StatusForbidden, domain.ErrorCodeForbidden, "local API access requires a loopback connection")
 			return
 		}

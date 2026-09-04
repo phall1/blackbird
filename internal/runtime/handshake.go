@@ -32,6 +32,10 @@ type adminHandshake struct {
 	PID         int    `json:"pid"`
 	StartedAt   string `json:"started_at"`
 	Version     string `json:"version"`
+	// PeerAddress is where a tailnet peer reaches this daemon, and is absent
+	// when peering is off. It is the one place "blackbird status" can learn
+	// that a daemon it is not peered with is nevertheless peer-reachable.
+	PeerAddress string `json:"peer_address,omitempty"`
 }
 
 type adminHandshakeWorker struct {

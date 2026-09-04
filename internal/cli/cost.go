@@ -38,6 +38,7 @@ type CostCmd struct {
 	Project    string        `arg:"" optional:"" placeholder:"PATH" help:"Project key. Defaults to the current directory."`
 	SinceHours int           `name:"since-hours" help:"Lookback window in hours. Zero uses the daemon's default."`
 	Limit      int           `default:"20" help:"Maximum rows per list."`
+	Peer       []string      `name:"peer" placeholder:"HOST[:PORT]" help:"Also read this tailnet peer's report and union the spend into a fleet view. Repeatable. Spend is summed across hosts; contention is never summed, because agents on two machines hold leases over two different checkouts. A peer that does not answer is named in the report and exits degraded rather than silently shrinking the total."`
 	Watch      bool          `help:"Re-render until interrupted."`
 	Interval   time.Duration `default:"5s" help:"Re-render interval for --watch."`
 }
@@ -55,14 +56,47 @@ func (cmd *CostCmd) Run(ctx context.Context, console *Console) error {
 	if err != nil {
 		return err
 	}
+	query := CostQuery{ProjectKey: project, SinceHours: cmd.SinceHours, Limit: limit}
+	if len(cmd.Peer) > 0 {
+		endpoints, endpointErr := peerEndpoints(cmd.Peer)
+		if endpointErr != nil {
+			return endpointErr
+		}
+		return cmd.runFleet(ctx, console, query, endpoints)
+	}
 	return console.loop(ctx, cmd.Watch, cmd.Interval, func(ctx context.Context) (render.View, error) {
-		report, err := admin.Cost(ctx, CostQuery{ProjectKey: project,
-			SinceHours: cmd.SinceHours, Limit: limit})
+		report, err := admin.Cost(ctx, query)
 		if err != nil {
 			return nil, daemonFault(err, "read cost report")
 		}
 		return newView(report, drawCost), nil
 	})
+}
+
+// runFleet renders the fleet view and then exits ExitDegraded if any named host
+// was silent. The report is presented FIRST and the exit code carries the
+// incompleteness, because both readers matter: a person needs to see which host
+// is missing and what the rest said, and a script needs to learn that the
+// answer is short without parsing a report.
+//
+// Under --watch the exit code is left alone: the command ends when the operator
+// interrupts it, and turning that into a failure would report the last frame's
+// luck as the session's result.
+func (cmd *CostCmd) runFleet(ctx context.Context, console *Console, query CostQuery, endpoints []string) error {
+	incomplete := false
+	err := console.loop(ctx, cmd.Watch, cmd.Interval, func(ctx context.Context) (render.View, error) {
+		report, buildErr := fleetCost(ctx, console, query, endpoints)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		incomplete = !report.Complete
+		return newView(report, drawFleetCost), nil
+	})
+	if err != nil || cmd.Watch || !incomplete {
+		return err
+	}
+	return withRemedy(fault(ExitDegraded, nil, "the fleet report is missing at least one host"),
+		"check that the peer daemon is running with peering enabled and lists this machine as an allowed peer")
 }
 
 func drawCost(doc *render.Document, report CostReport) {

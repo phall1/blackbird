@@ -294,3 +294,35 @@ type CostModel struct {
 	CacheReadShare *float64 `json:"cache_read_share,omitempty"`
 	CacheReuse     *float64 `json:"cache_reuse,omitempty"`
 }
+
+// OutboxPage is the operator's view of cross-host mail this daemon is still
+// holding, newest first.
+//
+// It exists because a queued delivery was otherwise visible only to the agent
+// that sent it and in the daemon log. A peer being unreachable is the ordinary
+// failure of this feature -- a laptop closed, a host not yet peered, a name
+// misspelled -- and an operator who cannot see the queue cannot tell "the mail
+// is waiting" from "the mail was never sent".
+type OutboxPage struct {
+	ProjectKey string       `json:"project_key"`
+	Entries    []OutboxItem `json:"entries"`
+	ObservedAt string       `json:"observed_at,omitempty"`
+}
+
+// OutboxItem is one message owed to one host. Body and subject are deliberately
+// absent: this is a delivery view, and an operator diagnosing why mail is stuck
+// has no business reading its contents out of a queue.
+type OutboxItem struct {
+	MessageID string `json:"message_id"`
+	Host      string `json:"host"`
+	ToAgent   string `json:"to_agent"`
+	FromAgent string `json:"from_agent"`
+	State     string `json:"state"`
+	Attempts  int    `json:"attempts"`
+	// LastError is empty when no attempt has failed yet. It is never filled in
+	// with a placeholder: "no attempt has failed" and "an attempt failed for a
+	// reason nobody recorded" are different facts.
+	LastError     string `json:"last_error,omitempty"`
+	QueuedAt      string `json:"queued_at,omitempty"`
+	NextAttemptAt string `json:"next_attempt_at,omitempty"`
+}

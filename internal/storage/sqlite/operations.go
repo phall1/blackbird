@@ -217,6 +217,27 @@ func (store *Store) SendMessage(ctx context.Context, params coordination.SendMes
 	}
 	var result coordination.Message
 	err := store.withImmediate(ctx, func(tx *sql.Tx) error {
+		var sendErr error
+		result, sendErr = sendMessageTx(ctx, tx, params)
+		return sendErr
+	})
+	return result, err
+}
+
+// sendMessageTx appends one message inside a caller's transaction.
+//
+// It is separated from SendMessage so that a cross-host send can append the
+// message and queue its remote deliveries in ONE transaction. Without that, a
+// crash between the two would leave either a message nobody will ever transmit
+// or a queue entry pointing at a message that does not exist -- and the second
+// is unrecoverable, because the body it was supposed to carry was never
+// written. There is deliberately no second copy of this logic anywhere: a
+// message that crossed a host boundary is stored by exactly the statements that
+// store one that did not.
+func sendMessageTx(ctx context.Context, tx *sql.Tx,
+	params coordination.SendMessageParams) (coordination.Message, error) {
+	var result coordination.Message
+	err := func() error {
 		var status, workspace string
 		if err := tx.QueryRowContext(ctx, `SELECT status, workspace_id FROM conversations WHERE conversation_id = ?`,
 			params.ConversationID.String()).Scan(&status, &workspace); errors.Is(err, sql.ErrNoRows) {
@@ -295,7 +316,7 @@ func (store *Store) SendMessage(ctx context.Context, params coordination.SendMes
 			Subject: params.Subject, Body: params.Body, ReplyTo: params.ReplyTo, SentAt: now,
 			Position: uint64(position), Deliveries: deliveries})
 		return err
-	})
+	}()
 	return result, err
 }
 
@@ -1357,6 +1378,18 @@ func (store *Store) RegisterLocalAgent(ctx context.Context, projectKey, agentNam
 	if !validLocalCoordinationText(projectKey, coordination.MaxKeyBytes) ||
 		!validLocalCoordinationText(agentName, coordination.MaxNameBytes) {
 		return coordination.LocalAgentSession{}, "", coordination.ErrInvalid
+	}
+	// The address separator is reserved so that "reviewer" and
+	// "reviewer@some-host" cannot both be local names. Without this, whether a
+	// recipient meant this host or another one would depend on which agents
+	// happened to have registered, and the same message would go to different
+	// machines on different days. Rejecting it at registration -- the one place
+	// a name is minted -- makes the address grammar unambiguous by
+	// construction, and costs nothing: peer actors are created by the mail path
+	// below rather than through this call.
+	if strings.Contains(agentName, coordination.PeerAddressSeparator) {
+		return coordination.LocalAgentSession{}, "", coordinationError(domain.ErrorCodeInvalidArgument,
+			"agent name may not contain \"@\"; that separator addresses an agent on another host, as in reviewer@some-tailnet-host")
 	}
 	actorID, err := domain.NewActorID()
 	if err != nil {

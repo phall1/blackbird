@@ -10,13 +10,29 @@ import (
 
 // InstallCmd installs the per-user service, the unattended updater, and the MCP
 // client entries. The rendered line preserves the pre-0.4 output exactly.
-type InstallCmd struct{}
+type InstallCmd struct {
+	// Peer and PeerAllow record a PREFERENCE rather than decorating this run's
+	// service definition. `blackbird update` regenerates the argv, so a flag
+	// written only into the unit file is dropped by the next unattended
+	// upgrade; recording it means the installed service and the operator's
+	// intention cannot drift apart.
+	//
+	// Omitting the flags on a later install leaves the recorded preference
+	// alone: install is run again for many reasons, and silently switching
+	// peering off during one of them is the failure this is built to avoid.
+	// --no-peer is how it is turned off.
+	Peer        *bool    `name:"peer" negatable:"" help:"Record that the installed service serves peer routes on this machine's tailnet address. --no-peer turns it off; omitted leaves the recorded preference alone."`
+	PeerAddress string   `name:"peer-address" placeholder:"HOST:PORT" help:"Tailnet address for the installed service's peer listener. Defaults to this machine's tailnet address on the HTTP port."`
+	PeerAllow   []string `name:"peer-allow" placeholder:"NAME" help:"Peer the installed service admits, by tailnet stable node id (preferred) or machine name. Repeatable, and required with --peer."`
+}
 
 type installReport struct {
 	ServicePath    string   `json:"service_path"`
 	UpdaterPaths   []string `json:"updater_paths"`
 	Clients        []string `json:"clients"`
 	UpdaterSkipped string   `json:"updater_skipped,omitempty"`
+	Peering        string   `json:"peering"`
+	PeerAllowed    []string `json:"peer_allowed,omitempty"`
 }
 
 func (cmd *InstallCmd) Run(ctx context.Context, console *Console) error {
@@ -24,16 +40,59 @@ func (cmd *InstallCmd) Run(ctx context.Context, console *Console) error {
 	if err != nil {
 		return err
 	}
+	preference, err := cmd.peering(console, manager)
+	if err != nil {
+		return err
+	}
 	result, err := manager.Install(ctx)
 	if err != nil {
 		return fault(ExitError, err, "install")
 	}
-	return console.present(newView(installReport{
+	report := installReport{
 		ServicePath:    result.ServicePath,
 		UpdaterPaths:   result.UpdaterPaths,
 		Clients:        result.Clients,
 		UpdaterSkipped: result.UpdaterSkipped,
-	}, drawInstall))
+		Peering:        "off",
+	}
+	if preference.Enabled {
+		report.Peering = "on"
+		report.PeerAllowed = preference.Allowed
+	}
+	return console.present(newView(report, drawInstall))
+}
+
+// peering reconciles the flags with what is already recorded, and writes the
+// result BEFORE the install converges the service definition, so the unit file
+// this run produces is the one the preference describes.
+func (cmd *InstallCmd) peering(console *Console, manager ProductPort) (install.Peering, error) {
+	existing, err := manager.Peering()
+	if err != nil {
+		return install.Peering{}, fault(ExitError, err, "install")
+	}
+	// Nothing said means nothing changed. An install run to repair a client
+	// entry must not switch off a capability the operator turned on last week.
+	if cmd.Peer == nil && cmd.PeerAddress == "" && len(cmd.PeerAllow) == 0 {
+		return existing, nil
+	}
+	// Naming peers without saying --peer is taken as asking for peering: an
+	// operator who typed an allow-list wants one, and refusing on a technicality
+	// would be the daemon's flag rule imported where it helps nobody. Saying
+	// --no-peer alongside them is the contradiction, and SetPeering refuses it.
+	enabled := len(cmd.PeerAllow) != 0 || cmd.PeerAddress != ""
+	if cmd.Peer != nil {
+		enabled = *cmd.Peer
+	}
+	wanted := install.Peering{Enabled: enabled, Address: cmd.PeerAddress, Allowed: cmd.PeerAllow}
+	if enabled && len(wanted.Allowed) == 0 {
+		// Carrying the recorded list forward lets `--peer --peer-address=...`
+		// change one thing without restating the fleet.
+		wanted.Allowed = existing.Allowed
+	}
+	if err := manager.SetPeering(wanted); err != nil {
+		return install.Peering{}, fault(ExitUsage, err, "install")
+	}
+	return wanted, nil
 }
 
 func drawInstall(doc *render.Document, report installReport) {
@@ -44,6 +103,14 @@ func drawInstall(doc *render.Document, report installReport) {
 	if report.UpdaterSkipped != "" {
 		doc.Linef(render.RoleMuted, "  no unattended updater: %s; update with the tool you installed with",
 			report.UpdaterSkipped)
+	}
+	// Peering is the one thing install writes that opens a network surface, so
+	// it is stated on the successful path rather than left to be discovered.
+	// The OFF case is silent on purpose: it is the default, it is what every
+	// existing install prints, and a line saying so on every run would be noise
+	// that trains an operator to skip the line that matters.
+	if report.Peering == "on" {
+		doc.Linef(render.RolePlain, "  peering on, admitting %s", joinOrNone(report.PeerAllowed))
 	}
 }
 

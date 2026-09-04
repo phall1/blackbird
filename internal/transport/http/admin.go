@@ -67,6 +67,10 @@ type AdminDependencies struct {
 	// missing capability rather than an empty report, because an empty report
 	// would be a claim about the project rather than about this daemon.
 	Cost telemetry.CostAdminReader
+	// Outbox reads cross-host mail this daemon is still holding. It is optional
+	// for the same reason Cost is: a daemon without the capability must report
+	// the capability missing rather than an empty queue.
+	Outbox coordination.PeerMailQueueReader
 }
 
 type adminHandler struct {
@@ -75,6 +79,7 @@ type adminHandler struct {
 	identity LocalIdentity
 	metrics  *metrics.Registry
 	costs    telemetry.CostAdminReader
+	outboxes coordination.PeerMailQueueReader
 	now      func() time.Time
 }
 
@@ -110,6 +115,9 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	handler := &adminHandler{admin: dependencies.Admin, token: dependencies.Token,
 		identity: dependencies.Identity, metrics: dependencies.Metrics,
 		costs: dependencies.Cost, now: time.Now}
+	if !isNil(dependencies.Outbox) {
+		handler.outboxes = dependencies.Outbox
+	}
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("GET "+PathLocalAdminIdentity, handler.describe)
 	mux.HandleFunc("GET "+PathLocalAdminOverview, handler.overview)
@@ -121,6 +129,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("POST "+PathLocalAdminReservations+"/{lease_id}/release", handler.forceReleaseReservation)
 	mux.HandleFunc("GET "+PathLocalAdminEvents, handler.events)
 	mux.HandleFunc("GET "+PathLocalAdminCost, handler.cost)
+	mux.HandleFunc("GET "+PathLocalAdminOutbox, handler.outbox)
 	return localSafety(mux), nil
 }
 

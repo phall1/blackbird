@@ -20,11 +20,27 @@ type sayInput struct {
 	ConversationID          string   `json:"conversation_id,omitempty" jsonschema:"Existing thread to write in; omit to open or rejoin by slug."`
 	Topic                   string   `json:"topic,omitempty" jsonschema:"Short topic used when opening a thread."`
 	Slug                    string   `json:"slug,omitempty" jsonschema:"Stable thread name; opening the same slug returns the same conversation."`
-	To                      []string `json:"to,omitempty" jsonschema:"Registered peer names to receive the message; omit to open without sending."`
+	To                      []string `json:"to,omitempty" jsonschema:"Registered peer names to receive the message; omit to open without sending. Write name@host to reach an agent on another tailnet host, which resolves the name in its own project and answers in remote_deliveries."`
 	Subject                 string   `json:"subject,omitempty" jsonschema:"One-line message subject."`
 	Body                    string   `json:"body,omitempty" jsonschema:"Durable message body."`
 	ReplyToMessageID        string   `json:"reply_to_message_id,omitempty" jsonschema:"Message this answers, when replying."`
 	AcknowledgementRequired bool     `json:"acknowledgement_required,omitempty" jsonschema:"Require recipients to acknowledge the exact body."`
+	PeerProjectKey          string   `json:"peer_project_key,omitempty" jsonschema:"Project key the name@host recipients are resolved in on their own host. Omit when that host checks the repository out at the same absolute path as this one."`
+}
+
+// remoteDeliveryOutput is one cross-host delivery. State is the whole point of
+// the type: delivered, queued and undeliverable call for three different
+// responses from the sender, and collapsing them would leave an agent waiting
+// for a reply that can never come.
+type remoteDeliveryOutput struct {
+	Recipient string `json:"recipient"`
+	State     string `json:"state" jsonschema:"delivered: that host accepted it. queued: this host holds it and will retry. undeliverable: it will never arrive, and detail says why."`
+	// RemoteMessageID is the id the OTHER host minted. It is a receipt, not an
+	// id this host can resolve, so it is absent whenever that host named none.
+	RemoteMessageID string `json:"remote_message_id,omitempty"`
+	// Detail is absent on a delivered recipient and names the cause otherwise.
+	Detail   string `json:"detail,omitempty"`
+	Attempts int    `json:"attempts,omitempty"`
 }
 
 type sayOutput struct {
@@ -42,6 +58,8 @@ type sayOutput struct {
 	SentAt         string           `json:"sent_at,omitempty"`
 	Position       uint64           `json:"position,omitempty"`
 	Deliveries     []deliveryOutput `json:"deliveries,omitempty"`
+	// RemoteDeliveries is present only when a recipient was on another host.
+	RemoteDeliveries []remoteDeliveryOutput `json:"remote_deliveries,omitempty"`
 }
 
 type readInput struct {
@@ -89,7 +107,7 @@ type claimOutput struct {
 	Options   []string                   `json:"options,omitempty"`
 }
 
-func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalStore,
+func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalStore, peers peerMailPorts,
 	observations telemetry.Reader, workReferences coordination.WorkReferenceObserver, logger *slog.Logger) {
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolJoin,
 		Description: "Read blackbird://coordination/protocol, then start or resume one durable repository agent and recover its compact snapshot: claims, inbox, conversations, and peers."},
@@ -181,7 +199,7 @@ func registerAgentNativeTools(server *sdkmcp.Server, store coordination.LocalSto
 	})
 	coordinationTool(server, logger, &sdkmcp.Tool{Name: ToolSay,
 		Description: "Open or rejoin a durable thread by slug and optionally send a message to named peers in that thread.", InputSchema: saySchema},
-		func(ctx context.Context, input sayInput) (sayOutput, error) { return say(ctx, store, input) })
+		func(ctx context.Context, input sayInput) (sayOutput, error) { return say(ctx, store, peers, input) })
 
 	readSchema := coordinationInputSchema[readInput](func(properties map[string]*jsonschema.Schema) {
 		properties["unread_only"].Default = json.RawMessage("false")
@@ -311,7 +329,23 @@ func agentStatus(ctx context.Context, store coordination.LocalStore, observation
 	return output, nil
 }
 
-func say(ctx context.Context, store coordination.LocalStore, input sayInput) (sayOutput, error) {
+// peerMailPorts is the cross-host half of blackbird_say, and it is optional.
+//
+// A daemon composed without it serves every local send exactly as before and
+// REFUSES a name@host recipient with a message that says the capability is
+// absent. That refusal is deliberate: silently dropping the remote half of a
+// recipient list would leave an agent believing it had handed work over.
+type peerMailPorts struct {
+	Store    coordination.PeerMailSendPort
+	Dispatch coordination.PeerMailDispatch
+}
+
+func (ports peerMailPorts) available() bool {
+	return !isNil(ports.Store) && !isNil(ports.Dispatch)
+}
+
+func say(ctx context.Context, store coordination.LocalStore, peers peerMailPorts,
+	input sayInput) (sayOutput, error) {
 	conversationID := input.ConversationID
 	output := sayOutput{}
 	if conversationID == "" {
@@ -336,16 +370,108 @@ func say(ctx context.Context, store coordination.LocalStore, input sayInput) (sa
 	if len(input.To) == 0 {
 		return output, nil
 	}
-	message, err := sendLocalMessage(ctx, store, sendMessageInput{AgentToken: input.AgentToken,
-		ConversationID: conversationID, To: input.To, Subject: input.Subject, Body: input.Body,
-		ReplyToMessageID: input.ReplyToMessageID, AcknowledgementRequired: input.AcknowledgementRequired})
+	local, remote, err := splitRecipients(input.To)
 	if err != nil {
 		return sayOutput{}, err
 	}
+	if len(remote) == 0 {
+		message, sendErr := sendLocalMessage(ctx, store, sendMessageInput{AgentToken: input.AgentToken,
+			ConversationID: conversationID, To: input.To, Subject: input.Subject, Body: input.Body,
+			ReplyToMessageID: input.ReplyToMessageID, AcknowledgementRequired: input.AcknowledgementRequired})
+		if sendErr != nil {
+			return sayOutput{}, sendErr
+		}
+		return withMessage(output, message), nil
+	}
+	if !peers.available() {
+		return sayOutput{}, invalidInput("this daemon was built or composed without cross-host mail, " +
+			"so a name@host recipient cannot be delivered; send to agents on this host only")
+	}
+	message, remoteDeliveries, err := sendPeerMessage(ctx, store, peers, conversationID, local, remote, input)
+	if err != nil {
+		return sayOutput{}, err
+	}
+	output = withMessage(output, message)
+	output.RemoteDeliveries = remoteDeliveries
+	return output, nil
+}
+
+func withMessage(output sayOutput, message messageOutput) sayOutput {
 	output.ConversationID, output.MessageID, output.AuthorActorID = message.ConversationID, message.MessageID, message.AuthorActorID
 	output.Subject, output.Body, output.BodyDigest = message.Subject, message.Body, message.BodyDigest
 	output.ReplyTo, output.SentAt, output.Position, output.Deliveries = message.ReplyTo, message.SentAt, message.Position, message.Deliveries
-	return output, nil
+	return output
+}
+
+// splitRecipients separates the two kinds of name. The test is SYNTACTIC --
+// a name containing the address separator is a cross-host address, always --
+// so which machine a message reaches never depends on which agents happen to
+// be registered here.
+func splitRecipients(names []string) ([]string, []coordination.PeerAddress, error) {
+	local := make([]string, 0, len(names))
+	remote := make([]coordination.PeerAddress, 0, len(names))
+	for _, name := range names {
+		if !coordination.IsPeerAddress(name) {
+			local = append(local, name)
+			continue
+		}
+		address, err := coordination.ParsePeerAddress(name)
+		if err != nil {
+			return nil, nil, invalidInput("recipient " + name +
+				" is not a valid cross-host address; write it as name@host, where host is a tailnet name or address")
+		}
+		remote = append(remote, address)
+	}
+	return local, remote, nil
+}
+
+// sendPeerMessage records the message and then tries the wire once, inline and
+// briefly bounded, so the agent's own turn ends with a real per-recipient state
+// instead of always being told "queued". A peer that does not answer in that
+// window is left queued and retried by the background drain; nothing is lost
+// either way, because the message was durable before the first attempt.
+func sendPeerMessage(ctx context.Context, store coordination.LocalStore, peers peerMailPorts,
+	conversationID string, local []string, remote []coordination.PeerAddress,
+	input sayInput) (messageOutput, []remoteDeliveryOutput, error) {
+	session, err := store.AuthenticateLocalAgent(ctx, input.AgentToken)
+	if err != nil {
+		return messageOutput{}, nil, err
+	}
+	conversation, err := domain.ParseConversationID(conversationID)
+	if err != nil {
+		return messageOutput{}, nil, invalidInput("conversation_id must be a valid UUID")
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		return messageOutput{}, nil, err
+	}
+	params := coordination.SendPeerMailParams{MessageID: messageID, ConversationID: conversation,
+		Subject: input.Subject, Body: input.Body, AcknowledgementRequired: input.AcknowledgementRequired,
+		LocalRecipients: local, PeerRecipients: remote, PeerProjectKey: input.PeerProjectKey}
+	if input.ReplyToMessageID != "" {
+		reply, parseErr := domain.ParseMessageID(input.ReplyToMessageID)
+		if parseErr != nil {
+			return messageOutput{}, nil, coordination.ErrInvalid
+		}
+		params.ReplyTo = &reply
+	}
+	sent, err := peers.Store.SendPeerMail(ctx, session, params)
+	if err != nil {
+		return messageOutput{}, nil, err
+	}
+	results := peers.Dispatch.Deliver(ctx, sent.Queued)
+	return localMessageOutput(sent.Message), remoteDeliveryOutputs(results), nil
+}
+
+func remoteDeliveryOutputs(results []coordination.PeerMailResult) []remoteDeliveryOutput {
+	deliveries := make([]remoteDeliveryOutput, 0, len(results))
+	for _, result := range results {
+		deliveries = append(deliveries, remoteDeliveryOutput{
+			Recipient: result.Address.String(), State: string(result.State),
+			RemoteMessageID: result.RemoteMessageID, Detail: result.Detail, Attempts: result.Attempts,
+		})
+	}
+	return deliveries
 }
 
 func readMessages(ctx context.Context, store coordination.LocalStore, input readInput) (messagePageOutput, error) {

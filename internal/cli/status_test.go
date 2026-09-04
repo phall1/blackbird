@@ -86,3 +86,99 @@ func TestStatusReportsAnUnreachableDaemonWithoutFailing(t *testing.T) {
 		t.Fatalf("--require-running code = %d, want %d", required.code, ExitUnavailable)
 	}
 }
+
+// peeringAdmin is a fakeAdmin that also implements the optional PeeringPort. It
+// is a separate type so the tests above keep asserting what a client WITHOUT
+// that capability reports, which is nothing.
+type peeringAdmin struct {
+	fakeAdmin
+	peering Peering
+	err     error
+}
+
+func (admin *peeringAdmin) Peering() (Peering, error) {
+	if admin.err != nil {
+		return Peering{}, admin.err
+	}
+	return admin.peering, nil
+}
+
+// TestStatusReportsPeering is the observability half: an operator cannot debug
+// what the tool will not tell them, and "on" without the address would be a
+// fact they cannot act on.
+func TestStatusReportsPeering(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		admin AdminPort
+		want  string
+	}{
+		"on names the address it is reachable at": {
+			&peeringAdmin{fakeAdmin: fakeAdmin{health: Health{Reachable: true, Ready: true}},
+				peering: Peering{Enabled: true, Address: "100.78.103.8:8080"}},
+			"peering    on 100.78.103.8:8080",
+		},
+		"off is stated rather than left out": {
+			&peeringAdmin{fakeAdmin: fakeAdmin{health: Health{Reachable: true, Ready: true}}},
+			"peering    off",
+		},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			deps := dependencies(t)
+			deps.Product = &fakeProduct{}
+			deps.Store = &fakeStore{database: healthyDatabase()}
+			deps.Admin = testCase.admin
+
+			result := runCLI(t, deps, []string{"status", "--width=200"})
+			if result.code != ExitOK {
+				t.Fatalf("code = %d, want %d; stderr=%q", result.code, ExitOK, result.stderr)
+			}
+			if !strings.Contains(result.stdout, testCase.want) {
+				t.Fatalf("stdout = %q, want %q", result.stdout, testCase.want)
+			}
+		})
+	}
+}
+
+// TestStatusSaysNothingAboutPeeringWhenItCannotRead is the honest silence: a
+// client that could not read the record must not report peering as off, which
+// would be a claim.
+func TestStatusSaysNothingAboutPeeringWhenItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	deps := dependencies(t)
+	deps.Product = &fakeProduct{}
+	deps.Store = &fakeStore{database: healthyDatabase()}
+	deps.Admin = &peeringAdmin{fakeAdmin: fakeAdmin{health: Health{Reachable: true, Ready: true}},
+		err: errors.New("no handshake record")}
+
+	result := runCLI(t, deps, []string{"status", "--width=200"})
+	if result.code != ExitOK {
+		t.Fatalf("code = %d, want %d; stderr=%q", result.code, ExitOK, result.stderr)
+	}
+	if strings.Contains(result.stdout, "peering") {
+		t.Fatalf("stdout = %q, want no claim about peering", result.stdout)
+	}
+}
+
+// TestStatusWithoutAPeeringCapableClientSaysNothing keeps the optional
+// capability optional.
+func TestStatusWithoutAPeeringCapableClientSaysNothing(t *testing.T) {
+	t.Parallel()
+
+	deps := dependencies(t)
+	deps.Product = &fakeProduct{}
+	deps.Store = &fakeStore{database: healthyDatabase()}
+	deps.Admin = &fakeAdmin{health: Health{Reachable: true, Ready: true}}
+
+	result := runCLI(t, deps, []string{"status", "--width=200"})
+	if result.code != ExitOK {
+		t.Fatalf("code = %d, want %d; stderr=%q", result.code, ExitOK, result.stderr)
+	}
+	if strings.Contains(result.stdout, "peering") {
+		t.Fatalf("stdout = %q, want no claim about peering", result.stdout)
+	}
+}

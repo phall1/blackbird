@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -29,6 +30,7 @@ type productionStore interface {
 	Storage
 	coordination.LocalStore
 	coordination.LocalAdminStore
+	coordination.PeerMailStore
 }
 
 // NewProductionDaemon constructs the source-built local coordination daemon.
@@ -64,7 +66,7 @@ func composeProduction(build BuildInfo, config Config, logger *slog.Logger) Comp
 }
 
 func composeProductionBundle(
-	_ context.Context,
+	ctx context.Context,
 	build BuildInfo,
 	config Config,
 	logger *slog.Logger,
@@ -104,7 +106,7 @@ func composeProductionBundle(
 	started := time.Now().UTC()
 	adminHTTPHandler, err := httptransport.NewAdminHandler(httptransport.AdminDependencies{
 		Admin: store, Token: httptransport.NewAdminTokenDigest(token), Metrics: metricsRegistry,
-		Cost: costAdminReader(store),
+		Cost: costAdminReader(store), Outbox: peerMailQueueReader(store),
 		Identity: httptransport.LocalIdentity{
 			Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt,
 			PID: os.Getpid(), StartedAt: started,
@@ -120,18 +122,61 @@ func composeProductionBundle(
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose health HTTP transport: %w", err)
 	}
+	// Peering resolves before anything binds. Enabling it on a machine without
+	// Tailscale fails here, which is where an operator can still read why.
+	admission, peerAddress, err := composePeering(ctx, config, newTailnet(), metricsRegistry, logger)
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose tailnet peering: %w", err)
+	}
+	peerHandler, err := httptransport.NewPeerHandler(httptransport.PeerDependencies{
+		Version: build.Version, Address: peerAddress, Enabled: admission.Enabled(),
+	})
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose peer HTTP transport: %w", err)
+	}
+	peerCostHandler, err := httptransport.NewPeerCostHandler(httptransport.PeerCostDependencies{
+		Cost: costAdminReader(store), Logger: logger,
+	})
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose peer cost HTTP transport: %w", err)
+	}
+	peerMailHandler, err := httptransport.NewPeerMailHandler(httptransport.PeerMailDependencies{
+		Mail: store, Logger: logger,
+	})
+	if err != nil {
+		return HandlerBundle{}, fmt.Errorf("compose peer mail HTTP transport: %w", err)
+	}
+	// The outbound half exists only when peering does. A daemon that is not
+	// peered can never receive a reply to a name@host recipient, so queueing
+	// mail for one would be a promise it cannot keep; with the ports absent the
+	// agent-facing send refuses the recipient by name instead, which is an
+	// answer the agent can act on.
+	var peerMailDispatcher *coordination.PeerMailDispatcher
+	if admission.Enabled() {
+		peerMailDispatcher, err = coordination.NewPeerMailDispatcher(coordination.PeerMailDispatcherDependencies{
+			Store: store, Logger: logger,
+			Sender: httptransport.NewPeerMailClient(httptransport.PeerMailClientDependencies{
+				Port: addressPort(config.HTTPAddress), Logger: logger,
+			}),
+		})
+		if err != nil {
+			return HandlerBundle{}, fmt.Errorf("compose peer mail dispatcher: %w", err)
+		}
+	}
 	handshake, err := newAdminHandshakeWorker(config.StateDir, token, config.HTTPAddress, build.Version, started, logger)
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose admin handshake: %w", err)
 	}
 	httpMux := http.NewServeMux()
-	httpMux.Handle("GET "+httptransport.PathHealth, healthHandler)
-	httpMux.Handle("GET "+httptransport.PathReady, healthHandler)
-	httpMux.Handle(httptransport.PathLocalAdmin, adminHTTPHandler)
-	httpMux.Handle("/api/v1/local/", localHTTPHandler)
+	for _, route := range productionHTTPRoutes(healthHandler, peerHandler,
+		peerCostHandler, peerMailHandler, adminHTTPHandler, localHTTPHandler) {
+		httpMux.Handle(route.pattern, route.handler)
+	}
 	mcpServer, err := mcptransport.NewServer(mcptransport.Dependencies{
 		Logger: logger, Metrics: metricsRegistry, Coordination: store,
 		Observations: observationReader(store), WorkReferences: newBeadsWorkReferenceObserver(),
+		PeerMailStore:    peerMailSendPort(store, peerMailDispatcher),
+		PeerMailDispatch: peerMailDispatch(peerMailDispatcher),
 	})
 	if err != nil {
 		return HandlerBundle{}, fmt.Errorf("compose MCP transport: %w", err)
@@ -140,11 +185,89 @@ func composeProductionBundle(
 		slog.String("admin_path", httptransport.PathLocalAdmin),
 		slog.String("health_path", httptransport.PathHealth),
 		slog.String("readiness_path", httptransport.PathReady))
+	workers := telemetryWorkers(handshake, telemetryIngest, ledgerCollectors)
+	if peerMailDispatcher != nil {
+		workers = append(workers, peerMailDispatcher)
+	}
 	return HandlerBundle{
-		HTTP:    metricsRegistry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
-		Workers: telemetryWorkers(handshake, telemetryIngest, ledgerCollectors),
-		MCP:     mcpServer.HTTPHandler(&sdkmcp.StreamableHTTPOptions{SessionTimeout: mcpSessionTimeout}),
+		HTTP:          metricsRegistry.WrapHTTP(httpMux, httptransport.PathLocalCoordinationEventsStream),
+		Workers:       workers,
+		MCP:           mcpServer.HTTPHandler(&sdkmcp.StreamableHTTPOptions{SessionTimeout: mcpSessionTimeout}),
+		PeerAdmission: admission,
+		PeerAddress:   peerAddress,
 	}, nil
+}
+
+// productionRoute is one pattern and the handler that serves it.
+type productionRoute struct {
+	pattern string
+	handler http.Handler
+}
+
+// productionHTTPRoutes is the daemon's ENTIRE HTTP route table, in one value.
+//
+// It is a list rather than a sequence of mux.Handle calls so that a test can
+// hold the same table the daemon serves and check it against the peer
+// partition in peer.go. That cross-check is not decoration: the peer cost route
+// was classified peer-reachable and never registered, so every request for it
+// fell through to the catch-all and answered 404 -- a route that was in the
+// security partition, in the client, and served by nobody. A hand-written test
+// table could not catch that, because it agreed with the classifier rather than
+// with the mux.
+func productionHTTPRoutes(
+	health, peer, peerCost, peerMail, admin, local http.Handler,
+) []productionRoute {
+	return []productionRoute{
+		{"GET " + httptransport.PathHealth, health},
+		{"GET " + httptransport.PathReady, health},
+		{"GET " + httptransport.PathLocalPeer, peer},
+		{"GET " + httptransport.PathLocalPeerCost, peerCost},
+		{"POST " + httptransport.PathLocalPeerMail, peerMail},
+		{httptransport.PathLocalAdmin, admin},
+		{"/api/v1/local/", local},
+	}
+}
+
+// peerMailSendPort and peerMailDispatch return nil INTERFACES rather than typed
+// nil pointers when peering is off, because the MCP transport reads a nil port
+// as "this daemon cannot send cross-host mail" and refuses a name@host
+// recipient by name. A typed nil would pass that check and panic on use.
+func peerMailSendPort(
+	store coordination.PeerMailStore,
+	dispatcher *coordination.PeerMailDispatcher,
+) coordination.PeerMailSendPort {
+	if dispatcher == nil {
+		return nil
+	}
+	return store
+}
+
+func peerMailDispatch(dispatcher *coordination.PeerMailDispatcher) coordination.PeerMailDispatch {
+	if dispatcher == nil {
+		return nil
+	}
+	return dispatcher
+}
+
+// peerMailQueueReader returns a nil INTERFACE when the store cannot answer the
+// outbox, so the admin route reports the capability missing rather than an
+// empty queue -- which an operator would read as "nothing is stuck".
+func peerMailQueueReader(store Storage) coordination.PeerMailQueueReader {
+	reader, ok := store.(coordination.PeerMailQueueReader)
+	if !ok {
+		return nil
+	}
+	return reader
+}
+
+// addressPort is the port half of a listen address, used as the default port
+// for dialling a peer that names none.
+func addressPort(address string) string {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 // SetBoundHTTPAddress replaces the configured address with the one the HTTP
@@ -153,6 +276,15 @@ func (worker *adminHandshakeWorker) SetBoundHTTPAddress(address string) {
 	if address != "" {
 		worker.handshake.HTTPAddress = address
 	}
+}
+
+// SetBoundPeerAddress publishes what the peer listener actually bound, and
+// publishes the empty string when there is no peer listener. It assigns
+// unconditionally, unlike its HTTP counterpart: "no peer address" is the fact
+// an operator most needs the record to be able to state, and a version of this
+// that skipped the empty case could only ever report peering as on.
+func (worker *adminHandshakeWorker) SetBoundPeerAddress(address string) {
+	worker.handshake.PeerAddress = address
 }
 
 // observationReader returns a nil interface rather than a typed nil when the

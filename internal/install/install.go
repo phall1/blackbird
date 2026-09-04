@@ -282,16 +282,129 @@ func (manager *Manager) StateDir() string {
 	return manager.blackbirdStateDir()
 }
 
+// Peering is the operator's persisted tailnet peering preference.
+//
+// It exists because the alternative -- passing --peer on the daemon invocation
+// and nowhere else -- silently loses the setting. `blackbird update` runs
+// convergeServiceDefinition, which REGENERATES the argv from ServiceArgv, so a
+// flag that lives only in the unit file is erased by the next unattended
+// Homebrew upgrade. The operator's machine would stop peering hours later, for
+// no reason they could connect to anything they did.
+//
+// The preference is therefore the source of truth and the unit file is derived
+// from it, which is the only arrangement in which an upgrade cannot disagree
+// with the operator.
+type Peering struct {
+	Enabled bool     `json:"enabled"`
+	Address string   `json:"address,omitempty"`
+	Allowed []string `json:"allowed,omitempty"`
+}
+
+// peeringFileName holds the preference. It is in the CONFIG directory rather
+// than the state directory: state is what the daemon publishes about itself and
+// is safe to delete, and deleting this would silently switch peering off.
+const peeringFileName = "peering.json"
+
+func (manager *Manager) peeringPath() string {
+	return filepath.Join(manager.blackbirdConfigDir(), peeringFileName)
+}
+
+// Peering reads the persisted preference. A missing file is peering off, which
+// is the default this product will not change under anybody.
+func (manager *Manager) Peering() (Peering, error) {
+	content, err := os.ReadFile(manager.peeringPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return Peering{}, nil
+	}
+	if err != nil {
+		return Peering{}, fmt.Errorf("read peering preference: %w", err)
+	}
+	var preference Peering
+	if err := json.Unmarshal(content, &preference); err != nil {
+		return Peering{}, fmt.Errorf("read peering preference %s: %w", manager.peeringPath(), err)
+	}
+	return preference, nil
+}
+
+// SetPeering records the preference. It validates the same rule the daemon
+// does -- peering needs at least one named peer -- so an operator learns at the
+// command line rather than from a service that will not start.
+func (manager *Manager) SetPeering(preference Peering) error {
+	named := make([]string, 0, len(preference.Allowed))
+	for _, name := range preference.Allowed {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			named = append(named, trimmed)
+		}
+	}
+	preference.Allowed = named
+	if !preference.Enabled {
+		if preference.Address != "" || len(named) != 0 {
+			return errors.New("peering options were supplied without enabling peering")
+		}
+		if err := os.Remove(manager.peeringPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("clear peering preference: %w", err)
+		}
+		return nil
+	}
+	if len(named) == 0 {
+		return errors.New("enabling peering requires naming at least one allowed peer")
+	}
+	if err := os.MkdirAll(manager.blackbirdConfigDir(), 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	content, err := json.Marshal(preference)
+	if err != nil {
+		return fmt.Errorf("encode peering preference: %w", err)
+	}
+	if err := atomicWrite(manager.peeringPath(), content, 0o600); err != nil {
+		return fmt.Errorf("write peering preference: %w", err)
+	}
+	return nil
+}
+
 // ServiceArgv returns the argv the service definition must invoke. The explicit
 // daemon subcommand replaces the pre-0.4 bare-flag form, which the CLI still
 // accepts so an upgraded binary survives an unrewritten unit file.
+//
+// This is the REPORTING form, used by doctor and the support bundle. It cannot
+// report a preference it could not read, so an unreadable preference is
+// reported as peering off here; everything that WRITES a unit file goes through
+// serviceArgv instead, which refuses rather than quietly dropping the flags.
 func (manager *Manager) ServiceArgv() []string {
-	return []string{
+	argv, err := manager.serviceArgv()
+	if err != nil {
+		preference := Peering{}
+		return manager.argvWith(preference)
+	}
+	return argv
+}
+
+func (manager *Manager) serviceArgv() ([]string, error) {
+	preference, err := manager.Peering()
+	if err != nil {
+		return nil, err
+	}
+	return manager.argvWith(preference), nil
+}
+
+func (manager *Manager) argvWith(preference Peering) []string {
+	argv := []string{
 		manager.config.Executable,
 		daemonCommand,
 		"--sqlite-path=" + filepath.Join(manager.blackbirdDataDir(), "blackbird.db"),
 		"--state-dir=" + manager.blackbirdStateDir(),
 	}
+	if !preference.Enabled {
+		return argv
+	}
+	argv = append(argv, "--peer")
+	if preference.Address != "" {
+		argv = append(argv, "--peer-address="+preference.Address)
+	}
+	for _, name := range preference.Allowed {
+		argv = append(argv, "--peer-allow="+name)
+	}
+	return argv
 }
 
 // Install creates local directories, converges detected MCP clients, and restarts the service.
@@ -1128,8 +1241,11 @@ WantedBy=timers.target
 	return []string{service, timer}
 }
 
-func (manager *Manager) serviceDefinition() string {
-	argv := manager.ServiceArgv()
+func (manager *Manager) serviceDefinition() (string, error) {
+	argv, err := manager.serviceArgv()
+	if err != nil {
+		return "", err
+	}
 	if manager.config.GOOS == "darwin" {
 		arguments := make([]string, 0, len(argv))
 		for _, argument := range argv {
@@ -1151,7 +1267,7 @@ func (manager *Manager) serviceDefinition() string {
 </dict>
 </plist>
 `, serviceLabel, strings.Join(arguments, ""), xmlEscape(manager.config.StateHome),
-			xmlEscape(manager.daemonLogPath()), xmlEscape(manager.daemonErrorLogPath()))
+			xmlEscape(manager.daemonLogPath()), xmlEscape(manager.daemonErrorLogPath())), nil
 	}
 	arguments := make([]string, 0, len(argv))
 	for _, argument := range argv {
@@ -1180,7 +1296,7 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 `, systemdEscape("XDG_STATE_HOME="+manager.config.StateHome), strings.Join(arguments, " "),
-		systemdPath(manager.daemonLogPath()), systemdPath(manager.daemonErrorLogPath()))
+		systemdPath(manager.daemonLogPath()), systemdPath(manager.daemonErrorLogPath())), nil
 }
 
 // convergeServiceDefinition rewrites the service definition only when the
@@ -1197,12 +1313,16 @@ func (manager *Manager) convergeServiceDefinition() (bool, error) {
 	if err := os.MkdirAll(manager.blackbirdStateDir(), 0o700); err != nil {
 		return false, fmt.Errorf("create state directory: %w", err)
 	}
-	wanted := []byte(manager.serviceDefinition())
-	current, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return false, fmt.Errorf("read service definition: %w", err)
+	definition, err := manager.serviceDefinition()
+	if err != nil {
+		return false, err
 	}
-	if err == nil && bytes.Equal(current, wanted) {
+	wanted := []byte(definition)
+	current, readErr := os.ReadFile(path)
+	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
+		return false, fmt.Errorf("read service definition: %w", readErr)
+	}
+	if readErr == nil && bytes.Equal(current, wanted) {
 		return false, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -1318,7 +1438,11 @@ func (manager *Manager) definitionState() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read service definition: %w", err)
 	}
-	if !bytes.Equal(current, []byte(manager.serviceDefinition())) {
+	wanted, err := manager.serviceDefinition()
+	if err != nil {
+		return "", err
+	}
+	if !bytes.Equal(current, []byte(wanted)) {
 		return DefinitionStale, nil
 	}
 	return DefinitionCurrent, nil

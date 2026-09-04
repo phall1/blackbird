@@ -110,6 +110,23 @@ with:
 go list ./... | grep node_modules   # must print nothing
 ```
 
+**The test timeout is enforced in two places and they must stay identical** --
+`TEST_TIMEOUT` in `Makefile`, and the `-timeout` on the CI workflow's race step.
+It is stated rather than left to `go test`'s 10-minute default because the
+storage package, race-instrumented over a pure-Go SQLite driver, runs for
+minutes; it once crossed 600s on a loaded workstation and failed on the clock
+with every assertion passing. Read both before changing either:
+
+```sh
+grep TEST_TIMEOUT Makefile
+grep -n 'go test -timeout' .github/workflows/ci.yml
+```
+
+A test that fails only on a busy machine is a flake, not a gate. Where a timing
+budget guards a real property -- a daemon becoming ready, a connection pool
+going idle -- widen the PATIENCE and keep the assertion; never sample for a
+fixed window and call the absence of an observation a failure.
+
 CI also enforces formatting and module tidiness, and runs the test matrix on
 more than one OS. Read the workflow for the current set rather than assuming.
 
@@ -214,6 +231,47 @@ rule.
 When the architecture test fails, delegate to the `boundary-auditor` agent — a
 violation almost always means a dependency points the wrong way, and the fix is
 an inversion rather than an exemption.
+
+## The network surface
+
+The daemon is loopback-only by default and that default is the product's
+promise: an upgrade must never start it listening. Peering is opt-in per
+machine, and the whole non-loopback surface is one list -- `peerReachableRoutes`
+in `internal/transport/http/peer.go`. Read it there rather than from any
+description, including this one:
+
+```sh
+grep -A 8 'var peerReachableRoutes' internal/transport/http/peer.go
+go test ./internal/runtime/ -run PeerReachable   # partition vs the served mux
+```
+
+Four rules are load-bearing, and each replaced a bug:
+
+- **A route in the partition must be REGISTERED.** The peer cost route was
+  classified peer-reachable, requested by the fleet client, and mounted by
+  nobody: every request fell to the catch-all and answered 404, which the
+  client reported as the peer running an old build. The transport package's own
+  route table could not catch it, because it checks the classifier against a
+  hand-written copy of itself. `productionHTTPRoutes` in
+  `internal/runtime/production.go` is the table the daemon actually serves, and
+  the runtime test checks the partition against THAT.
+- **Identity is verified per request and never cached.** A remembered admission
+  keeps admitting after tailscaled dies, after a node is deleted, and after an
+  ACL changes -- the window an operator revoking access believes is closed.
+  Only REFUSALS are remembered, briefly, and only as a flood bound.
+- **This machine is not its own peer**, and MCP refuses non-loopback callers at
+  the request rather than at the bind. Both were one mechanism pretending to be
+  two: a symmetric allow-list makes every local process a peer, and
+  "MCP is loopback-only" was a convention a single flag revoked.
+- **Peer-sourced text is sanitized before it is rendered.** A terminal is an
+  interpreter, and a fleet report is the first text another host chooses. The
+  filter belongs at the client boundary (`internal/cli/fleetclient.go`), not in
+  the renderer.
+
+Peering is persisted as an operator PREFERENCE (`internal/install`), never only
+as a flag in the unit file: `blackbird update` regenerates the service
+definition, so a flag that lived only there would be erased by the next
+unattended upgrade.
 
 ## Conventions
 

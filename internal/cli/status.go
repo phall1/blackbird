@@ -35,6 +35,7 @@ type statusReport struct {
 	Legacy       bool              `json:"legacy_protocol,omitempty"`
 	Undiscovered bool              `json:"serving_without_record,omitempty"`
 	Probe        *daemonProbe      `json:"probe,omitempty"`
+	Peering      *Peering          `json:"peering,omitempty"`
 	Identity     *Identity         `json:"identity,omitempty"`
 	Database     Database          `json:"database"`
 	Problems     []string          `json:"problems,omitempty"`
@@ -93,6 +94,15 @@ func (cmd *StatusCmd) collect(ctx context.Context, console *Console) (statusRepo
 			report.Probe = &probe
 		}
 		report.Undiscovered = state.Undiscovered
+		// Peering comes from the discovery record rather than an endpoint,
+		// because an operator asking "is this daemon reachable from the
+		// tailnet" most needs the answer when it is not, and a client that
+		// could only learn it by reaching the daemon would say nothing then.
+		if reporter, ok := admin.(PeeringPort); ok {
+			if peering, peeringErr := reporter.Peering(); peeringErr == nil {
+				report.Peering = &peering
+			}
+		}
 		switch {
 		case state.Legacy:
 			report.Daemon = legacyProtocolState
@@ -231,6 +241,24 @@ func metricOutcomeSummary(outcomes map[string]int64) string {
 // liveness endpoint to report readiness from at all, so readiness is named
 // unknown rather than false.
 func daemonFields(report statusReport) []render.Field {
+	return append(reachabilityFields(report), peeringFields(report)...)
+}
+
+// peeringFields say both halves in one row, or say nothing at all. "on" without
+// the address would be a fact an operator cannot act on, and reporting "off"
+// for a daemon whose record could not be read would be a claim rather than an
+// observation -- so an unreadable record produces no row.
+func peeringFields(report statusReport) []render.Field {
+	if report.Peering == nil {
+		return nil
+	}
+	if !report.Peering.Enabled {
+		return []render.Field{{Key: "peering", Value: "off", Role: render.RoleMuted}}
+	}
+	return []render.Field{{Key: "peering", Value: "on " + report.Peering.Address, Role: render.RoleWarn}}
+}
+
+func reachabilityFields(report statusReport) []render.Field {
 	if report.Legacy && report.Probe != nil {
 		return []render.Field{
 			{Key: "reachable", Value: "yes (older protocol)", Role: render.RoleWarn},

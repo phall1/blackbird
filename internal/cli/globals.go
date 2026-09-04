@@ -203,6 +203,17 @@ func (console *Console) admin() (AdminPort, error) {
 	return console.Deps.Admin, nil
 }
 
+// peerCost is the fleet view's outbound port. Unlike every other port here it
+// never reports "unavailable": the default client is part of this binary, needs
+// no daemon on this machine to construct, and an operator who named a peer has
+// already said what they want contacted.
+func (console *Console) peerCost() PeerCostPort {
+	if console.Deps.Peers != nil {
+		return console.Deps.Peers
+	}
+	return newPeerCostClient()
+}
+
 func (console *Console) store() (StorePort, error) {
 	if console.Deps.Store == nil {
 		return nil, unavailableFault(nil, "no database reader is available")

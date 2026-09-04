@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -629,14 +630,26 @@ func TestUpdaterDefinitionCarriesTheResolvedXDGEnvironment(t *testing.T) {
 				DataHome: environment["XDG_DATA_HOME"], StateHome: environment["XDG_STATE_HOME"],
 				Executable: manager.config.Executable, UID: 501, Runner: &recordingRunner{},
 			})
-			if got, want := updater.serviceDefinition(), manager.serviceDefinition(); got != want {
+			got, err := updater.serviceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := manager.serviceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
 				t.Fatalf("updater converges a different definition:\n%s\nwant:\n%s", got, want)
 			}
 			bare := NewManager(Config{
 				GOOS: goos, HomeDir: home, Executable: manager.config.Executable,
 				UID: 501, Runner: &recordingRunner{},
 			})
-			if bare.serviceDefinition() == manager.serviceDefinition() {
+			bareDefinition, err := bare.serviceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bareDefinition == want {
 				t.Fatal("the XDG environment does not affect the converged definition, so this test proves nothing")
 			}
 		})
@@ -650,7 +663,10 @@ func TestServiceDefinitionInvokesTheDaemonSubcommandWithAnExplicitStateDir(t *te
 			t.Parallel()
 			home := t.TempDir()
 			manager := testManager(home, goos, &recordingRunner{})
-			definition := manager.serviceDefinition()
+			definition, err := manager.serviceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
 			stateDir := filepath.Join(home, "state", "blackbird")
 			environment := "XDG_STATE_HOME=" + filepath.Join(home, "state")
 			if goos == "darwin" {
@@ -697,7 +713,10 @@ func TestServiceDefinitionRedirectsDaemonOutputWhereTheLogReaderLooks(t *testing
 			t.Parallel()
 			home := t.TempDir()
 			manager := testManager(home, testCase.goos, &recordingRunner{})
-			definition := manager.serviceDefinition()
+			definition, err := manager.serviceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
 			stateDir := filepath.Join(home, "state", "blackbird")
 			// The file names are the log reader's, not this package's: a rename
 			// on either side silently empties `blackbird logs`.
@@ -1282,5 +1301,118 @@ func TestRestartLeavesLogsAloneWhenAbsent(t *testing.T) {
 	// turn that into an error.
 	if err := manager.restart(context.Background()); err != nil {
 		t.Fatalf("restart with no logs present: %v", err)
+	}
+}
+
+// TestPeeringPreferenceSurvivesAnUnattendedUpdate is the reason the preference
+// is a file rather than a flag on the daemon invocation.
+//
+// `blackbird update` runs convergeServiceDefinition, which REGENERATES the argv
+// from the manager. A --peer that lived only in the unit file would therefore
+// be erased by the next unattended Homebrew upgrade -- the operator's machine
+// silently stopping peering hours after anything they did, which is the exact
+// class of silent disagreement the peering flags refuse to make at startup.
+func TestPeeringPreferenceSurvivesAnUnattendedUpdate(t *testing.T) {
+	t.Parallel()
+
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			manager := testManager(home, goos, &recordingRunner{})
+			if err := manager.SetPeering(Peering{
+				Enabled: true, Address: "100.78.103.8:8080",
+				Allowed: []string{"phalls-mac-mini", "nFJpq2jD1311CNTRL"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			argv := manager.ServiceArgv()
+			for _, want := range []string{"--peer", "--peer-address=100.78.103.8:8080",
+				"--peer-allow=phalls-mac-mini", "--peer-allow=nFJpq2jD1311CNTRL"} {
+				if !slices.Contains(argv, want) {
+					t.Fatalf("argv = %v, missing %q", argv, want)
+				}
+			}
+			// A second manager is the updater: a different process, holding no
+			// memory of the install, regenerating the definition from disk.
+			updater := testManager(home, goos, &recordingRunner{})
+			definition, err := updater.serviceDefinition()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"--peer", "--peer-allow=phalls-mac-mini"} {
+				if !strings.Contains(definition, want) {
+					t.Fatalf("the regenerated definition dropped %q:\n%s", want, definition)
+				}
+			}
+		})
+	}
+}
+
+// TestPeeringPreferenceDefaultsOffAndRefusesAnEmptyAllowList holds the two
+// rules the daemon holds, at the command line where an operator can still act
+// on them.
+func TestPeeringPreferenceDefaultsOffAndRefusesAnEmptyAllowList(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	manager := testManager(home, runtime.GOOS, &recordingRunner{})
+	preference, err := manager.Peering()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preference.Enabled {
+		t.Fatal("a machine nobody configured reports peering on")
+	}
+	if slices.Contains(manager.ServiceArgv(), "--peer") {
+		t.Fatalf("the default argv opens a network surface: %v", manager.ServiceArgv())
+	}
+	if err := manager.SetPeering(Peering{Enabled: true}); err == nil {
+		t.Fatal("peering was enabled with no allowed peer")
+	}
+	// Options without the switch are refused rather than recorded, for the same
+	// reason the daemon refuses them: the operator believes peering is on.
+	if err := manager.SetPeering(Peering{Allowed: []string{"phalls-mac-mini"}}); err == nil {
+		t.Fatal("an allow-list was recorded with peering off")
+	}
+}
+
+// TestPeeringPreferenceCanBeTurnedOff proves the setting is reversible without
+// hand-editing a unit file.
+func TestPeeringPreferenceCanBeTurnedOff(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	manager := testManager(home, runtime.GOOS, &recordingRunner{})
+	if err := manager.SetPeering(Peering{Enabled: true, Allowed: []string{"phalls-mac-mini"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetPeering(Peering{}); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(manager.ServiceArgv(), "--peer") {
+		t.Fatalf("peering survived being turned off: %v", manager.ServiceArgv())
+	}
+}
+
+// TestUnreadablePeeringPreferenceNeverWritesAUnitFile is the fail-closed half.
+// A corrupt preference must not converge a definition that silently drops the
+// flags; it must refuse where an operator sees it.
+func TestUnreadablePeeringPreferenceNeverWritesAUnitFile(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	manager := testManager(home, runtime.GOOS, &recordingRunner{})
+	if err := os.MkdirAll(manager.blackbirdConfigDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.peeringPath(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.convergeServiceDefinition(); err == nil {
+		t.Fatal("a corrupt peering preference converged a definition anyway")
+	}
+	if _, err := os.Stat(manager.servicePath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a unit file was written from an unreadable preference: %v", err)
 	}
 }

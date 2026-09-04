@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"reflect"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/phall1/blackbird/internal/application/coordination"
 	"github.com/phall1/blackbird/internal/storage/sqlite"
+	httptransport "github.com/phall1/blackbird/internal/transport/http"
 )
 
 const (
@@ -41,6 +43,9 @@ type Config struct {
 	MCPAddress      string
 	LogLevel        string
 	ShutdownTimeout time.Duration
+	// Peering is the operator's opt-in to tailnet reachability. Its zero value
+	// is off, and a daemon nobody configured stays loopback-only.
+	Peering PeeringConfig
 }
 
 // Validate rejects configurations that cannot safely start a complete daemon.
@@ -65,6 +70,9 @@ func (config Config) Validate() error {
 	}
 	if config.ShutdownTimeout < 0 {
 		return errors.New("shutdown timeout cannot be negative")
+	}
+	if err := config.Peering.validate(); err != nil {
+		return fmt.Errorf("peering: %w", err)
 	}
 	if _, err := config.logLevel(); err != nil {
 		return err
@@ -152,12 +160,35 @@ type BoundAddressReceiver interface {
 	SetBoundHTTPAddress(address string)
 }
 
+// BoundPeerAddressReceiver is the same capability for the peer listener. It is
+// separate from BoundAddressReceiver because the two addresses answer different
+// questions -- where the CLI reaches this daemon, and where a tailnet peer does
+// -- and a worker that publishes one may have no business publishing the other.
+// A daemon with peering off hands over the empty string.
+type BoundPeerAddressReceiver interface {
+	SetBoundPeerAddress(address string)
+}
+
 // HandlerBundle is the complete ingress and background-work composition. Both
 // handlers are mandatory; runtime never substitutes placeholder handlers.
 type HandlerBundle struct {
 	HTTP    http.Handler
 	MCP     http.Handler
 	Workers []Worker
+	// PeerAdmission decides every non-loopback caller. Runtime installs it
+	// around the HTTP handler itself rather than trusting each composition to
+	// remember, so a composer that supplies a peer address without a guard is a
+	// startup failure instead of an open port.
+	PeerAdmission *httptransport.PeerAdmission
+	// PeerAddress is the tailnet address an additional HTTP listener binds.
+	// Empty is the default and means no second listener exists at all: with
+	// peering off the daemon is unreachable by bind address as well as by
+	// guard, which is two independent mechanisms rather than one.
+	//
+	// The MCP listener is deliberately not part of this. Every agent-facing
+	// lease mutation is an MCP tool, and MCP is never bound anywhere but
+	// loopback.
+	PeerAddress string
 }
 
 // Composer constructs the complete application-facing process graph around an
@@ -470,6 +501,15 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 		daemon.logger.Error("composition supplied incomplete ingress handlers")
 		return errors.Join(errors.New("composition must supply complete HTTP and MCP handlers"), daemon.Shutdown(context.Background()))
 	}
+	// A peer address without a guard that can admit anybody is refused here
+	// rather than served. There is no useful daemon on the far side of that
+	// mistake -- only a port on a shared network with nothing deciding who
+	// reaches it -- so it fails closed at startup where an operator sees it.
+	if bundle.PeerAddress != "" && !bundle.PeerAdmission.Enabled() {
+		daemon.logger.Error("composition supplied a peer address without an enabled peer admission")
+		return errors.Join(errors.New("a peer listener requires an enabled peer admission"),
+			daemon.Shutdown(context.Background()))
+	}
 	if ctx.Err() != nil {
 		return daemon.Shutdown(context.Background())
 	}
@@ -485,8 +525,30 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return errors.Join(err, daemon.Shutdown(context.Background()))
 	}
+	// An operator who binds MCP off loopback is told, at startup, that the
+	// listener will refuse every caller that reaches it there. Refusing
+	// silently would be the same silent disagreement the peering flags refuse
+	// to make: the operator believes they published a surface, and they did
+	// not.
+	if host, _, splitErr := net.SplitHostPort(mcpListener.Addr().String()); splitErr == nil {
+		if parsed, parseErr := netip.ParseAddr(host); parseErr == nil && !parsed.IsLoopback() {
+			daemon.logger.Warn("the MCP listener is bound off loopback and will refuse every caller that reaches it there",
+				slog.String("mcp_address", mcpListener.Addr().String()))
+		}
+	}
+	var peerListener net.Listener
+	if bundle.PeerAddress != "" {
+		peerListener, err = daemon.bind(bundle.PeerAddress, "peer")
+		if err != nil {
+			return errors.Join(err, daemon.Shutdown(context.Background()))
+		}
+	}
 
 	boundHTTPAddress := httpListener.Addr().String()
+	boundPeerAddress := ""
+	if peerListener != nil {
+		boundPeerAddress = peerListener.Addr().String()
+	}
 	for index, worker := range bundle.Workers {
 		if isNil(worker) {
 			daemon.logger.Error("composition supplied a nil worker", slog.Int("worker", index))
@@ -494,6 +556,9 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 		}
 		if receiver, ok := worker.(BoundAddressReceiver); ok {
 			receiver.SetBoundHTTPAddress(boundHTTPAddress)
+		}
+		if receiver, ok := worker.(BoundPeerAddressReceiver); ok {
+			receiver.SetBoundPeerAddress(boundPeerAddress)
 		}
 		daemon.resourcesMu.Lock()
 		daemon.workers = append(daemon.workers, worker)
@@ -511,56 +576,99 @@ func (daemon *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	httpServer := daemon.dependencies.NewServer(daemon.config.HTTPAddress, daemon.ingress.wrap(bundle.HTTP))
-	mcpServer := daemon.dependencies.NewServer(daemon.config.MCPAddress, daemon.ingress.wrap(bundle.MCP))
+	// The peer guard wraps the HTTP handler for BOTH listeners. On the loopback
+	// listener it is a pass-through, and installing it there anyway means the
+	// admission decision has exactly one implementation rather than one per
+	// listener.
+	httpHandler := bundle.HTTP
+	if bundle.PeerAdmission != nil {
+		httpHandler = bundle.PeerAdmission.Guard(bundle.HTTP)
+	}
+	httpServer := daemon.dependencies.NewServer(daemon.config.HTTPAddress, daemon.ingress.wrap(httpHandler))
+	// The MCP listener is loopback-only at the REQUEST, not merely at the bind.
+	// See httptransport.LoopbackOnly: every agent-facing lease mutation is an
+	// MCP tool, and "MCP is bound to loopback" was a convention a single flag
+	// could revoke.
+	mcpServer := daemon.dependencies.NewServer(daemon.config.MCPAddress,
+		daemon.ingress.wrap(httptransport.LoopbackOnly(bundle.MCP)))
 	if isNil(httpServer) || isNil(mcpServer) {
 		daemon.logger.Error("server factory returned nil")
 		return errors.Join(errors.New("server factory returned nil"), daemon.Shutdown(context.Background()))
 	}
+	ingresses := []servedIngress{{name: "HTTP", server: httpServer, listener: httpListener},
+		{name: "MCP", server: mcpServer, listener: mcpListener}}
+	if peerListener != nil {
+		peerServer := daemon.dependencies.NewServer(bundle.PeerAddress, daemon.ingress.wrap(httpHandler))
+		if isNil(peerServer) {
+			daemon.logger.Error("server factory returned nil")
+			return errors.Join(errors.New("server factory returned nil"), daemon.Shutdown(context.Background()))
+		}
+		ingresses = append(ingresses, servedIngress{name: "peer", server: peerServer, listener: peerListener})
+	}
 	daemon.resourcesMu.Lock()
-	daemon.servers = []IngressServer{httpServer, mcpServer}
+	for _, ingress := range ingresses {
+		daemon.servers = append(daemon.servers, ingress.server)
+	}
 	daemon.resourcesMu.Unlock()
 
-	serveResults := make(chan error, 2)
-	serveStarted := make(chan struct{}, 2)
-	go func() {
-		serveStarted <- struct{}{}
-		serveResults <- normalizeServeError("HTTP", httpServer.Serve(httpListener))
-	}()
-	go func() {
-		serveStarted <- struct{}{}
-		serveResults <- normalizeServeError("MCP", mcpServer.Serve(mcpListener))
-	}()
-	<-serveStarted
-	<-serveStarted
+	serveResults := make(chan error, len(ingresses))
+	serveStarted := make(chan struct{}, len(ingresses))
+	for _, ingress := range ingresses {
+		go func() {
+			serveStarted <- struct{}{}
+			serveResults <- normalizeServeError(ingress.name, ingress.server.Serve(ingress.listener))
+		}()
+	}
+	for range ingresses {
+		<-serveStarted
+	}
+	remaining := len(ingresses)
 	select {
 	case serveErr := <-serveResults:
 		daemon.logger.Error("ingress stopped during startup", slog.Any("error", serveErr))
-		return errors.Join(serveErr, daemon.Shutdown(context.Background()), <-serveResults)
+		return errors.Join(serveErr, daemon.Shutdown(context.Background()), drainServeResults(serveResults, remaining-1))
 	default:
 	}
 	if ctx.Err() != nil {
 		shutdownErr := daemon.Shutdown(context.Background())
-		first, second := <-serveResults, <-serveResults
-		return errors.Join(shutdownErr, first, second)
+		return errors.Join(shutdownErr, drainServeResults(serveResults, remaining))
 	}
 	if daemon.dependencies.Ready != nil {
 		daemon.dependencies.Ready()
 	}
 	daemon.logger.Info("daemon ready",
-		slog.String("http_address", boundHTTPAddress), slog.String("mcp_address", mcpListener.Addr().String()))
+		slog.String("http_address", boundHTTPAddress), slog.String("mcp_address", mcpListener.Addr().String()),
+		slog.Bool("peering", boundPeerAddress != ""), slog.String("peer_address", boundPeerAddress))
 
 	select {
 	case <-ctx.Done():
 		daemon.logger.Info("shutdown signalled")
 		shutdownErr := daemon.Shutdown(context.Background())
-		first, second := <-serveResults, <-serveResults
-		return errors.Join(shutdownErr, first, second)
+		return errors.Join(shutdownErr, drainServeResults(serveResults, remaining))
 	case serveErr := <-serveResults:
 		daemon.logger.Error("ingress stopped unexpectedly", slog.Any("error", serveErr))
 		shutdownErr := daemon.Shutdown(context.Background())
-		return errors.Join(serveErr, shutdownErr, <-serveResults)
+		return errors.Join(serveErr, shutdownErr, drainServeResults(serveResults, remaining-1))
 	}
+}
+
+// servedIngress pairs a bound listener with the server that drives it. The
+// daemon serves two or three of them depending on whether peering is on, which
+// is why the serve and drain paths count rather than name them.
+type servedIngress struct {
+	name     string
+	server   IngressServer
+	listener net.Listener
+}
+
+// drainServeResults collects the outstanding serve outcomes so no goroutine is
+// left blocked on an unread send and no ingress failure is silently discarded.
+func drainServeResults(results <-chan error, outstanding int) error {
+	var joined error
+	for range outstanding {
+		joined = errors.Join(joined, <-results)
+	}
+	return joined
 }
 
 func (daemon *Daemon) bind(address, name string) (net.Listener, error) {
