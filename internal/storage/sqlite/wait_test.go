@@ -300,15 +300,24 @@ func TestAwaitCoordinationHoldsNoConnectionWhileItWaits(t *testing.T) {
 		t.Fatalf("an unrelated read waited %v behind %d parked waiters", elapsed, waiters)
 	}
 
+	// The assertion is that an idle moment EXISTS, so the sampler stops at the
+	// first one and only the patience is budgeted. A fixed 1s window was not
+	// patience: with the whole suite running race-instrumented in parallel,
+	// twenty waiters' polls can overlap for longer than that and the sampler
+	// reported "a wait is holding its connection" about a machine that was
+	// merely busy. Nothing here admits a wait that holds a connection -- such a
+	// wait pins InUse for its whole life, so no window finds it idle.
 	idle := false
 	busiest := 0
-	for range 200 {
+	deadline := time.Now().Add(20 * time.Second)
+	for !idle && time.Now().Before(deadline) {
 		stats := fixture.store.db.Stats()
 		if stats.InUse > busiest {
 			busiest = stats.InUse
 		}
 		if stats.InUse == 0 {
 			idle = true
+			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

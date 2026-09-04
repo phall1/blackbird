@@ -7,6 +7,15 @@ GOVULNCHECK_VERSION ?= v1.6.0
 BLACKBIRD_DB ?= $(HOME)/.local/share/blackbird/blackbird.db
 COVERAGE_FLOOR ?= 80.0
 
+# TEST_TIMEOUT is per package binary, and it is stated rather than left to go
+# test's 10-minute default because the storage package sits close to it. The
+# SQLite driver is pure Go, so a race-instrumented migration ladder plus the
+# backup and coordination suites run for minutes; on a loaded workstation the
+# package crossed 600s and failed on the clock while every assertion passed.
+# A timeout that only fires on a busy machine is a flake, not a gate. This
+# value must stay in step with the one in the CI workflow's race step.
+TEST_TIMEOUT ?= 30m
+
 format:
 	$(GOLANGCI_LINT) fmt
 
@@ -22,16 +31,16 @@ vet:
 	$(GO) vet ./...
 
 test:
-	$(GO) test -shuffle=on ./...
+	$(GO) test -timeout $(TEST_TIMEOUT) -shuffle=on ./...
 
 test-race:
-	$(GO) test -race -shuffle=on ./...
+	$(GO) test -timeout $(TEST_TIMEOUT) -race -shuffle=on ./...
 
 test-stress:
-	$(GO) test -shuffle=on -count=3 ./...
+	$(GO) test -timeout $(TEST_TIMEOUT) -shuffle=on -count=3 ./...
 
 coverage:
-	$(GO) test -covermode=atomic -coverprofile=/tmp/blackbird-coverage.out ./...
+	$(GO) test -timeout $(TEST_TIMEOUT) -covermode=atomic -coverprofile=/tmp/blackbird-coverage.out ./...
 	$(GO) tool cover -func=/tmp/blackbird-coverage.out | tail -1
 	@total="$$( $(GO) tool cover -func=/tmp/blackbird-coverage.out | awk '/^total:/ {gsub("%", "", $$3); print $$3}' )"; \
 	awk -v total="$$total" -v floor="$(COVERAGE_FLOOR)" 'BEGIN { if (total + 0 < floor + 0) { printf "coverage %.1f%% is below %.1f%%\n", total, floor; exit 1 } }'

@@ -53,13 +53,18 @@ jobs:
           go-version: 1.26.6
           cache-dependency-path: go.sum
       - name: Race detector and shuffled tests
-        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+        # -timeout is per package binary and must stay in step with
+        # TEST_TIMEOUT in the Makefile. It is stated rather than left to the
+        # 10-minute default because the storage package, race-instrumented and
+        # collecting coverage over a pure-Go SQLite driver, runs close to it: a
+        # timeout that fires only on a busy runner is a flake, not a gate.
+        run: go test -timeout 30m -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
       - name: Enforce coverage floor
         run: |
           total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')"
           awk -v total="$total" 'BEGIN { if (total + 0 < 80.0) { printf "coverage %.1f%% is below 80.0%%\n", total; exit 1 } }'
       - name: Repeat tests to expose order and concurrency flakes
-        run: go test -shuffle=on -count=3 ./...
+        run: go test -timeout 30m -shuffle=on -count=3 ./...
       - name: Build all packages without CGO
         env:
           CGO_ENABLED: "0"

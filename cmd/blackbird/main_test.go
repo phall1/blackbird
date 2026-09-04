@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -223,6 +224,7 @@ func TestDaemonAdapterTranslatesOptions(t *testing.T) {
 		Storage: "sqlite", SQLitePath: "/data/blackbird.db", StateDir: "/state",
 		HTTPAddress: "127.0.0.1:1", MCPAddress: "127.0.0.1:2", LogLevel: "debug",
 		ShutdownTimeout: 7 * time.Second,
+		PeerEnabled:     true, PeerAddress: "100.64.0.7:1", PeerAllowed: []string{"phalls-mac-mini"},
 	}
 	if err := adapter.Run(context.Background(), options); err != nil {
 		t.Fatalf("Run() = %v", err)
@@ -231,8 +233,11 @@ func TestDaemonAdapterTranslatesOptions(t *testing.T) {
 		Storage: blackbirdruntime.StorageSQLite, SQLitePath: "/data/blackbird.db", StateDir: "/state",
 		HTTPAddress: "127.0.0.1:1", MCPAddress: "127.0.0.1:2", LogLevel: "debug",
 		ShutdownTimeout: 7 * time.Second,
+		Peering: blackbirdruntime.PeeringConfig{
+			Enabled: true, Address: "100.64.0.7:1", Allowed: []string{"phalls-mac-mini"},
+		},
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %#v, want %#v", got, want)
 	}
 }
@@ -595,7 +600,16 @@ func awaitRequest(
 ) *http.Response {
 	t.Helper()
 	client := &http.Client{Timeout: time.Second}
-	deadline := time.Now().Add(15 * time.Second)
+	// The budget is patience, not a performance assertion: the loop returns on
+	// the first successful request, so a healthy daemon costs milliseconds and
+	// only a struggling machine spends any of this. What it waits for is a
+	// race-instrumented child process opening SQLite, climbing the migration
+	// ladder and binding three listeners while the rest of the suite runs
+	// beside it -- which crossed fifteen seconds and failed a daemon that was
+	// starting perfectly well. The loop still fails the moment the child exits,
+	// so a daemon that cannot start is reported immediately rather than waited
+	// out.
+	deadline := time.Now().Add(60 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		select {
@@ -659,6 +673,12 @@ func (manager *fakeProductManager) Uninstall(context.Context) (install.Result, e
 	manager.called = "uninstall"
 	return install.Result{ServicePath: "/service", UpdaterPaths: []string{"/updater"}}, nil
 }
+
+func (manager *fakeProductManager) Peering() (install.Peering, error) {
+	return install.Peering{}, nil
+}
+
+func (manager *fakeProductManager) SetPeering(install.Peering) error { return nil }
 
 func (manager *fakeProductManager) ServiceArgv() []string {
 	return []string{"/opt/homebrew/bin/blackbird", "daemon"}
