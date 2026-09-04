@@ -105,6 +105,7 @@ func composeProductionBundle(
 	adminHTTPHandler, err := httptransport.NewAdminHandler(httptransport.AdminDependencies{
 		Admin: store, Token: httptransport.NewAdminTokenDigest(token), Metrics: metricsRegistry,
 		Cost: costAdminReader(store),
+		Spend: spendAdminReader(store),
 		Identity: httptransport.LocalIdentity{
 			Version: build.Version, Commit: build.Commit, BuiltAt: build.BuiltAt,
 			PID: os.Getpid(), StartedAt: started,
@@ -172,6 +173,18 @@ func observationReader(store Storage) telemetry.Reader {
 // different answer from a report full of zeros.
 func costAdminReader(store Storage) telemetry.CostAdminReader {
 	reader, ok := store.(telemetry.CostAdminReader)
+	if !ok {
+		return nil
+	}
+	return reader
+}
+
+// spendAdminReader is the spend half of the same optional capability, nil for
+// the same reason: the route reads a nil dependency as "this daemon cannot
+// answer spend" and says so, which is a different answer from a report full
+// of zeros.
+func spendAdminReader(store Storage) telemetry.SpendAdminReader {
+	reader, ok := store.(telemetry.SpendAdminReader)
 	if !ok {
 		return nil
 	}

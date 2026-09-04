@@ -366,3 +366,52 @@ func (store *Store) spendGroups(ctx context.Context, shape spendShape, filter st
 	}
 	return groups, truncated, nil
 }
+
+// AdminSpendReport answers the same rollup for an operator, over a project it
+// names rather than a session it authenticated into.
+//
+// It shares every query below with the agent report, deliberately: two
+// implementations of "where did the spend go" would drift, and the operator's
+// number disagreeing with the agent's about the same window is precisely the
+// kind of discrepancy nobody can debug. The only differences are where the
+// project comes from -- a name the caller must prove exists, instead of the
+// session's own -- and that there is no caller to narrow to.
+func (store *Store) AdminSpendReport(ctx context.Context,
+	query telemetry.AdminSpendQuery) (telemetry.SpendReport, error) {
+	if err := query.Validate(); err != nil {
+		return telemetry.SpendReport{}, err
+	}
+	if !validLocalCoordinationText(query.ProjectKey, coordination.MaxKeyBytes) {
+		return telemetry.SpendReport{}, coordination.ErrInvalid
+	}
+	now := time.Now().UTC()
+	query = query.Normalized(now)
+	if _, err := store.requireAdminProject(ctx, query.ProjectKey); err != nil {
+		return telemetry.SpendReport{}, err
+	}
+	shape, ok := spendShapeFor(query.Dimension)
+	if !ok {
+		return telemetry.SpendReport{}, coordination.ErrInvalid
+	}
+
+	// Closed at both ends for the same reason as the agent report:
+	// started_at_us is the adapter's clock and unclamped at ingest, so the
+	// upper bound is what stops a future-dated call being counted in every
+	// window until that date passes.
+	filter := "WHERE calls.project_key = ? AND calls.started_at_us >= ? AND calls.started_at_us <= ?"
+	arguments := []any{query.ProjectKey, query.Since.UnixMicro(), timeMicros(now)}
+
+	report := telemetry.SpendReport{Dimension: query.Dimension, Since: query.Since, Until: now}
+	totals, err := store.spendTotals(ctx, shape, filter, arguments)
+	if err != nil {
+		return telemetry.SpendReport{}, err
+	}
+	report.Totals = totals
+	groups, truncated, err := store.spendGroups(ctx, shape, filter, arguments, query.Limit)
+	if err != nil {
+		return telemetry.SpendReport{}, err
+	}
+	report.Groups = groups
+	report.Truncated = truncated
+	return report, nil
+}
