@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0](https://github.com/phall1/blackbird/compare/v0.5.0...v0.6.0) (2026-09-04)
+
+
+### Features
+
+* **http:** let tailnet peers reach a daemon that opts in ([b9b53c4](https://github.com/phall1/blackbird/commit/b9b53c4d07d9c07268f5e4d022ccfc31ebcc3307))
+* **mcp:** observe provider work references from the coordination plane ([c051bba](https://github.com/phall1/blackbird/commit/c051bbaf7d777835188bf9353b7d07dd68e39fc0))
+* **telemetry:** collect Claude Code and Codex usage into the observation plane ([4560d64](https://github.com/phall1/blackbird/commit/4560d64c5b7d811263eecd76c49dc46910f633de))
+* **telemetry:** record contention and report what it costs ([01e7aa5](https://github.com/phall1/blackbird/commit/01e7aa53fecf8b8b07671222d8cf80dcb71fce37))
+
 ## [0.5.0](https://github.com/phall1/blackbird/compare/v0.4.1...v0.5.0) (2026-09-02)
 
 
