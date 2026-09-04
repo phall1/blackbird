@@ -140,18 +140,9 @@ func (store *Store) AdminCostReport(ctx context.Context,
 	}
 	now := time.Now().UTC()
 	query = query.Normalized(now)
-	var workspace string
-	err := store.db.QueryRowContext(ctx, `SELECT workspace_id FROM coordination_projects
-		WHERE project_key = ?`, query.ProjectKey).Scan(&workspace)
-	if errors.Is(err, sql.ErrNoRows) {
-		// A project this daemon has never seen is not an empty report -- an
-		// empty report would say "this project cost nothing", which is a claim
-		// about a project rather than about a typo.
-		return telemetry.CostReport{}, coordinationError(domain.ErrorCodeNotFound,
-			"no such project in this daemon's coordination store")
-	}
+	workspace, err := store.requireAdminProject(ctx, query.ProjectKey)
 	if err != nil {
-		return telemetry.CostReport{}, fmt.Errorf("resolve admin cost project: %w", err)
+		return telemetry.CostReport{}, err
 	}
 	scope := costScope{workspace: workspace, projectKey: query.ProjectKey,
 		sinceUS: query.Since.UnixMicro(), nowUS: timeMicros(now), limit: int64(query.Limit)}
@@ -175,6 +166,25 @@ func (store *Store) costSections(ctx context.Context, report telemetry.CostRepor
 		return telemetry.CostReport{}, err
 	}
 	return report, nil
+}
+
+// requireAdminProject resolves a project the operator named to its workspace.
+// A project this daemon has never seen is not an empty report -- an empty
+// report would say "this project cost nothing", which is a claim about a
+// project rather than about a typo. Every admin report routes through this, so
+// no entry point can grow its own answer to an unknown name.
+func (store *Store) requireAdminProject(ctx context.Context, projectKey string) (string, error) {
+	var workspace string
+	err := store.db.QueryRowContext(ctx, `SELECT workspace_id FROM coordination_projects
+		WHERE project_key = ?`, projectKey).Scan(&workspace)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", coordinationError(domain.ErrorCodeNotFound,
+			"no such project in this daemon's coordination store")
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve admin project: %w", err)
+	}
+	return workspace, nil
 }
 
 // recordingHealth translates the journal's counters into the report's own

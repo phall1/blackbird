@@ -72,6 +72,10 @@ type AdminDependencies struct {
 	// for the same reason Cost is: a daemon without the capability must report
 	// the capability missing rather than an empty queue.
 	Outbox coordination.PeerMailQueueReader
+	// Spend is optional for the same reason, and separate: answering "what did
+	// contention cost" and "where did the tokens go" are two capabilities a
+	// storage backend holds independently.
+	Spend telemetry.SpendAdminReader
 }
 
 type adminHandler struct {
@@ -81,6 +85,7 @@ type adminHandler struct {
 	metrics  *metrics.Registry
 	costs    telemetry.CostAdminReader
 	outboxes coordination.PeerMailQueueReader
+	spends   telemetry.SpendAdminReader
 	now      func() time.Time
 }
 
@@ -115,7 +120,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	}
 	handler := &adminHandler{admin: dependencies.Admin, token: dependencies.Token,
 		identity: dependencies.Identity, metrics: dependencies.Metrics,
-		costs: dependencies.Cost, now: time.Now}
+		costs: dependencies.Cost, spends: dependencies.Spend, now: time.Now}
 	if !isNil(dependencies.Outbox) {
 		handler.outboxes = dependencies.Outbox
 	}
@@ -132,6 +137,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("GET "+PathLocalAdminEvents, handler.events)
 	mux.HandleFunc("GET "+PathLocalAdminCost, handler.cost)
 	mux.HandleFunc("GET "+PathLocalAdminOutbox, handler.outbox)
+	mux.HandleFunc("GET "+PathLocalAdminSpend, handler.spend)
 	return localSafety(mux), nil
 }
 

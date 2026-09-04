@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -322,5 +323,81 @@ func TestSpendReportIsEmptyRatherThanFailingWithNoData(t *testing.T) {
 	}
 	if len(report.Groups) != 0 || report.Totals.Observations != 0 || report.Truncated {
 		t.Fatalf("report=%+v, want an empty but valid report", report)
+	}
+}
+
+// TestAdminSpendReportAnswersForANamedProject is the operator's entry, and the
+// assertion that matters is scope: the report covers the project it was asked
+// about and ONLY that project, because the caller holds no registration in it
+// and the route is how an external coordinator answers "what did this
+// repository cost" across repos it does not belong to.
+func TestAdminSpendReportAnswersForANamedProject(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCoordinationStore(t)
+	watched := spendSession(t, store, "/workspace/watched", "alice")
+	other := spendSession(t, store, "/workspace/other", "bob")
+	now := time.Now().UTC()
+	appendFor(t, store, watched, []domain.ModelCall{
+		spendCall("w1", "claude-opus-5", domain.HarnessClaudeCode,
+			domain.TokenUsage{UncachedInput: 10, CacheRead: 100, Output: 50}, now, 0, false),
+	}, nil)
+	appendFor(t, store, other, []domain.ModelCall{
+		spendCall("o1", "claude-opus-5", domain.HarnessClaudeCode,
+			domain.TokenUsage{UncachedInput: 999, Output: 999}, now, 0, false),
+	}, nil)
+
+	report, err := store.AdminSpendReport(ctx, telemetry.AdminSpendQuery{
+		ProjectKey: "/workspace/watched", Dimension: telemetry.SpendByModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Totals.Observations != 1 || report.Totals.Output != 50 {
+		t.Fatalf("totals=%+v, want only the named project's spend", report.Totals)
+	}
+}
+
+// TestAdminSpendReportRefusesAnUnknownProject is the typo rule: a project this
+// daemon has never seen is not an empty report, because an empty report would
+// say "this project spent nothing", which is a claim about a project rather
+// than about a name.
+func TestAdminSpendReportRefusesAnUnknownProject(t *testing.T) {
+	t.Parallel()
+	store := newCoordinationStore(t)
+	_, err := store.AdminSpendReport(context.Background(), telemetry.AdminSpendQuery{
+		ProjectKey: "/workspace/never-seen", Dimension: telemetry.SpendByModel})
+	var commandErr *domain.CommandError
+	if !errors.As(err, &commandErr) || commandErr.Code() != domain.ErrorCodeNotFound {
+		t.Fatalf("err=%v, want not-found for a project this daemon has never seen", err)
+	}
+}
+
+// TestAdminSpendReportSharesTheAgentReportWindow is the drift guard: the two
+// entry points must answer the same window identically, or the operator's
+// number and the agent's number about the same work disagree and nobody can
+// say which is wrong.
+func TestAdminSpendReportSharesTheAgentReportWindow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCoordinationStore(t)
+	session := spendSession(t, store, "/workspace/shared", "alice")
+	now := time.Now().UTC()
+	appendFor(t, store, session, []domain.ModelCall{
+		spendCall("s1", "claude-opus-5", domain.HarnessClaudeCode,
+			domain.TokenUsage{UncachedInput: 7, CacheRead: 70, CacheWrite: 30, Output: 20}, now, 0, false),
+	}, nil)
+
+	agent, err := store.SpendReport(ctx, session, telemetry.SpendQuery{Dimension: telemetry.SpendByModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.AdminSpendReport(ctx, telemetry.AdminSpendQuery{
+		ProjectKey: "/workspace/shared", Dimension: telemetry.SpendByModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.Totals != admin.Totals {
+		t.Fatalf("agent totals=%+v, admin totals=%+v — the two entries disagree about the same window",
+			agent.Totals, admin.Totals)
 	}
 }
