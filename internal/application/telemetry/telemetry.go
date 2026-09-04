@@ -509,3 +509,53 @@ type Reader interface {
 	// exactly the successes-only report this join exists to replace.
 	CostReport(context.Context, coordination.LocalAgentSession, CostQuery) (CostReport, error)
 }
+
+// AdminSpendQuery is the operator's spend rollup, and it names its project
+// EXPLICITLY. That is the whole difference from SpendQuery and it is the same
+// decision AdminCostQuery makes: the agent query carries no project BY
+// CONSTRUCTION, so an agent reads the workspace it authenticated into or
+// nothing, while an operator holds the loopback admin credential and asks
+// about a project it names. Merging the two would give the agent query a
+// project field, and a field that exists is a field something will eventually
+// populate from a request body.
+//
+// The consumer this exists for is an external coordinator answering "what did
+// this repository cost" without holding an agent registration in it.
+type AdminSpendQuery struct {
+	// ProjectKey is required. There is no "every project" reading, for the
+	// same reason AdminCostQuery refuses one: a rollup summed across projects
+	// would add spend by agents that never shared a workspace.
+	ProjectKey string
+	Dimension  SpendDimension
+	Since      time.Time
+	Limit      uint16
+}
+
+func (query AdminSpendQuery) Validate() error {
+	if query.ProjectKey == "" {
+		return fmt.Errorf("%w: an admin spend report requires a project key", coordination.ErrInvalid)
+	}
+	return SpendQuery{Dimension: query.Dimension, Limit: query.Limit}.Validate()
+}
+
+// Normalized shares the agent query's window and page ceilings, so the
+// operator report and the agent report cannot disagree about how far back
+// "recently" reaches.
+func (query AdminSpendQuery) Normalized(now time.Time) AdminSpendQuery {
+	normalized := SpendQuery{Dimension: query.Dimension, Since: query.Since,
+		Limit: query.Limit}.Normalized(now)
+	query.Since = normalized.Since
+	query.Limit = normalized.Limit
+	return query
+}
+
+// SpendAdminReader is the operator half of the spend read surface, separate
+// from Reader for the same reason CostAdminReader is: the two answer to
+// different credentials. Reader is reached with an agent's registration token
+// and is confined to that agent's workspace; this is reached with the
+// loopback admin token and names its project. A composition may offer either,
+// both, or neither, and the transport that cannot get one simply does not
+// register the route.
+type SpendAdminReader interface {
+	AdminSpendReport(context.Context, AdminSpendQuery) (SpendReport, error)
+}

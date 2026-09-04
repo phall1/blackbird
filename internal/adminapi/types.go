@@ -294,3 +294,39 @@ type CostModel struct {
 	CacheReadShare *float64 `json:"cache_read_share,omitempty"`
 	CacheReuse     *float64 `json:"cache_reuse,omitempty"`
 }
+
+// SpendReport is the operator's answer to "where did this project's spend go".
+// It is a projection of the daemon's report, not a second computation of it:
+// every figure here is carried across as the daemon measured it.
+//
+// The wire form keeps the report's own discipline. Totals covers the whole
+// window rather than the returned groups, so a truncated report still states
+// honest totals, and Truncated is what lets a caller tell a complete report
+// from the top of a long tail.
+type SpendReport struct {
+	ProjectKey string       `json:"project_key"`
+	Dimension  string       `json:"dimension"`
+	Since      string       `json:"since"`
+	Until      string       `json:"until"`
+	Totals     SpendGroup   `json:"totals"`
+	Groups     []SpendGroup `json:"groups,omitempty"`
+	Truncated  bool         `json:"truncated"`
+}
+
+// SpendGroup is one row of the rollup. The token classes stay apart on the
+// wire for the same reason the schema keeps them in separate columns: they
+// are billed at materially different rates, and a caller cannot recover the
+// split from a sum. Span groupings carry no tokens, and their zeroes are the
+// truth rather than a missing value.
+type SpendGroup struct {
+	Key               string `json:"key"`
+	Observations      uint64 `json:"observations"`
+	UncachedInput     uint64 `json:"uncached_input_tokens"`
+	CacheRead         uint64 `json:"cache_read_tokens"`
+	CacheWrite        uint64 `json:"cache_write_tokens"`
+	Output            uint64 `json:"output_tokens"`
+	Reasoning         uint64 `json:"reasoning_tokens"`
+	MeasuredDurations uint64 `json:"measured_durations"`
+	TotalDurationMS   uint64 `json:"total_duration_ms"`
+	MaxDurationMS     uint64 `json:"max_duration_ms"`
+}

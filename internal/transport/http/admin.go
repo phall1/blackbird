@@ -67,6 +67,10 @@ type AdminDependencies struct {
 	// missing capability rather than an empty report, because an empty report
 	// would be a claim about the project rather than about this daemon.
 	Cost telemetry.CostAdminReader
+	// Spend is optional for the same reason, and separate: answering "what did
+	// contention cost" and "where did the tokens go" are two capabilities a
+	// storage backend holds independently.
+	Spend telemetry.SpendAdminReader
 }
 
 type adminHandler struct {
@@ -75,6 +79,7 @@ type adminHandler struct {
 	identity LocalIdentity
 	metrics  *metrics.Registry
 	costs    telemetry.CostAdminReader
+	spends   telemetry.SpendAdminReader
 	now      func() time.Time
 }
 
@@ -109,7 +114,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	}
 	handler := &adminHandler{admin: dependencies.Admin, token: dependencies.Token,
 		identity: dependencies.Identity, metrics: dependencies.Metrics,
-		costs: dependencies.Cost, now: time.Now}
+		costs: dependencies.Cost, spends: dependencies.Spend, now: time.Now}
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("GET "+PathLocalAdminIdentity, handler.describe)
 	mux.HandleFunc("GET "+PathLocalAdminOverview, handler.overview)
@@ -121,6 +126,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("POST "+PathLocalAdminReservations+"/{lease_id}/release", handler.forceReleaseReservation)
 	mux.HandleFunc("GET "+PathLocalAdminEvents, handler.events)
 	mux.HandleFunc("GET "+PathLocalAdminCost, handler.cost)
+	mux.HandleFunc("GET "+PathLocalAdminSpend, handler.spend)
 	return localSafety(mux), nil
 }
 
