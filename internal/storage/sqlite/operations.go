@@ -1590,8 +1590,8 @@ func (store *Store) flushLocalHeartbeat(ctx context.Context, sessionText string,
 
 // claimHeartbeat reports whether this call owes a durable heartbeat write. A
 // clock that moved backwards flushes rather than stalls: the comparison asks
-// whether the recorded flush is in the past and recent, not merely how far
-// apart the two instants are.
+// whether the recorded flush is at or before now and recent, not merely how
+// far apart the two instants are. Equal SQLite clock ticks are coalesced too.
 func (store *Store) claimHeartbeat(sessionText string, now time.Time) bool {
 	store.heartbeats.Lock()
 	defer store.heartbeats.Unlock()
@@ -1599,7 +1599,7 @@ func (store *Store) claimHeartbeat(sessionText string, now time.Time) bool {
 		store.heartbeats.flushed = make(map[string]time.Time)
 	}
 	if flushed, known := store.heartbeats.flushed[sessionText]; known &&
-		now.After(flushed) && now.Sub(flushed) < coordination.LocalAgentHeartbeatInterval {
+		!now.Before(flushed) && now.Sub(flushed) < coordination.LocalAgentHeartbeatInterval {
 		return false
 	}
 	// Sessions that stopped calling are dropped here rather than by a sweeper,

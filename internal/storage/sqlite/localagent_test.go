@@ -47,21 +47,38 @@ func TestAuthenticateLocalAgentCoalescesTheSessionHeartbeat(t *testing.T) {
 	}
 	// The caller is still told the truth even though the row was not touched:
 	// it is being seen now, and only the durable record is allowed to lag.
-	if !retried.LastSeenAt.After(microsTime(flushed)) {
-		t.Fatalf("reported last seen=%v, want an instant after the stored %v",
+	// SQLite can return the same clock tick for both calls.
+	if retried.LastSeenAt.Before(microsTime(flushed)) {
+		t.Fatalf("reported last seen=%v, want an instant at or after the stored %v",
 			retried.LastSeenAt, microsTime(flushed))
 	}
+}
 
-	// Once the coalescing window has elapsed the next call does write, so the
-	// durable row can never fall further behind than one interval.
-	store.heartbeats.Lock()
-	store.heartbeats.flushed[sessionText] = time.Now().Add(-2 * coordination.LocalAgentHeartbeatInterval)
-	store.heartbeats.Unlock()
-	if _, err := store.AuthenticateLocalAgent(ctx, token); err != nil {
+func TestAuthenticateLocalAgentFlushesAnExpiredHeartbeat(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := newCoordinationStore(t)
+	registered, token, err := store.RegisterLocalAgent(ctx, "/workspace/expired-heartbeat", "alice", "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if after := storedLastSeen(t, store, sessionText); after <= flushed {
-		t.Fatalf("last_seen_at_us=%d after the interval elapsed, want later than %d", after, flushed)
+	sessionText := registered.ActorSessionID.String()
+	// Backdate both records so a flush must visibly advance the durable row,
+	// even when consecutive authentication calls share a SQLite clock tick.
+	expired := registered.LastSeenAt.Add(-2 * coordination.LocalAgentHeartbeatInterval)
+	if _, err := store.db.ExecContext(ctx, `UPDATE coordination_agent_sessions SET started_at_us = ?, last_seen_at_us = ?
+		WHERE session_id = ?`, timeMicros(expired), timeMicros(expired), sessionText); err != nil {
+		t.Fatal(err)
+	}
+	store.heartbeats.Lock()
+	store.heartbeats.flushed = map[string]time.Time{sessionText: expired}
+	store.heartbeats.Unlock()
+	refreshed, err := store.AuthenticateLocalAgent(ctx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := storedLastSeen(t, store, sessionText); after != timeMicros(refreshed.LastSeenAt) || after <= timeMicros(expired) {
+		t.Fatalf("last_seen_at_us=%d after expiry, want current authentication instant %v", after, refreshed.LastSeenAt)
 	}
 }
 
@@ -373,6 +390,32 @@ func acquireTestLease(t *testing.T, store *Store, session coordination.LocalAgen
 		t.Fatal(err)
 	}
 	return lease
+}
+
+func TestHeartbeatLedgerClockBoundaries(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.September, 9, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		gap  time.Duration
+		want bool
+	}{
+		{name: "same tick", gap: 0, want: false},
+		{name: "within interval", gap: coordination.LocalAgentHeartbeatInterval - time.Nanosecond, want: false},
+		{name: "interval elapsed", gap: coordination.LocalAgentHeartbeatInterval, want: true},
+		{name: "clock moved backwards", gap: -time.Nanosecond, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &Store{}
+			if !store.claimHeartbeat("session", now) {
+				t.Fatal("the first call did not owe a heartbeat")
+			}
+			if got := store.claimHeartbeat("session", now.Add(test.gap)); got != test.want {
+				t.Fatalf("heartbeat owed at gap %v = %v, want %v", test.gap, got, test.want)
+			}
+		})
+	}
 }
 
 // TestHeartbeatLedgerGivesTheClaimBackWhenTheWriteFails is the safety property
