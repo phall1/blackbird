@@ -3,7 +3,7 @@ import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { PluginInput } from "@opencode-ai/plugin"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { acquireSupervisor, createSessionClient, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient } from "../src/index.js"
+import plugin, { acquireSupervisor, createSessionClient, createV2SessionClient, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient, type V2Context } from "../src/index.js"
 
 const controllers: AbortController[] = []
 afterEach(() => { for (const controller of controllers) controller.abort() })
@@ -325,5 +325,74 @@ describe("OpenCode adapter", () => {
     expect(body.agent).toBe("build")
     expect(body.parts[0]?.metadata).toEqual({ blackbird_message_id: "m1", blackbird_conversation_id: "c1", blackbird_position: 1 })
     expect(JSON.parse(await readFile(join(stateDir, "cursor.json"), "utf8"))).toEqual({ sessions: { c1: "ses_new" } })
+  })
+})
+
+describe("OpenCode V2 runtime", () => {
+  // 0.2.0 migrated to the stable v1 API and exported only `{ id, server }`.
+  // The V2 preview validates the default export against `{ id, setup | effect }`
+  // and refused to load it, so the plugin silently vanished from `opencode2
+  // plugin list`. These pin the shape that keeps one artifact loading on both.
+  it("exports the hooks both runtimes validate against", () => {
+    expect(plugin.id).toBe("phall1.blackbird")
+    expect(typeof plugin.server).toBe("function")
+    expect(typeof plugin.setup).toBe("function")
+  })
+
+  const v2Session = () => {
+    const calls: { method: string; input: unknown }[] = []
+    const session: V2Context["session"] = {
+      create: async (input) => { calls.push({ method: "create", input }); return { id: "ses_new" } },
+      synthetic: async (input) => { calls.push({ method: "synthetic", input }); return undefined },
+    }
+    return { session, calls }
+  }
+
+  it("delivers through `synthetic`, which spends no agent turn", async () => {
+    const { session, calls } = v2Session()
+    await createV2SessionClient(session).deliver({
+      sessionID: "ses_fixed",
+      messageID: deterministicMessageID("message_1"),
+      text: "hello",
+      metadata: { blackbird_message_id: "message_1", blackbird_position: 7 },
+      directory: "/repo",
+      agent: "build",
+    })
+    expect(calls).toEqual([{
+      method: "synthetic",
+      input: {
+        sessionID: "ses_fixed",
+        id: deterministicMessageID("message_1"),
+        text: "hello",
+        metadata: { blackbird_message_id: "message_1", blackbird_position: 7 },
+      },
+    }])
+  })
+
+  it("passes the Blackbird message id so redelivery upserts one transcript entry", async () => {
+    const { session, calls } = v2Session()
+    const adapter = createV2SessionClient(session)
+    const message = { sessionID: "ses_fixed", messageID: "msg_1", text: "hi", metadata: {}, directory: "/repo" }
+    await adapter.deliver(message)
+    await adapter.deliver(message)
+    expect(calls.map((call) => (call.input as { id?: string }).id)).toEqual(["msg_1", "msg_1"])
+  })
+
+  it("creates the session in the project directory", async () => {
+    const { session, calls } = v2Session()
+    expect(await createV2SessionClient(session).create({ title: "Blackbird: Work", directory: "/repo" })).toEqual({ id: "ses_new" })
+    expect(calls).toEqual([{ method: "create", input: { title: "Blackbird: Work", location: { directory: "/repo" } } }])
+  })
+
+  it("propagates a refused delivery so the supervisor retries instead of recording it", async () => {
+    const session: V2Context["session"] = {
+      create: async () => { throw new Error("no such project") },
+      synthetic: async () => { throw new Error("no such session") },
+    }
+    const adapter = createV2SessionClient(session)
+    await expect(adapter.deliver({
+      sessionID: "ses_gone", messageID: "msg_1", text: "hello", metadata: {}, directory: "/repo",
+    })).rejects.toThrow(/no such session/)
+    await expect(adapter.create({ title: "t", directory: "/repo" })).rejects.toThrow(/no such project/)
   })
 })

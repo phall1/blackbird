@@ -648,18 +648,82 @@ export function recordAssistantMessage(key: string, event: unknown): void {
   })
 }
 
-const plugin: PluginModule = {
+/**
+ * The subset of OpenCode V2's plugin context this plugin uses.
+ *
+ * V2 is still a moving preview line (`@opencode-ai/plugin@beta`) while this
+ * package builds against the stable v1 line, and a package cannot depend on two
+ * versions of the same name. Typing the context structurally keeps the V2 path
+ * compiled and tested without pinning a preview SDK that churns underneath it.
+ */
+export interface V2Context {
+  readonly options: PluginOptions
+  readonly session: {
+    create(input: { title?: string; location?: { directory: string } }): Promise<{ id: string }>
+    /**
+     * Insert a message into a session's transcript without running an agent
+     * turn -- V2's replacement for `prompt({ noReply: true })`. Passing the
+     * Blackbird message id as `id` keeps redelivery an upsert, exactly as the
+     * v1 path relies on.
+     */
+    synthetic(input: {
+      sessionID: string
+      id?: string
+      text: string
+      metadata?: Record<string, string | number>
+    }): Promise<unknown>
+  }
+}
+
+export function createV2SessionClient(session: V2Context["session"]): SessionClient {
+  return {
+    create: async ({ title, directory }) => {
+      const created = await session.create({ title, location: { directory } })
+      return { id: created.id }
+    },
+    // `synthetic` neither runs the agent loop nor accepts an agent, so the
+    // v1 path's `agent` and `directory` have no counterpart here: the session
+    // already carries its directory, and no turn is spent to route.
+    deliver: async ({ sessionID, messageID, text, metadata }) => {
+      await session.synthetic({ sessionID, id: messageID, text, metadata })
+    },
+  }
+}
+
+/**
+ * Start the shared inbox supervisor and return its release function.
+ *
+ * Both runtimes converge here: the difference between them is only how a
+ * `SessionClient` is built and how the teardown handle is returned.
+ */
+function startSupervisor(session: SessionClient, raw: PluginOptions): () => Promise<void> {
+  const key = supervisorKey(resolveOptions(raw))
+  return acquireSupervisor(key, (signal) => runSupervisor(session, raw, signal).catch((error: unknown) => {
+    if (!signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
+  }))
+}
+
+/**
+ * One default export that satisfies both runtimes.
+ *
+ * OpenCode v1 loads `{ id, server }`; the V2 preview validates the default
+ * export against `{ id, setup | effect }` and refuses to load a module that has
+ * only `server` -- which is how 0.2.x silently stopped loading under
+ * `opencode2` after the migration to the stable API. Carrying both hooks costs
+ * one small adapter and keeps a single published artifact working on either.
+ */
+const plugin: PluginModule & { readonly setup: (context: V2Context) => Promise<() => Promise<void>> } = {
   id: "phall1.blackbird",
+  setup: (context) => {
+    const release = startSupervisor(createV2SessionClient(context.session), context.options)
+    return Promise.resolve(release)
+  },
   // Not `async`: registering the supervisor is synchronous, and the supervisor
   // itself must keep running in the background rather than be awaited here.
   server: (input, pluginOptions) => {
     const raw = pluginOptions ?? {}
-    const options = resolveOptions(raw)
-    const session = createSessionClient(input.client)
-    const key = supervisorKey(options)
-    const release = acquireSupervisor(key, (signal) => runSupervisor(session, raw, signal).catch((error: unknown) => {
-      if (!signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
-    }))
+    const release = startSupervisor(createSessionClient(input.client), raw)
+    const key = supervisorKey(resolveOptions(raw))
     // OpenCode tears a plugin down through the returned hooks, so the shared
     // supervisor's reference release has to hang off `dispose`.
     return Promise.resolve({
