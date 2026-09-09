@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.2...opencode-plugin-v0.2.3) (2026-09-09)
+
+
+### Bug Fixes
+
+* **opencode-plugin:** clear the high advisory blocking the release gate ([#17](https://github.com/phall1/blackbird/issues/17)) ([f103772](https://github.com/phall1/blackbird/commit/f103772e2c9657e14a524069f5e47726d4f4bd93))
+
 ## [0.2.2](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.1...opencode-plugin-v0.2.2) (2026-09-09)
 
 
