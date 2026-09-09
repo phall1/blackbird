@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.1...opencode-plugin-v0.2.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* load under the OpenCode V2 runtime, and unbreak CI ([#16](https://github.com/phall1/blackbird/issues/16)) ([eb74d16](https://github.com/phall1/blackbird/commit/eb74d16fcf376063b62a1d30a3688a5b48eb7eba))
+
 ## [0.2.1](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.0...opencode-plugin-v0.2.1) (2026-09-02)
 
 
