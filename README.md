@@ -189,6 +189,19 @@ triggerable push. Codex's outbound-only `notify` callback and Devin's hosted
 automations cannot consume this contract and are explicitly unsupported. See
 [command-hook delivery](docs/HOOK_ADAPTERS.md) for exact config and limits.
 
+## OpenCode mailbox browser (V2)
+
+The plugin in [`packages/opencode-plugin`](packages/opencode-plugin) includes a
+native `/blackbird` (`/mail`) browser: select an agent mailbox, filter unread
+mail, and open full, paginated threads. It opens beside a session or as a page
+from home, with keyboard and mouse navigation and narrow-terminal support.
+Browsing leaves agent read receipts and acknowledgements unchanged.
+
+The server uses the V2 Effect SDK and the local daemon's authenticated admin
+API; the terminal uses typed RPC. See the
+[plugin setup and development guide](packages/opencode-plugin/README.md) for
+loading the checkout, optional notify-mode delivery, and isolated UI tests.
+
 ## OpenCode Delivery (notify)
 
 The `blackbird-opencode` package appends each durable `message.available` event

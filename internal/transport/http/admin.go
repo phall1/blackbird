@@ -28,6 +28,7 @@ const (
 	PathLocalAdminProjects      = "/api/v1/local/admin/projects"
 	PathLocalAdminAgents        = "/api/v1/local/admin/agents"
 	PathLocalAdminInbox         = "/api/v1/local/admin/inbox"
+	PathLocalAdminThread        = "/api/v1/local/admin/thread"
 	PathLocalAdminConversations = "/api/v1/local/admin/conversations"
 	PathLocalAdminReservations  = "/api/v1/local/admin/reservations"
 	PathLocalAdminEvents        = "/api/v1/local/admin/events"
@@ -124,6 +125,7 @@ func NewAdminHandler(dependencies AdminDependencies) (stdhttp.Handler, error) {
 	mux.HandleFunc("GET "+PathLocalAdminProjects, handler.projects)
 	mux.HandleFunc("GET "+PathLocalAdminAgents, handler.agents)
 	mux.HandleFunc("GET "+PathLocalAdminInbox, handler.inbox)
+	mux.HandleFunc("GET "+PathLocalAdminThread, handler.thread)
 	mux.HandleFunc("GET "+PathLocalAdminConversations, handler.conversations)
 	mux.HandleFunc("GET "+PathLocalAdminReservations, handler.reservations)
 	mux.HandleFunc("POST "+PathLocalAdminReservations+"/{lease_id}/release", handler.forceReleaseReservation)

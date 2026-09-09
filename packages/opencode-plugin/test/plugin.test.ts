@@ -3,7 +3,7 @@ import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { PluginInput } from "@opencode-ai/plugin"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import plugin, { acquireSupervisor, createSessionClient, createV2SessionClient, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient, type V2Context } from "../src/index.js"
+import plugin, { acquireSupervisor, createSessionClient, createV2SessionClient, deterministicMessageID, resolveOptions, runSupervisor, type SessionClient, type V2Context } from "../src/legacy.js"
 
 const controllers: AbortController[] = []
 afterEach(() => { for (const controller of controllers) controller.abort() })

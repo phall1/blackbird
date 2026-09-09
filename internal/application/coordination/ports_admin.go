@@ -286,6 +286,38 @@ type AdminInboxPage struct {
 	ObservedAtUS int64
 }
 
+// AdminThreadMaxPosition matches the messages.position schema bound and is
+// exactly representable by JSON clients using JavaScript numbers.
+const AdminThreadMaxPosition = 1<<53 - 1
+
+// AdminThreadQuery requires both scopes. After is an exclusive message position.
+type AdminThreadQuery struct {
+	ProjectKey     string
+	ConversationID domain.ConversationID
+	After          uint64
+	Limit          uint16
+}
+
+// AdminThreadMessage exposes content only through an explicit human thread read.
+// It deliberately contains no recipient list or delivery facts.
+type AdminThreadMessage struct {
+	MessageID       domain.MessageID
+	Position        uint64
+	AuthorAgentName string
+	Subject         string
+	Body            string
+	SentAtUS        int64
+}
+
+type AdminThreadPage struct {
+	ProjectKey     string
+	ConversationID domain.ConversationID
+	Messages       []AdminThreadMessage
+	HasMore        bool
+	Next           uint64
+	ObservedAtUS   int64
+}
+
 type AdminConversationStatus string
 
 const (
@@ -362,7 +394,9 @@ type ReadinessProbe interface {
 // surface. Reads are point-in-time snapshots against the durable store's own
 // clock. ForceReleaseAdminReservation is the one mutation: an authenticated
 // operator escape hatch for a lease whose holder is gone. An empty ProjectKey
-// means "every project" and an empty AgentName means "every agent".
+// means "every project" except for AdminInbox and AdminThread, which require a
+// project. An empty AgentName means "every agent". AdminThread also requires a
+// conversation and never records delivery facts or agent activity.
 type LocalAdminStore interface {
 	ReadinessProbe
 	AdminStorageIdentity(context.Context) (AdminStorageIdentity, error)
@@ -370,6 +404,7 @@ type LocalAdminStore interface {
 	ListAdminProjects(context.Context) (AdminProjectsPage, error)
 	ListAdminAgents(context.Context, AdminAgentsQuery) (AdminAgentsPage, error)
 	AdminInbox(context.Context, AdminInboxQuery) (AdminInboxPage, error)
+	AdminThread(context.Context, AdminThreadQuery) (AdminThreadPage, error)
 	ListAdminConversations(context.Context, AdminConversationsQuery) (AdminConversationsPage, error)
 	ListAdminReservations(context.Context, AdminReservationsQuery) (AdminReservationsPage, error)
 	ForceReleaseAdminReservation(context.Context, domain.LeaseID) (Lease, error)

@@ -15,6 +15,13 @@ export default tseslint.config(
     },
   },
   {
+    files: ["src/{index,effect-delivery,mail-reader,rpc}.ts", "src/*.tsx"],
+    rules: {
+      complexity: ["error", 10],
+      "max-depth": ["error", 3],
+    },
+  },
+  {
     files: ["test/**/*.ts"],
     rules: {
       "@typescript-eslint/no-empty-function": "off",

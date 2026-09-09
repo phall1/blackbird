@@ -7,10 +7,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./server": "./dist/index.js",
+    "./rpc": "./dist/rpc.js",
+    "./tui": "./dist/tui.js"
   },
   "files": [
     "dist",
+    "server.ts",
+    "tui.tsx",
+    "rpc.ts",
     "README.md",
     "LICENSE"
   ],
@@ -19,9 +25,10 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "bun scripts/build.mjs",
     "check": "tsc --noEmit && eslint src test",
     "test": "vitest run",
+    "test:tui": "npm run build && opencode-drive run scripts/tui-drive.ts",
     "test:pack": "npm run build && node scripts/pack-test.mjs",
     "prepack": "npm run build",
     "gates": "npm run check && npm test && npm run test:pack && npm audit --audit-level=high"
@@ -43,9 +50,20 @@
   },
   "homepage": "https://github.com/phall1/blackbird/tree/main/packages/opencode-plugin#readme",
   "dependencies": {
-    "@opencode-ai/plugin": "1.18.26"
+    "@opencode-ai/plugin": "1.18.26",
+    "@opencode/plugin": "0.0.0-beta-19365",
+    "@opencode/schema": "0.0.0-beta-19365",
+    "effect": "4.0.0-rc.112",
+    "zod": "4.3.6"
+  },
+  "peerDependencies": {
+    "@opentui/core": "0.5.11",
+    "@opentui/solid": "0.5.11",
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
+    "@opencode/theme": "0.0.0-beta-19365",
+    "opencode-drive": "2.1.0",
     "@eslint/js": "9.33.0",
     "@types/node": "24.2.1",
     "eslint": "9.33.0",

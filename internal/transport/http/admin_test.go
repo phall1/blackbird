@@ -23,6 +23,7 @@ type stubAdminStore struct {
 	projects      coordination.AdminProjectsPage
 	agents        coordination.AdminAgentsPage
 	inbox         coordination.AdminInboxPage
+	thread        coordination.AdminThreadPage
 	conversations coordination.AdminConversationsPage
 	reservations  coordination.AdminReservationsPage
 	forcedLease   coordination.Lease
@@ -34,6 +35,7 @@ type stubAdminStore struct {
 
 	agentsQuery        coordination.AdminAgentsQuery
 	inboxQuery         coordination.AdminInboxQuery
+	threadQuery        coordination.AdminThreadQuery
 	conversationsQuery coordination.AdminConversationsQuery
 	reservationsQuery  coordination.AdminReservationsQuery
 	eventsQuery        coordination.AdminEventsQuery
@@ -65,6 +67,12 @@ func (store *stubAdminStore) AdminInbox(_ context.Context,
 	query coordination.AdminInboxQuery) (coordination.AdminInboxPage, error) {
 	store.inboxQuery = query
 	return store.inbox, store.err
+}
+
+func (store *stubAdminStore) AdminThread(_ context.Context,
+	query coordination.AdminThreadQuery) (coordination.AdminThreadPage, error) {
+	store.threadQuery = query
+	return store.thread, store.err
 }
 
 func (store *stubAdminStore) ListAdminConversations(_ context.Context,

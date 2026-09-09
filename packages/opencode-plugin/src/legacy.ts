@@ -1,0 +1,741 @@
+import { createHash } from "node:crypto"
+import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
+import type { PluginInput, PluginModule, PluginOptions } from "@opencode-ai/plugin"
+
+type Cursor = string
+type MessagePosition = string | number
+
+export interface BlackbirdMessage {
+  readonly message_id: string
+  readonly conversation_id: string
+  readonly subject: string
+  readonly body: string
+  readonly position: MessagePosition
+  readonly author_actor_id?: string
+  readonly sent_at?: string
+}
+
+interface State {
+  sessions: Record<string, string>
+}
+
+interface LoadedState extends State {
+  legacyCursor: Cursor
+}
+
+const CONSUMER_ID = "opencode-plugin"
+
+interface RoutingFixed {
+  readonly mode: "fixed"
+  readonly sessionID: string
+}
+
+interface RoutingConversation {
+  readonly mode: "conversation"
+  readonly agent?: string
+}
+
+export interface BlackbirdOptions {
+  readonly baseUrl: string
+  readonly projectKey: string
+  readonly agentName: string
+  readonly token?: string
+  readonly stateDir?: string
+  readonly routing?: RoutingFixed | RoutingConversation
+  readonly paths?: {
+    readonly register?: string
+    readonly catchUp?: string
+    readonly stream?: string
+    readonly ack?: string
+    readonly message?: string
+  }
+  readonly catchUpLimit?: number
+  readonly backoff?: {
+    readonly minimumMs?: number
+    readonly maximumMs?: number
+    readonly jitter?: number
+  }
+}
+
+/**
+ * The narrow slice of OpenCode this plugin needs. It exists so the supervisor
+ * can be tested without an OpenCode server, and so an OpenCode API change is a
+ * change to one adapter rather than to the delivery loop.
+ */
+export interface SessionClient {
+  create(input: { title: string; directory: string }): Promise<{ id: string }>
+  /**
+   * Append a Blackbird message to a session's transcript *without* running an
+   * agent turn. Resolves only once OpenCode has durably accepted the message —
+   * the supervisor marks a message delivered on that promise and must not
+   * record delivery for a message OpenCode rejected.
+   */
+  deliver(input: {
+    sessionID: string
+    messageID: string
+    text: string
+    metadata: Record<string, string | number>
+    directory: string
+    agent?: string
+  }): Promise<void>
+}
+
+/**
+ * The generated OpenCode client resolves rather than rejects on a non-2xx
+ * response, handing back `{ data: undefined, error }`. Awaiting a call without
+ * this check would let a rejected delivery look successful, and the supervisor
+ * would record the message as delivered and never retry it.
+ */
+function unwrap<T>(result: { data: T | undefined; error: unknown; response: Response }, action: string): T {
+  if (result.error !== undefined || result.data === undefined) {
+    throw new Error(`blackbird: OpenCode ${action} failed with HTTP ${String(result.response.status)}`)
+  }
+  return result.data
+}
+
+export function createSessionClient(client: PluginInput["client"]): SessionClient {
+  return {
+    create: async ({ title, directory }) => {
+      const created = unwrap(await client.session.create({ body: { title }, query: { directory } }), "session create")
+      return { id: created.id }
+    },
+    deliver: async ({ sessionID, messageID, text, metadata, directory, agent }) => {
+      unwrap(
+        await client.session.prompt({
+          path: { id: sessionID },
+          query: { directory },
+          body: {
+            // OpenCode upserts the user message on this ID, so redelivering the
+            // same Blackbird message rewrites one transcript entry rather than
+            // appending a duplicate.
+            messageID,
+            // The whole point: OpenCode persists the message and skips the
+            // agent loop, so a delivered message costs the user no turn.
+            noReply: true,
+            ...(agent === undefined ? {} : { agent }),
+            // Part metadata is the only per-message metadata channel the stable
+            // API has; it is what carries Blackbird's identifiers into the
+            // transcript.
+            parts: [{ type: "text", text, metadata }],
+          },
+        }),
+        "message delivery",
+      )
+    },
+  }
+}
+
+export interface SupervisorDependencies {
+  readonly fetch: typeof globalThis.fetch
+  readonly random: () => number
+  readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>
+}
+
+import {
+  TelemetryEmitter,
+  boundedRawUsage,
+  emitterFor,
+  errorKindForMessage,
+  normalizeOpenCodeTokens,
+  outcomeForMessage,
+  publishEmitter,
+} from "./telemetry.js"
+
+interface ResolvedOptions {
+  readonly baseUrl: URL
+  readonly projectKey: string
+  readonly agentName: string
+  readonly token?: string
+  readonly stateDir: string
+  readonly routing: RoutingFixed | RoutingConversation
+  readonly registerPath: string
+  readonly catchUpPath: string
+  readonly streamPath: string
+  readonly ackPath: string
+  readonly messagePath: string
+  readonly catchUpLimit: number
+  readonly minimumMs: number
+  readonly maximumMs: number
+  readonly jitter: number
+}
+
+const defaultDependencies: SupervisorDependencies = {
+  fetch: globalThis.fetch,
+  random: Math.random,
+  sleep: async (milliseconds, signal) => {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", abort)
+        resolve()
+      }, milliseconds)
+      const abort = (): void => {
+        clearTimeout(timer)
+        reject(signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+      }
+      if (signal.aborted) abort()
+      else signal.addEventListener("abort", abort, { once: true })
+    })
+  },
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function requiredString(source: Record<string, unknown>, key: string): string {
+  const value = source[key]
+  if (typeof value !== "string" || value.trim() === "") throw new Error(`blackbird: ${key} must be a non-empty string`)
+  return value
+}
+
+function optionalNumber(value: unknown, fallback: number, minimum: number, maximum: number, name: string): number {
+  if (value === undefined) return fallback
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(`blackbird: ${name} must be between ${String(minimum)} and ${String(maximum)}`)
+  }
+  return value
+}
+
+function safeSegment(value: string): string {
+  const segment = value.replaceAll(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80)
+  return segment || "agent"
+}
+
+export function resolveOptions(raw: PluginOptions | BlackbirdOptions, environment: NodeJS.ProcessEnv = process.env): ResolvedOptions {
+  const source = record(raw)
+  if (!source) throw new Error("blackbird: options must be an object")
+  const baseUrl = new URL(requiredString(source, "baseUrl"))
+  if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") throw new Error("blackbird: baseUrl must use http or https")
+  if (baseUrl.protocol === "http:" && !isLoopbackHostname(baseUrl.hostname)) {
+    throw new Error("blackbird: plaintext http is allowed only for a loopback Blackbird server")
+  }
+  baseUrl.pathname = baseUrl.pathname.replace(/\/$/, "") + "/"
+  const projectKey = expandHome(requiredString(source, "projectKey"))
+  const agentName = requiredString(source, "agentName")
+  const routingValue = record(source["routing"])
+  let routing: RoutingFixed | RoutingConversation
+  if (routingValue?.["mode"] === "fixed") routing = { mode: "fixed", sessionID: requiredString(routingValue, "sessionID") }
+  else if (routingValue === undefined || routingValue["mode"] === "conversation") {
+    const agent = routingValue?.["agent"]
+    if (agent !== undefined && typeof agent !== "string") throw new Error("blackbird: routing.agent must be a string")
+    routing = agent === undefined ? { mode: "conversation" } : { mode: "conversation", agent }
+  } else throw new Error("blackbird: routing.mode must be fixed or conversation")
+  const paths = record(source["paths"])
+  const backoff = record(source["backoff"])
+  const projectHash = createHash("sha256").update(projectKey).digest("hex").slice(0, 16)
+  const stateRoot = environment["XDG_STATE_HOME"] ?? join(environment["HOME"] ?? homedir(), ".local", "state")
+  return {
+    baseUrl,
+    projectKey,
+    agentName,
+    ...(typeof source["token"] === "string" ? { token: source["token"] } : {}),
+    stateDir: typeof source["stateDir"] === "string" ? expandHome(source["stateDir"]) : join(stateRoot, "blackbird", "opencode", projectHash, safeSegment(agentName)),
+    routing,
+    registerPath: typeof paths?.["register"] === "string" ? paths["register"] : "/api/v1/local/agents/register",
+    catchUpPath: typeof paths?.["catchUp"] === "string" ? paths["catchUp"] : "/api/v1/local/coordination/events",
+    streamPath: typeof paths?.["stream"] === "string" ? paths["stream"] : "/api/v1/local/coordination/events/stream",
+    ackPath: typeof paths?.["ack"] === "string" ? paths["ack"] : "/api/v1/local/coordination/events/ack",
+    messagePath: typeof paths?.["message"] === "string" ? paths["message"] : "/api/v1/local/messages",
+    catchUpLimit: optionalNumber(source["catchUpLimit"], 100, 1, 256, "catchUpLimit"),
+    minimumMs: optionalNumber(backoff?.["minimumMs"], 250, 10, 60_000, "backoff.minimumMs"),
+    maximumMs: optionalNumber(backoff?.["maximumMs"], 30_000, 10, 300_000, "backoff.maximumMs"),
+    jitter: optionalNumber(backoff?.["jitter"], 0.2, 0, 1, "backoff.jitter"),
+  }
+}
+
+function expandHome(value: string): string {
+  if (value === "~") return homedir()
+  if (value.startsWith("~/")) return join(homedir(), value.slice(2))
+  return value
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "")
+  if (normalized === "localhost" || normalized === "::1") return true
+  const octets = normalized.split(".")
+  return octets.length === 4 && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255) && Number(octets[0]) === 127
+}
+
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 })
+  await chmod(path, 0o700)
+}
+
+async function writeAtomic(path: string, contents: string, mode: number): Promise<void> {
+  await ensurePrivateDirectory(dirname(path))
+  const temporary = `${path}.${String(process.pid)}.${crypto.randomUUID()}.tmp`
+  const handle = await open(temporary, "wx", mode)
+  try {
+    await handle.writeFile(contents, "utf8")
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  await chmod(temporary, mode)
+  await rename(temporary, path)
+  const directory = await open(dirname(path), "r")
+  try { await directory.sync() } finally { await directory.close() }
+}
+
+async function readState(path: string): Promise<LoadedState> {
+  try {
+    const value: unknown = JSON.parse(await readFile(path, "utf8"))
+    const source = record(value)
+    if (!source) throw new Error("invalid state")
+    const sessionsSource = record(source["sessions"]) ?? {}
+    const sessions = Object.fromEntries(Object.entries(sessionsSource).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+    return { sessions, legacyCursor: typeof source["cursor"] === "string" ? source["cursor"] : "" }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { sessions: {}, legacyCursor: "" }
+    throw new Error(`blackbird: cannot read adapter state ${path}`, { cause: error })
+  }
+}
+
+async function register(options: ResolvedOptions, fetcher: typeof fetch, signal: AbortSignal): Promise<string> {
+  const tokenPath = join(options.stateDir, "token")
+  let savedToken = options.token
+  if (savedToken === undefined) {
+    try {
+      savedToken = (await readFile(tokenPath, "utf8")).trim()
+      if (!savedToken) throw new Error("empty token file")
+      await chmod(tokenPath, 0o600)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
+  }
+  const response = await fetcher(new URL(options.registerPath, options.baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      project_key: options.projectKey,
+      agent_name: options.agentName,
+      ...(savedToken === undefined ? {} : { registration_token: savedToken }),
+    }),
+    signal,
+  })
+  if (!response.ok) throw new Error(`blackbird: registration failed with HTTP ${String(response.status)}`)
+  const result = record(await response.json())
+  const issuedToken = result?.["registration_token"]
+  if (issuedToken !== undefined && (typeof issuedToken !== "string" || issuedToken === "")) {
+    throw new Error("blackbird: registration response included an invalid registration_token")
+  }
+  const token = typeof issuedToken === "string" ? issuedToken : savedToken
+  if (token === undefined) throw new Error("blackbird: initial registration response omitted registration_token")
+  await writeAtomic(tokenPath, `${token}\n`, 0o600)
+  return token
+}
+
+export function deterministicMessageID(blackbirdID: string): string {
+  return `msg_${createHash("sha256").update(`blackbird:${blackbirdID}`).digest("base64url").slice(0, 26)}`
+}
+
+function parseMessage(value: unknown): BlackbirdMessage {
+  const source = record(value)
+  if (!source) throw new Error("blackbird: message is not an object")
+  const position = source["position"]
+  if (typeof position !== "string" && typeof position !== "number") throw new Error("blackbird: message.position is invalid")
+  return {
+    message_id: requiredString(source, "message_id"),
+    conversation_id: requiredString(source, "conversation_id"),
+    subject: requiredString(source, "subject"),
+    body: requiredString(source, "body"),
+    position,
+    ...(typeof source["author_actor_id"] === "string" ? { author_actor_id: source["author_actor_id"] } : {}),
+    ...(typeof source["sent_at"] === "string" ? { sent_at: source["sent_at"] } : {}),
+  }
+}
+
+function promptText(message: BlackbirdMessage): string {
+  const author = message.author_actor_id ?? "unknown actor"
+  return `[Blackbird message ${message.message_id} from ${author}]\nSubject: ${message.subject}\n\n${message.body}`
+}
+
+function consumerURL(base: URL, path: string, limit?: number): URL {
+  const url = new URL(path, base)
+  url.searchParams.set("consumer", CONSUMER_ID)
+  if (limit !== undefined) url.searchParams.set("limit", String(limit))
+  return url
+}
+
+function messageURL(base: URL, path: string, messageID: string): URL {
+  return new URL(`${path.replace(/\/$/, "")}/${encodeURIComponent(messageID)}`, base)
+}
+
+interface CoordinationEvent {
+  readonly type: string
+  readonly subject: string
+  readonly cursor: Cursor
+}
+
+function parseEvent(value: unknown): CoordinationEvent {
+  const source = record(value)
+  if (!source || !Object.hasOwn(source, "payload")) throw new Error("blackbird: coordination event is invalid")
+  requiredString(source, "occurred_at")
+  return { type: requiredString(source, "type"), subject: requiredString(source, "subject"), cursor: requiredString(source, "cursor") }
+}
+
+async function* parseSSE(response: Response, signal: AbortSignal): AsyncGenerator<{ data: unknown; id?: string }> {
+  if (!response.body) throw new Error("blackbird: SSE response has no body")
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  const abort = (): void => { void reader.cancel(signal.reason).catch(() => undefined) }
+  signal.addEventListener("abort", abort, { once: true })
+  let buffer = ""
+  try {
+    while (!signal.aborted) {
+      const result = await reader.read()
+      buffer += result.value ?? ""
+      let boundary = buffer.search(/\r?\n\r?\n/)
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary)
+        const separator = buffer.slice(boundary).startsWith("\r\n") ? 4 : 2
+        buffer = buffer.slice(boundary + separator)
+        let id: string | undefined
+        const data: string[] = []
+        for (const line of block.split(/\r?\n/)) {
+          if (line.startsWith("id:")) id = line.slice(3).trimStart()
+          if (line.startsWith("data:")) data.push(line.slice(5).trimStart())
+        }
+        if (data.length > 0) yield { data: JSON.parse(data.join("\n")), ...(id === undefined ? {} : { id }) }
+        boundary = buffer.search(/\r?\n\r?\n/)
+      }
+      if (result.done) return
+    }
+  } finally {
+    signal.removeEventListener("abort", abort)
+    await reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+  }
+}
+
+export async function runSupervisor(
+  session: SessionClient,
+  rawOptions: PluginOptions | BlackbirdOptions,
+  signal: AbortSignal,
+  dependencies: SupervisorDependencies = defaultDependencies,
+): Promise<void> {
+  const options = resolveOptions(rawOptions)
+  if (options.maximumMs < options.minimumMs) throw new Error("blackbird: backoff.maximumMs must not be less than minimumMs")
+  await ensurePrivateDirectory(options.stateDir)
+  // Only host routing remains local. Delivery progress belongs to Blackbird's
+  // authenticated consumer, not to another adapter-owned cursor file.
+  const statePath = join(options.stateDir, "cursor.json")
+  const loaded = await readState(statePath)
+  const state: State = { sessions: loaded.sessions }
+  let token: string | undefined
+  let tokenAttempt = 0
+  while (!signal.aborted && token === undefined) {
+    try {
+      token = await register(options, dependencies.fetch, signal)
+    } catch (error) {
+      if (isAborted(signal) || (error as Error).name === "AbortError") return
+      const exponential = Math.min(options.maximumMs, options.minimumMs * 2 ** Math.min(tokenAttempt, 20))
+      const factor = 1 + (dependencies.random() * 2 - 1) * options.jitter
+      tokenAttempt += 1
+      await dependencies.sleep(Math.max(0, Math.round(exponential * factor)), signal)
+    }
+  }
+  if (token === undefined) return
+  // The observation plane shares this supervisor's token and lifetime. It is
+  // published for the `event` hook to find, because OpenCode delivers hooks to
+  // the plugin instance while the token is only ever known in here.
+  let releaseTelemetry: (() => void) | undefined
+  if (process.env["BLACKBIRD_OPENCODE_TELEMETRY"] !== "0") {
+    releaseTelemetry = publishEmitter(
+      supervisorKey(options),
+      new TelemetryEmitter({ baseUrl: options.baseUrl, token, fetch: dependencies.fetch }),
+    )
+    signal.addEventListener("abort", () => { releaseTelemetry?.() }, { once: true })
+  }
+  const sessionQueues = new Map<string, Promise<void>>()
+
+  const persist = async (): Promise<void> => {
+    await writeAtomic(statePath, `${JSON.stringify(state)}\n`, 0o600)
+  }
+  const targetSession = async (message: BlackbirdMessage): Promise<string> => {
+    if (options.routing.mode === "fixed") return options.routing.sessionID
+    const existing = state.sessions[message.conversation_id]
+    if (existing !== undefined) return existing
+    const created = await session.create({
+      title: `Blackbird: ${message.subject}`.slice(0, 120),
+      directory: options.projectKey,
+    })
+    state.sessions[message.conversation_id] = created.id
+    await persist()
+    return created.id
+  }
+  const deliver = async (message: BlackbirdMessage): Promise<void> => {
+    const sessionID = await targetSession(message)
+    const previous = sessionQueues.get(sessionID) ?? Promise.resolve()
+    const queued = previous.then(async () => {
+      await session.deliver({
+        sessionID,
+        messageID: deterministicMessageID(message.message_id),
+        text: promptText(message),
+        metadata: {
+          blackbird_message_id: message.message_id,
+          blackbird_conversation_id: message.conversation_id,
+          blackbird_position: message.position,
+        },
+        directory: options.projectKey,
+        // Only conversation routing owns its session, so only it may pin the
+        // agent. A fixed session belongs to the user; naming an agent there
+        // would switch the agent out from under them.
+        ...(options.routing.mode === "conversation" && options.routing.agent !== undefined
+          ? { agent: options.routing.agent }
+          : {}),
+      })
+    })
+    sessionQueues.set(sessionID, queued)
+    try { await queued } finally { if (sessionQueues.get(sessionID) === queued) sessionQueues.delete(sessionID) }
+  }
+  const headers = { authorization: `Bearer ${token}`, accept: "application/json" }
+  const acknowledge = async (cursor: Cursor): Promise<void> => {
+    const response = await dependencies.fetch(new URL(options.ackPath, options.baseUrl), {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ consumer_id: CONSUMER_ID, cursor }),
+      signal,
+    })
+    if (!response.ok) throw new Error(`blackbird: cursor acknowledgement failed with HTTP ${String(response.status)}`)
+  }
+  // Upgrade old installations without replaying their entire history. Once the
+  // server accepts the old opaque cursor, the next state write drops it.
+  if (loaded.legacyCursor !== "") await acknowledge(loaded.legacyCursor)
+  await persist()
+  const fetchMessage = async (messageID: string): Promise<BlackbirdMessage> => {
+    const response = await dependencies.fetch(messageURL(options.baseUrl, options.messagePath, messageID), { headers, signal })
+    if (!response.ok) throw new Error(`blackbird: message fetch failed with HTTP ${String(response.status)}`)
+    const message = parseMessage(await response.json())
+    if (message.message_id !== messageID) throw new Error("blackbird: message response ID did not match the requested message")
+    return message
+  }
+  const catchUp = async (): Promise<void> => {
+    while (!signal.aborted) {
+      const response = await dependencies.fetch(consumerURL(options.baseUrl, options.catchUpPath, options.catchUpLimit), { headers, signal })
+      if (!response.ok) throw new Error(`blackbird: catch-up failed with HTTP ${String(response.status)}`)
+      const page = record(await response.json())
+      if (!page || !Array.isArray(page["events"])) throw new Error("blackbird: invalid catch-up response")
+      const events = page["events"].map(parseEvent)
+      for (const event of events) {
+        if (event.type === "message.available") await deliver(await fetchMessage(event.subject))
+        // The host promise above is the durable acceptance boundary. A failure
+        // leaves the server cursor untouched and the deterministic host ID
+        // makes the retry idempotent.
+        await acknowledge(event.cursor)
+      }
+      if (page["has_more"] === true && events.length === 0) throw new Error("blackbird: catch-up page did not advance")
+      if (page["has_more"] !== true) return
+    }
+  }
+
+  let attempt = 0
+  while (!signal.aborted) {
+    try {
+      await catchUp()
+      const response = await dependencies.fetch(consumerURL(options.baseUrl, options.streamPath), {
+        headers: { ...headers, accept: "text/event-stream" },
+        signal,
+      })
+      if (!response.ok) throw new Error(`blackbird: stream failed with HTTP ${String(response.status)}`)
+      if (!(response.headers.get("content-type") ?? "").toLowerCase().includes("text/event-stream")) {
+        throw new Error("blackbird: stream did not return text/event-stream")
+      }
+      attempt = 0
+      for await (const event of parseSSE(response, signal)) {
+        const envelope = record(event.data)
+        const cursor = envelope?.["cursor"]
+        if (typeof cursor !== "string" || cursor === "") throw new Error("blackbird: invalid stream wakeup")
+        break
+      }
+    } catch (error) {
+      if (isAborted(signal) || (error as Error).name === "AbortError") break
+      const exponential = Math.min(options.maximumMs, options.minimumMs * 2 ** Math.min(attempt, 20))
+      const factor = 1 + (dependencies.random() * 2 - 1) * options.jitter
+      attempt += 1
+      await dependencies.sleep(Math.max(0, Math.round(exponential * factor)), signal)
+    }
+  }
+  await Promise.allSettled(sessionQueues.values())
+}
+
+function isAborted(signal: AbortSignal): boolean {
+  return signal.aborted
+}
+
+interface SharedSupervisor {
+  references: number
+  readonly controller: AbortController
+  task: Promise<void>
+}
+
+const supervisors = new Map<string, SharedSupervisor>()
+
+export function acquireSupervisor(key: string, start: (signal: AbortSignal) => Promise<void>): () => Promise<void> {
+  const existing = supervisors.get(key)
+  if (existing) {
+    existing.references += 1
+    return releaseSupervisor(key, existing)
+  }
+  const controller = new AbortController()
+  const supervisor: SharedSupervisor = { references: 1, controller, task: Promise.resolve() }
+  supervisor.task = start(controller.signal).finally(() => {
+    if (supervisors.get(key) === supervisor) supervisors.delete(key)
+  })
+  supervisors.set(key, supervisor)
+  return releaseSupervisor(key, supervisor)
+}
+
+function releaseSupervisor(key: string, supervisor: SharedSupervisor): () => Promise<void> {
+  return async () => {
+    supervisor.references -= 1
+    if (supervisor.references !== 0 || supervisors.get(key) !== supervisor) return
+    supervisors.delete(key)
+    supervisor.controller.abort()
+    await supervisor.task
+  }
+}
+
+export function supervisorKey(options: ResolvedOptions): string {
+  return `${options.baseUrl.toString()}\0${options.projectKey}\0${options.agentName}\0${options.stateDir}`
+}
+
+/**
+ * Records one finished assistant message on the observation plane.
+ *
+ * Exported for tests, and deliberately total: every path that cannot produce a
+ * well-formed observation returns rather than throwing, because this runs
+ * inside OpenCode's event dispatch and a throw here would surface as a plugin
+ * fault during someone's turn.
+ */
+export function recordAssistantMessage(key: string, event: unknown): void {
+  const emitter = emitterFor(key)
+  if (!emitter) return
+  const properties = (event as { properties?: unknown }).properties
+  const info = (properties as { info?: unknown } | undefined)?.info
+  const message = info as {
+    id?: unknown; sessionID?: unknown; role?: unknown; modelID?: unknown; providerID?: unknown
+    tokens?: unknown; error?: unknown; time?: { created?: unknown; completed?: unknown }
+  } | undefined
+  if (!message || message.role !== "assistant") return
+  // An in-flight message has no completion time yet. Recording it now would
+  // store a zero-duration call and then record it again when it finishes.
+  const completed = message.time?.completed
+  if (typeof completed !== "number") return
+  const created = typeof message.time?.created === "number" ? message.time.created : completed
+  const id = typeof message.id === "string" ? message.id : ""
+  const model = typeof message.modelID === "string" ? message.modelID : ""
+  const provider = typeof message.providerID === "string" ? message.providerID : ""
+  if (id === "" || model === "" || provider === "") return
+  const errorKind = errorKindForMessage(message.error)
+  const rawUsage = boundedRawUsage(message.tokens)
+  emitter.record({
+    dedupe_key: id,
+    harness: "opencode",
+    provider,
+    model,
+    operation: "chat",
+    usage: normalizeOpenCodeTokens(message.tokens as never),
+    outcome: outcomeForMessage(message.error),
+    started_at: new Date(created).toISOString(),
+    duration_ms: Math.max(0, completed - created),
+    ...(typeof message.sessionID === "string" ? { harness_session: message.sessionID } : {}),
+    ...(errorKind !== undefined ? { error_kind: errorKind } : {}),
+    ...(rawUsage !== undefined ? { raw_usage: rawUsage } : {}),
+  })
+}
+
+/**
+ * Compatibility port for the older Promise-based V2 adapter. Retained for
+ * existing consumers; the package entrypoint now uses the pinned Effect SDK's
+ * actual Context and delegates delivery through effect-delivery.ts.
+ */
+export interface V2Context {
+  readonly options: PluginOptions
+  readonly session: {
+    create(input: { title?: string; location?: { directory: string } }): Promise<{ id: string }>
+    /**
+     * Insert a message into a session's transcript without running an agent
+     * turn -- V2's replacement for `prompt({ noReply: true })`. Passing the
+     * Blackbird message id as `id` keeps redelivery an upsert, exactly as the
+     * v1 path relies on.
+     */
+    synthetic(input: {
+      sessionID: string
+      id?: string
+      text: string
+      metadata?: Record<string, string | number>
+    }): Promise<unknown>
+  }
+}
+
+export function createV2SessionClient(session: V2Context["session"]): SessionClient {
+  return {
+    create: async ({ title, directory }) => {
+      const created = await session.create({ title, location: { directory } })
+      return { id: created.id }
+    },
+    // `synthetic` neither runs the agent loop nor accepts an agent, so the
+    // v1 path's `agent` and `directory` have no counterpart here: the session
+    // already carries its directory, and no turn is spent to route.
+    deliver: async ({ sessionID, messageID, text, metadata }) => {
+      await session.synthetic({ sessionID, id: messageID, text, metadata })
+    },
+  }
+}
+
+/**
+ * Start the shared inbox supervisor and return its release function.
+ *
+ * Both runtimes converge here: the difference between them is only how a
+ * `SessionClient` is built and how the teardown handle is returned.
+ */
+function startSupervisor(session: SessionClient, raw: PluginOptions): () => Promise<void> {
+  const key = supervisorKey(resolveOptions(raw))
+  return acquireSupervisor(key, (signal) => runSupervisor(session, raw, signal).catch((error: unknown) => {
+    if (!signal.aborted) process.stderr.write(`[blackbird] inbox supervisor stopped: ${String(error)}\n`)
+  }))
+}
+
+/**
+ * Compatibility export for V1 and the older Promise-based V2 adapter.
+ *
+ * OpenCode v1 loads `{ id, server }`; the V2 preview validates the default
+ * export against `{ id, setup | effect }` and refuses to load a module that has
+ * only `server` -- which is how 0.2.x silently stopped loading under
+ * `opencode2` after the migration to the stable API. Carrying both hooks costs
+ * one small adapter. index.ts now owns the public default Effect export and
+ * reuses this export's V1 server hook.
+ */
+const plugin: PluginModule & { readonly setup: (context: V2Context) => Promise<() => Promise<void>> } = {
+  id: "phall1.blackbird",
+  setup: (context) => {
+    const release = startSupervisor(createV2SessionClient(context.session), context.options)
+    return Promise.resolve(release)
+  },
+  // Not `async`: registering the supervisor is synchronous, and the supervisor
+  // itself must keep running in the background rather than be awaited here.
+  server: (input, pluginOptions) => {
+    const raw = pluginOptions ?? {}
+    const release = startSupervisor(createSessionClient(input.client), raw)
+    const key = supervisorKey(resolveOptions(raw))
+    // OpenCode tears a plugin down through the returned hooks, so the shared
+    // supervisor's reference release has to hang off `dispose`.
+    return Promise.resolve({
+      dispose: release,
+      // message.updated fires repeatedly while a response streams; only the
+      // completed one is recorded, and the daemon deduplicates on the message
+      // id if a shared supervisor causes it to arrive twice.
+      event: async (input: { event: unknown }): Promise<void> => {
+        if ((input.event as { type?: unknown }).type !== "message.updated") return
+        recordAssistantMessage(key, input.event)
+        return Promise.resolve()
+      },
+    })
+  },
+}
+
+export default plugin

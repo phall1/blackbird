@@ -112,6 +112,24 @@ type InboxPage struct {
 	ObservedAt string         `json:"observed_at"`
 }
 
+type ThreadMessage struct {
+	MessageID       string `json:"message_id"`
+	Position        uint64 `json:"position"`
+	AuthorAgentName string `json:"author_agent_name"`
+	Subject         string `json:"subject"`
+	Body            string `json:"body"`
+	SentAt          string `json:"sent_at"`
+}
+
+type ThreadPage struct {
+	ProjectKey     string          `json:"project_key"`
+	ConversationID string          `json:"conversation_id"`
+	Messages       []ThreadMessage `json:"messages"`
+	HasMore        bool            `json:"has_more"`
+	Next           uint64          `json:"next"`
+	ObservedAt     string          `json:"observed_at"`
+}
+
 type Conversation struct {
 	ConversationID     string `json:"conversation_id"`
 	WorkspaceID        string `json:"workspace_id"`
