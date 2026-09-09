@@ -11,6 +11,7 @@ import (
 
 	"github.com/phall1/blackbird/internal/application/telemetry"
 	"github.com/phall1/blackbird/internal/domain"
+	"github.com/phall1/blackbird/internal/integration/ledger"
 	"github.com/phall1/blackbird/internal/integration/ledger/claudecode"
 	"github.com/phall1/blackbird/internal/integration/ledger/codex"
 )
@@ -220,14 +221,49 @@ func TestProductionComposesTheCollectedHarnesses(t *testing.T) {
 		// pass would overwrite the other's watermarks.
 		t.Fatalf("specs = %+v, want one collector per harness", specs)
 	}
+	// Claiming is deliberately conditional on the harness tree existing -- see
+	// collectedSpecHarnesses. Asserting that every composed harness is claimed
+	// would only hold on a workstation that happens to have ~/.claude and
+	// ~/.codex, and did not hold on a clean runner. Assert the actual contract:
+	// a spec is claimed exactly when its root is present.
 	set := collectedSpecHarnesses(specs)
-	for harness := range composed {
-		if !set.Collects(harness) {
-			t.Errorf("%s is composed but not claimed, so its pushes would not be superseded", harness)
+	for _, spec := range specs {
+		harness := spec.adapter.Harness()
+		present, reason := ledger.RootPresent(spec.root)
+		switch {
+		case present && !set.Collects(harness):
+			t.Errorf("%s has a present root but is not claimed, so its pushes would not be superseded", harness)
+		case !present && set.Collects(harness):
+			t.Errorf("%s has no root (%s) but is claimed, so its pushes would be dropped for nothing", harness, reason)
 		}
 	}
 	if set.Collects(domain.HarnessOpenCode) || set.Collects(domain.HarnessPi) {
 		t.Error("a harness with no collector was claimed; its plugin's pushes would be dropped for nothing")
+	}
+}
+
+// A present root must be claimed. The production roots depend on the machine,
+// so this pins the branch that the environment may not exercise.
+func TestAPresentRootIsClaimed(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if present, reason := ledger.RootPresent(root); !present {
+		t.Fatalf("RootPresent(%q) = false (%s); the fixture cannot exercise claiming", root, reason)
+	}
+	set := collectedSpecHarnesses([]ledgerCollectorSpec{{adapter: claudecode.New(), root: root}})
+	if !set.Collects(domain.HarnessClaudeCode) {
+		t.Error("a spec whose root exists was not claimed")
+	}
+}
+
+// And an absent root must not be, or the collector would suppress a plugin's
+// pushes for a harness it never actually reads.
+func TestAnAbsentRootIsNotClaimed(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "definitely-absent")
+	set := collectedSpecHarnesses([]ledgerCollectorSpec{{adapter: claudecode.New(), root: root}})
+	if set.Collects(domain.HarnessClaudeCode) {
+		t.Error("a spec whose root does not exist was claimed")
 	}
 }
 
