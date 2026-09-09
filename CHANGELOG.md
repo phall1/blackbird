@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/phall1/blackbird/compare/v0.6.0...v0.7.0) (2026-09-09)
+
+
+### Features
+
+* **opencode-plugin:** add native V2 Effect mailbox browser ([442086f](https://github.com/phall1/blackbird/commit/442086f50846d647f84f20b5f5d84203c0cbe972))
+
+
+### Bug Fixes
+
+* **sqlite:** coalesce heartbeat writes within the same clock tick ([0f8cfdd](https://github.com/phall1/blackbird/commit/0f8cfdd7fadada2c1772bd46b62882cf8187962b))
+
 ## [0.6.0](https://github.com/phall1/blackbird/compare/v0.5.0...v0.6.0) (2026-09-09)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "blackbird-opencode",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Deliver durable Blackbird messages into OpenCode V2 sessions.",
   "type": "module",
   "exports": {

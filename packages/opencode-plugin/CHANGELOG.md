@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.3...opencode-plugin-v0.3.0) (2026-09-09)
+
+
+### Features
+
+* **opencode-plugin:** add native V2 Effect mailbox browser ([442086f](https://github.com/phall1/blackbird/commit/442086f50846d647f84f20b5f5d84203c0cbe972))
+
 ## [0.2.3](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.2...opencode-plugin-v0.2.3) (2026-09-09)
 
 
