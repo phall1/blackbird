@@ -30,6 +30,7 @@ two files alone would merge silently.
 | # | Decision | Status |
 |---|----------|--------|
 | [0001](./0001-the-phux-boundary.md) | The phux boundary: consensus and lineage are different authorities | Accepted (the two daemons do not connect; the seam is one additive field in phux's `phux.agent/v1` record, and the observation plane lands here because phux ADR-0009 and ADR-0092 put it outside phux) |
+| [0002](./0002-optional-phux-provider.md) | An optional provider route preserves separate authorities | Proposed (narrow amendment for independently authorized correspondence through phux; does not supersede 0001 until ratified) |
 
 ## When to write one
 
