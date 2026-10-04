@@ -96,6 +96,7 @@ func servedRoutes() []servedRoute {
 		{stdhttp.MethodPost, PathLocalAdminReservations + "/lease-1/release", ReachLoopback},
 		{stdhttp.MethodGet, PathLocalAdminEvents, ReachLoopback},
 		{stdhttp.MethodGet, PathLocalAdminCost, ReachLoopback},
+		{stdhttp.MethodGet, PathLocalAdminSpend, ReachLoopback},
 	}
 }
 
