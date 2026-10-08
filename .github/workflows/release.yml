@@ -60,19 +60,18 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Install Go 1.26.6
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Install Rust 1.99.0
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-08
         with:
-          go-version: 1.26.6
-          cache-dependency-path: go.sum
+          toolchain: 1.99.0
+          components: rustfmt, clippy
 
-      - name: Verify and test module
-        env:
-          GOTOOLCHAIN: local
+      - name: Test the daemon
+        working-directory: rust
         run: |
-          go mod verify
-          go test ./...
-          go vet ./...
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
 
   build:
     name: Build ${{ matrix.target }}
@@ -101,22 +100,16 @@ jobs:
             goarch: arm64
             host_os: Linux
             host_arch: aarch64
-    env:
-      CGO_ENABLED: "0"
-      GOOS: ${{ matrix.goos }}
-      GOARCH: ${{ matrix.goarch }}
-      GOTOOLCHAIN: local
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Install Go 1.26.6
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Install Rust 1.99.0
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-10-08
         with:
-          go-version: 1.26.6
-          cache-dependency-path: go.sum
+          toolchain: 1.99.0
 
       - name: Assert native host and immutable source
         shell: bash
@@ -129,27 +122,26 @@ jobs:
           test "$(uname -s)" = "$HOST_OS"
           test "$(uname -m)" = "$HOST_ARCH"
           test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
-          go mod verify
 
-      - name: Build reproducible native binary
+      - name: Build native binary
         shell: bash
         env:
+          BLACKBIRD_VERSION: ${{ needs.prepare.outputs.version }}
+          BLACKBIRD_COMMIT: ${{ needs.prepare.outputs.commit }}
+          BLACKBIRD_BUILT_AT: ${{ needs.prepare.outputs.built_at }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+          TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT: ${{ needs.prepare.outputs.commit }}
           BUILT_AT: ${{ needs.prepare.outputs.built_at }}
-          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.builtAt=${BUILT_AT}"
-          go build -trimpath -buildvcs=false -tags='netgo osusergo' \
-            -ldflags="$ldflags" -o "dist/blackbird-${TARGET}" ./cmd/blackbird
-          go build -trimpath -buildvcs=false -tags='netgo osusergo' \
-            -ldflags="$ldflags" -o "dist/blackbird-${TARGET}.rebuild" ./cmd/blackbird
-          cmp "dist/blackbird-${TARGET}" "dist/blackbird-${TARGET}.rebuild"
+          cargo build --release --locked --manifest-path rust/Cargo.toml --bin blackbird
+          install -m 0755 rust/target/release/blackbird "dist/blackbird-${TARGET}"
           expected="blackbird version=${VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
           test "$("dist/blackbird-${TARGET}" --version)" = "$expected"
-          go version -m "dist/blackbird-${TARGET}" > "dist/BUILD-INFO-${TARGET}.txt"
+          rustc -vV > "dist/BUILD-INFO-${TARGET}.txt"
 
       - name: Upload native build
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

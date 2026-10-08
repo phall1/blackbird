@@ -28,7 +28,7 @@ pub fn serve(desk: &Desk) -> std::io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn dispatch(desk: &Desk, line: &str) -> Option<String> {
+pub(crate) fn dispatch(desk: &Desk, line: &str) -> Option<String> {
     let value: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(_) => return Some(rpc_error(Value::Null, -32700, "parse error")),
@@ -60,7 +60,7 @@ fn initialize() -> Value {
     json!({
         "protocolVersion": PROTOCOL,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "blackbird-rs", "version": env!("CARGO_PKG_VERSION") }
+        "serverInfo": { "name": "blackbird", "version": env!("CARGO_PKG_VERSION") }
     })
 }
 
@@ -720,7 +720,7 @@ mod tests {
         let desk = Desk::open(dir.path().join("coord.sqlite")).expect("open");
         let init =
             dispatch(&desk, r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).expect("response");
-        assert!(init.contains("blackbird-rs"));
+        assert!(init.contains("\"blackbird\""));
         let listed =
             dispatch(&desk, r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#).expect("tools");
         assert!(listed.contains("\"project_key\""));

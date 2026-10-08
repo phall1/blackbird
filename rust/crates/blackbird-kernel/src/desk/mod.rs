@@ -41,11 +41,13 @@ impl Desk {
         let conn = Connection::open(path).map_err(sql::store)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(sql::store)?;
-        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
-            .map_err(sql::store)?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(sql::store)?;
+        // Before WAL: switching journal mode rewrites the file header, and a
+        // refused database must come back byte-for-byte unchanged.
         migrate(&conn)?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .map_err(sql::store)?;
         set_private_file(path);
         Ok(Self {
             conn: Mutex::new(conn),
@@ -141,22 +143,33 @@ impl Desk {
 }
 
 fn migrate(conn: &Connection) -> Result<(), Error> {
-    let version = schema_version(conn)?;
-    if version == 0 {
-        // One transaction so a crash cannot leave tables without user_version 1.
-        let tx = conn.unchecked_transaction().map_err(sql::store)?;
-        tx.execute_batch(SCHEMA).map_err(sql::store)?;
-        tx.pragma_update(None, "user_version", 1)
-            .map_err(sql::store)?;
-        tx.commit().map_err(sql::store)?;
-        return Ok(());
+    match schema_version(conn)? {
+        1 => Ok(()),
+        0 if object_count(conn)? == 0 => create_schema(conn),
+        _ => Err(unsupported()),
     }
-    if version == 1 {
-        return Ok(());
-    }
-    Err(Error::Storage(format!(
-        "unsupported blackbird-rs schema version {version}"
-    )))
+}
+
+fn create_schema(conn: &Connection) -> Result<(), Error> {
+    // One transaction so a crash cannot leave tables without user_version 1.
+    let tx = conn.unchecked_transaction().map_err(sql::store)?;
+    tx.execute_batch(SCHEMA).map_err(sql::store)?;
+    tx.pragma_update(None, "user_version", 1)
+        .map_err(sql::store)?;
+    tx.commit().map_err(sql::store)
+}
+
+/// Tables and indexes already present. A file with user_version 0 and objects
+/// is not ours to adopt, so it is refused rather than overwritten.
+fn object_count(conn: &Connection) -> Result<i64, Error> {
+    count(
+        conn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'index')",
+    )
+}
+
+fn unsupported() -> Error {
+    Error::Storage("unsupported database; no migration performed".to_owned())
 }
 
 fn schema_version(conn: &Connection) -> Result<i64, Error> {
