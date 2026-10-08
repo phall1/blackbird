@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/phall1/blackbird/compare/v0.7.0...v0.8.0) (2026-10-08)
+
+
+### Features
+
+* **kernel:** add a Rust coordination plugin beside the Go daemon ([#21](https://github.com/phall1/blackbird/issues/21)) ([5d6b6c9](https://github.com/phall1/blackbird/commit/5d6b6c93f01ffdd553c89ff3310d7117a521dece))
+
 ## [0.7.0](https://github.com/phall1/blackbird/compare/v0.6.0...v0.7.0) (2026-09-09)
 
 
