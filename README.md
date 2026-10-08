@@ -25,6 +25,25 @@ SQLite is the only storage backend. The daemon's `--storage` flag survives with
 that single legal value so an already-installed service definition keeps
 working; `ls internal/storage/` is the current adapter set.
 
+## Rust kernel, as a phux plugin
+
+The eight coordination tools also ship as a Rust kernel in [`rust/`](rust/).
+phux launches it as a plugin child process (`rust/phux-plugin.toml`); the
+kernel does not link into the phux server and does not open a phux socket.
+Its SQLite file lives under `$XDG_STATE_HOME/blackbird-rs/` (or
+`BLACKBIRD_RS_DB`) and is not the Go daemon's database. Peer mail, telemetry,
+admin HTTP, and tracker observations stay on the Go service at
+`127.0.0.1:8081`. See [ADR-0003](docs/adr/0003-rust-coordination-kernel.md).
+
+```sh
+cargo test --manifest-path rust/Cargo.toml
+cargo build --manifest-path rust/Cargo.toml
+rust/target/debug/blackbird-rs doctor
+phux plugin link rust/phux-plugin.toml
+```
+
+`blackbird-rs mcp` speaks newline-delimited JSON-RPC on stdin and stdout.
+
 ## Install
 
 ```sh
