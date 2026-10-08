@@ -4,11 +4,6 @@
 //! the MCP endpoint and `GET /health` is a liveness probe. The caller binds the
 //! listener; this module never chooses an address.
 
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "nothing in the binary serves HTTP yet")
-)]
-
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -355,7 +350,7 @@ mod tests {
                 &post(server.port, "application/json", INITIALIZE),
             );
             assert_eq!(answer.status, 200);
-            assert!(answer.body.contains("blackbird-rs"), "{}", answer.body);
+            assert!(answer.body.contains("\"blackbird\""), "{}", answer.body);
             assert!(!answer.head.to_ascii_lowercase().contains("mcp-session-id"));
         }
     }
