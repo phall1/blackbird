@@ -276,7 +276,9 @@ fn print_status(desk: &Desk) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_loopback, database_path, serve_http, take_http_listen, take_sqlite_path};
+    use super::{bind_loopback, database_path, take_http_listen, take_sqlite_path};
+    use crate::http;
+    use blackbird_kernel::Desk;
 
     fn words(text: &[&str]) -> Vec<String> {
         text.iter().map(|word| (*word).to_owned()).collect()

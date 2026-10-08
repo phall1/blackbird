@@ -1,113 +1,68 @@
 # Blackbird
 
 Blackbird is a durable, local-first coordination service for human and AI agent
-work. It is a standalone Go replacement for the legacy Python Agent Mail
-service.
+work. The program is the Rust binary in [`rust/`](rust/). It is one database
+and eight MCP tools. See [ADR-0004](docs/adr/0004-rust-replaces-go.md).
 
-The released product includes:
+Agents get project-scoped identity, durable mail, and advisory path leases:
+`blackbird_join`, `blackbird_claim`, `blackbird_release`, `blackbird_status`,
+`blackbird_say`, `blackbird_read`, `blackbird_ack`, and `blackbird_wait`.
+Registration tokens are stored as a SHA-256 hash. A conflicting claim is
+`ok: false`. `name@host`, spend, and tracker reads are refused.
 
-- a production daemon with HTTP and MCP transports and durable SQLite storage;
-- repository-scoped agent registration, secure resume tokens, and peer
-  discovery;
-- conversations, immutable messages, replies, inboxes, threads, independent
-  read and acknowledgement facts, and To/Cc/Bcc privacy;
-- a private, tamper-evident coordination event journal with authenticated
-  catch-up cursors and a wake-only SSE stream;
-- shared and exclusive exact/subtree advisory path claims with expiry, renewal,
-  overlap detection, and internal claim generations, plus an opt-in
-  `blackbird lease-guard` pre-commit check that surfaces another agent's claim
-  before you overwrite it;
-- one per-user launchd or systemd daemon, unattended Homebrew updates, and
-  idempotent MCP client configuration; and
-- reproducible native releases for Apple Silicon macOS and amd64/arm64 Linux.
+The database file is `coordination-v1.sqlite` under `$XDG_STATE_HOME/blackbird/`
+(or `$BLACKBIRD_DB`). A Go database is refused and left unchanged. There is no
+migration.
 
-SQLite is the only storage backend. The daemon's `--storage` flag survives with
-that single legal value so an already-installed service definition keeps
-working; `ls internal/storage/` is the current adapter set.
-
-## Rust kernel, as a phux plugin
-
-The eight coordination tools also ship as a Rust kernel in [`rust/`](rust/).
-phux launches it as a plugin child process (`rust/phux-plugin.toml`); the
-kernel does not link into the phux server and does not open a phux socket.
-Its SQLite file lives under `$XDG_STATE_HOME/blackbird-rs/` (or
-`BLACKBIRD_RS_DB`) and is not the Go daemon's database. Peer mail, telemetry,
-admin HTTP, and tracker observations stay on the Go service at
-`127.0.0.1:8081`. See [ADR-0003](docs/adr/0003-rust-coordination-kernel.md).
+`blackbird daemon` listens on `127.0.0.1:8081`. `POST /` is stateless JSON-RPC.
+`GET /health` is the probe. `blackbird mcp` speaks the same JSON-RPC on stdin.
+phux can launch that stdio server as a plugin (`rust/phux-plugin.toml`). The
+wrapper unsets `PHUX_SOCKET` and does not attach to a phux server.
 
 ```sh
 cargo test --manifest-path rust/Cargo.toml
-cargo build --manifest-path rust/Cargo.toml
-rust/target/debug/blackbird-rs doctor
-phux plugin link rust/phux-plugin.toml
+cargo build --manifest-path rust/Cargo.toml --bin blackbird
+rust/target/debug/blackbird doctor
 ```
-
-`blackbird-rs mcp` speaks newline-delimited JSON-RPC on stdin and stdout.
 
 ## Install
 
 ```sh
-brew install phall1/tap/blackbird
 blackbird install
 blackbird status
 ```
 
-`blackbird install` starts the service and adds the remote MCP endpoint at
-`http://127.0.0.1:8081` to detected OpenCode, Claude Code, and Codex clients.
+`install` copies this binary to `~/.local/libexec/blackbird/blackbird` and
+writes a new unit (`io.phux.blackbird-rust` on macOS, `blackbird-rust.service`
+on Linux) plus the MCP client entries for Claude, Codex, and OpenCode. If
+port 8081 is already taken, install stops and leaves that process running.
+It does not replace a Go launchd job named `com.phall1.blackbird`.
 
-Upgrading from 0.3.x needs no action: the installed service definition keeps
-working. Run `blackbird install` once to move it to the explicit `daemon`
-command, which is required before 0.5.0.
+`uninstall` removes that unit, those client entries, and the copied binary.
+The database stays.
+
+The Homebrew formula tracks the last published release. A checkout of this
+tree builds the Rust binary with Cargo, above.
 
 ## Command Line
 
-`blackbird --help` lists every command. Each one renders a report for a
-terminal or, with `--json`, the same data for a script.
-
 ```sh
-blackbird overview                 # projects, agents, mail, reservations at a glance
-blackbird status                   # service, daemon handshake, and database state
-blackbird doctor                   # diagnose the installation and print remedies
-blackbird agents --project=$PWD    # who is registered, and what they hold
-blackbird inbox --unread           # mail waiting on an agent
-blackbird reservations --state=expired
-blackbird reservation release <lease-id> --force  # clear a dead agent's lease
-blackbird events --limit=20        # tail the coordination journal
-blackbird logs --follow
-blackbird support-bundle           # one redacted document describing the whole install
+blackbird daemon [--sqlite-path PATH] [--http-listen 127.0.0.1:8081]
+blackbird mcp
+blackbird doctor
+blackbird status
+blackbird overview
+blackbird agents
+blackbird inbox
+blackbird reservations
+blackbird install
+blackbird uninstall
+blackbird version
 ```
 
-`status` handshakes with the running daemon rather than trusting the
-supervisor, so a loaded-but-crashing job reports as crash-looping instead of
-running. `status -v` adds process-local request outcomes, lease contention,
-live SSE connections, and database/WAL bytes from the authenticated loopback
-admin surface. `doctor` exits 5 when any check fails and 0 otherwise, so
-warnings stay advisory; `--strict` makes a warning fail too. Every finding names
-the exact command that resolves it.
-
-`support-bundle` collects what a bug report needs in one pass -- build
-identity, a deep `doctor` run, `status`, the gc report, the tail of each log
-stream, install paths, and each detected MCP client -- and redacts the daemon's
-admin token, credential-shaped assignments in free text, and the home directory
-prefix before emitting anything. It exits 0 whenever it produced a bundle, even
-when the `doctor` run inside it reports failures: the command you reach for when
-Blackbird is sick must not be the one that refuses to answer. `--out PATH`
-writes the JSON owner-only and prints a receipt; without it the bundle is the
-output. The document carries its own redaction policy, so whoever receives it
-can read what was kept rather than infer it.
-
-Shell completions come from the binary itself:
-
-```sh
-blackbird completion bash > $(brew --prefix)/etc/bash_completion.d/blackbird
-blackbird completion zsh  > "${fpath[1]}/_blackbird"
-blackbird completion fish > ~/.config/fish/completions/blackbird.fish
-```
-
-The CLI reads a loopback-only admin API and authenticates with a per-start
-token the daemon writes to `$XDG_STATE_HOME/blackbird/admin.json` with owner
-only permissions. `--address` targets a daemon on a non-default port and
-refuses any host that is not loopback, since every request carries that token.
+`blackbird --sqlite-path=PATH` with no subcommand starts the daemon, which is
+what an existing service definition already runs. `--http-listen` must be
+loopback. Tests bind `127.0.0.1:0`.
 
 ## Daily Use
 
@@ -118,8 +73,7 @@ restarts.
 
 The MCP surface is exactly eight tools: `blackbird_join`, `blackbird_claim`,
 `blackbird_release`, `blackbird_status`, `blackbird_say`, `blackbird_read`,
-`blackbird_ack`, and `blackbird_wait`. Status also accepts optional work-item
-and spend queries instead of advertising specialist tools.
+`blackbird_ack`, and `blackbird_wait`. Spend, cost, and tracker fields on status are refused.
 
 All tools except initial join authenticate with the returned `agent_token`.
 Claim the narrowest relevant paths before editing, use one conversation per
@@ -135,52 +89,8 @@ what happened.
 
 ## Tailnet peering
 
-Blackbird is loopback-only by default and stays that way through every upgrade.
-Peering is opt-in, per machine, and needs two things said explicitly:
-
-```sh
-blackbird install --peer --peer-allow phalls-mac-mini --peer-allow nFJpq2jD1311CNTRL
-blackbird status          # reports "peering on <tailnet address>" or "peering off"
-blackbird install --no-peer
-```
-
-`--peer` alone is a startup error: naming no peer would open a listener that
-admits nobody. The preference is recorded rather than written only into the
-service definition, because `blackbird update` regenerates that definition — a
-flag that lived only there would be erased by the next unattended upgrade.
-
-What peering does and does not do:
-
-- **Identity is verified, never inferred.** Every non-loopback request is
-  resolved through `tailscale whois`. Being inside `100.64.0.0/10` is not a
-  credential, and no answer is cached: an operator who removes a node or
-  changes an ACL has closed the door immediately.
-- **The listener binds a tailnet address this machine owns**, and refuses any
-  other address — `0.0.0.0` included — at startup.
-- **Four routes cross, and nothing else**: `/healthz`, `/readyz`, the peer probe
-  at `/api/v1/local/peer`, the operator's cost projection at
-  `/api/v1/local/peer/cost`, and one write, `POST /api/v1/local/peer/mail`.
-  Every other route — reservations, registration, telemetry, the event feed,
-  and the whole admin surface — is loopback-only, and a route nobody classified
-  is loopback-only by default.
-- **Claims never cross a host boundary.** A lease protects a path on one
-  machine's disk, so a remote holder could only ever be wrong. Lease mutation
-  lives on the MCP listener, which refuses every non-loopback caller regardless
-  of the address it is bound to.
-- **This machine is not its own peer.** A local process that dials the peer
-  address instead of loopback is refused even when the allow-list names this
-  host, which the natural symmetric fleet configuration does.
-- **A browser is refused.** Nothing on the peer surface is for one, and a
-  browser on an allowed peer would otherwise be a confused deputy holding that
-  machine's credential.
-
-Cross-host mail addresses a recipient as `agent@host`, where the host is a
-tailnet machine name. The sending host ships a bare agent name and the
-receiving host resolves it, qualifies the author with the machine it verified,
-and mints every identifier itself — so a sender cannot name a host it is not.
-`blackbird outbox` shows what is still owed to the wire and why, and
-`blackbird cost --peer HOST` unions spend across a fleet while never summing
-contention.
+This binary does not serve peer mail. A `name@host` recipient is refused.
+The listener accepts loopback only.
 
 ## Delivery modes
 
@@ -335,26 +245,15 @@ already-running external-agent thread; stable ACP v1 exposes no such method.
 ## Development
 
 ```sh
-make lint       # all enabled static analyzers and formatting checks
-make test-race  # shuffled tests under the race detector
-make check      # the complete pre-push/CI quality gate
-make hooks      # install fast pre-commit and exhaustive pre-push hooks with prek
+cargo fmt --manifest-path rust/Cargo.toml -- --check
+cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path rust/Cargo.toml
 ```
 
-`make hooks` also installs `blackbird lease-guard`, which checks a commit's
-staged paths against exclusive path claims held by other agents. It is a
-courtesy check, not a lock: claims are advisory, the guard is opt-in twice over
-(you install the hooks, and it only refuses when `BLACKBIRD_AGENT_NAME` names
-your registered agent), an unreachable daemon always passes, and `--no-verify`
-skips it. Set `BLACKBIRD_LEASE_GUARD=off|warn|block` to override the default.
-
-The live `bd` compatibility probe is intentionally excluded from hermetic test
-runs. Set `BLACKBIRD_RUN_EXTERNAL_TESTS=1` to exercise it against the installed
-binary and local issue store.
-
-Build metadata can be supplied with linker flags targeting `main.version`,
-`main.commit`, and `main.builtAt`. Unset fields use explicit development
-values.
+`BLACKBIRD_VERSION`, `BLACKBIRD_COMMIT`, and `BLACKBIRD_BUILT_AT` are read at
+compile time. `--version` prints
+`blackbird version=<v> commit=<c> built_at=<t>`. Unset fields are the crate
+version, `unknown`, and `unknown`.
 
 ## Releases
 
