@@ -5,12 +5,12 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 unset PHUX_SOCKET PHUX_PROFILE PHUX_WS_TOKENS PHUX_WS_TLS_CERT PHUX_WS_TLS_KEY PHUX_WS_TLS_CA || true
-bin="$root/target/release/blackbird-rs"
+bin="$root/target/release/blackbird"
 if [ ! -x "$bin" ]; then
-  bin="$root/target/debug/blackbird-rs"
+  bin="$root/target/debug/blackbird"
 fi
 if [ ! -x "$bin" ]; then
-  echo "blackbird-rs is not built. From the blackbird repo: cargo build --manifest-path rust/Cargo.toml" >&2
+  echo "blackbird is not built. From the blackbird repo: cargo build --manifest-path rust/Cargo.toml" >&2
   exit 1
 fi
 exec "$bin" "$@"
