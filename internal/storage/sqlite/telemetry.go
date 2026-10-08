@@ -288,7 +288,19 @@ func (store *Store) SpendReport(ctx context.Context, session coordination.LocalA
 	}
 	now := time.Now().UTC()
 	query = query.Normalized(now)
-	shape, ok := spendShapeFor(query.Dimension)
+	actorID := ""
+	if query.MineOnly {
+		actorID = session.ActorID.String()
+	}
+	return store.projectSpendReport(ctx, session.ProjectKey, actorID, query.Dimension, query.Since, query.Limit, now)
+}
+
+// projectSpendReport is the one implementation of "where did this project's
+// spend go", shared by the agent and operator entries so their numbers about
+// the same window cannot drift. An empty actorID reports the whole project.
+func (store *Store) projectSpendReport(ctx context.Context, projectKey, actorID string,
+	dimension telemetry.SpendDimension, since time.Time, limit uint16, now time.Time) (telemetry.SpendReport, error) {
+	shape, ok := spendShapeFor(dimension)
 	if !ok {
 		return telemetry.SpendReport{}, coordination.ErrInvalid
 	}
@@ -297,19 +309,19 @@ func (store *Store) SpendReport(ctx context.Context, session coordination.LocalA
 	// daemon's, and it is unclamped at ingest -- so an upper bound is what stops
 	// a future-dated call being counted in every window until that date passes.
 	filter := "WHERE calls.project_key = ? AND calls.started_at_us >= ? AND calls.started_at_us <= ?"
-	arguments := []any{session.ProjectKey, query.Since.UnixMicro(), timeMicros(now)}
-	if query.MineOnly {
+	arguments := []any{projectKey, since.UnixMicro(), timeMicros(now)}
+	if actorID != "" {
 		filter += " AND calls.actor_id = ?"
-		arguments = append(arguments, session.ActorID.String())
+		arguments = append(arguments, actorID)
 	}
 
-	report := telemetry.SpendReport{Dimension: query.Dimension, Since: query.Since, Until: now}
+	report := telemetry.SpendReport{Dimension: dimension, Since: since, Until: now}
 	totals, err := store.spendTotals(ctx, shape, filter, arguments)
 	if err != nil {
 		return telemetry.SpendReport{}, err
 	}
 	report.Totals = totals
-	groups, truncated, err := store.spendGroups(ctx, shape, filter, arguments, query.Limit)
+	groups, truncated, err := store.spendGroups(ctx, shape, filter, arguments, limit)
 	if err != nil {
 		return telemetry.SpendReport{}, err
 	}
@@ -365,4 +377,28 @@ func (store *Store) spendGroups(ctx context.Context, shape spendShape, filter st
 		return nil, false, fmt.Errorf("group telemetry spend: %w", err)
 	}
 	return groups, truncated, nil
+}
+
+// AdminSpendReport answers the same rollup for an operator, over a project it
+// names rather than a session it authenticated into.
+//
+// It is the agent report's implementation, not a copy of it: the operator's
+// number disagreeing with the agent's about the same window is precisely the
+// kind of discrepancy nobody can debug. The only differences are where the
+// project comes from -- a name the caller must prove exists, instead of the
+// session's own -- and that there is no caller to narrow to.
+func (store *Store) AdminSpendReport(ctx context.Context,
+	query telemetry.AdminSpendQuery) (telemetry.SpendReport, error) {
+	if err := query.Validate(); err != nil {
+		return telemetry.SpendReport{}, err
+	}
+	if !validLocalCoordinationText(query.ProjectKey, coordination.MaxKeyBytes) {
+		return telemetry.SpendReport{}, coordination.ErrInvalid
+	}
+	now := time.Now().UTC()
+	query = query.Normalized(now)
+	if _, err := store.requireAdminProject(ctx, query.ProjectKey); err != nil {
+		return telemetry.SpendReport{}, err
+	}
+	return store.projectSpendReport(ctx, query.ProjectKey, "", query.Dimension, query.Since, query.Limit, now)
 }
