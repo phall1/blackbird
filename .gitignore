@@ -2,6 +2,9 @@ node_modules/
 dist/
 .pi/
 
+# Rust coordination kernel. The Go module does not build with Cargo.
+rust/target/
+
 # Personal Claude Code configuration. The edit gates are local developer
 # tooling, not part of the project's contract: they shell out to whatever Go
 # and Node happen to be on that developer's PATH. The committed .claude/

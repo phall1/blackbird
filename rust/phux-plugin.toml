@@ -1,0 +1,23 @@
+id = "dev.blackbird.coordination"
+name = "Blackbird"
+version = "0.1.0"
+min_phux_version = "0.0.2"
+description = "Out-of-process coordination kernel: project-scoped agent identity, durable mail, and advisory path leases. It does not attach to a phux server and does not replace the Go loopback daemon."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "doctor"
+title = "Blackbird doctor"
+description = "Opens the Rust kernel database and prints counts. This is not the Go daemon on 127.0.0.1:8081."
+contexts = ["workspace"]
+command = ["sh", "scripts/blackbird-rs.sh", "doctor"]
+
+[[actions]]
+id = "status"
+title = "Blackbird status"
+description = "Lists projects, agent names, and live leases in the Rust kernel database. Tokens are not printed."
+contexts = ["workspace"]
+command = ["sh", "scripts/blackbird-rs.sh", "status"]
+
+[[build]]
+command = ["cargo", "build", "--manifest-path", "Cargo.toml"]

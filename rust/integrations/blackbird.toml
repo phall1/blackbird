@@ -1,0 +1,18 @@
+schema_version = 1
+id = "blackbird"
+display_name = "Blackbird coordination"
+kind = "coordination"
+description = "Stdio MCP server for the Rust coordination kernel. It does not control a terminal and it does not replace the Go daemon."
+
+[session_identity]
+mode = "phux"
+native_env = "PHUX_BLACKBIRD_SESSION_ID"
+restore = "phux-session"
+
+[agent_identity]
+name = "blackbird"
+kind = "blackbird"
+
+[launch]
+command = ["sh", "${PHUX_PLUGIN_ROOT}/scripts/blackbird-rs.sh", "mcp"]
+working_directory = "workspace"
