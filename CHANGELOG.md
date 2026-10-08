@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/phall1/blackbird/compare/v0.8.0...v0.9.0) (2026-10-08)
+
+
+### Features
+
+* **daemon:** replace the Go program with the Rust binary ([#23](https://github.com/phall1/blackbird/issues/23)) ([971f78e](https://github.com/phall1/blackbird/commit/971f78e661947041744f296ddffdfd33758ede4d))
+
 ## [0.8.0](https://github.com/phall1/blackbird/compare/v0.7.0...v0.8.0) (2026-10-08)
 
 
