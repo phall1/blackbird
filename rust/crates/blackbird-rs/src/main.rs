@@ -14,6 +14,7 @@
     reason = "diagnostics stay off the MCP stdout stream"
 )]
 
+mod http;
 mod mcp;
 
 use std::env;

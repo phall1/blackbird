@@ -28,7 +28,7 @@ pub fn serve(desk: &Desk) -> std::io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn dispatch(desk: &Desk, line: &str) -> Option<String> {
+pub(crate) fn dispatch(desk: &Desk, line: &str) -> Option<String> {
     let value: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(_) => return Some(rpc_error(Value::Null, -32700, "parse error")),
