@@ -9,7 +9,7 @@ export function MailboxView(props: { context: Context; reader: MailReader; direc
   const model = createMailbox(props.reader)
   const state = model.state
   const theme = props.context.theme
-  const accent = theme.text.action.primary.default
+  const accent = theme.text.action.primary.base
   let root: BoxRenderable | undefined
   restoreMailboxFocus(props.context.renderer, () => root, () => state.mode === "thread" ? "blackbird-thread" : "blackbird-list", () => props.focused)
   onMount(() => { void model.refresh() })
@@ -36,37 +36,37 @@ export function MailboxView(props: { context: Context; reader: MailReader; direc
       { bind: "f", run: () => props.fullscreen?.() },
     ],
   }))
-  return <box ref={(value) => { root = value }} id="blackbird-mailbox" flexDirection="column" flexGrow={1} minHeight={0} paddingX={1} border borderColor={theme.border.default} backgroundColor={theme.background.default}>
+  return <box ref={(value) => { root = value }} id="blackbird-mailbox" flexDirection="column" flexGrow={1} minHeight={0} paddingX={1} border borderColor={theme.border.base} backgroundColor={theme.background.base}>
     <box flexDirection="row" justifyContent="space-between" paddingY={1}>
       <text fg={accent} flexShrink={1} wrapMode="word">BLACKBIRD / {state.mode === "agents" ? "Mailboxes" : mailText(state.agent || "All mailboxes")}</text>
-      <text id="blackbird-back" onMouseUp={() => { void back() }} fg={theme.text.subdued}>[esc] Back</text>
+      <text id="blackbird-back" onMouseUp={() => { void back() }} fg={theme.text.muted}>[esc] Back</text>
     </box>
-    <text fg={theme.text.subdued} wrapMode="word">{mailText(props.directory)}</text>
+    <text fg={theme.text.muted} wrapMode="word">{mailText(props.directory)}</text>
     <box flexDirection="row" gap={2} paddingY={1}>
       <text id="blackbird-refresh" onMouseUp={() => { void model.refresh() }} fg={accent}>[r] Refresh</text>
       <Show when={state.mode === "inbox"}><text id="blackbird-unread" onMouseUp={() => { void model.toggleUnread() }} fg={accent}>[u] {state.unread ? "Unread only" : "All mail"}</text></Show>
       <Show when={props.fullscreen}><text onMouseUp={() => props.fullscreen?.()} fg={accent}>[f] Expand</text></Show>
     </box>
-    <Show when={!state.loading && !state.error} fallback={<text fg={theme.text.subdued}>{state.error || "Loading mail…"}</text>}>
+    <Show when={!state.loading && !state.error} fallback={<text fg={theme.text.muted}>{state.error || "Loading mail…"}</text>}>
       <Show when={state.mode === "thread"} fallback={<>
-        <Show when={options().length > 0} fallback={<text fg={theme.text.subdued}>No messages in this view.</text>}>
+        <Show when={options().length > 0} fallback={<text fg={theme.text.muted}>No messages in this view.</text>}>
           <select id="blackbird-list" flexGrow={1} minHeight={0} focused={props.focused} options={options()} showDescription
-            backgroundColor={theme.background.default} textColor={theme.text.default}
-            selectedBackgroundColor={theme.background.surface.offset} selectedTextColor={accent}
+            backgroundColor={theme.background.base} textColor={theme.text.base}
+            selectedBackgroundColor={theme.background.raised.base} selectedTextColor={accent}
             onSelect={(_index, option) => {
               if (!option) return
               const value = String(option.value)
               void (state.mode === "agents" ? model.inbox(value) : model.thread(value))
             }} />
         </Show>
-        <Show when={truncated()}><text fg={theme.text.subdued}>Showing the newest 256 entries. Narrow to a mailbox or unread mail.</text></Show>
+        <Show when={truncated()}><text fg={theme.text.muted}>Showing the newest 256 entries. Narrow to a mailbox or unread mail.</text></Show>
       </>}>
         <scrollbox id="blackbird-thread" flexGrow={1} minHeight={0} focused={props.focused}>
           <Show when={state.thread.messages.length} fallback={<text>No messages in this thread.</text>}>
             <For each={state.thread.messages}>{(mail) => <box flexDirection="column" paddingBottom={2}>
               <text fg={accent} wrapMode="word">{mailText(mail.subject)}</text>
-              <text fg={theme.text.subdued} wrapMode="word">{mailText(mail.author_agent_name)} · {mailText(mail.sent_at)}</text>
-              <text fg={theme.text.default} wrapMode="word">{mailText(mail.body)}</text>
+              <text fg={theme.text.muted} wrapMode="word">{mailText(mail.author_agent_name)} · {mailText(mail.sent_at)}</text>
+              <text fg={theme.text.base} wrapMode="word">{mailText(mail.body)}</text>
             </box>}</For>
           </Show>
         </scrollbox>
@@ -76,6 +76,6 @@ export function MailboxView(props: { context: Context; reader: MailReader; direc
         </box>
       </Show>
     </Show>
-    <text fg={theme.text.subdued} paddingY={1} wrapMode="word">↑↓ Navigate · Enter Open · Browsing leaves receipts unchanged</text>
+    <text fg={theme.text.muted} paddingY={1} wrapMode="word">↑↓ Navigate · Enter Open · Browsing leaves receipts unchanged</text>
   </box>
 }

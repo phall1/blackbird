@@ -603,6 +603,11 @@ export function supervisorKey(options: ResolvedOptions): string {
   return `${options.baseUrl.toString()}\0${options.projectKey}\0${options.agentName}\0${options.stateDir}`
 }
 
+interface AssistantMessage {
+  id?: unknown; sessionID?: unknown; role?: unknown; modelID?: unknown; providerID?: unknown
+  tokens?: unknown; error?: unknown; time?: { created?: unknown; completed?: unknown }
+}
+
 /**
  * Records one finished assistant message on the observation plane.
  *
@@ -616,36 +621,45 @@ export function recordAssistantMessage(key: string, event: unknown): void {
   if (!emitter) return
   const properties = (event as { properties?: unknown }).properties
   const info = (properties as { info?: unknown } | undefined)?.info
-  const message = info as {
-    id?: unknown; sessionID?: unknown; role?: unknown; modelID?: unknown; providerID?: unknown
-    tokens?: unknown; error?: unknown; time?: { created?: unknown; completed?: unknown }
-  } | undefined
-  if (!message || message.role !== "assistant") return
+  const message = info as AssistantMessage | undefined
+  if (message?.role !== "assistant") return
   // An in-flight message has no completion time yet. Recording it now would
   // store a zero-duration call and then record it again when it finishes.
   const completed = message.time?.completed
   if (typeof completed !== "number") return
   const created = typeof message.time?.created === "number" ? message.time.created : completed
-  const id = typeof message.id === "string" ? message.id : ""
-  const model = typeof message.modelID === "string" ? message.modelID : ""
-  const provider = typeof message.providerID === "string" ? message.providerID : ""
-  if (id === "" || model === "" || provider === "") return
-  const errorKind = errorKindForMessage(message.error)
-  const rawUsage = boundedRawUsage(message.tokens)
+  const identity = messageIdentity(message)
+  if (!identity) return
   emitter.record({
-    dedupe_key: id,
+    dedupe_key: identity.id,
     harness: "opencode",
-    provider,
-    model,
+    provider: identity.provider,
+    model: identity.model,
     operation: "chat",
     usage: normalizeOpenCodeTokens(message.tokens as never),
     outcome: outcomeForMessage(message.error),
     started_at: new Date(created).toISOString(),
     duration_ms: Math.max(0, completed - created),
+    ...observationMetadata(message),
+  })
+}
+
+function messageIdentity(message: AssistantMessage) {
+  const id = typeof message.id === "string" ? message.id : ""
+  const model = typeof message.modelID === "string" ? message.modelID : ""
+  const provider = typeof message.providerID === "string" ? message.providerID : ""
+  if (id === "" || model === "" || provider === "") return undefined
+  return { id, model, provider }
+}
+
+function observationMetadata(message: AssistantMessage) {
+  const errorKind = errorKindForMessage(message.error)
+  const rawUsage = boundedRawUsage(message.tokens)
+  return {
     ...(typeof message.sessionID === "string" ? { harness_session: message.sessionID } : {}),
     ...(errorKind !== undefined ? { error_kind: errorKind } : {}),
     ...(rawUsage !== undefined ? { raw_usage: rawUsage } : {}),
-  })
+  }
 }
 
 /**
