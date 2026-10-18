@@ -9,13 +9,26 @@ export interface MailReader {
   thread(query: z.infer<typeof ThreadQuery>, signal: AbortSignal): Promise<z.infer<typeof ThreadPage>>
 }
 
+interface MailboxState {
+  mode: "agents" | "inbox" | "thread"
+  agent: string
+  unread: boolean
+  conversation: string
+  after: number
+  loading: boolean
+  error: string
+  agents: z.infer<typeof AgentsPage>
+  inbox: z.infer<typeof InboxPage>
+  thread: z.infer<typeof ThreadPage>
+}
+
 export function createMailbox(reader: MailReader) {
-  const [state, set] = createStore({
-    mode: "agents" as "agents" | "inbox" | "thread", agent: "", unread: false,
+  const [state, set] = createStore<MailboxState>({
+    mode: "agents", agent: "", unread: false,
     conversation: "", after: 0, loading: false, error: "",
-    agents: { agents: [], truncated: false } as z.infer<typeof AgentsPage>,
-    inbox: { pending: [], truncated: false } as z.infer<typeof InboxPage>,
-    thread: { messages: [], has_more: false, next: 0 } as z.infer<typeof ThreadPage>,
+    agents: { agents: [], truncated: false },
+    inbox: { pending: [], truncated: false },
+    thread: { messages: [], has_more: false, next: 0 },
   })
   let active: AbortController | undefined
 

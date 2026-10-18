@@ -1,13 +1,14 @@
 import { createServer } from "node:http"
 import { mkdtemp, writeFile, rm } from "node:fs/promises"
 import { join, resolve } from "node:path"
+import { tmpdir } from "node:os"
 import { Effect } from "effect"
 import { Llm, OpenCodeDriver } from "opencode-drive"
 
 const plugin = process.env.BLACKBIRD_PLUGIN_DIRECTORY ?? resolve(".")
 
 const fixture = Effect.acquireRelease(Effect.tryPromise(async () => {
-  const directory = await mkdtemp("/private/tmp/opencode/blackbird-drive-")
+  const directory = await mkdtemp(join(tmpdir(), "blackbird-drive-"))
   const server = createServer((request, response) => {
     const url = new URL(request.url!, "http://127.0.0.1")
     response.setHeader("content-type", "application/json")
@@ -36,6 +37,7 @@ const fixture = Effect.acquireRelease(Effect.tryPromise(async () => {
 export default Effect.scoped(Effect.gen(function* () {
   const { path } = yield* fixture
   yield* OpenCodeDriver.use({
+    opencode: { command: ["opencode"] },
     keepArtifacts: process.env.BLACKBIRD_DRIVE_KEEP === "1",
     project: { git: true, files: { "README.md": "# Isolated Blackbird UI fixture\n" } },
     config: { autoupdate: false, plugins: [{ package: plugin, options: { handshakePath: path } }] },

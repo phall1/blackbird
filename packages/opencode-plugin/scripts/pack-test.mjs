@@ -9,7 +9,9 @@ try {
 const output = execFileSync("npm", ["pack", "--json", "--pack-destination", workspace], { cwd: new URL("..", import.meta.url), encoding: "utf8" })
 const [{ filename }] = JSON.parse(output)
 execFileSync("npm", ["init", "--yes"], { cwd: workspace, stdio: "ignore" })
-execFileSync("npm", ["install", "--ignore-scripts", join(workspace, filename)], { cwd: workspace, stdio: "inherit" })
+// npm otherwise chooses the newest optional SDK UI peers before considering
+// the plugin's narrower host contract. Install the actual host peers together.
+execFileSync("npm", ["install", "--ignore-scripts", join(workspace, filename), "@opentui/core@0.5.17", "@opentui/solid@0.5.17", "solid-js@1.9.12"], { cwd: workspace, stdio: "inherit" })
 const installed = join(workspace, "node_modules", "blackbird-opencode")
 const manifest = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"))
 if (manifest.name !== "blackbird-opencode") throw new Error("installed tarball has the wrong package name")

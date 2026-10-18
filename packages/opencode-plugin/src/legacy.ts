@@ -620,7 +620,7 @@ export function recordAssistantMessage(key: string, event: unknown): void {
     id?: unknown; sessionID?: unknown; role?: unknown; modelID?: unknown; providerID?: unknown
     tokens?: unknown; error?: unknown; time?: { created?: unknown; completed?: unknown }
   } | undefined
-  if (!message || message.role !== "assistant") return
+  if (message?.role !== "assistant") return
   // An in-flight message has no completion time yet. Recording it now would
   // store a zero-duration call and then record it again when it finishes.
   const completed = message.time?.completed

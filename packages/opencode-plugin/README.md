@@ -134,8 +134,8 @@ BLACKBIRD_PACK_TUI=1 npm run test:pack
 `npm run test:pack` packs the package, installs that tarball into a clean
 temporary project, and imports the installed entrypoint.
 
-The V2 server pins `@opencode/plugin` and `@opencode/schema` beta-19365 with
-Effect rc.112; the TUI pins OpenTUI 0.5.11 and Solid 1.9.12. The default export
+The V2 server targets `@opencode/plugin` and `@opencode/schema` 2.0.32 with
+Effect 4.0.1; the TUI pins OpenTUI 0.5.17 and Solid 1.9.12. The default export
 uses `Plugin.define({ effect })`, with a separate V1 `server` compatibility hook.
 The existing Promise delivery transport feeds host operations through a scoped
 Effect queue: no nested runtime, and delivery settles only after host acceptance.

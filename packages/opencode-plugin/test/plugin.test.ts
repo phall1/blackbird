@@ -109,7 +109,7 @@ describe("supervisor", () => {
       stateDir,
       routing: { mode: "fixed", sessionID: "ses_fixed" },
       paths: { register: "/register", catchUp: "/events", stream: "/stream", ack: "/ack", message: "/messages" },
-    }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => undefined })
+    }, controller.signal, { fetch: fetcher, random: () => 0.5, sleep: async () => undefined })
     await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce())
     expect(deliver).toHaveBeenCalledWith({
       sessionID: "ses_fixed",
@@ -163,7 +163,7 @@ describe("supervisor", () => {
       baseUrl: "https://blackbird.test", projectKey: "/repo", agentName: "agent", stateDir,
       paths: { register: "/register", catchUp: "/events", stream: "/stream", ack: "/ack" }, routing: { mode: "conversation" },
       backoff: { minimumMs: 10, maximumMs: 10, jitter: 0 },
-    }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => undefined })
+    }, controller.signal, { fetch: fetcher, random: () => 0.5, sleep: async () => undefined })
     expect(registrationBody).toEqual({ project_key: "/repo", agent_name: "agent", registration_token: "saved-secret" })
     expect(await readFile(join(stateDir, "token"), "utf8")).toBe("saved-secret\n")
     expect(acknowledgements).toEqual([{ consumer_id: "opencode-plugin", cursor: "legacy-cursor" }])
@@ -206,7 +206,7 @@ describe("supervisor", () => {
       baseUrl: "https://blackbird.test", projectKey: "/repo", agentName: "agent", stateDir,
       paths: { register: "/register", catchUp: "/events", stream: "/stream", ack: "/ack", message: "/messages" },
       backoff: { minimumMs: 10, maximumMs: 10, jitter: 0 },
-    }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => { controller.abort() } })
+    }, controller.signal, { fetch: fetcher, random: () => 0.5, sleep: async () => { controller.abort() } })
     const state = JSON.parse(await readFile(join(stateDir, "cursor.json"), "utf8")) as unknown
     expect(state).toEqual({ sessions: { conversation: "session" } })
     expect(acknowledgements).toEqual([{ consumer_id: "opencode-plugin", cursor: "event-1" }])
@@ -318,7 +318,7 @@ describe("OpenCode adapter", () => {
       paths: { register: "/register", catchUp: "/events", stream: "/stream", ack: "/ack", message: "/messages" },
       routing: { mode: "conversation", agent: "build" },
       backoff: { minimumMs: 10, maximumMs: 10, jitter: 0 },
-    }, controller.signal, { fetch: fetcher as typeof fetch, random: () => 0.5, sleep: async () => undefined })
+    }, controller.signal, { fetch: fetcher, random: () => 0.5, sleep: async () => undefined })
     expect(calls.map(({ method }) => method)).toEqual(["create", "prompt"])
     const body = calls[1]?.options["body"] as { noReply: boolean; agent: string; parts: { metadata: Record<string, unknown> }[] }
     expect(body.noReply).toBe(true)

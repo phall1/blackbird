@@ -31,6 +31,7 @@
     "test:tui": "npm run build && opencode-drive run scripts/tui-drive.ts",
     "test:pack": "npm run build && node scripts/pack-test.mjs",
     "prepack": "npm run build",
+    "prepare": "npm run build",
     "gates": "npm run check && npm test && npm run test:pack && npm audit --audit-level=high"
   },
   "keywords": [
@@ -50,26 +51,36 @@
   },
   "homepage": "https://github.com/phall1/blackbird/tree/main/packages/opencode-plugin#readme",
   "dependencies": {
-    "@opencode-ai/plugin": "1.18.26",
-    "@opencode/plugin": "0.0.0-beta-19365",
-    "@opencode/schema": "0.0.0-beta-19365",
-    "effect": "4.0.0-rc.112",
+    "@opencode/plugin": "2.0.32",
+    "@opencode/schema": "2.0.32",
     "zod": "4.3.6"
   },
   "peerDependencies": {
-    "@opentui/core": "0.5.11",
-    "@opentui/solid": "0.5.11",
+    "@opencode-ai/plugin": "^1.19.3",
+    "effect": "^4.0.1",
+    "@opentui/core": "0.5.17",
+    "@opentui/solid": "0.5.17",
     "solid-js": "1.9.12"
   },
   "devDependencies": {
-    "@opencode/theme": "0.0.0-beta-19365",
-    "opencode-drive": "2.1.0",
+    "@opencode-ai/plugin": "1.19.3",
+    "@opencode/plugin": "2.0.32",
+    "@opencode/theme": "2.0.32",
+    "effect": "4.0.1",
+    "opencode-drive": "2.3.0",
     "@eslint/js": "9.33.0",
     "@types/node": "24.2.1",
     "eslint": "9.33.0",
     "typescript": "5.9.2",
-    "typescript-eslint": "8.39.1",
-    "vitest": "3.2.7"
+    "typescript-eslint": "8.71.2",
+    "vitest": "5.0.5"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": { "optional": true }
+  },
+  "overrides": {
+    "seroval": "1.6.9",
+    "seroval-plugins": "1.6.9"
   },
   "publishConfig": {
     "access": "public",
