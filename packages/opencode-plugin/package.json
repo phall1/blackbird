@@ -1,6 +1,6 @@
 {
   "name": "blackbird-opencode",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Deliver durable Blackbird messages into OpenCode V2 sessions.",
   "type": "module",
   "exports": {
@@ -51,7 +51,7 @@
   "dependencies": {
     "@opencode/plugin": "2.0.32",
     "@opencode/schema": "2.0.32",
-    "zod": "4.3.6"
+    "zod": "4.6.7"
   },
   "peerDependencies": {
     "effect": "^4.0.1",
@@ -64,10 +64,10 @@
     "@opencode/theme": "2.0.32",
     "effect": "4.0.1",
     "opencode-drive": "2.3.0",
-    "@eslint/js": "9.33.0",
-    "@types/node": "24.2.1",
-    "eslint": "9.33.0",
-    "typescript": "5.9.2",
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.13.0",
+    "typescript": "5.9.3",
     "typescript-eslint": "8.71.2",
     "vitest": "5.0.5"
   },

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.3.0...opencode-plugin-v0.3.1) (2026-10-17)
+
+### Bug Fixes
+
+* **opencode-plugin:** refresh Zod and development tooling while retaining the OpenCode 2.0.32 host runtime pins and compiled Git-install entrypoints.
+
 ## [0.3.0](https://github.com/phall1/blackbird/compare/opencode-plugin-v0.2.3...opencode-plugin-v0.3.0) (2026-09-09)
 
 

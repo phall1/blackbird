@@ -150,3 +150,9 @@ thread, session-panel, and full-screen screenshots. The packed-artifact smoke
 loads the server, shared RPC, and TUI with the V2 host resolver. Local directory
 entrypoints are deliberately at package root because the host probes `server`,
 `tui`, and `rpc` there.
+
+The checkout's paired Seroval overrides keep its dependency audit clean. npm
+does not apply a dependency's overrides in a consuming project: a fresh tarball
+install still reports Seroval advisories through the host-pinned Solid 1.9.12.
+Fixing that consumer graph requires a compatible host update, not independently
+upgrading the plugin's Solid, OpenTUI, or SDK internals.
