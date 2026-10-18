@@ -9,7 +9,7 @@ acknowledging it, or spending an agent turn.
 
 ### Mailbox browser
 
-Load the local checkout in `opencode.jsonc` after `npm ci && npm run build`
+Load the local checkout in `opencode.jsonc` after `npm ci && npm run compile`
 inside `packages/opencode-plugin`:
 
 ```jsonc

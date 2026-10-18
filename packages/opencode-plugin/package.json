@@ -25,13 +25,11 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "build": "bun scripts/build.mjs",
+    "compile": "bun scripts/build.mjs",
     "check": "tsc --noEmit && eslint src test",
     "test": "vitest run",
-    "test:tui": "npm run build && opencode-drive run scripts/tui-drive.ts",
-    "test:pack": "npm run build && node scripts/pack-test.mjs",
-    "prepack": "npm run build",
-    "prepare": "npm run build",
+    "test:tui": "npm run compile && opencode-drive run scripts/tui-drive.ts",
+    "test:pack": "npm run compile && node scripts/pack-test.mjs",
     "gates": "npm run check && npm test && npm run test:pack && npm audit --audit-level=high"
   },
   "keywords": [
