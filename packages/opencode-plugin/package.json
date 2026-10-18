@@ -54,7 +54,6 @@
     "zod": "4.3.6"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.19.3",
     "effect": "^4.0.1",
     "@opentui/core": "0.5.17",
     "@opentui/solid": "0.5.17",
@@ -62,7 +61,6 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.19.3",
-    "@opencode/plugin": "2.0.32",
     "@opencode/theme": "2.0.32",
     "effect": "4.0.1",
     "opencode-drive": "2.3.0",
@@ -72,9 +70,6 @@
     "typescript": "5.9.2",
     "typescript-eslint": "8.71.2",
     "vitest": "5.0.5"
-  },
-  "peerDependenciesMeta": {
-    "@opencode-ai/plugin": { "optional": true }
   },
   "overrides": {
     "seroval": "1.6.9",
