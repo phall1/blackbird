@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/phall1/blackbird/compare/v0.9.0...v0.9.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **opencode-plugin:** refresh compatible dependencies for 0.3.1 ([#27](https://github.com/phall1/blackbird/issues/27)) ([f5efd44](https://github.com/phall1/blackbird/commit/f5efd441ad09ae7595c584c1a65941f8bc71d396))
+
 ## [0.9.0](https://github.com/phall1/blackbird/compare/v0.8.0...v0.9.0) (2026-10-08)
 
 
